@@ -184,25 +184,36 @@ with appropriate HTTP status.
 Auth: **none in v1**. The service binds to `127.0.0.1:` by default and lives
 inside the BR LAN. If exposed later, that's a Cera-side reverse-proxy concern.
 
-## UI: leptos SSR + WASM hydration
+## UI: axum + maud HTML SSR (v1) ... leptos+WASM deferred
 
-Replaces the python+svelte `~/.claude/workspace/github/hive-ui`. Same routes
-the existing UI exposes (graph view at `/graph`, journal browse, tasks view).
+**Scope decision: v1 ships pure HTML SSR via axum + maud, NOT full leptos
+with WASM hydration.** Original plan was leptos SSR + WASM hydration; the
+hive-ui PR pivoted before merge for these reasons:
 
-Why leptos:
-- All-rust stack. One toolchain to build the workspace.
-- SSR gives sub-100ms first paint for the journal/tasks views (server hits
-  sqlite directly via `hive-db`, skipping the API hop for SSR rendering).
-- WASM hydration handles the interactive bits (graph d3-style render, search
-  box, tag filtering).
+- The user-visible result for the lists/forms/graph-tabular pages is the
+  same. SSR HTML renders fine for browse-and-filter workflows.
+- maud is `view!`-style HTML in rust without the cargo-leptos / hydration
+  feature-flag dance. One binary, debian:bookworm-slim runtime, no asset
+  pipeline. Ships in hours, not days.
+- The genuinely-WASM-warranted pieces (interactive d3-style force layout
+  on the graph page) are tracked as a follow-up. The graph page in v1
+  renders the same `graph` payload as a tag-grouped tabular view plus a
+  collapsible raw JSON pane, which covers exploration without the
+  hydration overhead.
+- Deferring leptos doesn't lock us out: a follow-up PR can replace
+  individual pages with leptos islands without touching `hive-db` or
+  `hive-api`.
 
-The leptos SSR server is its own axum binary; in dev it can call `hive-api`
-over HTTP, in production it embeds `hive-db` directly to avoid the round trip.
-For the graph page specifically, the SSR initial payload is the result of
-`hive graph` ... we serve it inline so the graph renders instantly without a
-client fetch.
+The SSR server reads `hive-db` directly (no API hop) ... it is its own
+axum binary that imports the `hive-db` crate and shares the same r2d2
+pool model used by `hive-api`.
 
-Build tool: `cargo-leptos`.
+Build: regular cargo, no cargo-leptos. Single static binary, runtime
+image identical in shape to `hive-api`.
+
+If/when interactive d3 lands, the path is either (a) leptos islands
+mounted into the maud-rendered page, or (b) a tiny vanilla-JS d3 setup
+fed by inlined JSON. Both are reversible; v1 doesn't lock the choice.
 
 ## Embedder: open question, flag for Cera
 
