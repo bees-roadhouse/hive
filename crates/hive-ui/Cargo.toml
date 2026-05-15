@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "leptos SSR + WASM hydration UI for the hive shared-state DB"
+description = "leptos SSR UI for the hive shared-state DB"
 
 [[bin]]
 name = "hive-ui"
@@ -22,3 +22,4 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+leptos = { version = "0.7", features = ["ssr"] }
