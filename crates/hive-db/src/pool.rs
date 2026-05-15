@@ -50,9 +50,13 @@ pub fn open_pool(path: &Path, create_if_missing: bool, max_size: u32) -> Result<
 }
 
 /// Per-connection PRAGMAs applied at checkout.
+///
+/// `journal_mode = WAL` is set via `pragma_update_and_check` because the
+/// pragma returns the new mode as a result row; plain `pragma_update`
+/// errors with "Execute returned results".
 fn configure_connection(conn: &mut Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
+    let _: String = conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     Ok(())
