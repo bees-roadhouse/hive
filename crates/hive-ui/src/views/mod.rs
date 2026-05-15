@@ -2,7 +2,7 @@
 //! hydration, no client JS. v1.5 will introduce islands of interactivity.
 
 use hive_db::queries::search::{JournalHit, NoteHit};
-use hive_db::types::{JournalEntry, Note, Task, WireEvent};
+use hive_db::types::{JournalEntry, Note, Project, Task, WireEvent};
 use leptos::prelude::*;
 
 const STYLE: &str = r#"
@@ -61,6 +61,7 @@ fn nav() -> impl IntoView {
             <a href="/tasks">"tasks"</a>
             <a href="/notes">"notes"</a>
             <a href="/wire">"wire"</a>
+            <a href="/projects">"projects"</a>
             <form class="search" action="/search" method="get">
                 <input type="search" name="q" placeholder="search journal + notes (FTS5)..."/>
             </form>
@@ -327,14 +328,16 @@ pub fn render_tasks_page(rows: Vec<Task>) -> String {
     let rendered: Vec<_> = rows
         .into_iter()
         .map(|t| {
+            let id = t.id;
+            let href = format!("/tasks/{id}");
             view! {
                 <tr>
-                    <td class="id">{t.id}</td>
+                    <td class="id"><a href={href.clone()} style="color:inherit">{id}</a></td>
                     <td class="ai">{t.owner}</td>
                     <td class="ai">{t.status}</td>
                     <td class="ai">{t.priority.unwrap_or_default()}</td>
                     <td class="date">{t.due.unwrap_or_default()}</td>
-                    <td>{t.title}</td>
+                    <td class="title"><a href={href}>{t.title}</a></td>
                     <td class="tags">{t.project}</td>
                 </tr>
             }
@@ -368,13 +371,21 @@ pub fn render_notes_page(rows: Vec<Note>) -> String {
     let rendered: Vec<_> = rows
         .into_iter()
         .map(|n| {
+            let id = n.id;
+            let href = format!("/notes/{id}");
+            let title = n.title.unwrap_or_default();
+            let body_preview = if n.body.len() > 200 {
+                format!("{}…", &n.body[..200])
+            } else {
+                n.body
+            };
             view! {
                 <tr>
-                    <td class="id">{n.id}</td>
+                    <td class="id"><a href={href.clone()} style="color:inherit">{id}</a></td>
                     <td class="ai">{n.author}</td>
-                    <td class="title">{n.title.unwrap_or_default()}</td>
-                    <td>{n.body}</td>
-                    <td class="tags">{n.tags.unwrap_or_default()}</td>
+                    <td class="title"><a href={href}>{title}</a></td>
+                    <td>{body_preview}</td>
+                    <td class="tags">{tag_chips(&n.tags.unwrap_or_default())}</td>
                     <td class="ai">{n.project.unwrap_or_default()}</td>
                 </tr>
             }
@@ -436,6 +447,111 @@ pub fn render_wire_page(rows: Vec<WireEvent>) -> String {
                         <th>"title"</th>
                         <th>"affects"</th>
                         <th>"ack"</th>
+                    </tr>
+                </thead>
+                <tbody>{rendered}</tbody>
+            </table>
+        },
+    )
+}
+
+pub fn render_task_detail(id: i64, task: Option<Task>) -> String {
+    match task {
+        None => page_shell(
+            &format!("hive-ui — task #{id} not found"),
+            view! {
+                <h1>"Task " {id} " not found"</h1>
+                <p><a href="/tasks">"← back to tasks"</a></p>
+            },
+        ),
+        Some(t) => {
+            let title_for_page = format!("hive-ui — task: {}", t.title);
+            let body = view! {
+                <h1>{t.title.clone()}</h1>
+                <p class="meta">
+                    "id " {t.id} " · status " {t.status} " · owner " {t.owner}
+                    " · priority " {t.priority.unwrap_or_else(|| "—".into())}
+                    " · due " {t.due.unwrap_or_else(|| "—".into())}
+                    " · project " {t.project}
+                </p>
+                <pre>{t.body.unwrap_or_default()}</pre>
+                <p class="meta">
+                    "created " {t.created_at}
+                    " · updated " {t.updated_at}
+                    " · closed " {t.closed_at.unwrap_or_else(|| "—".into())}
+                </p>
+                <p class="meta">
+                    "block reason: " {t.block_reason.unwrap_or_else(|| "—".into())}
+                </p>
+                <p><a href="/tasks">"← back to tasks"</a></p>
+            };
+            page_shell(&title_for_page, body)
+        }
+    }
+}
+
+pub fn render_note_detail(id: i64, note: Option<Note>) -> String {
+    match note {
+        None => page_shell(
+            &format!("hive-ui — note #{id} not found"),
+            view! {
+                <h1>"Note " {id} " not found"</h1>
+                <p><a href="/notes">"← back to notes"</a></p>
+            },
+        ),
+        Some(n) => {
+            let title = n.title.clone().unwrap_or_else(|| format!("note {}", n.id));
+            let title_for_page = format!("hive-ui — {title}");
+            let body = view! {
+                <h1>{title.clone()}</h1>
+                <p class="meta">
+                    "id " {n.id} " · author " {n.author}
+                    " · project " {n.project.unwrap_or_else(|| "—".into())}
+                    " · tags: " {tag_chips(&n.tags.unwrap_or_default())}
+                </p>
+                <pre>{n.body}</pre>
+                <p class="meta">
+                    "created " {n.created_at}
+                    " · updated " {n.updated_at}
+                </p>
+                <p><a href="/notes">"← back to notes"</a></p>
+            };
+            page_shell(&title_for_page, body)
+        }
+    }
+}
+
+pub fn render_projects_page(rows: Vec<Project>) -> String {
+    let count = rows.len();
+    let rendered: Vec<_> = rows
+        .into_iter()
+        .map(|p| {
+            view! {
+                <tr>
+                    <td class="id">{p.id}</td>
+                    <td class="title">{p.name}</td>
+                    <td class="ai">{p.status}</td>
+                    <td class="ai">{p.owner}</td>
+                    <td>{p.description.unwrap_or_default()}</td>
+                    <td class="date">{p.updated_at}</td>
+                </tr>
+            }
+        })
+        .collect();
+    page_shell(
+        "hive-ui — projects",
+        view! {
+            <h1>"Projects"</h1>
+            <p class="meta">{count} " projects"</p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>"id"</th>
+                        <th>"name"</th>
+                        <th>"status"</th>
+                        <th>"owner"</th>
+                        <th>"description"</th>
+                        <th>"updated"</th>
                     </tr>
                 </thead>
                 <tbody>{rendered}</tbody>

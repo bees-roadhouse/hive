@@ -14,7 +14,7 @@ use axum::{
     response::{Html, IntoResponse},
     routing::get,
 };
-use hive_db::queries::{journal, notes, search, tasks, wire};
+use hive_db::queries::{journal, notes, projects, search, tasks, wire};
 use hive_db::{Pool, default_db_path, open_pool};
 use serde::Deserialize;
 
@@ -46,6 +46,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/tasks", get(tasks_list))
         .route("/notes", get(notes_list))
         .route("/wire", get(wire_list))
+        .route("/tasks/{id}", get(task_detail))
+        .route("/notes/{id}", get(note_detail))
+        .route("/projects", get(projects_list))
         .route("/search", get(search_handler))
         .route("/healthz", get(healthz))
         .with_state(state);
@@ -147,6 +150,50 @@ async fn search_handler(
 
 async fn healthz() -> impl IntoResponse {
     "ok"
+}
+
+async fn task_detail(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Html<String> {
+    let pool = state.pool.clone();
+    let task = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = pool.get()?;
+        Ok(tasks::get(&conn, id)?)
+    })
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .flatten();
+    Html(views::render_task_detail(id, task))
+}
+
+async fn note_detail(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Html<String> {
+    let pool = state.pool.clone();
+    let note = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = pool.get()?;
+        Ok(notes::get(&conn, id)?)
+    })
+    .await
+    .ok()
+    .and_then(|r| r.ok())
+    .flatten();
+    Html(views::render_note_detail(id, note))
+}
+
+async fn projects_list(State(state): State<AppState>) -> Html<String> {
+    let pool = state.pool.clone();
+    let rows = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = pool.get()?;
+        Ok(projects::list(&conn, None)?)
+    })
+    .await
+    .unwrap_or_else(|_| Ok(Vec::new()))
+    .unwrap_or_default();
+    Html(views::render_projects_page(rows))
 }
 
 async fn journal_detail(
