@@ -1,0 +1,27 @@
+# Local dev stack. Pulls images from ghcr.io after a release; for local
+# iteration before publishing, point `image` at a locally-built tag (the
+# build instructions live in DESIGN.md).
+services:
+  hive-api:
+    image: ghcr.io/bees-roadhouse/hive-api:latest
+    container_name: hive-api
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    environment:
+      HIVE_DB: /data/hive.db
+      HIVE_API_BIND: 0.0.0.0:7878
+    ports:
+      - "127.0.0.1:7878:7878"
+
+  hive-ui:
+    image: ghcr.io/bees-roadhouse/hive-ui:latest
+    container_name: hive-ui
+    restart: unless-stopped
+    depends_on:
+      - hive-api
+    environment:
+      HIVE_API_URL: http://hive-api:7878
+      HIVE_UI_BIND: 0.0.0.0:8080
+    ports:
+      - "127.0.0.1:8080:8080"

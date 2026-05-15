@@ -1,0 +1,25 @@
+# Runtime-only image. Binary is built outside docker (cargo-zigbuild in CI)
+# and copied in. See .github/workflows/publish.yml for the build step.
+FROM debian:bookworm-slim
+
+ARG TARGETARCH
+ARG BINARY_DIR=artifacts
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# The build job uploads two artifacts: artifacts/amd64/hive-api and
+# artifacts/arm64/hive-api. buildx selects the right one per platform.
+COPY ${BINARY_DIR}/${TARGETARCH}/hive-api /usr/local/bin/hive-api
+
+VOLUME ["/data"]
+
+# 7878 = "hive" rotated through dial-pad; arbitrary local port.
+EXPOSE 7878
+
+ENV HIVE_DB=/data/hive.db
+ENV HIVE_API_BIND=0.0.0.0:7878
+
+ENTRYPOINT ["/usr/local/bin/hive-api"]
