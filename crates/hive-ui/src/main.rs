@@ -8,9 +8,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use axum::{Router, extract::{Path, State}, response::Html, routing::get};
-use hive_db::queries::{journal, notes, tasks, wire};
+use axum::{
+    Router,
+    extract::{Path, Query, State},
+    response::{Html, IntoResponse},
+    routing::get,
+};
+use hive_db::queries::{journal, notes, search, tasks, wire};
 use hive_db::{Pool, default_db_path, open_pool};
+use serde::Deserialize;
 
 mod views;
 
@@ -40,6 +46,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/tasks", get(tasks_list))
         .route("/notes", get(notes_list))
         .route("/wire", get(wire_list))
+        .route("/search", get(search_handler))
+        .route("/healthz", get(healthz))
         .with_state(state);
 
     let port: u16 = std::env::var("HIVE_UI_PORT")
@@ -76,12 +84,28 @@ async fn home(State(state): State<AppState>) -> Html<String> {
     Html(views::render_home(entries))
 }
 
-async fn journal_list(State(state): State<AppState>) -> Html<String> {
+#[derive(Debug, Deserialize, Default)]
+struct JournalFilterQuery {
+    tag: Option<String>,
+    ai: Option<String>,
+}
+
+async fn journal_list(
+    State(state): State<AppState>,
+    Query(q): Query<JournalFilterQuery>,
+) -> Html<String> {
     let pool = state.pool.clone();
+    let tag = q.tag.clone();
+    let ai = q.ai.clone();
     let entries = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = pool.get()?;
+        let parsed_ai = ai
+            .as_deref()
+            .and_then(|s| s.parse::<hive_db::enums::Ai>().ok());
         let filters = journal::ListFilters {
             limit: Some(100),
+            tag: tag.clone(),
+            ai: parsed_ai,
             ..Default::default()
         };
         Ok(journal::list(&conn, &filters)?)
@@ -89,7 +113,40 @@ async fn journal_list(State(state): State<AppState>) -> Html<String> {
     .await
     .unwrap_or_else(|_| Ok(Vec::new()))
     .unwrap_or_default();
-    Html(views::render_journal_page(entries))
+    Html(views::render_journal_page(entries, q.tag, q.ai))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct SearchQuery {
+    q: Option<String>,
+}
+
+async fn search_handler(
+    State(state): State<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> Html<String> {
+    let q = query.q.unwrap_or_default();
+    let q_clone = q.clone();
+    if q.trim().is_empty() {
+        return Html(views::render_search_page(String::new(), Vec::new(), Vec::new()));
+    }
+    let pool = state.pool.clone();
+    let (journal_hits, note_hits) = tokio::task::spawn_blocking(move || {
+        let conn = match pool.get() {
+            Ok(c) => c,
+            Err(_) => return (Vec::new(), Vec::new()),
+        };
+        let j = search::journal(&conn, &q_clone, 30).unwrap_or_default();
+        let n = search::notes(&conn, &q_clone, 30).unwrap_or_default();
+        (j, n)
+    })
+    .await
+    .unwrap_or_default();
+    Html(views::render_search_page(q, journal_hits, note_hits))
+}
+
+async fn healthz() -> impl IntoResponse {
+    "ok"
 }
 
 async fn journal_detail(
