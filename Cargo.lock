@@ -585,6 +585,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "clap",
  "hive-db",
  "serde",
  "serde_json",

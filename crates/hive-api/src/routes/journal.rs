@@ -1,0 +1,104 @@
+use axum::Router;
+use axum::extract::{Path, Query, State};
+use axum::routing::get;
+use axum::Json;
+use serde::Deserialize;
+
+use hive_db::enums::Ai;
+use hive_db::queries::{journal, search};
+
+use crate::error::ApiError;
+use crate::state::AppState;
+use crate::with_conn;
+
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/journal", get(list).post(add))
+        .route("/journal/{id}", get(show))
+        .route("/journal/search", get(search_endpoint))
+}
+
+#[derive(Debug, Deserialize)]
+struct ListQuery {
+    ai: Option<Ai>,
+    from: Option<String>,
+    to: Option<String>,
+    tag: Option<String>,
+    limit: Option<i64>,
+}
+
+async fn list(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<Vec<hive_db::types::JournalEntry>>, ApiError> {
+    let filters = journal::ListFilters {
+        ai: q.ai,
+        from_date: q.from,
+        to_date: q.to,
+        tag: q.tag,
+        limit: q.limit,
+    };
+    let rows = with_conn(&state, move |c| journal::list(c, &filters)).await?;
+    Ok(Json(rows))
+}
+
+#[derive(Debug, Deserialize)]
+struct AddBody {
+    ai: Ai,
+    /// YYYY-MM-DD; default today.
+    date: Option<String>,
+    title: Option<String>,
+    body: String,
+    tags: Option<String>,
+}
+
+async fn add(
+    State(state): State<AppState>,
+    Json(body): Json<AddBody>,
+) -> Result<Json<hive_db::types::JournalEntry>, ApiError> {
+    let date = body
+        .date
+        .clone()
+        .unwrap_or_else(|| chrono::Local::now().date_naive().format("%Y-%m-%d").to_string());
+    let e = with_conn(&state, move |c| {
+        journal::add(
+            c,
+            body.ai,
+            &date,
+            body.title.as_deref(),
+            &body.body,
+            body.tags.as_deref(),
+        )
+    })
+    .await?;
+    Ok(Json(e))
+}
+
+async fn show(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<hive_db::types::JournalEntry>, ApiError> {
+    let e = with_conn(&state, move |c| journal::require(c, id)).await?;
+    Ok(Json(e))
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    q: String,
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+fn default_limit() -> i64 {
+    20
+}
+
+async fn search_endpoint(
+    State(state): State<AppState>,
+    Query(q): Query<SearchQuery>,
+) -> Result<Json<Vec<search::JournalHit>>, ApiError> {
+    let limit = q.limit;
+    let query = q.q;
+    let hits = with_conn(&state, move |c| search::journal(c, &query, limit)).await?;
+    Ok(Json(hits))
+}

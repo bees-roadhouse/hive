@@ -1,0 +1,88 @@
+use axum::Router;
+use axum::extract::{Path, Query, State};
+use axum::routing::{get, post};
+use axum::Json;
+use serde::Deserialize;
+use serde_json::json;
+
+use hive_db::enums::Severity;
+use hive_db::queries::wire;
+
+use crate::error::ApiError;
+use crate::state::AppState;
+use crate::with_conn;
+
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/wire", get(list).post(add))
+        .route("/wire/{id}/ack", post(ack))
+}
+
+#[derive(Debug, Deserialize)]
+struct ListQuery {
+    source: Option<String>,
+    severity: Option<Severity>,
+    #[serde(default)]
+    unacknowledged: bool,
+    limit: Option<i64>,
+}
+
+async fn list(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<Vec<hive_db::types::WireEvent>>, ApiError> {
+    let filters = wire::ListFilters {
+        source: q.source,
+        severity: q.severity,
+        unacknowledged: q.unacknowledged,
+        limit: q.limit,
+    };
+    let rows = with_conn(&state, move |c| wire::list(c, &filters)).await?;
+    Ok(Json(rows))
+}
+
+#[derive(Debug, Deserialize)]
+struct AddBody {
+    source: String,
+    title: String,
+    body: Option<String>,
+    external_id: Option<String>,
+    severity: Option<Severity>,
+    affects: Option<String>,
+    url: Option<String>,
+    category: Option<String>,
+}
+
+async fn add(
+    State(state): State<AppState>,
+    Json(body): Json<AddBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let res = with_conn(&state, move |c| {
+        wire::add(
+            c,
+            wire::AddArgs {
+                source: &body.source,
+                title: &body.title,
+                body: body.body.as_deref(),
+                external_id: body.external_id.as_deref(),
+                severity: body.severity,
+                affects: body.affects.as_deref(),
+                url: body.url.as_deref(),
+                category: body.category.as_deref(),
+            },
+        )
+    })
+    .await?;
+    Ok(Json(match res {
+        wire::AddResult::Added(e) => json!({"added": e}),
+        wire::AddResult::AlreadySeen { id } => json!({"already_seen": {"id": id}}),
+    }))
+}
+
+async fn ack(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    with_conn(&state, move |c| wire::ack(c, id)).await?;
+    Ok(Json(json!({"acknowledged": true})))
+}
