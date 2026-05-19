@@ -6,6 +6,8 @@ members = [
     "crates/hive-api",
     "crates/hive-ui",
     "crates/hive-embed",
+    "crates/hive-core",
+    "crates/hive-desktop",
 ]
 
 [workspace.package]
@@ -19,6 +21,7 @@ authors = ["Bee's Roadhouse <nate.smith@beesroadhouse.com>"]
 # Workspace crates
 hive-db = { path = "crates/hive-db" }
 hive-embed = { path = "crates/hive-embed" }
+hive-core = { path = "crates/hive-core" }
 
 # Sqlite (bundled with FTS5)
 rusqlite = { version = "0.32", features = ["bundled-full", "serde_json", "chrono", "blob"] }
@@ -63,6 +66,10 @@ sha2 = "0.10"
 
 # UI templating (maud: type-safe HTML, no leptos WASM toolchain in v1)
 maud = { version = "0.27", features = ["axum"] }
+
+# Slint native desktop UI (hive-desktop crate; GPLv3-linked)
+slint = "1.16"
+slint-build = "1.16"
 
 [profile.release]
 lto = "thin"

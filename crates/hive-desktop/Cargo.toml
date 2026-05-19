@@ -1,0 +1,15 @@
+[package]
+name = "hive-desktop"
+version.workspace = true
+edition.workspace = true
+license = "GPL-3.0-or-later"
+repository.workspace = true
+authors.workspace = true
+description = "Slint native desktop client for the hive journal/tasks/notes API. GPL-3.0 because Slint is linked under GPLv3; hive-core stays MIT and is reusable."
+
+[dependencies]
+slint = { workspace = true }
+hive-core = { workspace = true }
+
+[build-dependencies]
+slint-build = { workspace = true }

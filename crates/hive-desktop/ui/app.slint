@@ -1,0 +1,55 @@
+import { VerticalBox, ListView } from "std-widgets.slint";
+
+struct JournalEntryView {
+    title: string,
+    ai: string,
+    entry-date: string,
+}
+
+export component AppWindow inherits Window {
+    title: "hive";
+    preferred-width: 1000px;
+    preferred-height: 700px;
+    background: #f5ecd9;
+
+    in property <[JournalEntryView]> entries;
+
+    VerticalBox {
+        padding: 24px;
+        spacing: 16px;
+
+        Text {
+            text: "the hive";
+            font-size: 32px;
+            font-weight: 600;
+            color: #2c1810;
+            horizontal-alignment: center;
+        }
+
+        ListView {
+            for entry in entries: Rectangle {
+                height: 64px;
+                background: #faf3e2;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: #d9c9a3;
+
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 4px;
+
+                    Text {
+                        text: entry.title;
+                        font-size: 18px;
+                        color: #2c1810;
+                    }
+                    Text {
+                        text: entry.ai + " · " + entry.entry-date;
+                        font-size: 12px;
+                        color: #6b4423;
+                    }
+                }
+            }
+        }
+    }
+}
