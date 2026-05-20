@@ -49,12 +49,9 @@ impl From<hive_db::Error> for ApiError {
             hive_db::Error::InvalidEnum { .. } | hive_db::Error::InvalidFormat { .. } => {
                 ApiError::BadRequest(e.to_string())
             }
-            hive_db::Error::DbNotFound(p) => {
-                ApiError::Internal(format!("db not found: {}", p.display()))
+            hive_db::Error::Sqlx(_) | hive_db::Error::Migrate(_) | hive_db::Error::Io(_) => {
+                ApiError::Internal(e.to_string())
             }
-            hive_db::Error::Sqlite(_)
-            | hive_db::Error::Pool(_)
-            | hive_db::Error::Io(_) => ApiError::Internal(e.to_string()),
         }
     }
 }

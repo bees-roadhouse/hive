@@ -10,6 +10,9 @@ description = "Slint native desktop client for the hive journal/tasks/notes API.
 [dependencies]
 slint = { workspace = true }
 hive-core = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true, features = ["blocking", "json"] }
+serde = { workspace = true }
 
 [build-dependencies]
 slint-build = { workspace = true }

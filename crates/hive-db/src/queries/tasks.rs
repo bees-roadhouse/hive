@@ -1,9 +1,13 @@
-use rusqlite::{Connection, OptionalExtension, params};
+use sqlx::{PgPool, QueryBuilder, Postgres};
 
 use crate::enums::{Owner, TaskStatus};
 use crate::error::{Error, Result};
 use crate::queries::projects;
 use crate::types::Task;
+
+const SELECT_COLS: &str =
+    "id, project, title, body, owner, status, priority, due, block_reason, \
+     created_at, updated_at, closed_at";
 
 #[derive(Debug, Default, Clone)]
 pub struct ListFilters {
@@ -38,8 +42,8 @@ impl UpdateFields {
     }
 }
 
-pub fn add(
-    conn: &Connection,
+pub async fn add(
+    pool: &PgPool,
     project: &str,
     title: &str,
     body: Option<&str>,
@@ -47,69 +51,63 @@ pub fn add(
     priority: Option<&str>,
     due: Option<&str>,
 ) -> Result<Task> {
-    projects::require(conn, project)?;
-    conn.execute(
-        "INSERT INTO tasks (project, title, body, owner, priority, due) VALUES (?, ?, ?, ?, ?, ?)",
-        params![project, title, body, owner, priority, due],
-    )?;
-    let id = conn.last_insert_rowid();
-    Ok(get(conn, id)?.ok_or_else(|| Error::NotFound {
-        kind: "task",
-        id: id.to_string(),
-    })?)
+    projects::require(pool, project).await?;
+    let task = sqlx::query_as::<_, Task>(
+        "INSERT INTO tasks (project, title, body, owner, priority, due) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         RETURNING id, project, title, body, owner, status, priority, due, block_reason, \
+                   created_at, updated_at, closed_at",
+    )
+    .bind(project)
+    .bind(title)
+    .bind(body)
+    .bind(owner.as_str())
+    .bind(priority)
+    .bind(due)
+    .fetch_one(pool)
+    .await?;
+    Ok(task)
 }
 
-pub fn get(conn: &Connection, id: i64) -> Result<Option<Task>> {
-    Ok(conn
-        .query_row(
-            "SELECT id, project, title, body, owner, status, priority, due, block_reason, \
-                    created_at, updated_at, closed_at \
-             FROM tasks WHERE id = ?",
-            [id],
-            Task::from_row,
-        )
-        .optional()?)
+pub async fn get(pool: &PgPool, id: i64) -> Result<Option<Task>> {
+    Ok(sqlx::query_as::<_, Task>(&format!(
+        "SELECT {SELECT_COLS} FROM tasks WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?)
 }
 
-pub fn require(conn: &Connection, id: i64) -> Result<Task> {
-    get(conn, id)?.ok_or_else(|| Error::NotFound {
+pub async fn require(pool: &PgPool, id: i64) -> Result<Task> {
+    get(pool, id).await?.ok_or_else(|| Error::NotFound {
         kind: "task",
         id: id.to_string(),
     })
 }
 
-pub fn list(conn: &Connection, filters: &ListFilters) -> Result<Vec<Task>> {
-    let mut sql = String::from(
-        "SELECT id, project, title, body, owner, status, priority, due, block_reason, \
-                created_at, updated_at, closed_at FROM tasks WHERE 1=1",
-    );
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+pub async fn list(pool: &PgPool, filters: &ListFilters) -> Result<Vec<Task>> {
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
+        "SELECT {SELECT_COLS} FROM tasks WHERE 1=1"
+    ));
 
     if let Some(p) = &filters.project {
-        sql.push_str(" AND project = ?");
-        params.push(Box::new(p.clone()));
+        qb.push(" AND project = ").push_bind(p.clone());
     }
     if let Some(o) = filters.owner {
-        sql.push_str(" AND owner = ?");
-        params.push(Box::new(o.as_str().to_string()));
+        qb.push(" AND owner = ").push_bind(o.as_str().to_string());
     }
     if let Some(s) = filters.status {
-        sql.push_str(" AND status = ?");
-        params.push(Box::new(s.as_str().to_string()));
+        qb.push(" AND status = ").push_bind(s.as_str().to_string());
     } else if !filters.all {
-        sql.push_str(" AND status IN ('in_progress', 'open')");
+        qb.push(" AND status IN ('in_progress', 'open')");
     }
-    sql.push_str(" ORDER BY project, status, COALESCE(due, '9999-99-99'), id");
+    qb.push(" ORDER BY project, status, COALESCE(due, '9999-99-99'), id");
 
-    let mut stmt = conn.prepare(&sql)?;
-    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| &**p as &dyn rusqlite::ToSql).collect();
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(refs.iter().copied()), Task::from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = qb.build_query_as::<Task>().fetch_all(pool).await?;
     Ok(rows)
 }
 
-pub fn update(conn: &Connection, id: i64, fields: &UpdateFields) -> Result<()> {
+pub async fn update(pool: &PgPool, id: i64, fields: &UpdateFields) -> Result<()> {
     if fields.is_empty() {
         return Err(Error::InvalidFormat {
             field: "update",
@@ -117,83 +115,91 @@ pub fn update(conn: &Connection, id: i64, fields: &UpdateFields) -> Result<()> {
             expected: "at least one of --status / --priority / --owner / --due / --body / --title",
         });
     }
-    let existing = require(conn, id)?;
+    let existing = require(pool, id).await?;
 
-    let mut sets: Vec<String> = Vec::new();
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new("UPDATE tasks SET ");
+    let mut first = true;
+    let mut push_set = |qb: &mut QueryBuilder<Postgres>, first: &mut bool| {
+        if *first {
+            *first = false;
+        } else {
+            qb.push(", ");
+        }
+    };
 
     if let Some(s) = fields.status {
-        sets.push("status = ?".into());
-        params.push(Box::new(s.as_str().to_string()));
+        push_set(&mut qb, &mut first);
+        qb.push("status = ").push_bind(s.as_str().to_string());
     }
     if let Some(p) = &fields.priority {
-        sets.push("priority = ?".into());
-        params.push(Box::new(p.clone()));
+        push_set(&mut qb, &mut first);
+        qb.push("priority = ").push_bind(p.clone());
     }
     if let Some(o) = fields.owner {
-        sets.push("owner = ?".into());
-        params.push(Box::new(o.as_str().to_string()));
+        push_set(&mut qb, &mut first);
+        qb.push("owner = ").push_bind(o.as_str().to_string());
     }
     if let Some(d) = &fields.due {
-        sets.push("due = ?".into());
-        params.push(Box::new(d.clone()));
+        push_set(&mut qb, &mut first);
+        qb.push("due = ").push_bind(d.clone());
     }
     if let Some(b) = &fields.body {
-        sets.push("body = ?".into());
-        params.push(Box::new(b.clone()));
+        push_set(&mut qb, &mut first);
+        qb.push("body = ").push_bind(b.clone());
     }
     if let Some(t) = &fields.title {
-        sets.push("title = ?".into());
-        params.push(Box::new(t.clone()));
+        push_set(&mut qb, &mut first);
+        qb.push("title = ").push_bind(t.clone());
     }
     if let Some(r) = &fields.block_reason {
-        sets.push("block_reason = ?".into());
-        params.push(Box::new(r.clone()));
+        push_set(&mut qb, &mut first);
+        qb.push("block_reason = ").push_bind(r.clone());
     }
-    sets.push("updated_at = datetime('now')".into());
+    push_set(&mut qb, &mut first);
+    qb.push("updated_at = now()");
 
     if let Some(new_status) = fields.status {
         let was_closed = matches!(existing.status.as_str(), "done" | "dropped");
         let now_closed = new_status.is_closed();
         if now_closed && !was_closed {
-            sets.push("closed_at = datetime('now')".into());
+            qb.push(", closed_at = now()");
         } else if !now_closed && was_closed {
-            sets.push("closed_at = NULL".into());
+            qb.push(", closed_at = NULL");
         }
     }
 
-    let sql = format!("UPDATE tasks SET {} WHERE id = ?", sets.join(", "));
-    params.push(Box::new(id));
-    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| &**p as &dyn rusqlite::ToSql).collect();
-    conn.execute(&sql, rusqlite::params_from_iter(refs.iter().copied()))?;
+    qb.push(" WHERE id = ").push_bind(id);
+    qb.build().execute(pool).await?;
     Ok(())
 }
 
-pub fn mark_done(conn: &Connection, id: i64) -> Result<()> {
+pub async fn mark_done(pool: &PgPool, id: i64) -> Result<()> {
     update(
-        conn,
+        pool,
         id,
         &UpdateFields {
             status: Some(TaskStatus::Done),
             ..Default::default()
         },
     )
+    .await
 }
 
-pub fn mark_dropped(conn: &Connection, id: i64) -> Result<()> {
+pub async fn mark_dropped(pool: &PgPool, id: i64) -> Result<()> {
     update(
-        conn,
+        pool,
         id,
         &UpdateFields {
             status: Some(TaskStatus::Dropped),
             ..Default::default()
         },
     )
+    .await
 }
 
-pub fn mark_blocked(conn: &Connection, id: i64, reason: &str) -> Result<()> {
+pub async fn mark_blocked(pool: &PgPool, id: i64, reason: &str) -> Result<()> {
     update(
-        conn,
+        pool,
         id,
         &UpdateFields {
             status: Some(TaskStatus::Blocked),
@@ -201,4 +207,5 @@ pub fn mark_blocked(conn: &Connection, id: i64, reason: &str) -> Result<()> {
             ..Default::default()
         },
     )
+    .await
 }

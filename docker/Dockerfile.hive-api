@@ -5,21 +5,22 @@ FROM debian:bookworm-slim
 ARG TARGETARCH
 ARG BINARY_DIR=artifacts
 
+# libpq5 = postgres client runtime. ca-certs for TLS.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        ca-certificates && \
+        ca-certificates libpq5 && \
     rm -rf /var/lib/apt/lists/*
 
 # The build job uploads two artifacts: artifacts/amd64/hive-api and
 # artifacts/arm64/hive-api. buildx selects the right one per platform.
 COPY ${BINARY_DIR}/${TARGETARCH}/hive-api /usr/local/bin/hive-api
 
-VOLUME ["/data"]
-
 # 7878 = "hive" rotated through dial-pad; arbitrary local port.
 EXPOSE 7878
 
-ENV HIVE_DB=/data/hive.db
+# Default DATABASE_URL targets a compose-sibling `postgres` service.
+# Production overrides via the Portainer stack env.
+ENV DATABASE_URL=postgres://hive:hive@postgres:5432/hive
 ENV HIVE_API_BIND=0.0.0.0:7878
 
 ENTRYPOINT ["/usr/local/bin/hive-api"]

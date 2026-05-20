@@ -8,8 +8,7 @@ use hive_db::enums::Ai;
 use hive_db::queries::{journal, search};
 
 use crate::error::ApiError;
-use crate::state::AppState;
-use crate::with_conn;
+use crate::state::{AppState, HiveEvent};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -38,7 +37,7 @@ async fn list(
         tag: q.tag,
         limit: q.limit,
     };
-    let rows = with_conn(&state, move |c| journal::list(c, &filters)).await?;
+    let rows = journal::list(&state.pool, &filters).await?;
     Ok(Json(rows))
 }
 
@@ -60,17 +59,23 @@ async fn add(
         .date
         .clone()
         .unwrap_or_else(|| chrono::Local::now().date_naive().format("%Y-%m-%d").to_string());
-    let e = with_conn(&state, move |c| {
-        journal::add(
-            c,
-            body.ai,
-            &date,
-            body.title.as_deref(),
-            &body.body,
-            body.tags.as_deref(),
-        )
-    })
+    let e = journal::add(
+        &state.pool,
+        body.ai,
+        &date,
+        body.title.as_deref(),
+        &body.body,
+        body.tags.as_deref(),
+    )
     .await?;
+    state.emitter.emit(
+        HiveEvent::now("journal.created", "journal_entries", e.id).with_extra(serde_json::json!({
+            "ai": e.ai,
+            "title": e.title,
+            "entry_date": e.entry_date,
+            "tags": e.tags,
+        })),
+    );
     Ok(Json(e))
 }
 
@@ -78,7 +83,7 @@ async fn show(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<hive_db::types::JournalEntry>, ApiError> {
-    let e = with_conn(&state, move |c| journal::require(c, id)).await?;
+    let e = journal::require(&state.pool, id).await?;
     Ok(Json(e))
 }
 
@@ -97,8 +102,6 @@ async fn search_endpoint(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<Vec<search::JournalHit>>, ApiError> {
-    let limit = q.limit;
-    let query = q.q;
-    let hits = with_conn(&state, move |c| search::journal(c, &query, limit)).await?;
+    let hits = search::journal(&state.pool, &q.q, q.limit).await?;
     Ok(Json(hits))
 }

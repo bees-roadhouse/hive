@@ -25,3 +25,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
+directories = { workspace = true }
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"

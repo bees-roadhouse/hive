@@ -1,63 +1,32 @@
-use std::path::{Path, PathBuf};
+//! Postgres connection pool + migrations bootstrap.
+//!
+//! sqlx's `PgPool` is the async, postgres-native replacement for the old
+//! r2d2 + rusqlite setup. The pool is cheap to clone and is intended to
+//! live in `AppState`. Migrations live in `crates/hive-db/migrations/` and
+//! are applied via `sqlx::migrate!` on first open.
 
-use r2d2_sqlite::SqliteConnectionManager;
-use rusqlite::{Connection, OpenFlags};
+use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 
-use crate::error::{Error, Result};
-use crate::schema::SCHEMA_SQL;
+use crate::error::Result;
 
-pub type Pool = r2d2::Pool<SqliteConnectionManager>;
+/// Default connection string, used when the caller (hive-api / hive-cli)
+/// doesn't pass `--database-url` or `DATABASE_URL`.
+pub const DEFAULT_DATABASE_URL: &str = "postgres://hive:hive@localhost:5432/hive";
 
-/// Resolve the default DB path: `$HIVE_DB` if set, otherwise `~/.hive/hive.db`.
-pub fn default_db_path() -> PathBuf {
-    if let Ok(p) = std::env::var("HIVE_DB") {
-        return PathBuf::from(p);
-    }
-    if let Some(home) = directories::UserDirs::new().and_then(|u| u.home_dir().to_path_buf().into())
-    {
-        return home.join(".hive").join("hive.db");
-    }
-    PathBuf::from("hive.db")
+/// Resolve the database URL: `DATABASE_URL` env override, else the default.
+pub fn default_database_url() -> String {
+    std::env::var("DATABASE_URL").unwrap_or_else(|_| DEFAULT_DATABASE_URL.to_string())
 }
 
-/// Open a connection pool against the given DB path.
-///
-/// `create_if_missing` mirrors the python `db(create_if_missing=...)` helper:
-/// when false and the file is absent, returns `Error::DbNotFound`. When true,
-/// the parent directory is created and the schema is applied.
-pub fn open_pool(path: &Path, create_if_missing: bool, max_size: u32) -> Result<Pool> {
-    if !path.exists() && !create_if_missing {
-        return Err(Error::DbNotFound(path.to_path_buf()));
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let manager = SqliteConnectionManager::file(path)
-        .with_flags(OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE)
-        .with_init(configure_connection);
-
-    let pool = r2d2::Pool::builder()
-        .max_size(max_size)
-        .build(manager)?;
-
-    // Apply schema (idempotent) on first checkout.
-    {
-        let conn = pool.get()?;
-        conn.execute_batch(SCHEMA_SQL)?;
-    }
+/// Open a `PgPool` against `url` with `max_size` connections, then run
+/// pending migrations from `./migrations` (compiled in via the
+/// `sqlx::migrate!` macro).
+pub async fn open_pool(url: &str, max_size: u32) -> Result<PgPool> {
+    let pool = PgPoolOptions::new()
+        .max_connections(max_size)
+        .connect(url)
+        .await?;
+    sqlx::migrate!("./migrations").run(&pool).await?;
     Ok(pool)
-}
-
-/// Per-connection PRAGMAs applied at checkout.
-///
-/// `journal_mode = WAL` is set via `pragma_update_and_check` because the
-/// pragma returns the new mode as a result row; plain `pragma_update`
-/// errors with "Execute returned results".
-fn configure_connection(conn: &mut Connection) -> rusqlite::Result<()> {
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    let _: String = conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    Ok(())
 }

@@ -1,9 +1,12 @@
-use rusqlite::{Connection, OptionalExtension, params};
+use sqlx::{PgPool, Postgres, QueryBuilder};
 
 use crate::enums::Author;
 use crate::error::{Error, Result};
 use crate::queries::projects;
 use crate::types::Note;
+
+const SELECT_COLS: &str =
+    "id, author, title, body, tags, project, created_at, updated_at";
 
 #[derive(Debug, Default, Clone)]
 pub struct ListFilters {
@@ -13,8 +16,8 @@ pub struct ListFilters {
     pub limit: Option<i64>,
 }
 
-pub fn add(
-    conn: &Connection,
+pub async fn add(
+    pool: &PgPool,
     author: Author,
     title: Option<&str>,
     body: &str,
@@ -22,66 +25,58 @@ pub fn add(
     tags: Option<&str>,
 ) -> Result<Note> {
     if let Some(p) = project {
-        projects::require(conn, p)?;
+        projects::require(pool, p).await?;
     }
-    conn.execute(
-        "INSERT INTO notes (author, title, body, tags, project) VALUES (?, ?, ?, ?, ?)",
-        params![author, title, body, tags, project],
-    )?;
-    let id = conn.last_insert_rowid();
-    Ok(get(conn, id)?.ok_or_else(|| Error::NotFound {
-        kind: "note",
-        id: id.to_string(),
-    })?)
+    let row = sqlx::query_as::<_, Note>(
+        "INSERT INTO notes (author, title, body, tags, project) \
+         VALUES ($1, $2, $3, $4, $5) \
+         RETURNING id, author, title, body, tags, project, created_at, updated_at",
+    )
+    .bind(author.as_str())
+    .bind(title)
+    .bind(body)
+    .bind(tags)
+    .bind(project)
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
 }
 
-pub fn get(conn: &Connection, id: i64) -> Result<Option<Note>> {
-    Ok(conn
-        .query_row(
-            "SELECT id, author, title, body, tags, project, created_at, updated_at \
-             FROM notes WHERE id = ?",
-            [id],
-            Note::from_row,
-        )
-        .optional()?)
+pub async fn get(pool: &PgPool, id: i64) -> Result<Option<Note>> {
+    Ok(sqlx::query_as::<_, Note>(&format!(
+        "SELECT {SELECT_COLS} FROM notes WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?)
 }
 
-pub fn require(conn: &Connection, id: i64) -> Result<Note> {
-    get(conn, id)?.ok_or_else(|| Error::NotFound {
+pub async fn require(pool: &PgPool, id: i64) -> Result<Note> {
+    get(pool, id).await?.ok_or_else(|| Error::NotFound {
         kind: "note",
         id: id.to_string(),
     })
 }
 
-pub fn list(conn: &Connection, filters: &ListFilters) -> Result<Vec<Note>> {
-    let mut sql = String::from(
-        "SELECT id, author, title, body, tags, project, created_at, updated_at \
-         FROM notes WHERE 1=1",
-    );
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+pub async fn list(pool: &PgPool, filters: &ListFilters) -> Result<Vec<Note>> {
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
+        "SELECT {SELECT_COLS} FROM notes WHERE 1=1"
+    ));
 
     if let Some(a) = filters.author {
-        sql.push_str(" AND author = ?");
-        params.push(Box::new(a.as_str().to_string()));
+        qb.push(" AND author = ").push_bind(a.as_str().to_string());
     }
     if let Some(p) = &filters.project {
-        sql.push_str(" AND project = ?");
-        params.push(Box::new(p.clone()));
+        qb.push(" AND project = ").push_bind(p.clone());
     }
     if let Some(t) = &filters.tag {
-        sql.push_str(" AND tags LIKE ?");
-        params.push(Box::new(format!("%{t}%")));
+        qb.push(" AND tags LIKE ").push_bind(format!("%{t}%"));
     }
-    sql.push_str(" ORDER BY created_at DESC, id DESC");
+    qb.push(" ORDER BY created_at DESC, id DESC");
     if let Some(l) = filters.limit {
-        sql.push_str(" LIMIT ?");
-        params.push(Box::new(l));
+        qb.push(" LIMIT ").push_bind(l);
     }
 
-    let mut stmt = conn.prepare(&sql)?;
-    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| &**p as &dyn rusqlite::ToSql).collect();
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(refs.iter().copied()), Note::from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = qb.build_query_as::<Note>().fetch_all(pool).await?;
     Ok(rows)
 }

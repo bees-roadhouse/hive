@@ -8,7 +8,6 @@ use hive_db::queries::graph::{self, GraphOptions, GraphPayload};
 
 use crate::error::ApiError;
 use crate::state::AppState;
-use crate::with_conn;
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/graph", get(get_graph))
@@ -46,6 +45,6 @@ async fn get_graph(
         limit_nodes: q.nodes,
         include_meta: q.include_meta,
     };
-    let payload = with_conn(&state, move |c| graph::build(c, opts)).await?;
+    let payload = graph::build(&state.pool, opts).await?;
     Ok(Json(payload))
 }

@@ -2,12 +2,19 @@
 resolver = "2"
 members = [
     "crates/hive-db",
-    "crates/hive-cli",
     "crates/hive-api",
-    "crates/hive-ui",
     "crates/hive-embed",
     "crates/hive-core",
     "crates/hive-desktop",
+    "crates/hive-migrate",
+]
+
+# Deferred (still on rusqlite sync API; retired by the api-first shift):
+#   "crates/hive-cli" ... CLI is hive.py (HTTP-only); rust port off the critical path
+#   "crates/hive-ui"  ... maud/leptos legacy SSR; superseded by hive-desktop (slint)
+exclude = [
+    "crates/hive-cli",
+    "crates/hive-ui",
 ]
 
 [workspace.package]
@@ -23,10 +30,23 @@ hive-db = { path = "crates/hive-db" }
 hive-embed = { path = "crates/hive-embed" }
 hive-core = { path = "crates/hive-core" }
 
-# Sqlite (bundled with FTS5)
+# Sqlite (legacy: hive-cli still uses it for the read-only migration assist path)
 rusqlite = { version = "0.32", features = ["bundled-full", "serde_json", "chrono", "blob"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"
+
+# Postgres (hive-db + hive-api)
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "macros",
+    "chrono",
+    "json",
+    "uuid",
+    "migrate",
+] }
+pgvector = { version = "0.4", features = ["sqlx"] }
 
 # Async runtime (api + ui only)
 tokio = { version = "1", features = ["full"] }
@@ -63,6 +83,9 @@ directories = "5"
 # Utilities
 hex = "0.4"
 sha2 = "0.10"
+
+# Embedding + reranking (hive-embed)
+fastembed = "5"
 
 # UI templating (maud: type-safe HTML, no leptos WASM toolchain in v1)
 maud = { version = "0.27", features = ["axum"] }

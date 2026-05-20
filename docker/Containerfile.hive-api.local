@@ -1,0 +1,39 @@
+# Self-contained local build of hive-api for podman/docker. Builds the
+# binary inside the container so no host toolchain is needed. Slower on
+# first run, fast on rebuilds because cargo's target cache is preserved
+# in the build stage layer.
+#
+# Build: podman build -t hive-api:local -f docker/Containerfile.hive-api.local .
+# Run:   see docker/docker-compose.local.yml (postgres + hive-api)
+
+FROM rust:1.93-slim-bookworm AS builder
+
+# pkg-config + build-essential for native deps; libpq-dev so sqlx/diesel
+# (whichever the api uses) can link against postgres client libs at build.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config build-essential ca-certificates libpq-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo build --release -p hive-api --locked
+
+FROM debian:bookworm-slim AS runtime
+
+# libpq5 = postgres client runtime. ca-certs for TLS to upstream postgres.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libpq5 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/hive-api /usr/local/bin/hive-api
+
+EXPOSE 7878
+
+# Default DATABASE_URL targets the compose `postgres` service. Override
+# for direct `docker run` against a different postgres instance.
+ENV DATABASE_URL=postgres://hive:hive@postgres:5432/hive
+ENV HIVE_API_BIND=0.0.0.0:7878
+
+ENTRYPOINT ["/usr/local/bin/hive-api"]

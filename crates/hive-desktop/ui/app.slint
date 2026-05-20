@@ -1,55 +1,1046 @@
-import { VerticalBox, ListView } from "std-widgets.slint";
+import "./fonts/Caveat.ttf";
 
-struct JournalEntryView {
+struct TaskRow {
+    id: string,
     title: string,
+    due-label: string,
+    overdue: bool,
+}
+
+struct WireRow {
+    title: string,
+    source: string,
+}
+
+// Body segment for journal entries. Slint can't expose Rust enums, so we
+// encode kind via `is-checkbox` + `check-state` int:
+//   0=Open, 1=Done, 2=Dropped, 3=InProgress.
+// `task-id` is 0 when no `^tasks-N` anchor was present.
+struct BodySegmentSlint {
+    is-checkbox: bool,
+    check-state: int,
+    text: string,
+    task-id: int,
+}
+
+struct JournalEntry {
+    id: int,
     ai: string,
-    entry-date: string,
+    when-label: string,
+    title: string,
+    body: string,
+    body-segments: [BodySegmentSlint],
+    tags-label: string,
+    related-label: string,
+}
+
+struct TaskFull {
+    id: int,
+    title: string,
+    body: string,
+    project: string,
+    owner: string,
+    priority: string,
+    status: string,
+    due-label: string,
+    block-reason: string,
+}
+
+component Tab inherits Rectangle {
+    in property <string> label;
+    in property <bool> active;
+    callback clicked;
+
+    height: 48px;
+    width: 130px;
+    background: active ? rgba(244, 236, 216, 0.08) : transparent;
+    border-radius: 4px;
+
+    Text {
+        text: root.label;
+        font-family: "Caveat";
+        font-size: 28px;
+        font-weight: root.active ? 700 : 500;
+        color: root.active ? #f4ecd8 : #8b6f47;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    // active underline
+    if root.active: Rectangle {
+        y: parent.height - 4px;
+        x: parent.width / 2 - 30px;
+        width: 60px;
+        height: 2px;
+        background: #b08838;
+    }
+
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+component Divider inherits Rectangle {
+    height: 1px;
+    background: #d9c89a;
+}
+
+component TaskLine inherits Rectangle {
+    in property <TaskRow> data;
+    height: 38px;
+
+    HorizontalLayout {
+        spacing: 12px;
+        padding-left: 4px;
+
+        // due chip
+        Rectangle {
+            width: 110px;
+            background: root.data.overdue ? rgba(125, 58, 46, 0.12) : transparent;
+            border-radius: 3px;
+            Text {
+                text: root.data.due-label;
+                font-family: "Caveat";
+                font-size: 20px;
+                font-weight: root.data.overdue ? 700 : 500;
+                color: root.data.overdue ? #7d3a2e : #6b4423;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        Text {
+            text: root.data.title;
+            font-family: "Caveat";
+            font-size: 23px;
+            color: #2a1f12;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component WireLine inherits Rectangle {
+    in property <WireRow> data;
+    height: 56px;
+
+    VerticalLayout {
+        spacing: 2px;
+        padding-left: 4px;
+
+        Text {
+            text: root.data.title;
+            font-family: "Caveat";
+            font-size: 21px;
+            color: #2a1f12;
+            wrap: word-wrap;
+        }
+        Text {
+            text: root.data.source;
+            font-family: "Caveat";
+            font-size: 17px;
+            font-weight: 500;
+            color: #8b6f47;
+        }
+    }
+}
+
+component Page inherits Rectangle {
+    in property <bool> spine-right: true;
+    background: #f4ecd8;
+
+    Rectangle {
+        background: @radial-gradient(circle, rgba(176, 136, 56, 0.10) 0%, transparent 60%);
+    }
+
+    Rectangle {
+        x: root.spine-right ? parent.width - 32px : 0;
+        y: 0;
+        width: 32px;
+        height: parent.height;
+        background: root.spine-right
+            ? @linear-gradient(90deg, transparent 0%, rgba(60, 30, 10, 0.55) 100%)
+            : @linear-gradient(90deg, rgba(60, 30, 10, 0.55) 0%, transparent 100%);
+    }
+
+    @children
+}
+
+component TodaySpreadLeft inherits Page {
+    spine-right: true;
+    in property <string> greeting;
+    in property <string> day-subtitle;
+    in property <[TaskRow]> tasks;
+
+    VerticalLayout {
+        padding: 44px;
+        padding-right: 64px;
+        spacing: 6px;
+
+        Text {
+            text: root.greeting;
+            font-family: "Caveat";
+            font-weight: 700;
+            font-size: 48px;
+            color: #1a1208;
+        }
+        Text {
+            text: root.day-subtitle;
+            font-family: "Caveat";
+            font-size: 22px;
+            color: #6b4423;
+        }
+        Divider { }
+        Rectangle { height: 8px; background: transparent; }
+
+        Text {
+            text: "what's on";
+            font-family: "Caveat";
+            font-weight: 700;
+            font-size: 28px;
+            color: #1a1208;
+        }
+        for t in root.tasks: TaskLine {
+            data: t;
+        }
+    }
+}
+
+component TodaySpreadRight inherits Page {
+    spine-right: false;
+    in property <[WireRow]> wire-items;
+
+    VerticalLayout {
+        padding: 44px;
+        padding-left: 64px;
+        spacing: 6px;
+
+        Text {
+            text: "from the wire";
+            font-family: "Caveat";
+            font-weight: 700;
+            font-size: 32px;
+            color: #1a1208;
+        }
+        for w in root.wire-items: WireLine {
+            data: w;
+        }
+    }
+}
+
+component PageChevron inherits Rectangle {
+    in property <string> glyph;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    width: 60px;
+    height: 60px;
+    background: transparent;
+
+    Text {
+        text: root.glyph;
+        font-family: "Caveat";
+        font-size: 42px;
+        font-weight: 700;
+        color: root.enabled ? #7d3a2e : #c5b48c;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Single checkbox row inside a journal body. Glyph by state:
+//   0 Open=☐  1 Done=☑  2 Dropped=☒ (strikethrough)  3 InProgress=▣
+// Clicking fires `clicked(task-id)`. The handler ignores task-id == 0.
+component CheckboxLine inherits Rectangle {
+    in property <int> check-state;
+    in property <string> text;
+    in property <int> task-id;
+    callback clicked(int);
+
+    height: 30px;
+
+    HorizontalLayout {
+        spacing: 8px;
+        padding-left: 2px;
+        alignment: start;
+
+        Text {
+            text: root.check-state == 1 ? "☑"
+                : root.check-state == 2 ? "☒"
+                : root.check-state == 3 ? "▣"
+                : "☐";
+            font-family: "Caveat";
+            font-size: 24px;
+            font-weight: 700;
+            color: root.check-state == 1 ? #6b4423
+                : root.check-state == 2 ? #8b6f47
+                : root.check-state == 3 ? #7d3a2e
+                : #2a1f12;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.text;
+            font-family: "Caveat";
+            font-size: 22px;
+            color: root.check-state == 2 ? #8b6f47 : #2a1f12;
+            font-italic: root.check-state == 2;
+            // slint Text has no strike-through prop; italic+muted reads as dropped.
+            vertical-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+
+    TouchArea {
+        clicked => { root.clicked(root.task-id); }
+    }
+}
+
+component JournalSpreadLeft inherits Page {
+    spine-right: true;
+    in property <JournalEntry> entry;
+    in property <bool> can-prev;
+    callback prev-clicked;
+    callback checkbox-clicked(int);
+
+    VerticalLayout {
+        padding: 44px;
+        padding-right: 64px;
+        spacing: 4px;
+
+        // entry header
+        Text {
+            text: "#" + root.entry.id + " .. " + root.entry.ai;
+            font-family: "Caveat";
+            font-weight: 700;
+            font-size: 22px;
+            color: #6b4423;
+        }
+        Text {
+            text: root.entry.title;
+            font-family: "Caveat";
+            font-weight: 700;
+            font-size: 38px;
+            color: #1a1208;
+            wrap: word-wrap;
+        }
+        Text {
+            text: root.entry.when-label;
+            font-family: "Caveat";
+            font-size: 18px;
+            color: #6b4423;
+        }
+        Divider { }
+        Rectangle { height: 6px; background: transparent; }
+
+        // body .. parsed segments. Text runs render as styled Text; checkbox
+        // lines render as CheckboxLine which fires checkbox-clicked(task-id).
+        VerticalLayout {
+            spacing: 2px;
+            vertical-stretch: 1;
+            for seg in root.entry.body-segments: VerticalLayout {
+                if !seg.is-checkbox: Text {
+                    text: seg.text;
+                    font-family: "Caveat";
+                    font-size: 22px;
+                    color: #2a1f12;
+                    wrap: word-wrap;
+                }
+                if seg.is-checkbox: CheckboxLine {
+                    check-state: seg.check-state;
+                    text: seg.text;
+                    task-id: seg.task-id;
+                    clicked(tid) => { root.checkbox-clicked(tid); }
+                }
+            }
+        }
+
+        // bottom row: prev chevron
+        HorizontalLayout {
+            alignment: start;
+            PageChevron {
+                glyph: "‹";
+                enabled: root.can-prev;
+                clicked => { root.prev-clicked(); }
+            }
+        }
+    }
+}
+
+component JournalSpreadRight inherits Page {
+    spine-right: false;
+    in property <JournalEntry> entry;
+    in property <bool> can-next;
+    in property <int> position-label;
+    in property <int> total-count;
+    callback next-clicked;
+
+    VerticalLayout {
+        padding: 44px;
+        padding-left: 64px;
+        spacing: 4px;
+
+        Text {
+            text: "tags";
+            font-family: "Caveat";
+            font-weight: 700;
+            font-size: 26px;
+            color: #1a1208;
+        }
+        Text {
+            text: root.entry.tags-label;
+            font-family: "Caveat";
+            font-size: 22px;
+            color: #2a1f12;
+            wrap: word-wrap;
+        }
+        Rectangle { height: 14px; background: transparent; }
+        Divider { }
+        Rectangle { height: 8px; background: transparent; }
+
+        Text {
+            text: "related";
+            font-family: "Caveat";
+            font-weight: 700;
+            font-size: 26px;
+            color: #1a1208;
+        }
+        Text {
+            text: root.entry.related-label;
+            font-family: "Caveat";
+            font-size: 22px;
+            color: #2a1f12;
+            wrap: word-wrap;
+            vertical-stretch: 1;
+        }
+
+        // bottom row: position + next chevron
+        HorizontalLayout {
+            alignment: space-between;
+            VerticalLayout {
+                alignment: center;
+                Text {
+                    text: root.position-label + " of " + root.total-count;
+                    font-family: "Caveat";
+                    font-size: 20px;
+                    color: #6b4423;
+                }
+            }
+            PageChevron {
+                glyph: "›";
+                enabled: root.can-next;
+                clicked => { root.next-clicked(); }
+            }
+        }
+    }
+}
+
+// small pill used for priority / status / due chips on the task spread.
+component Chip inherits Rectangle {
+    in property <string> text;
+    in property <color> tint: #6b4423;
+    in property <color> bg: rgba(176, 136, 56, 0.14);
+    height: 30px;
+    horizontal-stretch: 0;
+    background: root.bg;
+    border-radius: 4px;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        Text {
+            text: root.text;
+            font-family: "Caveat";
+            font-size: 20px;
+            font-weight: 700;
+            color: root.tint;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component TaskSpreadLeft inherits Page {
+    spine-right: true;
+    in property <TaskFull> task;
+    in property <bool> can-prev;
+    callback prev-clicked;
+
+    VerticalLayout {
+        padding: 44px;
+        padding-right: 64px;
+        spacing: 4px;
+
+        // header: id + project
+        Text {
+            text: "#" + root.task.id + (root.task.project == "" ? "" : " .. " + root.task.project);
+            font-family: "Caveat";
+            font-weight: 700;
+            font-size: 22px;
+            color: #6b4423;
+        }
+        Text {
+            text: root.task.title;
+            font-family: "Caveat";
+            font-weight: 700;
+            font-size: 38px;
+            color: #1a1208;
+            wrap: word-wrap;
+        }
+        Rectangle { height: 4px; background: transparent; }
+
+        // chips row: priority, status, due
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            if root.task.priority != "": Chip {
+                text: root.task.priority;
+                tint: #7d3a2e;
+                bg: rgba(125, 58, 46, 0.12);
+            }
+            if root.task.status != "": Chip {
+                text: root.task.status;
+                tint: #1a1208;
+                bg: rgba(176, 136, 56, 0.18);
+            }
+            if root.task.due-label != "": Chip {
+                text: root.task.due-label;
+                tint: #6b4423;
+                bg: rgba(176, 136, 56, 0.10);
+            }
+        }
+
+        Rectangle { height: 6px; background: transparent; }
+        Divider { }
+        Rectangle { height: 6px; background: transparent; }
+
+        // body
+        Text {
+            text: root.task.body == "" ? "(no body)" : root.task.body;
+            font-family: "Caveat";
+            font-size: 22px;
+            color: #2a1f12;
+            wrap: word-wrap;
+            vertical-stretch: 1;
+        }
+
+        // prev chevron
+        HorizontalLayout {
+            alignment: start;
+            PageChevron {
+                glyph: "‹";
+                enabled: root.can-prev;
+                clicked => { root.prev-clicked(); }
+            }
+        }
+    }
+}
+
+component TaskSpreadRight inherits Page {
+    spine-right: false;
+    in property <TaskFull> task;
+    in property <bool> can-next;
+    in property <int> position-label;
+    in property <int> total-count;
+    callback next-clicked;
+
+    VerticalLayout {
+        padding: 44px;
+        padding-left: 64px;
+        spacing: 4px;
+
+        Text {
+            text: "owner";
+            font-family: "Caveat";
+            font-weight: 700;
+            font-size: 26px;
+            color: #1a1208;
+        }
+        Text {
+            text: root.task.owner == "" ? "(unassigned)" : root.task.owner;
+            font-family: "Caveat";
+            font-size: 22px;
+            color: #2a1f12;
+        }
+
+        Rectangle { height: 14px; background: transparent; }
+
+        // block-reason only when populated
+        if root.task.block-reason != "": Text {
+            text: "blocked";
+            font-family: "Caveat";
+            font-weight: 700;
+            font-size: 26px;
+            color: #7d3a2e;
+        }
+        if root.task.block-reason != "": Text {
+            text: root.task.block-reason;
+            font-family: "Caveat";
+            font-size: 22px;
+            font-italic: true;
+            color: #2a1f12;
+            wrap: word-wrap;
+        }
+        if root.task.block-reason != "": Rectangle { height: 14px; background: transparent; }
+
+        Divider { }
+        Rectangle { height: 8px; background: transparent; }
+
+        // placeholder action hint .. no mutation yet
+        Text {
+            text: "next";
+            font-family: "Caveat";
+            font-weight: 700;
+            font-size: 26px;
+            color: #1a1208;
+        }
+        Text {
+            text: "tap to mark complete";
+            font-family: "Caveat";
+            font-size: 22px;
+            color: #6b4423;
+            wrap: word-wrap;
+            vertical-stretch: 1;
+        }
+
+        // bottom row: position + next chevron
+        HorizontalLayout {
+            alignment: space-between;
+            VerticalLayout {
+                alignment: center;
+                Text {
+                    text: root.position-label + " of " + root.total-count;
+                    font-family: "Caveat";
+                    font-size: 20px;
+                    color: #6b4423;
+                }
+            }
+            PageChevron {
+                glyph: "›";
+                enabled: root.can-next;
+                clicked => { root.next-clicked(); }
+            }
+        }
+    }
+}
+
+component StubSpreadLeft inherits Page {
+    spine-right: true;
+    in property <string> title;
+    in property <string> tagline;
+
+    VerticalLayout {
+        padding: 44px;
+        padding-right: 64px;
+        alignment: center;
+
+        Text {
+            text: root.title;
+            font-family: "Caveat";
+            font-weight: 700;
+            font-size: 64px;
+            color: #1a1208;
+            horizontal-alignment: center;
+        }
+        Rectangle { height: 12px; background: transparent; }
+        Text {
+            text: root.tagline;
+            font-family: "Caveat";
+            font-size: 24px;
+            color: #6b4423;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+}
+
+component StubSpreadRight inherits Page {
+    spine-right: false;
+    in property <string> note;
+
+    VerticalLayout {
+        padding: 44px;
+        padding-left: 64px;
+        alignment: center;
+
+        Text {
+            text: root.note;
+            font-family: "Caveat";
+            font-size: 22px;
+            color: #6b4423;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+    }
 }
 
 export component AppWindow inherits Window {
     title: "hive";
-    preferred-width: 1000px;
-    preferred-height: 700px;
-    background: #f5ecd9;
+    preferred-width: 1240px;
+    preferred-height: 920px;
+    min-width: 820px;
+    min-height: 620px;
+    background: #150a05;
 
-    in property <[JournalEntryView]> entries;
+    in-out property <int> current-tab: 0;
+    in property <string> greeting: "hello.";
+    in property <string> day-subtitle: "";
+    in property <[TaskRow]> today-tasks: [];
+    in property <[WireRow]> today-wire: [];
 
-    VerticalBox {
-        padding: 24px;
-        spacing: 16px;
+    // journal state
+    in property <[JournalEntry]> journal-entries: [];
+    in-out property <int> journal-index: 0;
 
-        Text {
-            text: "the hive";
-            font-size: 32px;
-            font-weight: 600;
-            color: #2c1810;
-            horizontal-alignment: center;
+    // tasks state
+    in property <[TaskFull]> task-entries: [];
+    in-out property <int> task-index: 0;
+
+    // fires when a journal-body checkbox is clicked. Rust wires this to a
+    // POST /tasks/{tid}/done call; ignored when tid == 0 (no anchor).
+    callback checkbox-clicked(int);
+
+    // page-flip animation state.
+    //
+    // displayed-* lags behind current-* so we can slide the old right-page out,
+    // swap to the new content while off-screen, slide it back in.
+    //
+    // slide-offset is a unitless fraction (-1..0..1) of the right-page width.
+    //   0.0 = settled at its normal x
+    //  -1.0 = fully off to the left (used as the out target on forward flips)
+    //   1.0 = fully off to the right (used as the out target on backward flips,
+    //         and as the start position right after a forward swap)
+    //
+    // slide-direction: 1 = forward, -1 = backward, 0 = idle.
+    // Used by the shadow-sweep gradient to flip its direction.
+    in-out property <int> displayed-tab: 0;
+    in-out property <int> displayed-index: 0;
+    in-out property <int> displayed-task-index: 0;
+    property <float> slide-offset: 0.0;
+    property <int> slide-direction: 0;
+
+    animate slide-offset {
+        duration: 280ms;
+        easing: cubic-bezier(0.65, 0, 0.35, 1);
+    }
+
+    // Slide-out duration. Must match the animate-slide-offset duration above.
+    // out-timer fires once at the end of the out-phase to do the content swap
+    // and snap the right-page to the opposite edge. in-timer then fires one
+    // frame later to start the slide back to 0 (so the snap-then-animate
+    // sequence isn't collapsed into a single value-change-no-animation).
+    out-timer := Timer {
+        interval: 280ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            // out-anim done. swap displayed to current and snap to opposite edge.
+            root.displayed-tab = root.current-tab;
+            root.displayed-index = root.journal-index;
+            root.displayed-task-index = root.task-index;
+            root.slide-offset = root.slide-direction > 0 ? 1.0 : -1.0;
+            in-timer.running = true;
+        }
+    }
+
+    in-timer := Timer {
+        interval: 16ms;
+        running: false;
+        triggered => {
+            self.running = false;
+            // drive back to settled.
+            root.slide-offset = 0.0;
+        }
+    }
+
+    // kick off a page-flip. captures direction, animates slide-offset to the
+    // off-screen target, schedules out-timer for the swap.
+    function start-flip(direction: int) {
+        root.slide-direction = direction;
+        root.slide-offset = direction > 0 ? -1.0 : 1.0;
+        out-timer.running = true;
+    }
+
+    // tab navigation entry point. The parallel main.rs / db.rs agent can also
+    // wire any future filter-apply callback to call this same function (or
+    // trigger-refresh-flip below) for the same animation.
+    function go-to-tab(target: int) {
+        if (target != root.current-tab) {
+            root.start-flip(target > root.displayed-tab ? 1 : -1);
+            root.current-tab = target;
+        }
+    }
+
+    function go-to-journal-index(target: int) {
+        if (target != root.journal-index) {
+            root.start-flip(target > root.displayed-index ? 1 : -1);
+            root.journal-index = target;
+        }
+    }
+
+    function go-to-task-index(target: int) {
+        if (target != root.task-index) {
+            root.start-flip(target > root.displayed-task-index ? 1 : -1);
+            root.task-index = target;
+        }
+    }
+
+    // future hook: filter-apply or any other "refresh the right page" trigger
+    // can call this to get the shadow-sweep animation without changing
+    // current-tab / journal-index (displayed-* will resync to the unchanged
+    // current-* values at swap time, which is a no-op visually but still
+    // gives the user a "the page is refreshing" cue).
+    function trigger-refresh-flip() {
+        root.start-flip(1);
+    }
+
+    // book scales with window, aspect-locked 16:11
+    property <length> book-w: min(self.width - 80px, (self.height - 140px) * 16 / 11);
+    property <length> book-h: root.book-w * 11 / 16;
+
+    // dark backdrop
+    Rectangle {
+        background: @radial-gradient(circle, #2a1810 0%, #150a05 100%);
+    }
+
+    VerticalLayout {
+        padding-top: 14px;
+        spacing: 10px;
+
+        // tab strip
+        HorizontalLayout {
+            alignment: center;
+            spacing: 6px;
+
+            Tab {
+                label: "today";
+                active: root.current-tab == 0;
+                clicked => { root.go-to-tab(0); }
+            }
+            Tab {
+                label: "journal";
+                active: root.current-tab == 1;
+                clicked => { root.go-to-tab(1); }
+            }
+            Tab {
+                label: "tasks";
+                active: root.current-tab == 2;
+                clicked => { root.go-to-tab(2); }
+            }
+            Tab {
+                label: "projects";
+                active: root.current-tab == 3;
+                clicked => { root.go-to-tab(3); }
+            }
+            Tab {
+                label: "calendar";
+                active: root.current-tab == 4;
+                clicked => { root.go-to-tab(4); }
+            }
         }
 
-        ListView {
-            for entry in entries: Rectangle {
-                height: 64px;
-                background: #faf3e2;
-                border-radius: 4px;
-                border-width: 1px;
-                border-color: #d9c9a3;
+        // book / spread (vertical-stretch absorbs remaining space; no preferred-size bubble-up to break the layout loop)
+        Rectangle {
+            vertical-stretch: 1;
+            Rectangle {
+                x: (parent.width - root.book-w) / 2;
+                y: (parent.height - root.book-h) / 2;
+                width: root.book-w;
+                height: root.book-h;
 
-                VerticalLayout {
-                    padding: 12px;
-                    spacing: 4px;
+                    // leather binding
+                    Rectangle {
+                        x: -28px;
+                        y: -22px;
+                        width: parent.width + 56px;
+                        height: parent.height + 44px;
+                        background: #3d2817;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: #2a1a0e;
+                        drop-shadow-color: rgba(0, 0, 0, 0.55);
+                        drop-shadow-blur: 60px;
+                        drop-shadow-offset-y: 40px;
 
-                    Text {
-                        text: entry.title;
-                        font-size: 18px;
-                        color: #2c1810;
+                        Rectangle {
+                            x: 4px;
+                            y: 4px;
+                            width: parent.width - 8px;
+                            height: parent.height - 8px;
+                            border-radius: 8px;
+                            border-width: 1px;
+                            border-color: rgba(255, 200, 150, 0.06);
+                        }
+
+                        Text {
+                            x: parent.width - 86px;
+                            y: parent.height - 40px;
+                            text: "hive";
+                            font-family: "Caveat";
+                            font-weight: 700;
+                            font-size: 24px;
+                            color: #b08838;
+                        }
                     }
-                    Text {
-                        text: entry.ai + " · " + entry.entry-date;
-                        font-size: 12px;
-                        color: #6b4423;
+
+                    // spread
+                    // Manual layout (not HorizontalLayout) so the right-page
+                    // slot can x-translate without the layout fighting us.
+                    // page-w is half the spread minus half the spine.
+                    Rectangle {
+                        width: parent.width;
+                        height: parent.height;
+                        clip: true;
+
+                        property <length> spine-w: 18px;
+                        property <length> page-w: (self.width - self.spine-w) / 2;
+
+                        // LEFT page slot (does not animate; the binding doesn't
+                        // move during a real page-turn).
+                        Rectangle {
+                            x: 0;
+                            y: 0;
+                            width: parent.page-w;
+                            height: parent.height;
+
+                            if root.displayed-tab == 0: TodaySpreadLeft {
+                                width: parent.width;
+                                height: parent.height;
+                                greeting: root.greeting;
+                                day-subtitle: root.day-subtitle;
+                                tasks: root.today-tasks;
+                            }
+                            if root.displayed-tab == 1: JournalSpreadLeft {
+                                width: parent.width;
+                                height: parent.height;
+                                entry: root.journal-entries[root.displayed-index];
+                                can-prev: root.journal-index > 0;
+                                prev-clicked => {
+                                    if (root.journal-index > 0) {
+                                        root.go-to-journal-index(root.journal-index - 1);
+                                    }
+                                }
+                                checkbox-clicked(tid) => { root.checkbox-clicked(tid); }
+                            }
+                            if root.displayed-tab == 2: TaskSpreadLeft {
+                                width: parent.width;
+                                height: parent.height;
+                                task: root.task-entries[root.displayed-task-index];
+                                can-prev: root.task-index > 0;
+                                prev-clicked => {
+                                    if (root.task-index > 0) {
+                                        root.go-to-task-index(root.task-index - 1);
+                                    }
+                                }
+                            }
+                            if root.displayed-tab == 3: StubSpreadLeft {
+                                width: parent.width;
+                                height: parent.height;
+                                title: "projects";
+                                tagline: "bees-roadhouse-tech .. hive-rs .. household-ops .. all the rooms.";
+                            }
+                            if root.displayed-tab == 4: StubSpreadLeft {
+                                width: parent.width;
+                                height: parent.height;
+                                title: "calendar";
+                                tagline: "the week ahead, written like a human.";
+                            }
+                        }
+
+                        // SPINE
+                        Rectangle {
+                            x: parent.page-w;
+                            y: 0;
+                            width: parent.spine-w;
+                            height: parent.height;
+                            background: @linear-gradient(90deg,
+                                transparent 0%,
+                                rgba(60, 30, 10, 0.45) 35%,
+                                rgba(30, 15, 5, 0.65) 50%,
+                                rgba(60, 30, 10, 0.45) 65%,
+                                transparent 100%);
+                        }
+
+                        // RIGHT page slot. Translates by slide-offset * page-w.
+                        // The parent Rectangle has clip: true, so when the slot
+                        // is off-screen during the swap moment it's hidden.
+                        Rectangle {
+                            x: parent.page-w + parent.spine-w + root.slide-offset * parent.page-w;
+                            y: 0;
+                            width: parent.page-w;
+                            height: parent.height;
+                            clip: true;
+
+                            if root.displayed-tab == 0: TodaySpreadRight {
+                                width: parent.width;
+                                height: parent.height;
+                                wire-items: root.today-wire;
+                            }
+                            if root.displayed-tab == 1: JournalSpreadRight {
+                                width: parent.width;
+                                height: parent.height;
+                                entry: root.journal-entries[root.displayed-index];
+                                can-next: root.journal-index < root.journal-entries.length - 1;
+                                position-label: root.displayed-index + 1;
+                                total-count: root.journal-entries.length;
+                                next-clicked => {
+                                    if (root.journal-index < root.journal-entries.length - 1) {
+                                        root.go-to-journal-index(root.journal-index + 1);
+                                    }
+                                }
+                            }
+                            if root.displayed-tab == 2: TaskSpreadRight {
+                                width: parent.width;
+                                height: parent.height;
+                                task: root.task-entries[root.displayed-task-index];
+                                can-next: root.task-index < root.task-entries.length - 1;
+                                position-label: root.displayed-task-index + 1;
+                                total-count: root.task-entries.length;
+                                next-clicked => {
+                                    if (root.task-index < root.task-entries.length - 1) {
+                                        root.go-to-task-index(root.task-index + 1);
+                                    }
+                                }
+                            }
+                            if root.displayed-tab == 3: StubSpreadRight {
+                                width: parent.width;
+                                height: parent.height;
+                                note: "next iteration: project cards with task counts, owners, last activity.";
+                            }
+                            if root.displayed-tab == 4: StubSpreadRight {
+                                width: parent.width;
+                                height: parent.height;
+                                note: "next iteration: week view with events written conversationally, google calendar sync.";
+                            }
+
+                            // shadow sweep overlay. Imitates the lift shadow
+                            // under a flipping page. Forward (slide-out to the
+                            // left, slide-in from the right) puts darkness on
+                            // the leading edge (left side of the page). Backward
+                            // mirrors. opacity = |slide-offset| so the shadow
+                            // peaks at the swap moment and fades to nothing
+                            // when settled.
+                            Rectangle {
+                                x: 0;
+                                y: 0;
+                                width: parent.width;
+                                height: parent.height;
+                                opacity: abs(root.slide-offset);
+                                background: root.slide-direction >= 0
+                                    ? @linear-gradient(90deg,
+                                        rgba(20, 10, 4, 0.75) 0%,
+                                        rgba(20, 10, 4, 0.45) 35%,
+                                        rgba(20, 10, 4, 0.0) 100%)
+                                    : @linear-gradient(90deg,
+                                        rgba(20, 10, 4, 0.0) 0%,
+                                        rgba(20, 10, 4, 0.45) 65%,
+                                        rgba(20, 10, 4, 0.75) 100%);
+                            }
+                        }
                     }
                 }
             }
         }
     }
-}
+

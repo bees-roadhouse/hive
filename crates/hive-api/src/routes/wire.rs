@@ -9,8 +9,7 @@ use hive_db::enums::Severity;
 use hive_db::queries::wire;
 
 use crate::error::ApiError;
-use crate::state::AppState;
-use crate::with_conn;
+use crate::state::{AppState, HiveEvent};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -37,7 +36,7 @@ async fn list(
         unacknowledged: q.unacknowledged,
         limit: q.limit,
     };
-    let rows = with_conn(&state, move |c| wire::list(c, &filters)).await?;
+    let rows = wire::list(&state.pool, &filters).await?;
     Ok(Json(rows))
 }
 
@@ -57,24 +56,34 @@ async fn add(
     State(state): State<AppState>,
     Json(body): Json<AddBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let res = with_conn(&state, move |c| {
-        wire::add(
-            c,
-            wire::AddArgs {
-                source: &body.source,
-                title: &body.title,
-                body: body.body.as_deref(),
-                external_id: body.external_id.as_deref(),
-                severity: body.severity,
-                affects: body.affects.as_deref(),
-                url: body.url.as_deref(),
-                category: body.category.as_deref(),
-            },
-        )
-    })
+    let res = wire::add(
+        &state.pool,
+        wire::AddArgs {
+            source: &body.source,
+            title: &body.title,
+            body: body.body.as_deref(),
+            external_id: body.external_id.as_deref(),
+            severity: body.severity,
+            affects: body.affects.as_deref(),
+            url: body.url.as_deref(),
+            category: body.category.as_deref(),
+        },
+    )
     .await?;
     Ok(Json(match res {
-        wire::AddResult::Added(e) => json!({"added": e}),
+        wire::AddResult::Added(e) => {
+            state.emitter.emit(
+                HiveEvent::now("wire.event", "wire_events", e.id).with_extra(serde_json::json!({
+                    "source": e.source,
+                    "title": e.title,
+                    "severity": e.severity,
+                    "category": e.category,
+                    "url": e.url,
+                    "affects": e.affects,
+                })),
+            );
+            json!({"added": e})
+        }
         wire::AddResult::AlreadySeen { id } => json!({"already_seen": {"id": id}}),
     }))
 }
@@ -83,6 +92,9 @@ async fn ack(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    with_conn(&state, move |c| wire::ack(c, id)).await?;
+    wire::ack(&state.pool, id).await?;
+    state
+        .emitter
+        .emit(HiveEvent::now("wire.acked", "wire_events", id));
     Ok(Json(json!({"acknowledged": true})))
 }

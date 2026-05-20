@@ -1,13 +1,13 @@
-//! FTS5 search over journal_entries and notes. Mirrors python
-//! `cmd_journal_search` / `cmd_notes_search` / `cmd_search` (non-hybrid path).
-//! Hybrid search lives in the `hive-embed` crate.
+//! tsvector full-text search over `journal_entries.fts` and `notes.fts`.
+//! Mirrors python `cmd_journal_search` / `cmd_notes_search` / `cmd_search`
+//! (non-hybrid path). Hybrid semantic search lives in the `hive-embed` crate.
 
-use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use sqlx::{FromRow, PgPool};
 
 use crate::error::Result;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct JournalHit {
     pub id: i64,
     pub ai: String,
@@ -17,7 +17,7 @@ pub struct JournalHit {
     pub snippet: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct NoteHit {
     pub id: i64,
     pub author: String,
@@ -27,52 +27,36 @@ pub struct NoteHit {
     pub snippet: String,
 }
 
-pub fn journal(conn: &Connection, query: &str, limit: i64) -> Result<Vec<JournalHit>> {
-    let mut stmt = conn.prepare(
+pub async fn journal(pool: &PgPool, query: &str, limit: i64) -> Result<Vec<JournalHit>> {
+    let rows = sqlx::query_as::<_, JournalHit>(
         "SELECT j.id, j.ai, j.entry_date, j.title, j.tags, \
-                snippet(journal_fts, 1, '[', ']', '...', 12) AS snip \
-         FROM journal_fts \
-         JOIN journal_entries j ON j.id = journal_fts.rowid \
-         WHERE journal_fts MATCH ? \
-         ORDER BY rank \
-         LIMIT ?",
-    )?;
-    let rows = stmt
-        .query_map(params![query, limit], |r| {
-            Ok(JournalHit {
-                id: r.get("id")?,
-                ai: r.get("ai")?,
-                entry_date: r.get("entry_date")?,
-                title: r.get("title")?,
-                tags: r.get("tags")?,
-                snippet: r.get("snip")?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+                ts_headline('english', j.body, plainto_tsquery('english', $1), \
+                            'StartSel=[, StopSel=], MaxFragments=1, MaxWords=20') AS snippet \
+         FROM journal_entries j \
+         WHERE j.fts @@ plainto_tsquery('english', $1) \
+         ORDER BY ts_rank(j.fts, plainto_tsquery('english', $1)) DESC \
+         LIMIT $2",
+    )
+    .bind(query)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
     Ok(rows)
 }
 
-pub fn notes(conn: &Connection, query: &str, limit: i64) -> Result<Vec<NoteHit>> {
-    let mut stmt = conn.prepare(
+pub async fn notes(pool: &PgPool, query: &str, limit: i64) -> Result<Vec<NoteHit>> {
+    let rows = sqlx::query_as::<_, NoteHit>(
         "SELECT n.id, n.author, n.project, n.title, n.tags, \
-                snippet(notes_fts, 1, '[', ']', '...', 12) AS snip \
-         FROM notes_fts \
-         JOIN notes n ON n.id = notes_fts.rowid \
-         WHERE notes_fts MATCH ? \
-         ORDER BY rank \
-         LIMIT ?",
-    )?;
-    let rows = stmt
-        .query_map(params![query, limit], |r| {
-            Ok(NoteHit {
-                id: r.get("id")?,
-                author: r.get("author")?,
-                project: r.get("project")?,
-                title: r.get("title")?,
-                tags: r.get("tags")?,
-                snippet: r.get("snip")?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+                ts_headline('english', n.body, plainto_tsquery('english', $1), \
+                            'StartSel=[, StopSel=], MaxFragments=1, MaxWords=20') AS snippet \
+         FROM notes n \
+         WHERE n.fts @@ plainto_tsquery('english', $1) \
+         ORDER BY ts_rank(n.fts, plainto_tsquery('english', $1)) DESC \
+         LIMIT $2",
+    )
+    .bind(query)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
     Ok(rows)
 }

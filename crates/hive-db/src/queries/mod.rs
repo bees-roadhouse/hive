@@ -2,6 +2,7 @@ pub mod embeddings;
 pub mod graph;
 pub mod journal;
 pub mod links;
+pub mod messages;
 pub mod notes;
 pub mod projects;
 pub mod search;

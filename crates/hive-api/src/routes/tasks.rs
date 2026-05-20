@@ -8,8 +8,7 @@ use hive_db::enums::{Owner, TaskStatus};
 use hive_db::queries::tasks;
 
 use crate::error::ApiError;
-use crate::state::AppState;
-use crate::with_conn;
+use crate::state::{AppState, HiveEvent};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -39,7 +38,7 @@ async fn list(
         status: q.status,
         all: q.all,
     };
-    let rows = with_conn(&state, move |c| tasks::list(c, &filters)).await?;
+    let rows = tasks::list(&state.pool, &filters).await?;
     Ok(Json(rows))
 }
 
@@ -57,18 +56,24 @@ async fn add(
     State(state): State<AppState>,
     Json(body): Json<AddBody>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
-    let t = with_conn(&state, move |c| {
-        tasks::add(
-            c,
-            &body.project,
-            &body.title,
-            body.body.as_deref(),
-            body.owner,
-            body.priority.as_deref(),
-            body.due.as_deref(),
-        )
-    })
+    let t = tasks::add(
+        &state.pool,
+        &body.project,
+        &body.title,
+        body.body.as_deref(),
+        body.owner,
+        body.priority.as_deref(),
+        body.due.as_deref(),
+    )
     .await?;
+    state.emitter.emit(
+        HiveEvent::now("task.created", "tasks", t.id).with_extra(serde_json::json!({
+            "title": t.title,
+            "owner": t.owner,
+            "project": t.project,
+            "priority": t.priority,
+        })),
+    );
     Ok(Json(t))
 }
 
@@ -76,7 +81,7 @@ async fn show(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
-    let t = with_conn(&state, move |c| tasks::require(c, id)).await?;
+    let t = tasks::require(&state.pool, id).await?;
     Ok(Json(t))
 }
 
@@ -116,24 +121,32 @@ async fn update(
         title: body.title,
         block_reason: None,
     };
-    with_conn(&state, move |c| {
-        tasks::update(c, id, &fields)?;
-        tasks::require(c, id)
-    })
-    .await
-    .map(Json)
+    tasks::update(&state.pool, id, &fields).await?;
+    let t = tasks::require(&state.pool, id).await?;
+    state.emitter.emit(
+        HiveEvent::now("task.updated", "tasks", t.id).with_extra(serde_json::json!({
+            "title": t.title,
+            "owner": t.owner,
+            "status": t.status,
+            "priority": t.priority,
+        })),
+    );
+    Ok(Json(t))
 }
 
 async fn done(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
-    with_conn(&state, move |c| {
-        tasks::mark_done(c, id)?;
-        tasks::require(c, id)
-    })
-    .await
-    .map(Json)
+    tasks::mark_done(&state.pool, id).await?;
+    let t = tasks::require(&state.pool, id).await?;
+    state.emitter.emit(
+        HiveEvent::now("task.done", "tasks", t.id).with_extra(serde_json::json!({
+            "title": t.title,
+            "owner": t.owner,
+        })),
+    );
+    Ok(Json(t))
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,22 +159,30 @@ async fn block(
     Path(id): Path<i64>,
     Json(body): Json<BlockBody>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
-    with_conn(&state, move |c| {
-        tasks::mark_blocked(c, id, &body.reason)?;
-        tasks::require(c, id)
-    })
-    .await
-    .map(Json)
+    let reason = body.reason.clone();
+    tasks::mark_blocked(&state.pool, id, &body.reason).await?;
+    let t = tasks::require(&state.pool, id).await?;
+    state.emitter.emit(
+        HiveEvent::now("task.blocked", "tasks", t.id).with_extra(serde_json::json!({
+            "title": t.title,
+            "owner": t.owner,
+            "reason": reason,
+        })),
+    );
+    Ok(Json(t))
 }
 
 async fn drop(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
-    with_conn(&state, move |c| {
-        tasks::mark_dropped(c, id)?;
-        tasks::require(c, id)
-    })
-    .await
-    .map(Json)
+    tasks::mark_dropped(&state.pool, id).await?;
+    let t = tasks::require(&state.pool, id).await?;
+    state.emitter.emit(
+        HiveEvent::now("task.dropped", "tasks", t.id).with_extra(serde_json::json!({
+            "title": t.title,
+            "owner": t.owner,
+        })),
+    );
+    Ok(Json(t))
 }

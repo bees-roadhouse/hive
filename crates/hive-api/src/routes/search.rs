@@ -8,7 +8,6 @@ use hive_db::queries::search;
 
 use crate::error::ApiError;
 use crate::state::AppState;
-use crate::with_conn;
 
 pub fn router() -> Router<AppState> {
     Router::new().route("/search", get(search_endpoint))
@@ -35,13 +34,7 @@ async fn search_endpoint(
     State(state): State<AppState>,
     Query(q): Query<SearchQuery>,
 ) -> Result<Json<CombinedHits>, ApiError> {
-    let limit = q.limit;
-    let query = q.q;
-    let hits = with_conn(&state, move |c| {
-        let j = search::journal(c, &query, limit)?;
-        let n = search::notes(c, &query, limit)?;
-        Ok::<_, hive_db::Error>(CombinedHits { journal: j, notes: n })
-    })
-    .await?;
-    Ok(Json(hits))
+    let j = search::journal(&state.pool, &q.q, q.limit).await?;
+    let n = search::notes(&state.pool, &q.q, q.limit).await?;
+    Ok(Json(CombinedHits { journal: j, notes: n }))
 }
