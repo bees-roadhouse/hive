@@ -1,20 +1,13 @@
-# Provisional: this crate is built standalone for now. Cera will wire it
-# into the workspace (and switch deps to workspace = true) once the
-# parallel workspace-cleanup pass settles.
 [package]
 name = "hive-md"
-version = "0.1.0"
-edition = "2021"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 description = "Obsidian-flavored markdown parser for hive task two-way binding."
 
 [dependencies]
-pulldown-cmark = "0.12"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-chrono = { version = "0.4", features = ["serde", "clock"] }
-thiserror = "1"
-
-# Provisional: opt out of the root workspace so this crate builds standalone
-# until Cera adds it as a workspace member.
-[workspace]
+pulldown-cmark = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }

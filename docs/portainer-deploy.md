@@ -77,7 +77,7 @@ Should return your three most recent journal entries.
 
 ## Step 5: point clients at the host
 
-The CLI (`python ~/.hive/hive.py`) and the rust desktop client (`hive-desktop`) both ship the same resolver ... no wrapper, no extra tooling. Set the three env vars below and the client picks the right URL based on the system's DNS search domain.
+The CLI (`python ~/.hive/hive.py`) and the leptos web UI (`hive-ui`) both ship the same resolver ... no wrapper, no extra tooling. Set the three env vars below and the client picks the right URL based on the system's DNS search domain.
 
 ```
 hive client URL resolution (laptop / agent sessions):

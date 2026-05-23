@@ -5,6 +5,7 @@ members = [
     "crates/hive-api",
     "crates/hive-embed",
     "crates/hive-core",
+    "crates/hive-md",
     "crates/hive-migrate",
     "crates/hive-ui",
 ]
@@ -85,8 +86,8 @@ sha2 = "0.10"
 # Embedding + reranking (hive-embed)
 fastembed = "5"
 
-# UI templating (maud: type-safe HTML, no leptos WASM toolchain in v1)
-maud = { version = "0.27", features = ["axum"] }
+# Markdown parsing (hive-md: Obsidian task grammar for journal-canvas dual-write)
+pulldown-cmark = "0.12"
 
 [profile.release]
 lto = "thin"
