@@ -1,9 +1,11 @@
+pub mod anchors;
 pub mod embeddings;
 pub mod graph;
 pub mod journal;
 pub mod links;
 pub mod messages;
 pub mod notes;
+pub mod people;
 pub mod projects;
 pub mod search;
 pub mod tasks;

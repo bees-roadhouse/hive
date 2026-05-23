@@ -119,7 +119,7 @@ pub async fn update(pool: &PgPool, id: i64, fields: &UpdateFields) -> Result<()>
 
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new("UPDATE tasks SET ");
     let mut first = true;
-    let mut push_set = |qb: &mut QueryBuilder<Postgres>, first: &mut bool| {
+    let push_set = |qb: &mut QueryBuilder<Postgres>, first: &mut bool| {
         if *first {
             *first = false;
         } else {

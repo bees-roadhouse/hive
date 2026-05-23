@@ -77,6 +77,26 @@ pub struct WireEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct TaskAnchor {
+    pub task_id: i64,
+    pub journal_entry_id: i64,
+    pub block_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Person {
+    pub id: i64,
+    pub slug: String,
+    pub display_name: String,
+    /// `ai` or `human` (CHECK-constrained at the schema level).
+    pub kind: String,
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Link {
     pub id: i64,
     pub source_table: String,
