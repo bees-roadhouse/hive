@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Shared domain types (DTOs) for the hive HTTP API. Consumed by hive-desktop (Slint Windows client) and the future iPad client via uniffi-generated Swift bindings."
+description = "Shared domain types (DTOs) for the hive HTTP API. Consumed by hive-ui (leptos web canvas) and the future iPad client via uniffi-generated Swift bindings."
 
 [dependencies]
 serde = { workspace = true }

@@ -5,13 +5,13 @@ members = [
     "crates/hive-api",
     "crates/hive-embed",
     "crates/hive-core",
-    "crates/hive-desktop",
     "crates/hive-migrate",
 ]
 
 # Deferred (still on rusqlite sync API; retired by the api-first shift):
 #   "crates/hive-cli" ... CLI is hive.py (HTTP-only); rust port off the critical path
-#   "crates/hive-ui"  ... maud/leptos legacy SSR; superseded by hive-desktop (slint)
+#   "crates/hive-ui"  ... will be reinstated as the leptos web canvas (journal-canvas work);
+#                       supersedes the dropped hive-desktop slint port
 exclude = [
     "crates/hive-cli",
     "crates/hive-ui",
@@ -89,10 +89,6 @@ fastembed = "5"
 
 # UI templating (maud: type-safe HTML, no leptos WASM toolchain in v1)
 maud = { version = "0.27", features = ["axum"] }
-
-# Slint native desktop UI (hive-desktop crate; GPLv3-linked)
-slint = "1.16"
-slint-build = "1.16"
 
 [profile.release]
 lto = "thin"

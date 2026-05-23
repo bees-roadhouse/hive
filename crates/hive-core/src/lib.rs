@@ -1,8 +1,8 @@
 //! hive-core: shared DTOs for the hive HTTP API.
 //!
 //! Wire-format types that travel between hive-api and any client
-//! (hive-desktop today, iPad/Swift via uniffi later). Pure data, no
-//! database access, no platform code. Add types here as endpoints
+//! (hive-ui leptos canvas, iPad/Swift via uniffi later). Pure data,
+//! no database access, no platform code. Add types here as endpoints
 //! get wired.
 
 use serde::{Deserialize, Serialize};
