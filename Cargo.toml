@@ -6,15 +6,13 @@ members = [
     "crates/hive-embed",
     "crates/hive-core",
     "crates/hive-migrate",
+    "crates/hive-ui",
 ]
 
 # Deferred (still on rusqlite sync API; retired by the api-first shift):
 #   "crates/hive-cli" ... CLI is hive.py (HTTP-only); rust port off the critical path
-#   "crates/hive-ui"  ... will be reinstated as the leptos web canvas (journal-canvas work);
-#                       supersedes the dropped hive-desktop slint port
 exclude = [
     "crates/hive-cli",
-    "crates/hive-ui",
 ]
 
 [workspace.package]

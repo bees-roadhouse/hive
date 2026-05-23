@@ -1,59 +1,59 @@
-//! `hive-ui` ... server-rendered HTML UI for the hive shared-state DB.
+//! hive-ui ... leptos 0.7 SSR axum server for the journal-canvas.
 //!
-//! Renders directly off the local `hive-db` (no API hop ... the SSR server
-//! already has DB access). The graph view fetches its payload from
-//! `/graph` rendered inline so the page is interactive without WASM
-//! hydration.
-//!
-//! v1 is HTML SSR only. The DESIGN.md leptos+WASM hydration story is
-//! deferred to a follow-up; the user-visible result of v1 is the same
-//! lists + nav + graph view the python+svelte UI ships today.
+//! v0 scope: one route (`/`) renders the 5 most-recent journal entries
+//! fetched live from hive-api. The markdown canvas, checkbox component,
+//! and structured views land in follow-up commits.
 
+mod api;
+mod app;
 mod pages;
 
 use std::net::SocketAddr;
 
 use axum::Router;
-use axum::routing::get;
-use clap::Parser;
+use leptos::config::LeptosOptions;
+use leptos_axum::{generate_route_list, LeptosRoutes};
+use tower_http::services::ServeDir;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-use crate::pages::AppState;
-
-#[derive(Debug, Parser)]
-#[command(name = "hive-ui", about = "Hive web UI")]
-struct Args {
-    #[arg(long, env = "HIVE_UI_BIND", default_value = "127.0.0.1:8080")]
-    bind: SocketAddr,
-    #[arg(long, env = "HIVE_DB")]
-    db: Option<std::path::PathBuf>,
-}
+use crate::app::{shell, App};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,hive_ui=debug")))
         .with(fmt::layer())
         .init();
 
-    let args = Args::parse();
-    let db_path = args.db.clone().unwrap_or_else(hive_db::default_db_path);
-    tracing::info!(db = %db_path.display(), bind = %args.bind, "starting hive-ui");
+    let port: u16 = std::env::var("HIVE_UI_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8091);
+    let addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], port));
 
-    let pool = hive_db::open_pool(&db_path, false, 4)?;
-    let state = AppState { pool };
+    let conf = LeptosOptions::builder()
+        .output_name("hive-ui")
+        .site_root("target/site")
+        .site_pkg_dir("pkg")
+        .site_addr(addr)
+        .reload_port(3001)
+        .env(leptos::config::Env::DEV)
+        .build();
 
-    let app: Router = Router::new()
-        .route("/", get(pages::home::view))
-        .route("/tasks", get(pages::tasks::view))
-        .route("/journal", get(pages::journal::view))
-        .route("/notes", get(pages::notes::view))
-        .route("/wire", get(pages::wire::view))
-        .route("/graph", get(pages::graph::view))
-        .route("/healthz", get(|| async { "ok" }))
-        .with_state(state);
+    let routes = generate_route_list(App);
 
-    let listener = tokio::net::TcpListener::bind(args.bind).await?;
-    axum::serve(listener, app).await?;
+    let style_dir = ServeDir::new("style");
+
+    let conf_for_shell = conf.clone();
+    let app: Router = Router::<LeptosOptions>::new()
+        .leptos_routes(&conf, routes, move || shell(conf_for_shell.clone()))
+        .nest_service("/style", style_dir)
+        .with_state(conf);
+
+    tracing::info!("hive-ui listening on http://{addr}");
+    tracing::info!("hive-api base: {}", api::api_base());
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app.into_make_service()).await?;
     Ok(())
 }
