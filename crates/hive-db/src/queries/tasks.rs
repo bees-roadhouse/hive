@@ -1,4 +1,5 @@
 use sqlx::{PgPool, QueryBuilder, Postgres};
+use uuid::Uuid;
 
 use crate::enums::{Owner, TaskStatus};
 use crate::error::{Error, Result};
@@ -69,7 +70,7 @@ pub async fn add(
     Ok(task)
 }
 
-pub async fn get(pool: &PgPool, id: i64) -> Result<Option<Task>> {
+pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Task>> {
     Ok(sqlx::query_as::<_, Task>(&format!(
         "SELECT {SELECT_COLS} FROM tasks WHERE id = $1"
     ))
@@ -78,7 +79,7 @@ pub async fn get(pool: &PgPool, id: i64) -> Result<Option<Task>> {
     .await?)
 }
 
-pub async fn require(pool: &PgPool, id: i64) -> Result<Task> {
+pub async fn require(pool: &PgPool, id: Uuid) -> Result<Task> {
     get(pool, id).await?.ok_or_else(|| Error::NotFound {
         kind: "task",
         id: id.to_string(),
@@ -107,7 +108,7 @@ pub async fn list(pool: &PgPool, filters: &ListFilters) -> Result<Vec<Task>> {
     Ok(rows)
 }
 
-pub async fn update(pool: &PgPool, id: i64, fields: &UpdateFields) -> Result<()> {
+pub async fn update(pool: &PgPool, id: Uuid, fields: &UpdateFields) -> Result<()> {
     if fields.is_empty() {
         return Err(Error::InvalidFormat {
             field: "update",
@@ -173,7 +174,7 @@ pub async fn update(pool: &PgPool, id: i64, fields: &UpdateFields) -> Result<()>
     Ok(())
 }
 
-pub async fn mark_done(pool: &PgPool, id: i64) -> Result<()> {
+pub async fn mark_done(pool: &PgPool, id: Uuid) -> Result<()> {
     update(
         pool,
         id,
@@ -185,7 +186,7 @@ pub async fn mark_done(pool: &PgPool, id: i64) -> Result<()> {
     .await
 }
 
-pub async fn mark_dropped(pool: &PgPool, id: i64) -> Result<()> {
+pub async fn mark_dropped(pool: &PgPool, id: Uuid) -> Result<()> {
     update(
         pool,
         id,
@@ -197,7 +198,7 @@ pub async fn mark_dropped(pool: &PgPool, id: i64) -> Result<()> {
     .await
 }
 
-pub async fn mark_blocked(pool: &PgPool, id: i64, reason: &str) -> Result<()> {
+pub async fn mark_blocked(pool: &PgPool, id: Uuid, reason: &str) -> Result<()> {
     update(
         pool,
         id,

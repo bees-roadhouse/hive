@@ -4,6 +4,7 @@ use axum::routing::{delete, get};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
+use uuid::Uuid;
 
 use hive_db::queries::links::{self, EntityRef};
 
@@ -88,7 +89,7 @@ async fn add(
 
 async fn remove(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     links::remove(&state.pool, id).await?;
     Ok(Json(json!({"removed": true})))

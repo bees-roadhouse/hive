@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use hive_db::PgPool;
 use tokio::sync::broadcast;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -16,20 +17,21 @@ pub struct AppState {
 /// `kind` is the high-level event name (e.g. `task.created`, `journal.created`,
 /// `message.sent`). `source_table` + `source_id` mirror the on-disk events.log
 /// format hive.py writes (`tasks`, `journal_entries`, `messages`) so `hive listen`
-/// stays compatible. `extra` is freeform per-event context (title, sender_ai,
-/// recipient_ai, owner, etc.) ... handlers fill what makes sense.
+/// stays compatible. Post-task-5 every PK is a UUIDv7; the wire emits the
+/// canonical hyphenated form. `extra` is freeform per-event context (title,
+/// sender_ai, recipient_ai, owner, etc.) ... handlers fill what makes sense.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct HiveEvent {
     pub kind: String,
     pub source_table: String,
-    pub source_id: i64,
+    pub source_id: Uuid,
     pub ts: String,
     #[serde(skip_serializing_if = "serde_json::Value::is_null")]
     pub extra: serde_json::Value,
 }
 
 impl HiveEvent {
-    pub fn now(kind: impl Into<String>, source_table: impl Into<String>, source_id: i64) -> Self {
+    pub fn now(kind: impl Into<String>, source_table: impl Into<String>, source_id: Uuid) -> Self {
         Self {
             kind: kind.into(),
             source_table: source_table.into(),
@@ -92,14 +94,14 @@ impl EventEmitter {
     }
 
     fn append_jsonl(&self, event: &HiveEvent) -> std::io::Result<()> {
-        // Match hive.py's _append_event line shape exactly: {ts, table, op, id}.
-        // op is always "insert" today; if we later emit updates/deletes we'll
-        // thread the op into HiveEvent.
+        // Match hive.py's _append_event line shape: {ts, table, op, id}. The
+        // `id` field used to be a json integer; post task-5 it's the canonical
+        // hyphenated UUIDv7 string. Tail consumers must read it as text.
         let line = serde_json::json!({
             "ts": event.ts,
             "table": event.source_table,
             "op": "insert",
-            "id": event.source_id,
+            "id": event.source_id.to_string(),
         });
         let mut f = std::fs::OpenOptions::new()
             .create(true)

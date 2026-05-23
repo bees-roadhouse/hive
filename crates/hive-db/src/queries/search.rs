@@ -4,12 +4,13 @@
 
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
+use uuid::Uuid;
 
 use crate::error::Result;
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct JournalHit {
-    pub id: i64,
+    pub id: Uuid,
     pub ai: String,
     pub entry_date: String,
     pub title: Option<String>,
@@ -19,7 +20,7 @@ pub struct JournalHit {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct NoteHit {
-    pub id: i64,
+    pub id: Uuid,
     pub author: String,
     pub project: Option<String>,
     pub title: Option<String>,

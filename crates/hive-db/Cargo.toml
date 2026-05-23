@@ -19,3 +19,4 @@ tracing = { workspace = true }
 directories = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+uuid = { workspace = true }

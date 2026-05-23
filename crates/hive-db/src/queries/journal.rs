@@ -1,4 +1,5 @@
 use sqlx::{PgPool, Postgres, QueryBuilder};
+use uuid::Uuid;
 
 use crate::enums::Ai;
 use crate::error::{Error, Result};
@@ -39,7 +40,7 @@ pub async fn add(
     Ok(row)
 }
 
-pub async fn get(pool: &PgPool, id: i64) -> Result<Option<JournalEntry>> {
+pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<JournalEntry>> {
     Ok(sqlx::query_as::<_, JournalEntry>(&format!(
         "SELECT {SELECT_COLS} FROM journal_entries WHERE id = $1"
     ))
@@ -48,7 +49,7 @@ pub async fn get(pool: &PgPool, id: i64) -> Result<Option<JournalEntry>> {
     .await?)
 }
 
-pub async fn require(pool: &PgPool, id: i64) -> Result<JournalEntry> {
+pub async fn require(pool: &PgPool, id: Uuid) -> Result<JournalEntry> {
     get(pool, id).await?.ok_or_else(|| Error::NotFound {
         kind: "journal_entry",
         id: id.to_string(),

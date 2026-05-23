@@ -8,6 +8,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool, Postgres, QueryBuilder};
+use uuid::Uuid;
 
 use crate::error::{Error, Result};
 
@@ -16,19 +17,19 @@ const SELECT_COLS: &str =
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Message {
-    pub id: i64,
+    pub id: Uuid,
     pub sender_ai: String,
     pub recipient_ai: String,
     pub kind: Option<String>,
     pub body: String,
-    pub in_reply_to: Option<i64>,
+    pub in_reply_to: Option<Uuid>,
     pub sent_at: DateTime<Utc>,
     pub read_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct MessageHit {
-    pub id: i64,
+    pub id: Uuid,
     pub sender_ai: String,
     pub recipient_ai: String,
     pub kind: Option<String>,
@@ -42,7 +43,7 @@ pub struct ListFilters {
     pub from_ai: Option<String>,
     pub to_ai: Option<String>,
     pub kind: Option<String>,
-    pub in_reply_to: Option<i64>,
+    pub in_reply_to: Option<Uuid>,
     pub unread_only: bool,
     pub limit: Option<i64>,
 }
@@ -53,7 +54,7 @@ pub async fn add(
     recipient_ai: &str,
     kind: Option<&str>,
     body: &str,
-    in_reply_to: Option<i64>,
+    in_reply_to: Option<Uuid>,
 ) -> Result<Message> {
     // validation: non-empty sender/recipient/body
     if sender_ai.trim().is_empty() {
@@ -97,7 +98,7 @@ pub async fn add(
     Ok(row)
 }
 
-pub async fn get(pool: &PgPool, id: i64) -> Result<Option<Message>> {
+pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Message>> {
     Ok(sqlx::query_as::<_, Message>(&format!(
         "SELECT {SELECT_COLS} FROM messages WHERE id = $1"
     ))
@@ -106,7 +107,7 @@ pub async fn get(pool: &PgPool, id: i64) -> Result<Option<Message>> {
     .await?)
 }
 
-pub async fn require(pool: &PgPool, id: i64) -> Result<Message> {
+pub async fn require(pool: &PgPool, id: Uuid) -> Result<Message> {
     get(pool, id).await?.ok_or_else(|| Error::NotFound {
         kind: "message",
         id: id.to_string(),
@@ -143,7 +144,7 @@ pub async fn list(pool: &PgPool, filters: &ListFilters) -> Result<Vec<Message>> 
 }
 
 /// Idempotent: leaves read_at untouched if already set.
-pub async fn mark_read(pool: &PgPool, id: i64) -> Result<Message> {
+pub async fn mark_read(pool: &PgPool, id: Uuid) -> Result<Message> {
     let existing = require(pool, id).await?;
     if existing.read_at.is_none() {
         sqlx::query("UPDATE messages SET read_at = now() WHERE id = $1")

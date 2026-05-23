@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use pgvector::Vector;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
+use uuid::Uuid;
 
 use crate::error::Result;
 
@@ -17,7 +18,7 @@ pub const VALID_SOURCE_TABLES: &[&str] = &["journal_entries", "notes"];
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct SourceRow {
-    pub id: i64,
+    pub id: Uuid,
     pub title: Option<String>,
     pub body: Option<String>,
     pub tags: Option<String>,
@@ -42,7 +43,7 @@ pub async fn fetch_source_rows(pool: &PgPool, table: &str) -> Result<Vec<SourceR
 pub async fn fetch_one_source_row(
     pool: &PgPool,
     table: &str,
-    source_id: i64,
+    source_id: Uuid,
 ) -> Result<Option<SourceRow>> {
     let sql = match table {
         "journal_entries" => "SELECT id, title, body, tags FROM journal_entries WHERE id = $1",
@@ -68,8 +69,8 @@ pub async fn existing_index(
     pool: &PgPool,
     table: &str,
     model: &str,
-) -> Result<HashMap<i64, String>> {
-    let rows: Vec<(i64, String)> = sqlx::query_as(
+) -> Result<HashMap<Uuid, String>> {
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
         "SELECT source_id, content_hash FROM embeddings WHERE source_table = $1 AND model = $2",
     )
     .bind(table)
@@ -114,7 +115,7 @@ pub async fn status(pool: &PgPool, model: &str) -> Result<Vec<StatusCount>> {
 pub async fn upsert(
     pool: &PgPool,
     table: &str,
-    source_id: i64,
+    source_id: Uuid,
     model: &str,
     dim: i32,
     embedding: &[f32],
@@ -149,8 +150,8 @@ pub async fn load_all(
     pool: &PgPool,
     table: &str,
     model: &str,
-) -> Result<(Vec<i64>, Vec<Vec<f32>>)> {
-    let rows: Vec<(i64, Vector)> = sqlx::query_as(
+) -> Result<(Vec<Uuid>, Vec<Vec<f32>>)> {
+    let rows: Vec<(Uuid, Vector)> = sqlx::query_as(
         "SELECT source_id, embedding FROM embeddings WHERE source_table = $1 AND model = $2",
     )
     .bind(table)

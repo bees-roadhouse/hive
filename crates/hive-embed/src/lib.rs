@@ -23,6 +23,7 @@ use fastembed::{
 };
 use hive_db::PgPool;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 pub const EMBED_MODEL_TAG: &str = "bge-small-en-v1.5";
 pub const EMBED_DIM: i64 = 384;
@@ -164,7 +165,7 @@ pub fn content_hash(text: &str) -> String {
 pub async fn store_embedding(
     pool: &PgPool,
     source_table: &str,
-    source_id: i64,
+    source_id: Uuid,
     model: &str,
     embedding: &[f32],
     content_hash: &str,
@@ -187,7 +188,7 @@ pub async fn load_embeddings(
     pool: &PgPool,
     source_table: &str,
     model: &str,
-) -> hive_db::Result<Vec<(i64, Vec<f32>)>> {
+) -> hive_db::Result<Vec<(Uuid, Vec<f32>)>> {
     let (ids, vecs) = hive_db::queries::embeddings::load_all(pool, source_table, model).await?;
     Ok(ids.into_iter().zip(vecs.into_iter()).collect())
 }

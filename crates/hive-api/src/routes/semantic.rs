@@ -8,6 +8,7 @@ use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use hive_db::queries::graph;
 
@@ -58,7 +59,7 @@ fn default_context_depth() -> u32 {
 #[derive(Debug, Serialize)]
 struct SemanticHit {
     source_table: String,
-    source_id: i64,
+    source_id: Uuid,
     score: f64,
     title: Option<String>,
     snippet: String,
@@ -106,15 +107,14 @@ async fn semantic_endpoint(
     Ok((StatusCode::NOT_IMPLEMENTED, Json(body)))
 }
 
-fn parse_context(spec: &str) -> Result<(String, i64), ApiError> {
+fn parse_context(spec: &str) -> Result<(String, Uuid), ApiError> {
     let (t, i) = spec
         .split_once(':')
-        .ok_or_else(|| ApiError::BadRequest(format!("context must be <table>:<id>, got '{spec}'")))?;
+        .ok_or_else(|| ApiError::BadRequest(format!("context must be <table>:<uuid>, got '{spec}'")))?;
     if t.is_empty() {
         return Err(ApiError::BadRequest("context table missing".into()));
     }
-    let id = i
-        .parse::<i64>()
-        .map_err(|_| ApiError::BadRequest(format!("context id not an integer: '{i}'")))?;
+    let id = Uuid::parse_str(i)
+        .map_err(|_| ApiError::BadRequest(format!("context id not a uuid: '{i}'")))?;
     Ok((t.to_string(), id))
 }

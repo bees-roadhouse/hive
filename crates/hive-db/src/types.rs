@@ -1,16 +1,19 @@
-//! Row types matching the postgres schema (see `migrations/0001_initial.sql`).
+//! Row types matching the postgres schema (see `migrations/`).
 //!
-//! Timestamps are `chrono::DateTime<Utc>` (TIMESTAMPTZ). `entry_date` and
-//! `due` stay TEXT (YYYY-MM-DD) because the python CLI writes them in that
-//! shape and we want byte-stable cross-tool reads.
+//! All PKs and FKs are UUIDv7 (`uuid::Uuid`) ... see migration 0002 for the
+//! type flip from BIGSERIAL. Timestamps are `chrono::DateTime<Utc>`
+//! (TIMESTAMPTZ). `entry_date` and `due` stay TEXT (YYYY-MM-DD) because the
+//! python CLI writes them in that shape and we want byte-stable cross-tool
+//! reads.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Project {
-    pub id: i64,
+    pub id: Uuid,
     pub name: String,
     pub description: Option<String>,
     pub status: String,
@@ -21,7 +24,7 @@ pub struct Project {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Task {
-    pub id: i64,
+    pub id: Uuid,
     pub project: Option<String>,
     pub title: String,
     pub body: Option<String>,
@@ -37,7 +40,7 @@ pub struct Task {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct JournalEntry {
-    pub id: i64,
+    pub id: Uuid,
     pub ai: String,
     pub entry_date: String,
     pub title: Option<String>,
@@ -49,7 +52,7 @@ pub struct JournalEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Note {
-    pub id: i64,
+    pub id: Uuid,
     pub author: String,
     pub title: Option<String>,
     pub body: String,
@@ -61,7 +64,7 @@ pub struct Note {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct WireEvent {
-    pub id: i64,
+    pub id: Uuid,
     pub source: String,
     pub category: Option<String>,
     pub external_id: Option<String>,
@@ -78,15 +81,15 @@ pub struct WireEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct TaskAnchor {
-    pub task_id: i64,
-    pub journal_entry_id: i64,
+    pub task_id: Uuid,
+    pub journal_entry_id: Uuid,
     pub block_id: String,
     pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Person {
-    pub id: i64,
+    pub id: Uuid,
     pub slug: String,
     pub display_name: String,
     /// `ai` or `human` (CHECK-constrained at the schema level).
@@ -98,11 +101,11 @@ pub struct Person {
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Link {
-    pub id: i64,
+    pub id: Uuid,
     pub source_table: String,
-    pub source_id: i64,
+    pub source_id: Uuid,
     pub target_table: String,
-    pub target_id: i64,
+    pub target_id: Uuid,
     pub link_type: Option<String>,
     pub note: Option<String>,
     pub created_at: DateTime<Utc>,

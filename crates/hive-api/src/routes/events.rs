@@ -19,6 +19,7 @@ use axum::routing::get;
 use futures_util::stream::{Stream, StreamExt};
 use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
+use uuid::Uuid;
 
 use crate::state::{AppState, HiveEvent};
 
@@ -72,7 +73,7 @@ fn to_sse(ev: &HiveEvent) -> Event {
     // Best-effort serialize; fallback to a minimal event if JSON fails (it shouldn't).
     let payload = serde_json::to_string(ev).unwrap_or_else(|_| {
         format!(
-            r#"{{"kind":"{}","source_table":"{}","source_id":{},"ts":"{}"}}"#,
+            r#"{{"kind":"{}","source_table":"{}","source_id":"{}","ts":"{}"}}"#,
             ev.kind, ev.source_table, ev.source_id, ev.ts
         )
     });
@@ -103,7 +104,14 @@ fn read_backfill(path: &std::path::Path, since: &str, limit: usize) -> Vec<Event
             continue;
         }
         let table = parsed.get("table").and_then(|v| v.as_str()).unwrap_or("");
-        let id = parsed.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+        // Post task-5 the on-disk log emits id as the canonical hyphenated
+        // UUIDv7 string. Skip malformed rows rather than fail the backfill.
+        let Some(id_str) = parsed.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Ok(id) = Uuid::parse_str(id_str) else {
+            continue;
+        };
         let kind = format!("{}.replay", normalize_table(table));
         let ev = HiveEvent {
             kind: kind.clone(),

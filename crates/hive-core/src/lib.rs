@@ -6,12 +6,13 @@
 //! get wired.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
-    pub id: i64,
+    pub id: Uuid,
     pub ai: String,
     pub entry_date: String,
     pub title: String,

@@ -3,6 +3,7 @@ use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::Json;
 use serde::Deserialize;
+use uuid::Uuid;
 
 use hive_db::enums::{Owner, TaskStatus};
 use hive_db::queries::tasks;
@@ -79,7 +80,7 @@ async fn add(
 
 async fn show(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(id): Path<Uuid>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
     let t = tasks::require(&state.pool, id).await?;
     Ok(Json(t))
@@ -109,7 +110,7 @@ where
 
 async fn update(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(id): Path<Uuid>,
     Json(body): Json<UpdateBody>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
     let fields = tasks::UpdateFields {
@@ -136,7 +137,7 @@ async fn update(
 
 async fn done(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(id): Path<Uuid>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
     tasks::mark_done(&state.pool, id).await?;
     let t = tasks::require(&state.pool, id).await?;
@@ -156,7 +157,7 @@ struct BlockBody {
 
 async fn block(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(id): Path<Uuid>,
     Json(body): Json<BlockBody>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
     let reason = body.reason.clone();
@@ -174,7 +175,7 @@ async fn block(
 
 async fn drop(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(id): Path<Uuid>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
     tasks::mark_dropped(&state.pool, id).await?;
     let t = tasks::require(&state.pool, id).await?;

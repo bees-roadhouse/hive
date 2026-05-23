@@ -1,16 +1,18 @@
--- task_anchors: tie an Obsidian-style ^taskN block id on a journal entry to a tasks row.
+-- journal-canvas dual-write schema: task_anchors maps Obsidian-style ^taskN
+-- block ids on journal entries to tasks rows; people captures @mentioned
+-- ai/human references. Built on the pure-uuid PKs landed by 0002.
+
 CREATE TABLE task_anchors (
-  task_id BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-  journal_entry_id BIGINT NOT NULL REFERENCES journal_entries(id) ON DELETE CASCADE,
+  task_id uuid NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  journal_entry_id uuid NOT NULL REFERENCES journal_entries(id) ON DELETE CASCADE,
   block_id TEXT NOT NULL CHECK (block_id ~ '^[a-z][a-z0-9_-]*$'),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (journal_entry_id, block_id)
 );
 CREATE INDEX task_anchors_task_id_idx ON task_anchors(task_id);
 
--- people: first-class person records (ai or human) referenced by @mentions in journal entries.
 CREATE TABLE people (
-  id BIGSERIAL PRIMARY KEY,
+  id uuid PRIMARY KEY DEFAULT gen_uuid_v7(),
   slug TEXT NOT NULL UNIQUE CHECK (slug ~ '^[a-z][a-z0-9_-]*$'),
   display_name TEXT NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN ('ai', 'human')),

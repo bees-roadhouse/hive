@@ -1,4 +1,5 @@
 use sqlx::{PgPool, Postgres, QueryBuilder};
+use uuid::Uuid;
 
 use crate::enums::Severity;
 use crate::error::{Error, Result};
@@ -31,7 +32,7 @@ pub struct AddArgs<'a> {
 #[derive(Debug, Clone)]
 pub enum AddResult {
     Added(WireEvent),
-    AlreadySeen { id: i64 },
+    AlreadySeen { id: Uuid },
 }
 
 pub async fn add(pool: &PgPool, args: AddArgs<'_>) -> Result<AddResult> {
@@ -59,7 +60,7 @@ pub async fn add(pool: &PgPool, args: AddArgs<'_>) -> Result<AddResult> {
             if err.is_unique_violation() && args.external_id.is_some() {
                 // Re-emit AlreadySeen with the existing row's id; bump last_seen_at.
                 let ext = args.external_id.unwrap();
-                let row: Option<(i64,)> =
+                let row: Option<(Uuid,)> =
                     sqlx::query_as("SELECT id FROM wire_events WHERE external_id = $1")
                         .bind(ext)
                         .fetch_optional(pool)
@@ -82,7 +83,7 @@ pub async fn add(pool: &PgPool, args: AddArgs<'_>) -> Result<AddResult> {
     }
 }
 
-pub async fn get(pool: &PgPool, id: i64) -> Result<Option<WireEvent>> {
+pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<WireEvent>> {
     Ok(sqlx::query_as::<_, WireEvent>(&format!(
         "SELECT {SELECT_COLS} FROM wire_events WHERE id = $1"
     ))
@@ -114,7 +115,7 @@ pub async fn list(pool: &PgPool, filters: &ListFilters) -> Result<Vec<WireEvent>
     Ok(rows)
 }
 
-pub async fn ack(pool: &PgPool, id: i64) -> Result<()> {
+pub async fn ack(pool: &PgPool, id: Uuid) -> Result<()> {
     let res = sqlx::query("UPDATE wire_events SET acknowledged = true WHERE id = $1")
         .bind(id)
         .execute(pool)

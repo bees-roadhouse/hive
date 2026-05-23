@@ -4,6 +4,7 @@ use axum::routing::{get, post};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
+use uuid::Uuid;
 
 use hive_db::enums::Severity;
 use hive_db::queries::wire;
@@ -90,7 +91,7 @@ async fn add(
 
 async fn ack(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     wire::ack(&state.pool, id).await?;
     state

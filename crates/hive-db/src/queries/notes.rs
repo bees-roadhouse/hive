@@ -1,4 +1,5 @@
 use sqlx::{PgPool, Postgres, QueryBuilder};
+use uuid::Uuid;
 
 use crate::enums::Author;
 use crate::error::{Error, Result};
@@ -42,7 +43,7 @@ pub async fn add(
     Ok(row)
 }
 
-pub async fn get(pool: &PgPool, id: i64) -> Result<Option<Note>> {
+pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Note>> {
     Ok(sqlx::query_as::<_, Note>(&format!(
         "SELECT {SELECT_COLS} FROM notes WHERE id = $1"
     ))
@@ -51,7 +52,7 @@ pub async fn get(pool: &PgPool, id: i64) -> Result<Option<Note>> {
     .await?)
 }
 
-pub async fn require(pool: &PgPool, id: i64) -> Result<Note> {
+pub async fn require(pool: &PgPool, id: Uuid) -> Result<Note> {
     get(pool, id).await?.ok_or_else(|| Error::NotFound {
         kind: "note",
         id: id.to_string(),

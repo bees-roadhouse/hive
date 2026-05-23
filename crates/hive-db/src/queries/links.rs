@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
+use uuid::Uuid;
 
 use crate::enums::LinkTable;
 use crate::error::{Error, Result};
@@ -8,12 +9,13 @@ use crate::types::Link;
 const SELECT_COLS: &str =
     "id, source_table, source_id, target_table, target_id, link_type, note, created_at";
 
-/// Reference to a hive entity, e.g. `tasks:53` or `projects:1`.
+/// Reference to a hive entity, e.g. `tasks:0190fae8-...` or
+/// `projects:0190fae8-...`. Post-task-5, every PK in the hive schema is a
+/// UUIDv7; references parse the second half as a uuid.
 #[derive(Debug, Clone)]
 pub struct EntityRef {
     pub table: LinkTable,
-    /// Tasks/journal/notes/wire/projects all key on integer `id` post-task-8.
-    pub id: i64,
+    pub id: Uuid,
 }
 
 impl EntityRef {
@@ -21,26 +23,26 @@ impl EntityRef {
         let (table_str, ident) = spec.split_once(':').ok_or(Error::InvalidFormat {
             field: label,
             value: spec.to_string(),
-            expected: "<table>:<id>",
+            expected: "<table>:<uuid>",
         })?;
         if ident.is_empty() {
             return Err(Error::InvalidFormat {
                 field: label,
                 value: spec.to_string(),
-                expected: "<table>:<id> (id missing)",
+                expected: "<table>:<uuid> (id missing)",
             });
         }
         let table = LinkTable::parse_short(table_str)?;
-        let id = ident.parse::<i64>().map_err(|_| Error::InvalidFormat {
+        let id = Uuid::parse_str(ident).map_err(|_| Error::InvalidFormat {
             field: label,
             value: ident.to_string(),
-            expected: "integer id",
+            expected: "uuid",
         })?;
         Ok(EntityRef { table, id })
     }
 }
 
-/// `<table>:<id>[:<link_type>]` ... used by --link on add commands.
+/// `<table>:<uuid>[:<link_type>]` ... used by --link on add commands.
 #[derive(Debug, Clone)]
 pub struct LinkSpec {
     pub target: EntityRef,
@@ -53,12 +55,12 @@ impl LinkSpec {
         let table_str = parts.next().ok_or(Error::InvalidFormat {
             field: "--link",
             value: spec.to_string(),
-            expected: "<table>:<id>[:<link_type>]",
+            expected: "<table>:<uuid>[:<link_type>]",
         })?;
         let ident = parts.next().ok_or(Error::InvalidFormat {
             field: "--link",
             value: spec.to_string(),
-            expected: "<table>:<id>[:<link_type>]",
+            expected: "<table>:<uuid>[:<link_type>]",
         })?;
         let link_type = parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
         let table = LinkTable::parse_short(table_str)?;
@@ -66,13 +68,13 @@ impl LinkSpec {
             return Err(Error::InvalidFormat {
                 field: "--link",
                 value: spec.to_string(),
-                expected: "<table>:<id>[:<link_type>] (id missing)",
+                expected: "<table>:<uuid>[:<link_type>] (id missing)",
             });
         }
-        let id = ident.parse::<i64>().map_err(|_| Error::InvalidFormat {
+        let id = Uuid::parse_str(ident).map_err(|_| Error::InvalidFormat {
             field: "--link",
             value: ident.to_string(),
-            expected: "integer id",
+            expected: "uuid",
         })?;
         Ok(LinkSpec {
             target: EntityRef { table, id },
@@ -117,8 +119,8 @@ pub async fn add(
     target: &EntityRef,
     link_type: Option<&str>,
     note: Option<&str>,
-) -> Result<Option<i64>> {
-    let res = sqlx::query_as::<_, (i64,)>(
+) -> Result<Option<Uuid>> {
+    let res = sqlx::query_as::<_, (Uuid,)>(
         "INSERT INTO links (source_table, source_id, target_table, target_id, link_type, note) \
          VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
     )
@@ -168,7 +170,7 @@ pub async fn incoming(pool: &PgPool, target: &EntityRef) -> Result<Vec<Link>> {
     Ok(rows)
 }
 
-pub async fn remove(pool: &PgPool, id: i64) -> Result<()> {
+pub async fn remove(pool: &PgPool, id: Uuid) -> Result<()> {
     let res = sqlx::query("DELETE FROM links WHERE id = $1")
         .bind(id)
         .execute(pool)

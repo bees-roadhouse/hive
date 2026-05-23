@@ -3,6 +3,7 @@ use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::Json;
 use serde::Deserialize;
+use uuid::Uuid;
 
 use hive_db::enums::Ai;
 use hive_db::queries::{journal, search};
@@ -81,7 +82,7 @@ async fn add(
 
 async fn show(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(id): Path<Uuid>,
 ) -> Result<Json<hive_db::types::JournalEntry>, ApiError> {
     let e = journal::require(&state.pool, id).await?;
     Ok(Json(e))

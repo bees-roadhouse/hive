@@ -3,6 +3,7 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use serde::Deserialize;
+use uuid::Uuid;
 
 use hive_db::queries::messages;
 
@@ -24,7 +25,7 @@ struct ListQuery {
     kind: Option<String>,
     #[serde(default)]
     unread_only: bool,
-    in_reply_to: Option<i64>,
+    in_reply_to: Option<Uuid>,
     limit: Option<i64>,
 }
 
@@ -50,7 +51,7 @@ struct AddBody {
     recipient_ai: String,
     kind: Option<String>,
     body: String,
-    in_reply_to: Option<i64>,
+    in_reply_to: Option<Uuid>,
 }
 
 async fn add(
@@ -89,7 +90,7 @@ async fn add(
 
 async fn show(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(id): Path<Uuid>,
 ) -> Result<Json<messages::Message>, ApiError> {
     let m = messages::require(&state.pool, id).await?;
     Ok(Json(m))
@@ -97,7 +98,7 @@ async fn show(
 
 async fn mark_read(
     State(state): State<AppState>,
-    Path(id): Path<i64>,
+    Path(id): Path<Uuid>,
 ) -> Result<Json<messages::Message>, ApiError> {
     let m = messages::mark_read(&state.pool, id).await?;
     state.emitter.emit(

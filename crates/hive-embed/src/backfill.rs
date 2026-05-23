@@ -7,6 +7,7 @@
 use anyhow::{Context, Result};
 use hive_db::PgPool;
 use sqlx::Row;
+use uuid::Uuid;
 
 use crate::{Embedder, content_hash, store_embedding};
 
@@ -32,7 +33,7 @@ impl BackfillScope {
 
 /// Per-row payload used to compute content_hash + the text to embed.
 struct SourceRow {
-    id: i64,
+    id: Uuid,
     text: String,
 }
 
@@ -47,7 +48,7 @@ async fn fetch_rows(pool: &PgPool, table: &str) -> Result<Vec<SourceRow>> {
     let out = rows
         .into_iter()
         .map(|r| {
-            let id: i64 = r.try_get("id")?;
+            let id: Uuid = r.try_get("id")?;
             let title: String = r.try_get("title")?;
             let body: String = r.try_get("body")?;
             let text = if title.is_empty() {
@@ -85,7 +86,7 @@ pub async fn backfill_embeddings(
             .with_context(|| format!("existing_index for {table}"))?;
 
         // Build the work list first so we can batch-embed.
-        let mut pending: Vec<(i64, String, String)> = Vec::new(); // (id, text, hash)
+        let mut pending: Vec<(Uuid, String, String)> = Vec::new(); // (id, text, hash)
         for r in rows {
             if r.text.is_empty() {
                 continue;

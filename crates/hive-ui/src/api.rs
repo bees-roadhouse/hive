@@ -12,10 +12,11 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JournalEntry {
-    pub id: i64,
+    pub id: Uuid,
     pub ai: String,
     pub entry_date: Option<String>,
     pub title: Option<String>,

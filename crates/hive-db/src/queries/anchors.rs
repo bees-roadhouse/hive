@@ -1,11 +1,12 @@
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::error::Result;
 use crate::types::TaskAnchor;
 
 const SELECT_COLS: &str = "task_id, journal_entry_id, block_id, created_at";
 
-pub async fn list_for_entry(pool: &PgPool, journal_entry_id: i64) -> Result<Vec<TaskAnchor>> {
+pub async fn list_for_entry(pool: &PgPool, journal_entry_id: Uuid) -> Result<Vec<TaskAnchor>> {
     let rows = sqlx::query_as::<_, TaskAnchor>(&format!(
         "SELECT {SELECT_COLS} FROM task_anchors \
          WHERE journal_entry_id = $1 ORDER BY block_id"
@@ -16,7 +17,7 @@ pub async fn list_for_entry(pool: &PgPool, journal_entry_id: i64) -> Result<Vec<
     Ok(rows)
 }
 
-pub async fn list_for_task(pool: &PgPool, task_id: i64) -> Result<Vec<TaskAnchor>> {
+pub async fn list_for_task(pool: &PgPool, task_id: Uuid) -> Result<Vec<TaskAnchor>> {
     let rows = sqlx::query_as::<_, TaskAnchor>(&format!(
         "SELECT {SELECT_COLS} FROM task_anchors \
          WHERE task_id = $1 ORDER BY journal_entry_id, block_id"
@@ -32,8 +33,8 @@ pub async fn list_for_task(pool: &PgPool, task_id: i64) -> Result<Vec<TaskAnchor
 /// is updated in place.
 pub async fn upsert(
     pool: &PgPool,
-    task_id: i64,
-    journal_entry_id: i64,
+    task_id: Uuid,
+    journal_entry_id: Uuid,
     block_id: &str,
 ) -> Result<TaskAnchor> {
     let row = sqlx::query_as::<_, TaskAnchor>(
@@ -50,7 +51,7 @@ pub async fn upsert(
     Ok(row)
 }
 
-pub async fn delete(pool: &PgPool, journal_entry_id: i64, block_id: &str) -> Result<()> {
+pub async fn delete(pool: &PgPool, journal_entry_id: Uuid, block_id: &str) -> Result<()> {
     sqlx::query("DELETE FROM task_anchors WHERE journal_entry_id = $1 AND block_id = $2")
         .bind(journal_entry_id)
         .bind(block_id)

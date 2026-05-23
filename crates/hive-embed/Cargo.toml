@@ -21,3 +21,4 @@ fastembed = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 directories = { workspace = true }
+uuid = { workspace = true }
