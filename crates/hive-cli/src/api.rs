@@ -322,8 +322,18 @@ fn error_message(status: reqwest::StatusCode, body: &str) -> String {
     }
 }
 
+/// Attach the current bearer token (Phase 3, §3.2) to a request if one is
+/// configured. Tokenless requests still go out — the warn-only server accepts
+/// them; an enforce-mode server replies 401, surfaced via `error_message`.
+fn with_auth(req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match crate::auth::current_token() {
+        Some(t) => req.bearer_auth(t),
+        None => req,
+    }
+}
+
 async fn get_json<T: serde::de::DeserializeOwned>(url: &str) -> anyhow::Result<T> {
-    let resp = http_client().get(url).send().await?;
+    let resp = with_auth(http_client().get(url)).send().await?;
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {
@@ -336,7 +346,7 @@ async fn post_json<B: Serialize, T: serde::de::DeserializeOwned>(
     url: &str,
     body: &B,
 ) -> anyhow::Result<T> {
-    let resp = http_client().post(url).json(body).send().await?;
+    let resp = with_auth(http_client().post(url).json(body)).send().await?;
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {
@@ -349,7 +359,9 @@ async fn patch_json<B: Serialize, T: serde::de::DeserializeOwned>(
     url: &str,
     body: &B,
 ) -> anyhow::Result<T> {
-    let resp = http_client().patch(url).json(body).send().await?;
+    let resp = with_auth(http_client().patch(url).json(body))
+        .send()
+        .await?;
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {
@@ -359,7 +371,23 @@ async fn patch_json<B: Serialize, T: serde::de::DeserializeOwned>(
 }
 
 async fn delete_json<T: serde::de::DeserializeOwned>(url: &str) -> anyhow::Result<T> {
-    let resp = http_client().delete(url).send().await?;
+    let resp = with_auth(http_client().delete(url)).send().await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("{}", error_message(status, &text));
+    }
+    Ok(serde_json::from_str(&text)?)
+}
+
+/// POST without a bearer token: the login flow's `/authorize` + `/token` calls
+/// are how the CLI *gets* a token, so they must not carry one (§3.2). Public
+/// to `crate::auth` only.
+pub(crate) async fn post_unauthed<B: Serialize, T: serde::de::DeserializeOwned>(
+    url: &str,
+    body: &B,
+) -> anyhow::Result<T> {
+    let resp = http_client().post(url).json(body).send().await?;
     let status = resp.status();
     let text = resp.text().await?;
     if !status.is_success() {

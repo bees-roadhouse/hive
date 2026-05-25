@@ -14,6 +14,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// The current request's session id, provided into Leptos context by `App`
+/// (read from the `hive_ui_session` cookie). `None` => not logged in; fetches
+/// then go out tokenless (accepted by the warn-only server, 401 under enforce).
+#[derive(Debug, Clone, Default)]
+pub struct SessionId(pub Option<String>);
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JournalEntry {
     pub id: Uuid,
@@ -172,8 +178,19 @@ fn http_client() -> &'static reqwest::Client {
     })
 }
 
+/// The session id for the current SSR render, from Leptos context. `None` when
+/// no `App`-provided context exists (e.g. in unit tests) or the user isn't
+/// logged in.
+fn current_session() -> Option<String> {
+    leptos::prelude::use_context::<SessionId>().and_then(|s| s.0)
+}
+
 /// GET a hive-api list endpoint, deserializing the JSON array. The query
 /// string is built from `(key, value)` pairs, skipping any with empty value.
+///
+/// Auth (Phase 3, §3.1): attaches the session's bearer token when logged in.
+/// On a 401 (access token expired/revoked under enforce mode) it rotates the
+/// refresh token once and retries — transparent token refresh.
 async fn fetch_list<T: serde::de::DeserializeOwned>(
     path: &str,
     params: &[(&str, &str)],
@@ -188,13 +205,42 @@ async fn fetch_list<T: serde::de::DeserializeOwned>(
         url.push('?');
         url.push_str(&query.join("&"));
     }
-    let resp = http_client().get(&url).send().await?;
+
+    let session = current_session();
+    let token = session.as_deref().and_then(crate::auth::access_token_for);
+
+    let resp = send_get(&url, token.as_deref()).await?;
     let status = resp.status();
+
+    // 401 + a live session => try one refresh, then retry once.
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        if let Some(sid) = session.as_deref()
+            && let Some(fresh) = crate::auth::refresh(sid).await
+        {
+            let resp = send_get(&url, Some(&fresh)).await?;
+            let status = resp.status();
+            if !status.is_success() {
+                anyhow::bail!("GET {url} returned {status} (after refresh)");
+            }
+            return Ok(resp.json().await?);
+        }
+        anyhow::bail!("GET {url} returned 401 (not authenticated — please log in)");
+    }
+
     if !status.is_success() {
         anyhow::bail!("GET {url} returned {status}");
     }
     let rows: Vec<T> = resp.json().await?;
     Ok(rows)
+}
+
+/// Issue a GET, attaching the bearer token when present.
+async fn send_get(url: &str, token: Option<&str>) -> anyhow::Result<reqwest::Response> {
+    let mut req = http_client().get(url);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    Ok(req.send().await?)
 }
 
 /// Minimal percent-encoding for query values (filters are short alnum/dash

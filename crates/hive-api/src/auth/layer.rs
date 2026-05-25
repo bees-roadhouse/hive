@@ -166,6 +166,94 @@ mod tests {
         assert!(matches!(got, Err(AuthRejection::InvalidToken(_))));
     }
 
+    /// Phase 3 verification (§8 Phase 3): the enforce path is reachable and a
+    /// real Bearer token passes it. We mint a token with the same key the
+    /// `AuthState` holds (mirroring what `/token` does), then confirm
+    /// `resolve_request` — the exact function the enforce-mode middleware runs —
+    /// accepts it and rejects the tokenless case. This is the "tokenless ->
+    /// reject, Bearer -> pass under Enforce" gate the lead asked for.
+    #[test]
+    fn enforce_rejects_tokenless_and_accepts_bearer_token() {
+        use crate::auth::tokens::{self, AccessTokenParams};
+
+        let auth = test_auth(EnforcementMode::Enforce);
+
+        // Tokenless under enforce => MissingToken (the middleware 401s on this).
+        assert_eq!(
+            resolve_request(&auth, None, None).unwrap_err(),
+            AuthRejection::MissingToken
+        );
+
+        // Mint a valid human access token against the auth state's key + config.
+        let cfg = auth.config().clone();
+        let scopes = vec!["hive.read".to_string(), "hive.write".to_string()];
+        let token = tokens::mint_access_token(
+            auth.key(),
+            &AccessTokenParams {
+                issuer: &cfg.issuer,
+                audience: &cfg.audience,
+                subject: "11111111-1111-7111-8111-111111111111",
+                principal_type: "human",
+                scopes: &scopes,
+                is_admin: false,
+                data_visibility: "owner",
+                session_id: "22222222-2222-7222-8222-222222222222",
+                now: chrono::Utc::now().timestamp(),
+                ttl_secs: 600,
+            },
+        )
+        .expect("mint access token");
+
+        // The same token presented as a Bearer resolves to a Principal: enforce
+        // would let this request through.
+        let principal = resolve_request(&auth, None, Some(&token))
+            .expect("a valid Bearer token must pass the enforce path");
+        assert_eq!(principal.subject, "11111111-1111-7111-8111-111111111111");
+        assert!(principal.permissions.has_scope("hive.read"));
+        assert!(principal.permissions.has_scope("hive.write"));
+        assert!(!principal.permissions.has_scope("mcp"));
+    }
+
+    /// A token signed by a *different* key must not pass — guards against the
+    /// enforce path accepting anything that merely parses as a JWT.
+    #[test]
+    fn enforce_rejects_token_signed_by_foreign_key() {
+        use crate::auth::tokens::{self, AccessTokenParams};
+
+        let auth = test_auth(EnforcementMode::Enforce);
+        // A separate, unrelated signing key.
+        let (kid, der, _) = test_key();
+        let foreign = keys::SigningKey {
+            kid: kid.clone(),
+            encoding: jsonwebtoken::EncodingKey::from_ed_der(&der),
+            decoding: decoding_for(&der),
+            public_jwk: serde_json::json!({"kid": kid}),
+        };
+        let cfg = auth.config().clone();
+        let token = tokens::mint_access_token(
+            &foreign,
+            &AccessTokenParams {
+                issuer: &cfg.issuer,
+                audience: &cfg.audience,
+                subject: "33333333-3333-7333-8333-333333333333",
+                principal_type: "human",
+                scopes: &["hive.read".to_string()],
+                is_admin: false,
+                data_visibility: "owner",
+                session_id: "44444444-4444-7444-8444-444444444444",
+                now: chrono::Utc::now().timestamp(),
+                ttl_secs: 600,
+            },
+        )
+        .expect("mint with foreign key");
+
+        let got = resolve_request(&auth, None, Some(&token));
+        assert!(
+            matches!(got, Err(AuthRejection::InvalidToken(_))),
+            "a foreign-signed token must be rejected, got {got:?}"
+        );
+    }
+
     #[test]
     fn reject_response_sets_www_authenticate_and_401() {
         let auth = test_auth(EnforcementMode::Enforce);
