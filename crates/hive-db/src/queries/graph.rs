@@ -85,11 +85,10 @@ pub async fn build(pool: &PgPool, opts: GraphOptions) -> Result<GraphPayload> {
     .fetch_all(pool)
     .await?;
 
-    let note_rows: Vec<(Uuid, Option<String>, String)> = sqlx::query_as(
-        "SELECT id, title, tags FROM notes WHERE tags IS NOT NULL AND tags != ''",
-    )
-    .fetch_all(pool)
-    .await?;
+    let note_rows: Vec<(Uuid, Option<String>, String)> =
+        sqlx::query_as("SELECT id, title, tags FROM notes WHERE tags IS NOT NULL AND tags != ''")
+            .fetch_all(pool)
+            .await?;
 
     let meta: HashSet<&'static str> = META_TAGS.iter().copied().collect();
     let mut tag_freq: HashMap<String, i64> = HashMap::new();

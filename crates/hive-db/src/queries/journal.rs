@@ -5,8 +5,7 @@ use crate::enums::Ai;
 use crate::error::{Error, Result};
 use crate::types::JournalEntry;
 
-const SELECT_COLS: &str =
-    "id, ai, entry_date, title, body, tags, created_at, updated_at";
+const SELECT_COLS: &str = "id, ai, entry_date, title, body, tags, created_at, updated_at";
 
 #[derive(Debug, Default, Clone)]
 pub struct ListFilters {

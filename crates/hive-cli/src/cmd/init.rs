@@ -11,9 +11,9 @@ use crate::api;
 
 pub async fn run() -> anyhow::Result<()> {
     let base = api::api_base();
-    api::healthz().await.map_err(|e| {
-        anyhow::anyhow!("hive-api not reachable at {base}: {e}")
-    })?;
+    api::healthz()
+        .await
+        .map_err(|e| anyhow::anyhow!("hive-api not reachable at {base}: {e}"))?;
     println!("hive-api reachable at {base}");
     Ok(())
 }

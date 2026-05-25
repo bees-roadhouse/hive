@@ -53,10 +53,7 @@ async fn main() -> anyhow::Result<()> {
     let hive_dir = args
         .hive_dir
         .clone()
-        .or_else(|| {
-            directories::UserDirs::new()
-                .map(|u| u.home_dir().join(".hive"))
-        })
+        .or_else(|| directories::UserDirs::new().map(|u| u.home_dir().join(".hive")))
         .unwrap_or_else(|| PathBuf::from("/data"));
     let events_log = hive_dir.join("events.log");
     if let Some(parent) = events_log.parent() {

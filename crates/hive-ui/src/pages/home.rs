@@ -1,6 +1,6 @@
 use leptos::prelude::*;
 
-use crate::api::{fetch_journal, JournalEntry, api_base};
+use crate::api::{JournalEntry, api_base, fetch_journal};
 
 #[component]
 pub fn HomePage() -> impl IntoView {
@@ -45,5 +45,6 @@ fn EntryList(entries: Vec<JournalEntry>) -> impl IntoView {
                 }
             }).collect_view()}
         </ul>
-    }.into_any()
+    }
+    .into_any()
 }

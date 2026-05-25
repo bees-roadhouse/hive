@@ -3,8 +3,7 @@ use sqlx::PgPool;
 use crate::error::Result;
 use crate::types::Person;
 
-const SELECT_COLS: &str =
-    "id, slug, display_name, kind, notes, created_at, updated_at";
+const SELECT_COLS: &str = "id, slug, display_name, kind, notes, created_at, updated_at";
 
 pub async fn list(pool: &PgPool) -> Result<Vec<Person>> {
     let rows = sqlx::query_as::<_, Person>(&format!(
@@ -16,12 +15,12 @@ pub async fn list(pool: &PgPool) -> Result<Vec<Person>> {
 }
 
 pub async fn get_by_slug(pool: &PgPool, slug: &str) -> Result<Option<Person>> {
-    Ok(sqlx::query_as::<_, Person>(&format!(
-        "SELECT {SELECT_COLS} FROM people WHERE slug = $1"
-    ))
-    .bind(slug)
-    .fetch_optional(pool)
-    .await?)
+    Ok(
+        sqlx::query_as::<_, Person>(&format!("SELECT {SELECT_COLS} FROM people WHERE slug = $1"))
+            .bind(slug)
+            .fetch_optional(pool)
+            .await?,
+    )
 }
 
 /// Insert-if-missing, return current row either way. `default_display_name`

@@ -1,7 +1,7 @@
 use leptos::prelude::*;
-use leptos_meta::{Stylesheet, Title, MetaTags, provide_meta_context};
-use leptos_router::components::{Route, Router, Routes};
+use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
 use leptos_router::StaticSegment;
+use leptos_router::components::{Route, Router, Routes};
 
 use crate::pages::home::HomePage;
 use crate::pages::journal::JournalPage;

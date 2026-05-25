@@ -64,7 +64,11 @@ impl Embedder {
     fn with_model(model: EmbeddingModel, tag: &'static str, dim: usize) -> Result<Self> {
         let cache = cache_dir();
         if let Err(e) = std::fs::create_dir_all(&cache) {
-            tracing::warn!("could not create fastembed cache dir {}: {}", cache.display(), e);
+            tracing::warn!(
+                "could not create fastembed cache dir {}: {}",
+                cache.display(),
+                e
+            );
         }
         let opts = TextInitOptions::new(model)
             .with_cache_dir(cache)

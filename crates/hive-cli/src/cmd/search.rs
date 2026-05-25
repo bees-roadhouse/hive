@@ -30,7 +30,11 @@ pub async fn run(args: SearchArgs) -> Result<()> {
         println!("=== notes ===");
         for h in &hits.notes {
             let title = h.title.clone().unwrap_or_else(|| "(untitled)".into());
-            let proj = h.project.as_deref().map(|p| format!(" [{p}]")).unwrap_or_default();
+            let proj = h
+                .project
+                .as_deref()
+                .map(|p| format!(" [{p}]"))
+                .unwrap_or_default();
             println!("#{}  {}{}  {}", h.id, h.author, proj, title);
             println!("    {}", h.snippet);
         }

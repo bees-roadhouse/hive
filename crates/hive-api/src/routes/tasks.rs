@@ -1,7 +1,7 @@
+use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
-use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -67,14 +67,16 @@ async fn add(
         body.due.as_deref(),
     )
     .await?;
-    state.emitter.emit(
-        HiveEvent::now("task.created", "tasks", t.id).with_extra(serde_json::json!({
-            "title": t.title,
-            "owner": t.owner,
-            "project": t.project,
-            "priority": t.priority,
-        })),
-    );
+    state
+        .emitter
+        .emit(
+            HiveEvent::now("task.created", "tasks", t.id).with_extra(serde_json::json!({
+                "title": t.title,
+                "owner": t.owner,
+                "project": t.project,
+                "priority": t.priority,
+            })),
+        );
     Ok(Json(t))
 }
 
@@ -124,14 +126,16 @@ async fn update(
     };
     tasks::update(&state.pool, id, &fields).await?;
     let t = tasks::require(&state.pool, id).await?;
-    state.emitter.emit(
-        HiveEvent::now("task.updated", "tasks", t.id).with_extra(serde_json::json!({
-            "title": t.title,
-            "owner": t.owner,
-            "status": t.status,
-            "priority": t.priority,
-        })),
-    );
+    state
+        .emitter
+        .emit(
+            HiveEvent::now("task.updated", "tasks", t.id).with_extra(serde_json::json!({
+                "title": t.title,
+                "owner": t.owner,
+                "status": t.status,
+                "priority": t.priority,
+            })),
+        );
     Ok(Json(t))
 }
 
@@ -163,13 +167,15 @@ async fn block(
     let reason = body.reason.clone();
     tasks::mark_blocked(&state.pool, id, &body.reason).await?;
     let t = tasks::require(&state.pool, id).await?;
-    state.emitter.emit(
-        HiveEvent::now("task.blocked", "tasks", t.id).with_extra(serde_json::json!({
-            "title": t.title,
-            "owner": t.owner,
-            "reason": reason,
-        })),
-    );
+    state
+        .emitter
+        .emit(
+            HiveEvent::now("task.blocked", "tasks", t.id).with_extra(serde_json::json!({
+                "title": t.title,
+                "owner": t.owner,
+                "reason": reason,
+            })),
+        );
     Ok(Json(t))
 }
 
@@ -179,11 +185,13 @@ async fn drop(
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
     tasks::mark_dropped(&state.pool, id).await?;
     let t = tasks::require(&state.pool, id).await?;
-    state.emitter.emit(
-        HiveEvent::now("task.dropped", "tasks", t.id).with_extra(serde_json::json!({
-            "title": t.title,
-            "owner": t.owner,
-        })),
-    );
+    state
+        .emitter
+        .emit(
+            HiveEvent::now("task.dropped", "tasks", t.id).with_extra(serde_json::json!({
+                "title": t.title,
+                "owner": t.owner,
+            })),
+        );
     Ok(Json(t))
 }

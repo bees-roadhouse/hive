@@ -43,7 +43,11 @@ async fn stream(
     Query(q): Query<StreamQuery>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let backfill = match q.since.as_deref() {
-        Some(since) => read_backfill(state.emitter.log_path(), since, q.limit.unwrap_or(200).min(1000)),
+        Some(since) => read_backfill(
+            state.emitter.log_path(),
+            since,
+            q.limit.unwrap_or(200).min(1000),
+        ),
         None => Vec::new(),
     };
 

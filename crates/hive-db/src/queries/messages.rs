@@ -12,8 +12,7 @@ use uuid::Uuid;
 
 use crate::error::{Error, Result};
 
-const SELECT_COLS: &str =
-    "id, sender_ai, recipient_ai, kind, body, in_reply_to, sent_at, read_at";
+const SELECT_COLS: &str = "id, sender_ai, recipient_ai, kind, body, in_reply_to, sent_at, read_at";
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Message {
@@ -99,12 +98,12 @@ pub async fn add(
 }
 
 pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Message>> {
-    Ok(sqlx::query_as::<_, Message>(&format!(
-        "SELECT {SELECT_COLS} FROM messages WHERE id = $1"
-    ))
-    .bind(id)
-    .fetch_optional(pool)
-    .await?)
+    Ok(
+        sqlx::query_as::<_, Message>(&format!("SELECT {SELECT_COLS} FROM messages WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(pool)
+            .await?,
+    )
 }
 
 pub async fn require(pool: &PgPool, id: Uuid) -> Result<Message> {
@@ -115,9 +114,8 @@ pub async fn require(pool: &PgPool, id: Uuid) -> Result<Message> {
 }
 
 pub async fn list(pool: &PgPool, filters: &ListFilters) -> Result<Vec<Message>> {
-    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
-        "SELECT {SELECT_COLS} FROM messages WHERE 1=1"
-    ));
+    let mut qb: QueryBuilder<Postgres> =
+        QueryBuilder::new(format!("SELECT {SELECT_COLS} FROM messages WHERE 1=1"));
 
     if let Some(s) = &filters.from_ai {
         qb.push(" AND sender_ai = ").push_bind(s.clone());

@@ -1,4 +1,4 @@
-use hive_md::{assign_block_ids, parse, update_task, ParseError, TaskPatch};
+use hive_md::{ParseError, TaskPatch, assign_block_ids, parse, update_task};
 
 const SAMPLE: &str = "\
 # Notes for today
@@ -38,14 +38,18 @@ fn parses_three_tasks_with_mixed_state() {
     assert_eq!(t3.priority.as_deref(), Some("high"));
 
     // person_refs/tag_refs come from prose lines only, not task lines.
-    assert!(parsed
-        .person_refs
-        .iter()
-        .any(|p| p.slug == "pia" && p.line_index == 2));
-    assert!(parsed
-        .tag_refs
-        .iter()
-        .any(|t| t.tag == "household" && t.line_index == 2));
+    assert!(
+        parsed
+            .person_refs
+            .iter()
+            .any(|p| p.slug == "pia" && p.line_index == 2)
+    );
+    assert!(
+        parsed
+            .tag_refs
+            .iter()
+            .any(|t| t.tag == "household" && t.line_index == 2)
+    );
     // Tokens inside task lines are surfaced via ParsedTask.persons/tags,
     // not person_refs/tag_refs.
     assert!(!parsed.person_refs.iter().any(|p| p.slug == "cera"));

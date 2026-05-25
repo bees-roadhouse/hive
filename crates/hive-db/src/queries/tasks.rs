@@ -1,4 +1,4 @@
-use sqlx::{PgPool, QueryBuilder, Postgres};
+use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::enums::{Owner, TaskStatus};
@@ -6,8 +6,7 @@ use crate::error::{Error, Result};
 use crate::queries::projects;
 use crate::types::Task;
 
-const SELECT_COLS: &str =
-    "id, project, title, body, owner, status, priority, due, block_reason, \
+const SELECT_COLS: &str = "id, project, title, body, owner, status, priority, due, block_reason, \
      created_at, updated_at, closed_at";
 
 #[derive(Debug, Default, Clone)]
@@ -71,12 +70,12 @@ pub async fn add(
 }
 
 pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Task>> {
-    Ok(sqlx::query_as::<_, Task>(&format!(
-        "SELECT {SELECT_COLS} FROM tasks WHERE id = $1"
-    ))
-    .bind(id)
-    .fetch_optional(pool)
-    .await?)
+    Ok(
+        sqlx::query_as::<_, Task>(&format!("SELECT {SELECT_COLS} FROM tasks WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(pool)
+            .await?,
+    )
 }
 
 pub async fn require(pool: &PgPool, id: Uuid) -> Result<Task> {
@@ -87,9 +86,8 @@ pub async fn require(pool: &PgPool, id: Uuid) -> Result<Task> {
 }
 
 pub async fn list(pool: &PgPool, filters: &ListFilters) -> Result<Vec<Task>> {
-    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
-        "SELECT {SELECT_COLS} FROM tasks WHERE 1=1"
-    ));
+    let mut qb: QueryBuilder<Postgres> =
+        QueryBuilder::new(format!("SELECT {SELECT_COLS} FROM tasks WHERE 1=1"));
 
     if let Some(p) = &filters.project {
         qb.push(" AND project = ").push_bind(p.clone());

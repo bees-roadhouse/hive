@@ -62,7 +62,10 @@ impl LinkSpec {
             value: spec.to_string(),
             expected: "<table>:<uuid>[:<link_type>]",
         })?;
-        let link_type = parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty());
+        let link_type = parts
+            .next()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty());
         let table = LinkTable::parse_short(table_str)?;
         if ident.is_empty() {
             return Err(Error::InvalidFormat {
@@ -106,10 +109,12 @@ pub async fn require_exists(
     target: &EntityRef,
     label: &'static str,
 ) -> Result<String> {
-    let title = label_for(pool, target).await?.ok_or_else(|| Error::NotFound {
-        kind: label,
-        id: format!("{}:{}", target.table, target.id),
-    })?;
+    let title = label_for(pool, target)
+        .await?
+        .ok_or_else(|| Error::NotFound {
+            kind: label,
+            id: format!("{}:{}", target.table, target.id),
+        })?;
     Ok(title)
 }
 

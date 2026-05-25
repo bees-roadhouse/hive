@@ -2,11 +2,11 @@
 //! integration is in flight on a parallel branch; this returns 501 so clients
 //! can target it now and the markov-blanket boost logic is verified pre-fastembed.
 
+use axum::Json;
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::routing::get;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -108,9 +108,9 @@ async fn semantic_endpoint(
 }
 
 fn parse_context(spec: &str) -> Result<(String, Uuid), ApiError> {
-    let (t, i) = spec
-        .split_once(':')
-        .ok_or_else(|| ApiError::BadRequest(format!("context must be <table>:<uuid>, got '{spec}'")))?;
+    let (t, i) = spec.split_once(':').ok_or_else(|| {
+        ApiError::BadRequest(format!("context must be <table>:<uuid>, got '{spec}'"))
+    })?;
     if t.is_empty() {
         return Err(ApiError::BadRequest("context table missing".into()));
     }

@@ -73,9 +73,15 @@ async fn list(args: WireListArgs) -> Result<()> {
     let cols: Vec<Column<'_, WireEvent>> = vec![
         Column::new("id", |r: &WireEvent| r.id.to_string()),
         Column::new("source", |r: &WireEvent| r.source.clone()),
-        Column::new("sev", |r: &WireEvent| r.severity.clone().unwrap_or_default()),
+        Column::new("sev", |r: &WireEvent| {
+            r.severity.clone().unwrap_or_default()
+        }),
         Column::new("ack", |r: &WireEvent| {
-            if r.acknowledged { "yes".into() } else { "no".into() }
+            if r.acknowledged {
+                "yes".into()
+            } else {
+                "no".into()
+            }
         }),
         Column::new("title", |r: &WireEvent| truncate(&r.title, 60)),
     ];

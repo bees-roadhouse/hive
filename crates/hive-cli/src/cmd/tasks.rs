@@ -3,9 +3,7 @@ use chrono::Local;
 use serde_json::{Map, Value};
 
 use crate::api::{self, Task};
-use crate::cli::{
-    ProjectAddArgs, ProjectCmd, TaskAddArgs, TaskListArgs, TaskUpdateArgs, TasksCmd,
-};
+use crate::cli::{ProjectAddArgs, ProjectCmd, TaskAddArgs, TaskListArgs, TaskUpdateArgs, TasksCmd};
 use crate::cmd::links::attach_links;
 use crate::format::{Column, fmt_ts_opt, pad_right, print_json, print_table};
 

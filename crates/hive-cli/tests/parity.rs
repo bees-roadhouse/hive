@@ -48,7 +48,10 @@ fn python_invocation() -> Option<(String, Vec<String>)> {
     if !py_path.exists() {
         return None;
     }
-    Some(("python".into(), vec![py_path.to_string_lossy().into_owned()]))
+    Some((
+        "python".into(),
+        vec![py_path.to_string_lossy().into_owned()],
+    ))
 }
 
 fn temp_db() -> PathBuf {
@@ -198,17 +201,21 @@ fn rust_task_list_json_shape() {
     let db = temp_db();
     assert_ok(&run_rust(&db, &["init"]), "init");
     assert_ok(
-        &run_rust(
-            &db,
-            &["tasks", "project", "add", "p1", "--owner", "cera"],
-        ),
+        &run_rust(&db, &["tasks", "project", "add", "p1", "--owner", "cera"]),
         "project add",
     );
     assert_ok(
         &run_rust(
             &db,
             &[
-                "tasks", "add", "--project", "p1", "--title", "t1", "--owner", "cera",
+                "tasks",
+                "add",
+                "--project",
+                "p1",
+                "--title",
+                "t1",
+                "--owner",
+                "cera",
             ],
         ),
         "task add",
@@ -287,14 +294,32 @@ fn rust_links_outgoing_incoming() {
     assert_ok(
         &run_rust(
             &db,
-            &["tasks", "add", "--project", "p1", "--title", "t1", "--owner", "cera"],
+            &[
+                "tasks",
+                "add",
+                "--project",
+                "p1",
+                "--title",
+                "t1",
+                "--owner",
+                "cera",
+            ],
         ),
         "t1",
     );
     assert_ok(
         &run_rust(
             &db,
-            &["tasks", "add", "--project", "p1", "--title", "t2", "--owner", "cera"],
+            &[
+                "tasks",
+                "add",
+                "--project",
+                "p1",
+                "--title",
+                "t2",
+                "--owner",
+                "cera",
+            ],
         ),
         "t2",
     );
@@ -302,8 +327,7 @@ fn rust_links_outgoing_incoming() {
         &run_rust(
             &db,
             &[
-                "links", "add", "--source", "tasks:1", "--target", "tasks:2", "--type",
-                "blocks",
+                "links", "add", "--source", "tasks:1", "--target", "tasks:2", "--type", "blocks",
             ],
         ),
         "links add",

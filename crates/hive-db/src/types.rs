@@ -113,11 +113,7 @@ pub struct Link {
 
 /// Compose the canonical text used for embedding hashes (see python
 /// `hive_semantic.compose_text`). Stable across the rust port.
-pub fn compose_embed_text(
-    title: Option<&str>,
-    body: Option<&str>,
-    tags: Option<&str>,
-) -> String {
+pub fn compose_embed_text(title: Option<&str>, body: Option<&str>, tags: Option<&str>) -> String {
     let mut pieces = Vec::with_capacity(3);
     if let Some(t) = title.map(str::trim).filter(|s| !s.is_empty()) {
         pieces.push(t.to_string());

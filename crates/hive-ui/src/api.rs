@@ -134,8 +134,12 @@ pub fn api_base() -> &'static str {
                 return u.trim_end_matches('/').to_string();
             }
         }
-        let public = std::env::var("HIVE_PUBLIC_URL").ok().filter(|s| !s.is_empty());
-        let private = std::env::var("HIVE_PRIVATE_URL").ok().filter(|s| !s.is_empty());
+        let public = std::env::var("HIVE_PUBLIC_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let private = std::env::var("HIVE_PRIVATE_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
         let awareness: HashSet<String> =
             std::env::var("HIVE_DHCP_NAME_SEARCH_DOMAIN_NETWORK_AWARENESS")
                 .unwrap_or_default()
@@ -143,12 +147,12 @@ pub fn api_base() -> &'static str {
                 .map(|s| s.trim().to_lowercase())
                 .filter(|s| !s.is_empty())
                 .collect();
-        if let Some(p) = private.as_ref() {
-            if !awareness.is_empty() {
-                let domains: HashSet<_> = system_search_domains().into_iter().collect();
-                if !domains.is_disjoint(&awareness) {
-                    return p.trim_end_matches('/').to_string();
-                }
+        if let Some(p) = private.as_ref()
+            && !awareness.is_empty()
+        {
+            let domains: HashSet<_> = system_search_domains().into_iter().collect();
+            if !domains.is_disjoint(&awareness) {
+                return p.trim_end_matches('/').to_string();
             }
         }
         if let Some(p) = public {
@@ -226,11 +230,7 @@ pub async fn fetch_journal_filtered(
 }
 
 /// Task list. `owner` and `status` are optional; `all=true` includes closed.
-pub async fn fetch_tasks(
-    owner: &str,
-    status: &str,
-    all: bool,
-) -> anyhow::Result<Vec<Task>> {
+pub async fn fetch_tasks(owner: &str, status: &str, all: bool) -> anyhow::Result<Vec<Task>> {
     fetch_list(
         "/tasks",
         &[
@@ -246,7 +246,11 @@ pub async fn fetch_tasks(
 pub async fn fetch_notes(author: &str, tag: &str, limit: i64) -> anyhow::Result<Vec<Note>> {
     fetch_list(
         "/notes",
-        &[("author", author), ("tag", tag), ("limit", &limit.to_string())],
+        &[
+            ("author", author),
+            ("tag", tag),
+            ("limit", &limit.to_string()),
+        ],
     )
     .await
 }
@@ -264,10 +268,7 @@ pub async fn fetch_wire(
         &[
             ("source", source),
             ("severity", severity),
-            (
-                "unacknowledged",
-                if unacknowledged { "true" } else { "" },
-            ),
+            ("unacknowledged", if unacknowledged { "true" } else { "" }),
             ("limit", &limit.to_string()),
         ],
     )

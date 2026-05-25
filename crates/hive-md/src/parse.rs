@@ -14,16 +14,10 @@ pub(crate) fn parse_with_today(body: &str, today: NaiveDate) -> ParsedBody {
 
     for (line_index, line) in body.split('\n').enumerate() {
         for slug in collect_persons(line) {
-            person_refs.push(PersonRef {
-                slug,
-                line_index,
-            });
+            person_refs.push(PersonRef { slug, line_index });
         }
         for tag in collect_tags(line) {
-            tag_refs.push(TagRef {
-                tag,
-                line_index,
-            });
+            tag_refs.push(TagRef { tag, line_index });
         }
 
         if let Some(task) = parse_task_line(line, line_index, today) {
@@ -121,10 +115,11 @@ fn parse_task_line(line: &str, line_index: usize, today: NaiveDate) -> Option<Pa
                 raw_due = Some(rest.to_string());
                 due = resolve_due(rest, today);
             }
-        } else if let Some(rest) = token.strip_prefix("pri:") {
-            if priority.is_none() && matches!(rest, "high" | "medium" | "low") {
-                priority = Some(rest.to_string());
-            }
+        } else if let Some(rest) = token.strip_prefix("pri:")
+            && priority.is_none()
+            && matches!(rest, "high" | "medium" | "low")
+        {
+            priority = Some(rest.to_string());
         }
     }
 
@@ -150,10 +145,10 @@ fn collect_persons(line: &str) -> Vec<String> {
         return out;
     }
     for token in tokenize(line) {
-        if let Some(rest) = token.strip_prefix('@') {
-            if is_slug(rest) {
-                out.push(rest.to_string());
-            }
+        if let Some(rest) = token.strip_prefix('@')
+            && is_slug(rest)
+        {
+            out.push(rest.to_string());
         }
     }
     out
@@ -165,10 +160,10 @@ fn collect_tags(line: &str) -> Vec<String> {
         return out;
     }
     for token in tokenize(line) {
-        if let Some(rest) = token.strip_prefix('#') {
-            if is_slug(rest) {
-                out.push(rest.to_string());
-            }
+        if let Some(rest) = token.strip_prefix('#')
+            && is_slug(rest)
+        {
+            out.push(rest.to_string());
         }
     }
     out

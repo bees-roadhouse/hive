@@ -37,12 +37,20 @@ pub struct Column<'a, T> {
     pub get: Box<dyn Fn(&T) -> String + 'a>,
 }
 
+/// A trailing (unsized, flush-to-end) column: `(label, cell-getter)`. Rendered
+/// after the last sized column with no width, mirroring how python prints
+/// `... title` / `... tags` at end-of-line.
+pub type Trailing<'a, T> = (&'a str, Box<dyn Fn(&T) -> String + 'a>);
+
 impl<'a, T> Column<'a, T> {
     pub fn new<F>(header: &'a str, get: F) -> Self
     where
         F: Fn(&T) -> String + 'a,
     {
-        Column { header, get: Box::new(get) }
+        Column {
+            header,
+            get: Box::new(get),
+        }
     }
 }
 
@@ -59,11 +67,7 @@ impl<'a, T> Column<'a, T> {
 /// `trailing_col_label` is rendered after the last sized column with no
 /// width; mirrors how python prints `... title` and `... tags` flush at
 /// end-of-line.
-pub fn print_table<T>(
-    cols: &[Column<'_, T>],
-    rows: &[T],
-    trailing: Option<(&str, Box<dyn Fn(&T) -> String + '_>)>,
-) {
+pub fn print_table<T>(cols: &[Column<'_, T>], rows: &[T], trailing: Option<Trailing<'_, T>>) {
     if rows.is_empty() {
         return;
     }

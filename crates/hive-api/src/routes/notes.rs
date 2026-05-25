@@ -1,7 +1,7 @@
+use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
-use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -62,14 +62,16 @@ async fn add(
         body.tags.as_deref(),
     )
     .await?;
-    state.emitter.emit(
-        HiveEvent::now("note.created", "notes", n.id).with_extra(serde_json::json!({
-            "author": n.author,
-            "title": n.title,
-            "project": n.project,
-            "tags": n.tags,
-        })),
-    );
+    state
+        .emitter
+        .emit(
+            HiveEvent::now("note.created", "notes", n.id).with_extra(serde_json::json!({
+                "author": n.author,
+                "title": n.title,
+                "project": n.project,
+                "tags": n.tags,
+            })),
+        );
     Ok(Json(n))
 }
 

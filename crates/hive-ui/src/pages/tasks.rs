@@ -1,6 +1,6 @@
 use leptos::prelude::*;
 
-use crate::api::{fetch_tasks, Task};
+use crate::api::{Task, fetch_tasks};
 
 /// Task list with owner + status filters and an "include closed" toggle.
 #[component]
@@ -88,5 +88,6 @@ fn TaskList(tasks: Vec<Task>) -> impl IntoView {
                 }
             }).collect_view()}
         </ul>
-    }.into_any()
+    }
+    .into_any()
 }

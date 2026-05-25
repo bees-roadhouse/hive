@@ -240,8 +240,12 @@ pub fn api_base() -> &'static str {
                 return u.trim_end_matches('/').to_string();
             }
         }
-        let public = std::env::var("HIVE_PUBLIC_URL").ok().filter(|s| !s.is_empty());
-        let private = std::env::var("HIVE_PRIVATE_URL").ok().filter(|s| !s.is_empty());
+        let public = std::env::var("HIVE_PUBLIC_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let private = std::env::var("HIVE_PRIVATE_URL")
+            .ok()
+            .filter(|s| !s.is_empty());
         let awareness: HashSet<String> =
             std::env::var("HIVE_DHCP_NAME_SEARCH_DOMAIN_NETWORK_AWARENESS")
                 .unwrap_or_default()
@@ -249,12 +253,12 @@ pub fn api_base() -> &'static str {
                 .map(|s| s.trim().to_lowercase())
                 .filter(|s| !s.is_empty())
                 .collect();
-        if let Some(p) = private.as_ref() {
-            if !awareness.is_empty() {
-                let domains: HashSet<_> = system_search_domains().into_iter().collect();
-                if !domains.is_disjoint(&awareness) {
-                    return p.trim_end_matches('/').to_string();
-                }
+        if let Some(p) = private.as_ref()
+            && !awareness.is_empty()
+        {
+            let domains: HashSet<_> = system_search_domains().into_iter().collect();
+            if !domains.is_disjoint(&awareness) {
+                return p.trim_end_matches('/').to_string();
             }
         }
         if let Some(p) = public {
@@ -306,10 +310,10 @@ fn build_url(path: &str, params: &[(&str, String)]) -> String {
 /// Pull a human-readable error message out of hive-api's `{error, code}` body,
 /// falling back to the raw text / status when it isn't the expected shape.
 fn error_message(status: reqwest::StatusCode, body: &str) -> String {
-    if let Ok(v) = serde_json::from_str::<Value>(body) {
-        if let Some(msg) = v.get("error").and_then(|e| e.as_str()) {
-            return msg.to_string();
-        }
+    if let Ok(v) = serde_json::from_str::<Value>(body)
+        && let Some(msg) = v.get("error").and_then(|e| e.as_str())
+    {
+        return msg.to_string();
     }
     if body.trim().is_empty() {
         format!("hive-api returned {status}")
@@ -391,7 +395,15 @@ pub async fn add_project(
     owner: &str,
 ) -> anyhow::Result<Project> {
     let url = format!("{}/projects", api_base());
-    post_json(&url, &ProjectAddBody { name, description, owner }).await
+    post_json(
+        &url,
+        &ProjectAddBody {
+            name,
+            description,
+            owner,
+        },
+    )
+    .await
 }
 
 pub async fn archive_project(name: &str) -> anyhow::Result<Value> {
@@ -444,7 +456,14 @@ pub async fn add_task(
     let url = format!("{}/tasks", api_base());
     post_json(
         &url,
-        &TaskAddBody { project, title, body, owner, priority, due },
+        &TaskAddBody {
+            project,
+            title,
+            body,
+            owner,
+            priority,
+            due,
+        },
     )
     .await
 }
@@ -521,7 +540,17 @@ pub async fn add_journal(
     tags: Option<&str>,
 ) -> anyhow::Result<JournalEntry> {
     let url = format!("{}/journal", api_base());
-    post_json(&url, &JournalAddBody { ai, date, title, body, tags }).await
+    post_json(
+        &url,
+        &JournalAddBody {
+            ai,
+            date,
+            title,
+            body,
+            tags,
+        },
+    )
+    .await
 }
 
 pub async fn show_journal(id: &str) -> anyhow::Result<JournalEntry> {
@@ -577,7 +606,17 @@ pub async fn add_note(
     tags: Option<&str>,
 ) -> anyhow::Result<Note> {
     let url = format!("{}/notes", api_base());
-    post_json(&url, &NoteAddBody { author, title, body, project, tags }).await
+    post_json(
+        &url,
+        &NoteAddBody {
+            author,
+            title,
+            body,
+            project,
+            tags,
+        },
+    )
+    .await
 }
 
 pub async fn show_note(id: &str) -> anyhow::Result<Note> {
@@ -695,7 +734,16 @@ pub async fn add_link(
     note: Option<&str>,
 ) -> anyhow::Result<Value> {
     let url = format!("{}/links", api_base());
-    post_json(&url, &LinkAddBody { source, target, link_type, note }).await
+    post_json(
+        &url,
+        &LinkAddBody {
+            source,
+            target,
+            link_type,
+            note,
+        },
+    )
+    .await
 }
 
 pub async fn remove_link(id: &str) -> anyhow::Result<Value> {
@@ -710,12 +758,7 @@ pub async fn link_types() -> anyhow::Result<Vec<LinkTypeCount>> {
 
 // ---------- graph + search ----------
 
-pub async fn graph(
-    min: i64,
-    tags: i64,
-    nodes: i64,
-    include_meta: bool,
-) -> anyhow::Result<Value> {
+pub async fn graph(min: i64, tags: i64, nodes: i64, include_meta: bool) -> anyhow::Result<Value> {
     let url = build_url(
         "/graph",
         &[

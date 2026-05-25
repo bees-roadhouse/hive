@@ -1,6 +1,6 @@
 use leptos::prelude::*;
 
-use crate::api::{fetch_notes, Note};
+use crate::api::{Note, fetch_notes};
 
 /// Notes list with author + tag filters.
 #[component]
@@ -78,5 +78,6 @@ fn NoteList(notes: Vec<Note>) -> impl IntoView {
                 }
             }).collect_view()}
         </ul>
-    }.into_any()
+    }
+    .into_any()
 }

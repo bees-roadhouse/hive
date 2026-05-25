@@ -1,6 +1,6 @@
 use leptos::prelude::*;
 
-use crate::api::{fetch_wire, WireEvent};
+use crate::api::{WireEvent, fetch_wire};
 
 /// Wire-event list with source + severity filters and an "unacked only" toggle.
 #[component]
@@ -96,5 +96,6 @@ fn EventList(events: Vec<WireEvent>) -> impl IntoView {
                 }
             }).collect_view()}
         </ul>
-    }.into_any()
+    }
+    .into_any()
 }

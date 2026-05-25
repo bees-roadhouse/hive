@@ -1,7 +1,7 @@
+use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::routing::{delete, get};
-use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
@@ -29,8 +29,8 @@ async fn outgoing_or_all(
     State(state): State<AppState>,
     Query(q): Query<OutgoingQuery>,
 ) -> Result<Json<Vec<hive_db::types::Link>>, ApiError> {
-    let src = EntityRef::parse(&q.source, "source")
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let src =
+        EntityRef::parse(&q.source, "source").map_err(|e| ApiError::BadRequest(e.to_string()))?;
     links::require_exists(&state.pool, &src, "source").await?;
     let rows = links::outgoing(&state.pool, &src).await?;
     Ok(Json(rows))
@@ -45,8 +45,8 @@ async fn incoming(
     State(state): State<AppState>,
     Query(q): Query<IncomingQuery>,
 ) -> Result<Json<Vec<hive_db::types::Link>>, ApiError> {
-    let tgt = EntityRef::parse(&q.target, "target")
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let tgt =
+        EntityRef::parse(&q.target, "target").map_err(|e| ApiError::BadRequest(e.to_string()))?;
     links::require_exists(&state.pool, &tgt, "target").await?;
     let rows = links::incoming(&state.pool, &tgt).await?;
     Ok(Json(rows))
@@ -95,9 +95,7 @@ async fn remove(
     Ok(Json(json!({"removed": true})))
 }
 
-async fn types(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+async fn types(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let rows = links::type_counts(&state.pool).await?;
     let payload: Vec<_> = rows
         .into_iter()

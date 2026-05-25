@@ -1,7 +1,7 @@
+use axum::Json;
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::routing::get;
-use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use hive_db::queries::search;
@@ -36,5 +36,8 @@ async fn search_endpoint(
 ) -> Result<Json<CombinedHits>, ApiError> {
     let j = search::journal(&state.pool, &q.q, q.limit).await?;
     let n = search::notes(&state.pool, &q.q, q.limit).await?;
-    Ok(Json(CombinedHits { journal: j, notes: n }))
+    Ok(Json(CombinedHits {
+        journal: j,
+        notes: n,
+    }))
 }

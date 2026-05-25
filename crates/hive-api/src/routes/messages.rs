@@ -63,7 +63,9 @@ async fn add(
         return Err(ApiError::BadRequest("sender_ai must not be empty".into()));
     }
     if b.recipient_ai.trim().is_empty() {
-        return Err(ApiError::BadRequest("recipient_ai must not be empty".into()));
+        return Err(ApiError::BadRequest(
+            "recipient_ai must not be empty".into(),
+        ));
     }
     if b.body.trim().is_empty() {
         return Err(ApiError::BadRequest("body must not be empty".into()));
@@ -77,14 +79,16 @@ async fn add(
         b.in_reply_to,
     )
     .await?;
-    state.emitter.emit(
-        HiveEvent::now("message.sent", "messages", m.id).with_extra(serde_json::json!({
-            "sender_ai": m.sender_ai,
-            "recipient_ai": m.recipient_ai,
-            "kind": m.kind,
-            "in_reply_to": m.in_reply_to,
-        })),
-    );
+    state
+        .emitter
+        .emit(
+            HiveEvent::now("message.sent", "messages", m.id).with_extra(serde_json::json!({
+                "sender_ai": m.sender_ai,
+                "recipient_ai": m.recipient_ai,
+                "kind": m.kind,
+                "in_reply_to": m.in_reply_to,
+            })),
+        );
     Ok(Json(m))
 }
 
@@ -101,13 +105,15 @@ async fn mark_read(
     Path(id): Path<Uuid>,
 ) -> Result<Json<messages::Message>, ApiError> {
     let m = messages::mark_read(&state.pool, id).await?;
-    state.emitter.emit(
-        HiveEvent::now("message.read", "messages", m.id).with_extra(serde_json::json!({
-            "sender_ai": m.sender_ai,
-            "recipient_ai": m.recipient_ai,
-            "kind": m.kind,
-        })),
-    );
+    state
+        .emitter
+        .emit(
+            HiveEvent::now("message.read", "messages", m.id).with_extra(serde_json::json!({
+                "sender_ai": m.sender_ai,
+                "recipient_ai": m.recipient_ai,
+                "kind": m.kind,
+            })),
+        );
     Ok(Json(m))
 }
 

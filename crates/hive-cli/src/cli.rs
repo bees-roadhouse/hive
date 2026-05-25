@@ -88,15 +88,11 @@ pub enum TasksCmd {
     /// List tasks (default: open + in_progress)
     List(TaskListArgs),
     /// Show one task
-    Show {
-        id: String,
-    },
+    Show { id: String },
     /// Update task fields
     Update(TaskUpdateArgs),
     /// Mark task done
-    Done {
-        id: String,
-    },
+    Done { id: String },
     /// Mark task blocked
     Block {
         id: String,
@@ -104,9 +100,7 @@ pub enum TasksCmd {
         reason: String,
     },
     /// Mark task dropped (cancelled)
-    Drop {
-        id: String,
-    },
+    Drop { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -119,9 +113,7 @@ pub enum ProjectCmd {
         status: Option<String>,
     },
     /// Archive a project
-    Archive {
-        name: String,
-    },
+    Archive { name: String },
 }
 
 #[derive(Debug, Args)]
@@ -368,9 +360,7 @@ pub enum LinksCmd {
         reference: String,
     },
     /// Delete a link by id
-    Remove {
-        id: String,
-    },
+    Remove { id: String },
     /// List distinct link_type values in use
     Types,
 }
@@ -410,7 +400,10 @@ fn validate(field: &str, s: &str, valid: &[&str]) -> Result<String, String> {
     } else {
         let mut sorted = valid.to_vec();
         sorted.sort_unstable();
-        Err(format!("invalid {field} '{s}'. valid: {}", sorted.join(", ")))
+        Err(format!(
+            "invalid {field} '{s}'. valid: {}",
+            sorted.join(", ")
+        ))
     }
 }
 

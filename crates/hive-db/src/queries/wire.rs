@@ -5,8 +5,7 @@ use crate::enums::Severity;
 use crate::error::{Error, Result};
 use crate::types::WireEvent;
 
-const SELECT_COLS: &str =
-    "id, source, category, external_id, title, body, url, severity, affects, \
+const SELECT_COLS: &str = "id, source, category, external_id, title, body, url, severity, affects, \
      acknowledged, pinged_discord, first_seen_at, last_seen_at";
 
 #[derive(Debug, Default, Clone)]
@@ -31,7 +30,10 @@ pub struct AddArgs<'a> {
 
 #[derive(Debug, Clone)]
 pub enum AddResult {
-    Added(WireEvent),
+    // Boxed: WireEvent is ~240 bytes vs the 16-byte AlreadySeen variant, so an
+    // unboxed enum wastes a stack slot on every call (clippy::large_enum_variant).
+    // Box derefs transparently for field access + serde, so callers are unchanged.
+    Added(Box<WireEvent>),
     AlreadySeen { id: Uuid },
 }
 
@@ -54,12 +56,11 @@ pub async fn add(pool: &PgPool, args: AddArgs<'_>) -> Result<AddResult> {
     .await;
 
     match res {
-        Ok(event) => Ok(AddResult::Added(event)),
+        Ok(event) => Ok(AddResult::Added(Box::new(event))),
         Err(e) => {
             let err: Error = e.into();
-            if err.is_unique_violation() && args.external_id.is_some() {
+            if let (true, Some(ext)) = (err.is_unique_violation(), args.external_id) {
                 // Re-emit AlreadySeen with the existing row's id; bump last_seen_at.
-                let ext = args.external_id.unwrap();
                 let row: Option<(Uuid,)> =
                     sqlx::query_as("SELECT id FROM wire_events WHERE external_id = $1")
                         .bind(ext)
@@ -93,15 +94,15 @@ pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<WireEvent>> {
 }
 
 pub async fn list(pool: &PgPool, filters: &ListFilters) -> Result<Vec<WireEvent>> {
-    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
-        "SELECT {SELECT_COLS} FROM wire_events WHERE 1=1"
-    ));
+    let mut qb: QueryBuilder<Postgres> =
+        QueryBuilder::new(format!("SELECT {SELECT_COLS} FROM wire_events WHERE 1=1"));
 
     if let Some(s) = &filters.source {
         qb.push(" AND source = ").push_bind(s.clone());
     }
     if let Some(s) = filters.severity {
-        qb.push(" AND severity = ").push_bind(s.as_str().to_string());
+        qb.push(" AND severity = ")
+            .push_bind(s.as_str().to_string());
     }
     if filters.unacknowledged {
         qb.push(" AND acknowledged = false");

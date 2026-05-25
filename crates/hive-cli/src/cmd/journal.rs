@@ -27,7 +27,10 @@ async fn add(args: JournalAddArgs) -> Result<()> {
         args.tags.as_deref(),
     )
     .await?;
-    println!("added journal entry #{} ({} {})", entry.id, entry.ai, entry.entry_date);
+    println!(
+        "added journal entry #{} ({} {})",
+        entry.id, entry.ai, entry.entry_date
+    );
     attach_links(&format!("journal:{}", entry.id), &args.link).await?;
     Ok(())
 }
@@ -63,7 +66,9 @@ async fn list(args: JournalListArgs) -> Result<()> {
         Column::new("id", |r: &JournalEntry| r.id.to_string()),
         Column::new("date", |r: &JournalEntry| r.entry_date.clone()),
         Column::new("ai", |r: &JournalEntry| r.ai.clone()),
-        Column::new("title", |r: &JournalEntry| r.title.clone().unwrap_or_default()),
+        Column::new("title", |r: &JournalEntry| {
+            r.title.clone().unwrap_or_default()
+        }),
     ];
     let trailing: Box<dyn Fn(&JournalEntry) -> String> =
         Box::new(|r| r.tags.clone().unwrap_or_default());

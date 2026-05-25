@@ -134,10 +134,8 @@ fn rewrite_owner(content: &str, new_owner: Option<&str>) -> String {
             out.push(token.to_string());
         }
     }
-    if !handled_first {
-        if let Some(name) = new_owner {
-            out.push(format!("@{}", name));
-        }
+    if !handled_first && let Some(name) = new_owner {
+        out.push(format!("@{}", name));
     }
     out.join(" ")
 }
@@ -158,10 +156,8 @@ fn rewrite_kv(content: &str, prefix: &str, new_value: Option<&str>) -> String {
             out.push(token.to_string());
         }
     }
-    if !replaced {
-        if let Some(v) = new_value {
-            out.push(format!("{}{}", prefix, v));
-        }
+    if !replaced && let Some(v) = new_value {
+        out.push(format!("{}{}", prefix, v));
     }
     out.join(" ")
 }

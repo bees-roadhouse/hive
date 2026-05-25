@@ -4,8 +4,7 @@ use crate::enums::{Owner, ProjectStatus};
 use crate::error::{Error, Result};
 use crate::types::Project;
 
-const SELECT_COLS: &str =
-    "id, name, description, status, owner, created_at, updated_at";
+const SELECT_COLS: &str = "id, name, description, status, owner, created_at, updated_at";
 
 pub async fn add(
     pool: &PgPool,
@@ -75,12 +74,11 @@ pub async fn list(pool: &PgPool, status: Option<ProjectStatus>) -> Result<Vec<Pr
 }
 
 pub async fn archive(pool: &PgPool, name: &str) -> Result<()> {
-    let res = sqlx::query(
-        "UPDATE projects SET status = 'archived', updated_at = now() WHERE name = $1",
-    )
-    .bind(name)
-    .execute(pool)
-    .await?;
+    let res =
+        sqlx::query("UPDATE projects SET status = 'archived', updated_at = now() WHERE name = $1")
+            .bind(name)
+            .execute(pool)
+            .await?;
     if res.rows_affected() == 0 {
         return Err(Error::NotFound {
             kind: "project",

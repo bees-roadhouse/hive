@@ -12,16 +12,19 @@ use std::net::SocketAddr;
 
 use axum::Router;
 use leptos::config::LeptosOptions;
-use leptos_axum::{generate_route_list, LeptosRoutes};
+use leptos_axum::{LeptosRoutes, generate_route_list};
 use tower_http::services::ServeDir;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-use crate::app::{shell, App};
+use crate::app::{App, shell};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,hive_ui=debug")))
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,hive_ui=debug")),
+        )
         .with(fmt::layer())
         .init();
 

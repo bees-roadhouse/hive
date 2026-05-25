@@ -11,9 +11,12 @@ const LINK_TABLES: &[&str] = &["tasks", "journal", "notes", "wire", "projects"];
 
 pub async fn run(cmd: LinksCmd) -> Result<()> {
     match cmd {
-        LinksCmd::Add { source, target, link_type, note } => {
-            add(&source, &target, link_type.as_deref(), note.as_deref()).await
-        }
+        LinksCmd::Add {
+            source,
+            target,
+            link_type,
+            note,
+        } => add(&source, &target, link_type.as_deref(), note.as_deref()).await,
         LinksCmd::List { source } => list_outgoing(&source).await,
         LinksCmd::Incoming { target } => list_incoming(&target).await,
         LinksCmd::Show { reference } => show(&reference).await,
@@ -46,7 +49,10 @@ fn validate_ref(spec: &str, field: &str) -> Result<()> {
     if !LINK_TABLES.contains(&table) {
         let mut valid = LINK_TABLES.to_vec();
         valid.sort_unstable();
-        anyhow::bail!("invalid {field} table '{table}'. valid: {}", valid.join(", "));
+        anyhow::bail!(
+            "invalid {field} table '{table}'. valid: {}",
+            valid.join(", ")
+        );
     }
     if ident.is_empty() {
         anyhow::bail!("invalid {field} '{spec}'. id missing");
@@ -111,8 +117,7 @@ fn print_link_rows(rows: &[Link], outgoing: bool) {
             }
         }),
     ];
-    let trailing: Box<dyn Fn(&Link) -> String> =
-        Box::new(|r| r.note.clone().unwrap_or_default());
+    let trailing: Box<dyn Fn(&Link) -> String> = Box::new(|r| r.note.clone().unwrap_or_default());
     print_table(&cols, rows, Some(("note", trailing)));
 }
 

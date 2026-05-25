@@ -6,8 +6,7 @@ use crate::error::{Error, Result};
 use crate::queries::projects;
 use crate::types::Note;
 
-const SELECT_COLS: &str =
-    "id, author, title, body, tags, project, created_at, updated_at";
+const SELECT_COLS: &str = "id, author, title, body, tags, project, created_at, updated_at";
 
 #[derive(Debug, Default, Clone)]
 pub struct ListFilters {
@@ -44,12 +43,12 @@ pub async fn add(
 }
 
 pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Note>> {
-    Ok(sqlx::query_as::<_, Note>(&format!(
-        "SELECT {SELECT_COLS} FROM notes WHERE id = $1"
-    ))
-    .bind(id)
-    .fetch_optional(pool)
-    .await?)
+    Ok(
+        sqlx::query_as::<_, Note>(&format!("SELECT {SELECT_COLS} FROM notes WHERE id = $1"))
+            .bind(id)
+            .fetch_optional(pool)
+            .await?,
+    )
 }
 
 pub async fn require(pool: &PgPool, id: Uuid) -> Result<Note> {
@@ -60,9 +59,8 @@ pub async fn require(pool: &PgPool, id: Uuid) -> Result<Note> {
 }
 
 pub async fn list(pool: &PgPool, filters: &ListFilters) -> Result<Vec<Note>> {
-    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
-        "SELECT {SELECT_COLS} FROM notes WHERE 1=1"
-    ));
+    let mut qb: QueryBuilder<Postgres> =
+        QueryBuilder::new(format!("SELECT {SELECT_COLS} FROM notes WHERE 1=1"));
 
     if let Some(a) = filters.author {
         qb.push(" AND author = ").push_bind(a.as_str().to_string());

@@ -1,6 +1,6 @@
 use leptos::prelude::*;
 
-use crate::api::{fetch_journal_filtered, JournalEntry};
+use crate::api::{JournalEntry, fetch_journal_filtered};
 
 /// Full journal list with an `ai` + `tag` filter. The filter signals drive a
 /// `Resource` that re-fetches whenever either changes.
@@ -78,5 +78,6 @@ fn EntryList(entries: Vec<JournalEntry>) -> impl IntoView {
                 }
             }).collect_view()}
         </ul>
-    }.into_any()
+    }
+    .into_any()
 }

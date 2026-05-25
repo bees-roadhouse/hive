@@ -1,7 +1,7 @@
+use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
-use axum::Json;
 use serde::Deserialize;
 
 use hive_db::enums::{Owner, ProjectStatus};
@@ -40,7 +40,13 @@ async fn add(
     State(state): State<AppState>,
     Json(body): Json<AddBody>,
 ) -> Result<Json<hive_db::types::Project>, ApiError> {
-    let p = projects::add(&state.pool, &body.name, body.description.as_deref(), body.owner).await?;
+    let p = projects::add(
+        &state.pool,
+        &body.name,
+        body.description.as_deref(),
+        body.owner,
+    )
+    .await?;
     state.emitter.emit(
         HiveEvent::now("project.created", "projects", p.id).with_extra(serde_json::json!({
             "name": p.name,

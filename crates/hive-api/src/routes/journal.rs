@@ -1,7 +1,7 @@
+use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
-use axum::Json;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -56,10 +56,12 @@ async fn add(
     State(state): State<AppState>,
     Json(body): Json<AddBody>,
 ) -> Result<Json<hive_db::types::JournalEntry>, ApiError> {
-    let date = body
-        .date
-        .clone()
-        .unwrap_or_else(|| chrono::Local::now().date_naive().format("%Y-%m-%d").to_string());
+    let date = body.date.clone().unwrap_or_else(|| {
+        chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string()
+    });
     let e = journal::add(
         &state.pool,
         body.ai,
