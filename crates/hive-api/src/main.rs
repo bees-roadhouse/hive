@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use axum::Router;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use crate::auth::AuthState;
@@ -37,6 +37,28 @@ struct Args {
     /// Directory for events.log (default: $HIVE_DIR or ~/.hive)
     #[arg(long, env = "HIVE_DIR")]
     hive_dir: Option<PathBuf>,
+    /// Optional subcommand; with none, run the HTTP server (default).
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Create a user + password credential (AS core bootstrap, Phase 2).
+    /// The first user created is auto-admin. Password is read from the
+    /// HIVE_BOOTSTRAP_PASSWORD env var (not a flag, so it doesn't hit shell
+    /// history). Use to create the first login before the UI exists.
+    BootstrapUser {
+        /// Username (^[A-Za-z0-9._-]{1,64}$).
+        #[arg(long)]
+        username: String,
+        /// Force admin even if not the first user.
+        #[arg(long)]
+        admin: bool,
+        /// Scopes to grant (repeatable). Defaults to `*` for the first user.
+        #[arg(long = "scope")]
+        scopes: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -47,6 +69,16 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+
+    if let Some(Command::BootstrapUser {
+        username,
+        admin,
+        scopes,
+    }) = &args.command
+    {
+        return bootstrap_user(&args.database_url, username, *admin, scopes).await;
+    }
+
     tracing::info!(
         database_url = %scrub_password(&args.database_url),
         bind = %args.bind,
@@ -102,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(routes::events::router())
         .merge(routes::health::router())
         .merge(routes::auth::router())
+        .merge(routes::oauth::router())
         .with_state(state)
         // Auth layer: resolves each request to a Principal (dev-bypass or JWT)
         // and stashes it for the AuthUser extractor. Warn-only in Phase 1.
@@ -120,6 +153,49 @@ async fn main() -> anyhow::Result<()> {
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await?;
+    Ok(())
+}
+
+/// Bootstrap a user (Phase 2). Reads the password from HIVE_BOOTSTRAP_PASSWORD,
+/// hashes argon2id (policy minimum length), and inserts user + credential. The
+/// first-ever user is auto-admin with `*` scopes so there's always a way in.
+async fn bootstrap_user(
+    database_url: &str,
+    username: &str,
+    force_admin: bool,
+    scopes: &[String],
+) -> anyhow::Result<()> {
+    let password = std::env::var("HIVE_BOOTSTRAP_PASSWORD").map_err(|_| {
+        anyhow::anyhow!("set HIVE_BOOTSTRAP_PASSWORD (not a flag, to keep it out of shell history)")
+    })?;
+
+    let pool = hive_db::open_pool(database_url, 2).await?;
+    let policy = auth::policy::AuthPolicy::load(&pool).await?;
+
+    let is_first = auth::store::user_count(&pool).await? == 0;
+    let is_admin = force_admin || is_first;
+    let granted: Vec<String> = if !scopes.is_empty() {
+        scopes.to_vec()
+    } else if is_first {
+        vec!["*".to_string()]
+    } else {
+        Vec::new()
+    };
+
+    let phc = auth::password::hash_password(&password, policy.password_min_length as usize)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let id = auth::store::create_user(&pool, username, &phc, is_admin, &granted)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    tracing::info!(
+        user_id = %id,
+        username,
+        is_admin,
+        first_user = is_first,
+        "bootstrapped user"
+    );
+    println!("created user '{username}' (id={id}, admin={is_admin})");
     Ok(())
 }
 
