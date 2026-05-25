@@ -4,6 +4,10 @@ use leptos_router::components::{Route, Router, Routes};
 use leptos_router::StaticSegment;
 
 use crate::pages::home::HomePage;
+use crate::pages::journal::JournalPage;
+use crate::pages::notes::NotesPage;
+use crate::pages::tasks::TasksPage;
+use crate::pages::wire::WirePage;
 
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
@@ -24,17 +28,35 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 }
 
 #[component]
+fn Nav() -> impl IntoView {
+    view! {
+        <nav class="hive-nav">
+            <a href="/">"links"</a>
+            <a href="/journal">"journal"</a>
+            <a href="/tasks">"tasks"</a>
+            <a href="/notes">"notes"</a>
+            <a href="/wire">"wire"</a>
+        </nav>
+    }
+}
+
+#[component]
 pub fn App() -> impl IntoView {
     provide_meta_context();
 
     view! {
         <Stylesheet id="hive-ui-css" href="/style/main.css"/>
-        <Title text="journal-canvas v0"/>
+        <Title text="hive-canvas"/>
 
         <Router>
+            <Nav/>
             <main>
                 <Routes fallback=|| view! { <p>"not found"</p> }>
                     <Route path=StaticSegment("") view=HomePage/>
+                    <Route path=StaticSegment("journal") view=JournalPage/>
+                    <Route path=StaticSegment("tasks") view=TasksPage/>
+                    <Route path=StaticSegment("notes") view=NotesPage/>
+                    <Route path=StaticSegment("wire") view=WirePage/>
                 </Routes>
             </main>
         </Router>

@@ -1,92 +1,92 @@
-use axum::extract::{Query, State};
-use axum::http::StatusCode;
-use chrono::Local;
-use maud::{Markup, html};
-use serde::Deserialize;
+use leptos::prelude::*;
 
-use hive_db::enums::{Owner, TaskStatus};
-use hive_db::queries::tasks;
+use crate::api::{fetch_tasks, Task};
 
-use super::layout::page;
-use super::{AppState, with_conn};
+/// Task list with owner + status filters and an "include closed" toggle.
+#[component]
+pub fn TasksPage() -> impl IntoView {
+    let (owner, set_owner) = signal(String::new());
+    let (status, set_status) = signal(String::new());
+    let (all, set_all) = signal(false);
 
-#[derive(Debug, Deserialize, Default)]
-pub struct Q {
-    pub project: Option<String>,
-    pub owner: Option<Owner>,
-    pub status: Option<TaskStatus>,
-    #[serde(default)]
-    pub all: bool,
+    let data = Resource::new(
+        move || (owner.get(), status.get(), all.get()),
+        |(owner, status, all)| async move {
+            fetch_tasks(&owner, &status, all)
+                .await
+                .map_err(|e| e.to_string())
+        },
+    );
+
+    view! {
+        <header class="canvas-header">
+            <h1>"tasks"</h1>
+            <p class="canvas-sub">"shared task tracker"</p>
+        </header>
+        <section class="filters">
+            <label>
+                "owner "
+                <select on:change=move |ev| set_owner.set(event_target_value(&ev))>
+                    <option value="">"all"</option>
+                    <option value="pia">"pia"</option>
+                    <option value="apis">"apis"</option>
+                    <option value="cera">"cera"</option>
+                    <option value="nate">"nate"</option>
+                    <option value="maggie">"maggie"</option>
+                </select>
+            </label>
+            <label>
+                "status "
+                <select on:change=move |ev| set_status.set(event_target_value(&ev))>
+                    <option value="">"any"</option>
+                    <option value="open">"open"</option>
+                    <option value="in_progress">"in_progress"</option>
+                    <option value="blocked">"blocked"</option>
+                    <option value="done">"done"</option>
+                    <option value="dropped">"dropped"</option>
+                </select>
+            </label>
+            <label>
+                <input
+                    type="checkbox"
+                    on:change=move |ev| set_all.set(event_target_checked(&ev))
+                />
+                " include closed"
+            </label>
+        </section>
+        <section class="canvas-body">
+            <Suspense fallback=move || view! { <p class="loading">"loading..."</p> }>
+                {move || data.get().map(|result| match result {
+                    Ok(tasks) => view! { <TaskList tasks/> }.into_any(),
+                    Err(msg) => view! { <p class="error">"error: " {msg}</p> }.into_any(),
+                })}
+            </Suspense>
+        </section>
+    }
 }
 
-pub async fn view(
-    State(state): State<AppState>,
-    Query(q): Query<Q>,
-) -> Result<Markup, StatusCode> {
-    let filters = tasks::ListFilters {
-        project: q.project.clone(),
-        owner: q.owner,
-        status: q.status,
-        all: q.all,
-    };
-    let rows = with_conn(&state, move |c| tasks::list(c, &filters)).await?;
-    let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
-
-    let body = html! {
-        h2 { "tasks " span.muted { "(" (rows.len()) ")" } }
-        form.inline action="/tasks" method="get" {
-            label { "owner: " }
-            select name="owner" {
-                option value="" { "(any)" }
-                @for o in Owner::ALL {
-                    option value=(o.as_str())
-                           selected[q.owner.map(|v| v == *o).unwrap_or(false)]
-                    { (o.as_str()) }
+#[component]
+fn TaskList(tasks: Vec<Task>) -> impl IntoView {
+    if tasks.is_empty() {
+        return view! { <p class="empty">"no tasks match"</p> }.into_any();
+    }
+    view! {
+        <ul class="task-list">
+            {tasks.into_iter().map(|t| {
+                let priority = t.priority.clone().unwrap_or_default();
+                let project = t.project.clone().unwrap_or_default();
+                let status_class = format!("task-status status-{}", t.status);
+                view! {
+                    <li class="task-row">
+                        <span class=status_class>{t.status}</span>
+                        <span class="task-owner">{t.owner}</span>
+                        <span class="task-title">
+                            {t.title}
+                            <span class="task-meta">{project}" "{priority}</span>
+                        </span>
+                    </li>
                 }
-            }
-            label { "status: " }
-            select name="status" {
-                option value="" { "(active)" }
-                @for s in TaskStatus::ALL {
-                    option value=(s.as_str())
-                           selected[q.status.map(|v| v == *s).unwrap_or(false)]
-                    { (s.as_str()) }
-                }
-            }
-            label { input type="checkbox" name="all" value="true" checked[q.all]; " include closed" }
-            button type="submit" { "filter" }
-        }
-
-        @if rows.is_empty() {
-            div.empty { "no tasks match the filter" }
-        } @else {
-            table {
-                thead {
-                    tr { th { "id" } th { "project" } th { "owner" } th { "status" } th { "pri" } th { "due" } th { "title" } }
-                }
-                tbody {
-                    @for r in &rows {
-                        tr {
-                            td.row-id { "#" (r.id) }
-                            td { (r.project) }
-                            td { (r.owner) }
-                            td { (r.status) }
-                            td.muted { (r.priority.clone().unwrap_or_default()) }
-                            td {
-                                @match &r.due {
-                                    Some(d) if d.as_str() < today.as_str() && r.status != "done" && r.status != "dropped" => {
-                                        span.overdue { (d) " OVERDUE" }
-                                    }
-                                    Some(d) => { (d) }
-                                    None => { "" }
-                                }
-                            }
-                            td { (r.title) }
-                        }
-                    }
-                }
-            }
-        }
-    };
-    Ok(page("tasks", "tasks", body))
+            }).collect_view()}
+        </ul>
+    }.into_any()
 }
