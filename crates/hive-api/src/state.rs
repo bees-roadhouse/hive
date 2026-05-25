@@ -6,10 +6,13 @@ use hive_db::PgPool;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::auth::AuthState;
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub emitter: EventEmitter,
+    pub auth: AuthState,
 }
 
 /// Canonical event payload for the SSE stream + downstream subscribers.

@@ -29,3 +29,23 @@ directories = { workspace = true }
 uuid = { workspace = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
+
+# Auth (Phase 1): JWT verify + Ed25519 keygen for the local AS.
+jsonwebtoken = { workspace = true }
+ring = { workspace = true }
+base64 = { workspace = true }
+# Direct DB access for the auth tables (signing_keys now; users/sessions in
+# Phase 2+). hive-db owns the shared schema + migrations; hive-api queries it.
+sqlx = { workspace = true }
+
+[features]
+# `dev` enables the dev-mode auth bypass (§5.8). It is DELIBERATELY NOT a
+# default feature: the bypass code path is compiled in ONLY when this feature
+# is on, so a release build (`cargo build -p hive-api`, no `--features dev`)
+# does not contain it at all. That compile-time gate is the primary safeguard.
+#
+# CI GUARD: production/release images MUST be built without `--features dev`.
+# The release build command never passes it; a CI check asserts the bypass
+# symbol is absent from the release artifact. See §5.8.
+default = []
+dev = []

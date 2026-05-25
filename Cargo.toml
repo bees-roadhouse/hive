@@ -90,6 +90,11 @@ hex = "0.4"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v7", "serde"] }
 
+# Auth (hive-api: JWT verification + Ed25519 keygen for the local AS)
+jsonwebtoken = "10"
+ring = "0.17"      # Ed25519 PKCS#8 keypair generation; already in-tree via rustls
+base64 = "0.22"    # base64url for JWK public-key encoding
+
 # Embedding + reranking (hive-embed)
 fastembed = "5"
 

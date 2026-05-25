@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod events;
 pub mod graph;
 pub mod health;
