@@ -90,10 +90,14 @@ hex = "0.4"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v7", "serde"] }
 
-# Auth (hive-api: JWT verification + Ed25519 keygen for the local AS)
-jsonwebtoken = "10"
+# Auth (hive-api: JWT verification + Ed25519 keygen for the local AS).
+# jsonwebtoken 10 requires an explicit crypto provider; pick `rust_crypto`
+# (pure-Rust, no OpenSSL/aws-lc build) to match the workspace's rustls choice.
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 ring = "0.17"      # Ed25519 PKCS#8 keypair generation; already in-tree via rustls
 base64 = "0.22"    # base64url for JWK public-key encoding
+argon2 = "0.5"     # argon2id password hashing (AS core, Phase 2)
+rand = "0.8"       # CSPRNG for opaque refresh tokens + salts
 
 # Embedding + reranking (hive-embed)
 fastembed = "5"

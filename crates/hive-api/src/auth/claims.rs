@@ -37,6 +37,15 @@ pub struct Claims {
     /// Space-delimited scope string (OAuth convention), e.g. "hive.read mcp".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// Admin flag, resolved by the AS at mint time from the user's record so the
+    /// RS stays stateless (§6.1: the AS reads roles once; the token carries the
+    /// resolved result). Custom claim, namespaced to avoid colliding with OIDC.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hive_admin: bool,
+    /// Data-visibility lever (§5.6), baked in at mint. "shared" | "owner" |
+    /// "custom"; absent => owner (narrowest).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hive_visibility: Option<String>,
 }
 
 impl Claims {
@@ -89,6 +98,25 @@ pub enum DataVisibility {
     Custom,
 }
 
+impl DataVisibility {
+    /// Parse the `hive_visibility` claim; unknown/absent => narrowest (`Owner`).
+    pub fn parse(s: Option<&str>) -> Self {
+        match s {
+            Some("shared") => DataVisibility::Shared,
+            Some("custom") => DataVisibility::Custom,
+            _ => DataVisibility::Owner,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DataVisibility::Shared => "shared",
+            DataVisibility::Owner => "owner",
+            DataVisibility::Custom => "custom",
+        }
+    }
+}
+
 /// hive's stable INTERNAL permission vocabulary (§6.1). Every enforcement point
 /// — route scope guards, RLS, admin checks, the AI-grant intersection — reads
 /// this. It never changes when the *source* of authority changes.
@@ -117,6 +145,18 @@ impl ResolvedPermissions {
             scopes: Vec::new(),
             data_visibility: DataVisibility::Owner,
             is_admin: false,
+        }
+    }
+
+    /// Reconstruct from a validated token's claims (§6.1: the AS baked the
+    /// resolved permissions into the token at mint, so the RS rebuilds them
+    /// without a DB hit). This is the builtin-mode resolution for real
+    /// principals from Phase 2 on.
+    pub fn from_claims(claims: &Claims) -> Self {
+        Self {
+            scopes: claims.scopes(),
+            data_visibility: DataVisibility::parse(claims.hive_visibility.as_deref()),
+            is_admin: claims.hive_admin,
         }
     }
 

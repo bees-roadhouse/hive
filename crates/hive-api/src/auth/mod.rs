@@ -28,7 +28,11 @@ pub mod config;
 pub mod extractor;
 pub mod keys;
 pub mod layer;
+pub mod password;
+pub mod policy;
 pub mod resolve;
+pub mod store;
+pub mod tokens;
 
 #[cfg(feature = "dev")]
 pub mod dev;

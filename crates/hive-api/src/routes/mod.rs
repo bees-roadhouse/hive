@@ -6,6 +6,7 @@ pub mod journal;
 pub mod links;
 pub mod messages;
 pub mod notes;
+pub mod oauth;
 pub mod projects;
 pub mod search;
 pub mod semantic;

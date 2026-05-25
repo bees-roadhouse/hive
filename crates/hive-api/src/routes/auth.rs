@@ -28,8 +28,10 @@ async fn jwks(State(state): State<AppState>) -> Json<Value> {
 
 async fn as_metadata(State(state): State<AppState>) -> Json<Value> {
     let issuer = state.auth.config().issuer.trim_end_matches('/').to_string();
-    // RFC 8414 metadata. Endpoint URLs are advertised against the issuer base;
-    // the endpoints themselves arrive in Phase 2+ (this is a Phase 1 stub).
+    // RFC 8414 metadata. As of Phase 2, /authorize + /token are LIVE
+    // (authorization_code + refresh_token grants, S256 PKCE). The device-code
+    // grant + dynamic registration land in Phase 5/6; advertised here so
+    // clients see the committed surface, gated by x_hive_phase.
     Json(json!({
         "issuer": issuer,
         "jwks_uri": format!("{issuer}/jwks.json"),
@@ -46,7 +48,8 @@ async fn as_metadata(State(state): State<AppState>) -> Json<Value> {
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
         "id_token_signing_alg_values_supported": ["EdDSA"],
-        // Phase 1 marker so consumers know endpoints are not all live yet.
-        "x_hive_phase": 1
+        // Phase marker: authorize+token live; device_authorization + register
+        // are advertised-but-not-yet-implemented until Phase 5/6.
+        "x_hive_phase": 2
     }))
 }
