@@ -2,9 +2,6 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error("database not found at {0}. run: hive init")]
-    DbNotFound(std::path::PathBuf),
-
     #[error("not found: {kind} {id}")]
     NotFound { kind: &'static str, id: String },
 
@@ -25,14 +22,28 @@ pub enum Error {
         expected: &'static str,
     },
 
-    #[error("sqlite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    #[error("sqlx error: {0}")]
+    Sqlx(#[from] sqlx::Error),
 
-    #[error("pool error: {0}")]
-    Pool(#[from] r2d2::Error),
+    #[error("migrate error: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    /// True when the underlying sqlx error is a unique/primary-key violation.
+    /// Mirrors the old rusqlite ConstraintViolation branch we used to match on.
+    pub fn is_unique_violation(&self) -> bool {
+        match self {
+            Error::Sqlx(sqlx::Error::Database(db)) => {
+                // Postgres SQLSTATE 23505 = unique_violation
+                db.code().map(|c| c.as_ref() == "23505").unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+}

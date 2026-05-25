@@ -1,27 +1,30 @@
 //! Embedding storage and retrieval.
 //!
 //! The `hive-embed` crate owns the model client (encoding, reranking).
-//! This module owns the sqlite IO: read existing rows, write embeddings,
-//! list staleness.
+//! This module owns the postgres IO: read existing rows, write embeddings,
+//! list staleness. Embeddings are stored as `pgvector::Vector` against the
+//! `vector` column type.
 
 use std::collections::HashMap;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use pgvector::Vector;
 use serde::{Deserialize, Serialize};
+use sqlx::{FromRow, PgPool};
+use uuid::Uuid;
 
 use crate::error::Result;
 
 pub const VALID_SOURCE_TABLES: &[&str] = &["journal_entries", "notes"];
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct SourceRow {
-    pub id: i64,
+    pub id: Uuid,
     pub title: Option<String>,
     pub body: Option<String>,
     pub tags: Option<String>,
 }
 
-pub fn fetch_source_rows(conn: &Connection, table: &str) -> Result<Vec<SourceRow>> {
+pub async fn fetch_source_rows(pool: &PgPool, table: &str) -> Result<Vec<SourceRow>> {
     let sql = match table {
         "journal_entries" => "SELECT id, title, body, tags FROM journal_entries",
         "notes" => "SELECT id, title, body, tags FROM notes",
@@ -33,28 +36,18 @@ pub fn fetch_source_rows(conn: &Connection, table: &str) -> Result<Vec<SourceRow
             });
         }
     };
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(SourceRow {
-                id: r.get("id")?,
-                title: r.get("title")?,
-                body: r.get("body")?,
-                tags: r.get("tags")?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = sqlx::query_as::<_, SourceRow>(sql).fetch_all(pool).await?;
     Ok(rows)
 }
 
-pub fn fetch_one_source_row(
-    conn: &Connection,
+pub async fn fetch_one_source_row(
+    pool: &PgPool,
     table: &str,
-    source_id: i64,
+    source_id: Uuid,
 ) -> Result<Option<SourceRow>> {
     let sql = match table {
-        "journal_entries" => "SELECT id, title, body, tags FROM journal_entries WHERE id = ?",
-        "notes" => "SELECT id, title, body, tags FROM notes WHERE id = ?",
+        "journal_entries" => "SELECT id, title, body, tags FROM journal_entries WHERE id = $1",
+        "notes" => "SELECT id, title, body, tags FROM notes WHERE id = $1",
         other => {
             return Err(crate::error::Error::InvalidEnum {
                 field: "source_table",
@@ -63,36 +56,28 @@ pub fn fetch_one_source_row(
             });
         }
     };
-    Ok(conn
-        .query_row(sql, [source_id], |r| {
-            Ok(SourceRow {
-                id: r.get("id")?,
-                title: r.get("title")?,
-                body: r.get("body")?,
-                tags: r.get("tags")?,
-            })
-        })
-        .optional()?)
+    let row = sqlx::query_as::<_, SourceRow>(sql)
+        .bind(source_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row)
 }
 
 /// Map of `source_id -> content_hash` for an (table, model) pair. Used to
 /// determine which rows need (re-)embedding.
-pub fn existing_index(
-    conn: &Connection,
+pub async fn existing_index(
+    pool: &PgPool,
     table: &str,
     model: &str,
-) -> Result<HashMap<i64, String>> {
-    let mut stmt = conn.prepare(
-        "SELECT source_id, content_hash FROM embeddings WHERE source_table = ? AND model = ?",
-    )?;
-    let mut map = HashMap::new();
-    for row in stmt.query_map(params![table, model], |r| {
-        Ok((r.get::<_, i64>("source_id")?, r.get::<_, String>("content_hash")?))
-    })? {
-        let (sid, ch) = row?;
-        map.insert(sid, ch);
-    }
-    Ok(map)
+) -> Result<HashMap<Uuid, String>> {
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT source_id, content_hash FROM embeddings WHERE source_table = $1 AND model = $2",
+    )
+    .bind(table)
+    .bind(model)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,66 +87,82 @@ pub struct StatusCount {
     pub embedded: i64,
 }
 
-pub fn status(conn: &Connection, model: &str) -> Result<Vec<StatusCount>> {
+pub async fn status(pool: &PgPool, model: &str) -> Result<Vec<StatusCount>> {
     let mut out = Vec::new();
     for &table in VALID_SOURCE_TABLES {
-        let total: i64 =
-            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
-        let embedded: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM embeddings WHERE source_table = ? AND model = ?",
-            params![table, model],
-            |r| r.get(0),
-        )?;
+        let total: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(pool)
+            .await?;
+        let embedded: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM embeddings WHERE source_table = $1 AND model = $2",
+        )
+        .bind(table)
+        .bind(model)
+        .fetch_one(pool)
+        .await?;
         out.push(StatusCount {
             table: table.to_string(),
-            total,
-            embedded,
+            total: total.0,
+            embedded: embedded.0,
         });
     }
     Ok(out)
 }
 
-pub fn upsert(
-    conn: &Connection,
+/// Insert or update an embedding row. `embedding` is the raw f32 slice the
+/// callers already produce via fastembed; we wrap it in `pgvector::Vector`
+/// to send it across the wire.
+pub async fn upsert(
+    pool: &PgPool,
     table: &str,
-    source_id: i64,
+    source_id: Uuid,
     model: &str,
-    dim: i64,
-    embedding: &[u8],
+    dim: i32,
+    embedding: &[f32],
     content_hash: &str,
 ) -> Result<()> {
-    conn.execute(
+    let vec = Vector::from(embedding.to_vec());
+    sqlx::query(
         "INSERT INTO embeddings (source_table, source_id, model, dim, embedding, content_hash) \
-         VALUES (?, ?, ?, ?, ?, ?) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
          ON CONFLICT (source_table, source_id, model) DO UPDATE SET \
-           embedding = excluded.embedding, \
-           dim = excluded.dim, \
-           content_hash = excluded.content_hash, \
-           created_at = datetime('now')",
-        params![table, source_id, model, dim, embedding, content_hash],
-    )?;
+           embedding = EXCLUDED.embedding, \
+           dim = EXCLUDED.dim, \
+           content_hash = EXCLUDED.content_hash, \
+           created_at = now()",
+    )
+    .bind(table)
+    .bind(source_id)
+    .bind(model)
+    .bind(dim)
+    .bind(vec)
+    .bind(content_hash)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-/// Load every embedding for a (table, model) pair as `(source_ids, raw blobs)`.
-/// Callers convert the blobs to f32 vectors themselves (typically via
-/// `bytemuck::cast_slice`).
-pub fn load_all(
-    conn: &Connection,
+/// Load every embedding for a (table, model) pair as `(source_ids, vectors)`.
+/// Returns the embeddings as raw `Vec<f32>` so existing call sites that worked
+/// against the old sqlite blob format only need a one-line change (skip the
+/// `bytemuck::cast_slice` step).
+pub async fn load_all(
+    pool: &PgPool,
     table: &str,
     model: &str,
-) -> Result<(Vec<i64>, Vec<Vec<u8>>)> {
-    let mut stmt = conn.prepare(
-        "SELECT source_id, embedding FROM embeddings WHERE source_table = ? AND model = ?",
-    )?;
-    let mut ids = Vec::new();
-    let mut blobs = Vec::new();
-    for row in stmt.query_map(params![table, model], |r| {
-        Ok((r.get::<_, i64>("source_id")?, r.get::<_, Vec<u8>>("embedding")?))
-    })? {
-        let (sid, blob) = row?;
+) -> Result<(Vec<Uuid>, Vec<Vec<f32>>)> {
+    let rows: Vec<(Uuid, Vector)> = sqlx::query_as(
+        "SELECT source_id, embedding FROM embeddings WHERE source_table = $1 AND model = $2",
+    )
+    .bind(table)
+    .bind(model)
+    .fetch_all(pool)
+    .await?;
+    let mut ids = Vec::with_capacity(rows.len());
+    let mut vecs = Vec::with_capacity(rows.len());
+    for (sid, v) in rows {
         ids.push(sid);
-        blobs.push(blob);
+        vecs.push(v.to_vec());
     }
-    Ok((ids, blobs))
+    Ok((ids, vecs))
 }

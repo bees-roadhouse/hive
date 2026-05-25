@@ -1,0 +1,192 @@
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
+    margin: 0;
+    padding: 0;
+    background: #f5efe2;
+    color: #2a2520;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    line-height: 1.5;
+}
+
+main {
+    max-width: 760px;
+    margin: 2rem auto;
+    padding: 1.5rem;
+}
+
+.canvas-header h1 {
+    margin: 0 0 0.25rem 0;
+    font-size: 1.5rem;
+}
+
+.canvas-sub {
+    margin: 0 0 1.5rem 0;
+    color: #7a6e5a;
+    font-size: 0.85rem;
+}
+
+.journal-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.journal-entry {
+    padding: 0.6rem 0;
+    border-bottom: 1px solid #e0d6c2;
+    display: grid;
+    grid-template-columns: 6rem 4rem 1fr;
+    gap: 0.75rem;
+    align-items: baseline;
+}
+
+.entry-date {
+    color: #7a6e5a;
+    font-variant-numeric: tabular-nums;
+    font-size: 0.85rem;
+}
+
+.entry-ai {
+    color: #8a5a30;
+    font-weight: 600;
+    font-size: 0.85rem;
+}
+
+.entry-title {
+    color: #2a2520;
+}
+
+.error {
+    color: #993322;
+    background: #fbe9e3;
+    padding: 0.75rem;
+    border-radius: 4px;
+}
+
+.loading, .empty {
+    color: #7a6e5a;
+    font-style: italic;
+}
+
+/* nav */
+.hive-nav {
+    max-width: 760px;
+    margin: 1.5rem auto 0 auto;
+    padding: 0 1.5rem;
+    display: flex;
+    gap: 1rem;
+    border-bottom: 2px solid #e0d6c2;
+}
+
+.hive-nav a {
+    padding: 0.5rem 0.25rem;
+    color: #8a5a30;
+    text-decoration: none;
+    font-weight: 600;
+    font-size: 0.9rem;
+}
+
+.hive-nav a:hover {
+    color: #2a2520;
+}
+
+/* filters */
+.filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    align-items: center;
+    margin-bottom: 1.25rem;
+    font-size: 0.85rem;
+    color: #7a6e5a;
+}
+
+.filters select,
+.filters input[type="text"] {
+    font: inherit;
+    padding: 0.2rem 0.4rem;
+    border: 1px solid #d0c4ac;
+    border-radius: 4px;
+    background: #fffdf8;
+    color: #2a2520;
+}
+
+.entry-tags,
+.task-meta,
+.note-tags,
+.wire-meta {
+    display: block;
+    color: #9a8e78;
+    font-size: 0.75rem;
+}
+
+/* tasks */
+.task-list, .note-list, .wire-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.task-row, .wire-row {
+    padding: 0.6rem 0;
+    border-bottom: 1px solid #e0d6c2;
+    display: grid;
+    grid-template-columns: 6rem 4rem 1fr;
+    gap: 0.75rem;
+    align-items: baseline;
+}
+
+.task-status, .wire-sev {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+
+.status-open { color: #2a6a2a; }
+.status-in_progress { color: #b07000; }
+.status-blocked { color: #993322; }
+.status-done { color: #7a6e5a; }
+.status-dropped { color: #9a8e78; }
+
+.task-owner, .wire-source {
+    color: #8a5a30;
+    font-weight: 600;
+    font-size: 0.85rem;
+}
+
+/* wire severity */
+.sev-critical { color: #8a1010; }
+.sev-high { color: #993322; }
+.sev-medium { color: #b07000; }
+.sev-low { color: #2a6a2a; }
+.sev-info { color: #7a6e5a; }
+
+.wire-title a { color: #2a2520; }
+
+/* notes */
+.note-row {
+    padding: 0.75rem 0;
+    border-bottom: 1px solid #e0d6c2;
+}
+
+.note-head {
+    display: flex;
+    gap: 0.6rem;
+    align-items: baseline;
+}
+
+.note-author {
+    color: #8a5a30;
+    font-weight: 600;
+    font-size: 0.85rem;
+}
+
+.note-title { color: #2a2520; font-weight: 600; }
+
+.note-preview {
+    margin: 0.3rem 0 0 0;
+    color: #5a5045;
+    font-size: 0.9rem;
+}

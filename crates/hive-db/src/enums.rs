@@ -1,8 +1,13 @@
 //! Closed-set enums validated at parse time.
 //!
-//! Sqlite has no enum constraint; the python toolchain validates at the CLI
-//! boundary (`validate_owner`, `validate_ai`, etc.). Mirror that here so the
-//! types layer can't hold an invalid value.
+//! Postgres has no native enum constraint here (we store everything as
+//! `TEXT` for forward-compat); the python toolchain validates at the CLI
+//! boundary (`validate_owner`, `validate_ai`, etc.). Mirror that in rust
+//! so the types layer can't hold an invalid value.
+//!
+//! For sqlx binding: use `.as_str()` when you need to `.bind(...)`. We
+//! don't implement `sqlx::Encode<Postgres>` directly because the queries
+//! crate prefers explicit `.as_str()` and the enum types are Copy.
 
 use std::fmt;
 use std::str::FromStr;
@@ -54,14 +59,6 @@ macro_rules! str_enum {
                         })
                     }
                 }
-            }
-        }
-
-        impl rusqlite::ToSql for $name {
-            fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-                Ok(rusqlite::types::ToSqlOutput::Borrowed(
-                    rusqlite::types::ValueRef::Text(self.as_str().as_bytes()),
-                ))
             }
         }
     };
@@ -201,13 +198,5 @@ impl FromStr for LinkTable {
     type Err = Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::parse_short(s)
-    }
-}
-
-impl rusqlite::ToSql for LinkTable {
-    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-        Ok(rusqlite::types::ToSqlOutput::Borrowed(
-            rusqlite::types::ValueRef::Text(self.as_str().as_bytes()),
-        ))
     }
 }

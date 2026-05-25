@@ -5,20 +5,30 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "leptos SSR + WASM hydration UI for the hive shared-state DB"
+description = "leptos 0.7 SSR web canvas for the hive shared-state DB (journal-canvas)"
 
 [[bin]]
 name = "hive-ui"
 path = "src/main.rs"
 
 [dependencies]
-hive-db = { workspace = true }
-axum = { workspace = true }
+# Leptos 0.7 SSR stack. Pin axum/tower-http locally to 0.7-era versions
+# because leptos_axum 0.7.x is built against axum 0.7, while the rest of
+# the hive workspace runs axum 0.8 (the api crate). Promote to workspace
+# deps when leptos 0.8 stabilizes against axum 0.8.
+leptos = { version = "0.7.8", features = ["ssr"] }
+leptos_axum = "0.7.8"
+leptos_meta = { version = "0.7.8", features = ["ssr"] }
+leptos_router = { version = "0.7.8", features = ["ssr"] }
+axum = { version = "0.7", features = ["macros"] }
+tower = { version = "0.5" }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
 tokio = { workspace = true }
-tower = { workspace = true }
-tower-http = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-anyhow = { workspace = true }
+chrono = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }

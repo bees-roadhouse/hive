@@ -1,8 +1,12 @@
-use rusqlite::{Connection, OptionalExtension, params};
+use sqlx::{PgPool, Postgres, QueryBuilder};
+use uuid::Uuid;
 
 use crate::enums::Severity;
 use crate::error::{Error, Result};
 use crate::types::WireEvent;
+
+const SELECT_COLS: &str = "id, source, category, external_id, title, body, url, severity, affects, \
+     acknowledged, pinged_discord, first_seen_at, last_seen_at";
 
 #[derive(Debug, Default, Clone)]
 pub struct ListFilters {
@@ -26,109 +30,98 @@ pub struct AddArgs<'a> {
 
 #[derive(Debug, Clone)]
 pub enum AddResult {
-    Added(WireEvent),
-    AlreadySeen { id: i64 },
+    // Boxed: WireEvent is ~240 bytes vs the 16-byte AlreadySeen variant, so an
+    // unboxed enum wastes a stack slot on every call (clippy::large_enum_variant).
+    // Box derefs transparently for field access + serde, so callers are unchanged.
+    Added(Box<WireEvent>),
+    AlreadySeen { id: Uuid },
 }
 
-pub fn add(conn: &Connection, args: AddArgs<'_>) -> Result<AddResult> {
-    let res = conn.execute(
+pub async fn add(pool: &PgPool, args: AddArgs<'_>) -> Result<AddResult> {
+    let res = sqlx::query_as::<_, WireEvent>(
         "INSERT INTO wire_events (source, category, external_id, title, body, url, severity, affects) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        params![
-            args.source,
-            args.category,
-            args.external_id,
-            args.title,
-            args.body,
-            args.url,
-            args.severity.map(|s| s.as_str().to_string()),
-            args.affects,
-        ],
-    );
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         RETURNING id, source, category, external_id, title, body, url, severity, affects, \
+                   acknowledged, pinged_discord, first_seen_at, last_seen_at",
+    )
+    .bind(args.source)
+    .bind(args.category)
+    .bind(args.external_id)
+    .bind(args.title)
+    .bind(args.body)
+    .bind(args.url)
+    .bind(args.severity.map(|s| s.as_str().to_string()))
+    .bind(args.affects)
+    .fetch_one(pool)
+    .await;
+
     match res {
-        Ok(_) => {
-            let id = conn.last_insert_rowid();
-            let event = get(conn, id)?.ok_or_else(|| Error::NotFound {
-                kind: "wire_event",
-                id: id.to_string(),
-            })?;
-            Ok(AddResult::Added(event))
+        Ok(event) => Ok(AddResult::Added(Box::new(event))),
+        Err(e) => {
+            let err: Error = e.into();
+            if let (true, Some(ext)) = (err.is_unique_violation(), args.external_id) {
+                // Re-emit AlreadySeen with the existing row's id; bump last_seen_at.
+                let row: Option<(Uuid,)> =
+                    sqlx::query_as("SELECT id FROM wire_events WHERE external_id = $1")
+                        .bind(ext)
+                        .fetch_optional(pool)
+                        .await?;
+                let id = row
+                    .ok_or_else(|| Error::NotFound {
+                        kind: "wire_event",
+                        id: ext.to_string(),
+                    })?
+                    .0;
+                sqlx::query("UPDATE wire_events SET last_seen_at = now() WHERE id = $1")
+                    .bind(id)
+                    .execute(pool)
+                    .await?;
+                Ok(AddResult::AlreadySeen { id })
+            } else {
+                Err(err)
+            }
         }
-        Err(rusqlite::Error::SqliteFailure(e, _))
-            if e.code == rusqlite::ErrorCode::ConstraintViolation && args.external_id.is_some() =>
-        {
-            let row = conn
-                .query_row(
-                    "SELECT id FROM wire_events WHERE external_id = ?",
-                    [args.external_id],
-                    |r| r.get::<_, i64>("id"),
-                )
-                .optional()?
-                .ok_or_else(|| Error::NotFound {
-                    kind: "wire_event",
-                    id: args.external_id.unwrap_or("").to_string(),
-                })?;
-            conn.execute(
-                "UPDATE wire_events SET last_seen_at = datetime('now') WHERE id = ?",
-                [row],
-            )?;
-            Ok(AddResult::AlreadySeen { id: row })
-        }
-        Err(e) => Err(e.into()),
     }
 }
 
-pub fn get(conn: &Connection, id: i64) -> Result<Option<WireEvent>> {
-    Ok(conn
-        .query_row(
-            "SELECT id, source, category, external_id, title, body, url, severity, affects, \
-                    acknowledged, pinged_discord, first_seen_at, last_seen_at \
-             FROM wire_events WHERE id = ?",
-            [id],
-            WireEvent::from_row,
-        )
-        .optional()?)
+pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<WireEvent>> {
+    Ok(sqlx::query_as::<_, WireEvent>(&format!(
+        "SELECT {SELECT_COLS} FROM wire_events WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(pool)
+    .await?)
 }
 
-pub fn list(conn: &Connection, filters: &ListFilters) -> Result<Vec<WireEvent>> {
-    let mut sql = String::from(
-        "SELECT id, source, category, external_id, title, body, url, severity, affects, \
-                acknowledged, pinged_discord, first_seen_at, last_seen_at \
-         FROM wire_events WHERE 1=1",
-    );
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+pub async fn list(pool: &PgPool, filters: &ListFilters) -> Result<Vec<WireEvent>> {
+    let mut qb: QueryBuilder<Postgres> =
+        QueryBuilder::new(format!("SELECT {SELECT_COLS} FROM wire_events WHERE 1=1"));
 
     if let Some(s) = &filters.source {
-        sql.push_str(" AND source = ?");
-        params.push(Box::new(s.clone()));
+        qb.push(" AND source = ").push_bind(s.clone());
     }
     if let Some(s) = filters.severity {
-        sql.push_str(" AND severity = ?");
-        params.push(Box::new(s.as_str().to_string()));
+        qb.push(" AND severity = ")
+            .push_bind(s.as_str().to_string());
     }
     if filters.unacknowledged {
-        sql.push_str(" AND acknowledged = 0");
+        qb.push(" AND acknowledged = false");
     }
-    sql.push_str(" ORDER BY last_seen_at DESC, id DESC");
+    qb.push(" ORDER BY last_seen_at DESC, id DESC");
     if let Some(l) = filters.limit {
-        sql.push_str(" LIMIT ?");
-        params.push(Box::new(l));
+        qb.push(" LIMIT ").push_bind(l);
     }
 
-    let mut stmt = conn.prepare(&sql)?;
-    let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| &**p as &dyn rusqlite::ToSql).collect();
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(refs.iter().copied()), WireEvent::from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = qb.build_query_as::<WireEvent>().fetch_all(pool).await?;
     Ok(rows)
 }
 
-pub fn ack(conn: &Connection, id: i64) -> Result<()> {
-    let n = conn.execute(
-        "UPDATE wire_events SET acknowledged = 1 WHERE id = ?",
-        [id],
-    )?;
-    if n == 0 {
+pub async fn ack(pool: &PgPool, id: Uuid) -> Result<()> {
+    let res = sqlx::query("UPDATE wire_events SET acknowledged = true WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    if res.rows_affected() == 0 {
         return Err(Error::NotFound {
             kind: "wire_event",
             id: id.to_string(),

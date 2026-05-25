@@ -116,6 +116,39 @@ Cross-domain edges between hive entities.
 Indexes: `idx_links_source (source_table, source_id)`,
 `idx_links_target (target_table, target_id)`, `idx_links_type (link_type)`.
 
+### `task_anchors`
+
+Maps an Obsidian-style `^taskN` block id (on a specific `journal_entries` row)
+to a `tasks` row. Drives the journal-canvas dual-write contract: an inline
+markdown task line in a journal entry resolves to a first-class task row.
+
+| col | type | notes |
+|---|---|---|
+| `task_id` | `BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE` | |
+| `journal_entry_id` | `BIGINT NOT NULL REFERENCES journal_entries(id) ON DELETE CASCADE` | |
+| `block_id` | `TEXT NOT NULL CHECK (block_id ~ '^[a-z][a-z0-9_-]*$')` | the `^xxx` block id, leading caret stripped |
+| `created_at` | `TIMESTAMPTZ NOT NULL DEFAULT now()` | |
+| `PRIMARY KEY (journal_entry_id, block_id)` | | one block id per entry |
+
+Indexes: `task_anchors_task_id_idx (task_id)`.
+
+### `people`
+
+First-class person records (`ai` or `human`) referenced by `@mention` in
+journal entries. Edges to journal_entries / tasks / notes go through the
+existing `links` table.
+
+| col | type | notes |
+|---|---|---|
+| `id` | `BIGSERIAL PRIMARY KEY` | |
+| `slug` | `TEXT NOT NULL UNIQUE CHECK (slug ~ '^[a-z][a-z0-9_-]*$')` | the `@mention` value |
+| `display_name` | `TEXT NOT NULL` | |
+| `kind` | `TEXT NOT NULL CHECK (kind IN ('ai', 'human'))` | |
+| `notes` | `TEXT` | nullable; short bio / role |
+| `created_at`, `updated_at` | `TIMESTAMPTZ NOT NULL DEFAULT now()` | |
+
+Seeded on migration `0002` with `pia` / `apis` / `cera` / `nate` / `maggie`.
+
 ### `embeddings`
 
 Vector store for hybrid search (per-source-row, per-model).

@@ -1,0 +1,25 @@
+# Runtime-only image. Binary is built outside docker (cargo-zigbuild in CI)
+# and copied in. See .github/workflows/publish.yml for the build step.
+#
+# NOTE: hive-ui crate is a stub today (task #5 in the rust-rewrite plan).
+# This Dockerfile is here so the publish pipeline doesn't need a special
+# case for "ui not yet built" once the leptos work lands. The CI matrix
+# can opt-out of building the hive-ui image until then.
+FROM debian:bookworm-slim
+
+ARG TARGETARCH
+ARG BINARY_DIR=artifacts
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY ${BINARY_DIR}/${TARGETARCH}/hive-ui /usr/local/bin/hive-ui
+
+EXPOSE 8080
+
+ENV HIVE_UI_BIND=0.0.0.0:8080
+ENV HIVE_API_URL=http://hive-api:7878
+
+ENTRYPOINT ["/usr/local/bin/hive-ui"]

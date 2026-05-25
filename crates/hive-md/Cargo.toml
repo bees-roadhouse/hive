@@ -1,0 +1,13 @@
+[package]
+name = "hive-md"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Obsidian-flavored markdown parser for hive task two-way binding."
+
+[dependencies]
+pulldown-cmark = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }

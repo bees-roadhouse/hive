@@ -3,8 +3,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::error::Result;
 use crate::types::split_tags;
@@ -44,8 +45,10 @@ pub struct GraphNode {
     pub size: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    /// Underlying row id when this node maps to a journal/note/task row.
+    /// Stringified uuid; tag nodes have None.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ref_id: Option<i64>,
+    pub ref_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,46 +74,27 @@ pub struct GraphPayload {
     pub options: GraphOptions,
 }
 
-pub fn build(conn: &Connection, opts: GraphOptions) -> Result<GraphPayload> {
+pub async fn build(pool: &PgPool, opts: GraphOptions) -> Result<GraphPayload> {
     let min_tag_count = opts.min_tag_count.max(1);
     let limit_tags = opts.limit_tags.max(1) as usize;
     let limit_nodes = opts.limit_nodes.max(limit_tags as i64) as usize;
 
-    let mut journal_rows: Vec<(i64, Option<String>, String)> = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT id, title, tags FROM journal_entries WHERE tags IS NOT NULL AND tags != ''",
-        )?;
-        for row in stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>("id")?,
-                r.get::<_, Option<String>>("title")?,
-                r.get::<_, String>("tags")?,
-            ))
-        })? {
-            journal_rows.push(row?);
-        }
-    }
-    let mut note_rows: Vec<(i64, Option<String>, String)> = Vec::new();
-    {
-        let mut stmt = conn
-            .prepare("SELECT id, title, tags FROM notes WHERE tags IS NOT NULL AND tags != ''")?;
-        for row in stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, i64>("id")?,
-                r.get::<_, Option<String>>("title")?,
-                r.get::<_, String>("tags")?,
-            ))
-        })? {
-            note_rows.push(row?);
-        }
-    }
+    let journal_rows: Vec<(Uuid, Option<String>, String)> = sqlx::query_as(
+        "SELECT id, title, tags FROM journal_entries WHERE tags IS NOT NULL AND tags != ''",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let note_rows: Vec<(Uuid, Option<String>, String)> =
+        sqlx::query_as("SELECT id, title, tags FROM notes WHERE tags IS NOT NULL AND tags != ''")
+            .fetch_all(pool)
+            .await?;
 
     let meta: HashSet<&'static str> = META_TAGS.iter().copied().collect();
     let mut tag_freq: HashMap<String, i64> = HashMap::new();
-    let mut tag_members: HashMap<String, Vec<(String, i64, String)>> = HashMap::new();
+    let mut tag_members: HashMap<String, Vec<(String, Uuid, String)>> = HashMap::new();
 
-    let mut record = |tag: &str, kind: &str, id: i64, title: Option<&str>| {
+    let mut record = |tag: &str, kind: &str, id: Uuid, title: Option<&str>| {
         if !opts.include_meta && meta.contains(tag) {
             return;
         }
@@ -118,7 +102,7 @@ pub fn build(conn: &Connection, opts: GraphOptions) -> Result<GraphPayload> {
         let label = title
             .filter(|t| !t.is_empty())
             .map(str::to_string)
-            .unwrap_or_else(|| format!("{kind} #{id}"));
+            .unwrap_or_else(|| format!("{kind} {id}"));
         tag_members
             .entry(tag.to_string())
             .or_default()
@@ -179,7 +163,7 @@ pub fn build(conn: &Connection, opts: GraphOptions) -> Result<GraphPayload> {
                     label: label.clone(),
                     size: 1,
                     tag: None,
-                    ref_id: Some(*id),
+                    ref_id: Some(id.to_string()),
                 });
                 seen.insert(nid.clone());
                 budget -= 1;
@@ -208,4 +192,71 @@ pub fn build(conn: &Connection, opts: GraphOptions) -> Result<GraphPayload> {
             include_meta: opts.include_meta,
         },
     })
+}
+
+/// Cap to keep BFS bounded ... the semantic-search blanket boost shouldn't
+/// fan out the whole graph.
+const MARKOV_BLANKET_CAP: usize = 200;
+
+/// BFS the `links` table from `(root_table, root_id)` up to `depth` hops in
+/// both directions. Returns `(table, id)` pairs including the root. Capped at
+/// `MARKOV_BLANKET_CAP` nodes to prevent runaway on hot tags.
+pub async fn markov_blanket(
+    pool: &PgPool,
+    root_table: &str,
+    root_id: Uuid,
+    depth: u32,
+) -> Result<Vec<(String, Uuid)>> {
+    let mut visited: HashSet<(String, Uuid)> = HashSet::new();
+    let mut order: Vec<(String, Uuid)> = Vec::new();
+    let root = (root_table.to_string(), root_id);
+    visited.insert(root.clone());
+    order.push(root.clone());
+    let mut frontier: Vec<(String, Uuid)> = vec![root];
+
+    'outer: for _ in 0..depth {
+        let mut next: Vec<(String, Uuid)> = Vec::new();
+        for (t, i) in &frontier {
+            let outs: Vec<(String, Uuid)> = sqlx::query_as(
+                "SELECT target_table, target_id FROM links \
+                 WHERE source_table = $1 AND source_id = $2",
+            )
+            .bind(t)
+            .bind(*i)
+            .fetch_all(pool)
+            .await?;
+            for pair in outs {
+                if visited.insert(pair.clone()) {
+                    order.push(pair.clone());
+                    next.push(pair);
+                    if visited.len() >= MARKOV_BLANKET_CAP {
+                        break 'outer;
+                    }
+                }
+            }
+            let ins: Vec<(String, Uuid)> = sqlx::query_as(
+                "SELECT source_table, source_id FROM links \
+                 WHERE target_table = $1 AND target_id = $2",
+            )
+            .bind(t)
+            .bind(*i)
+            .fetch_all(pool)
+            .await?;
+            for pair in ins {
+                if visited.insert(pair.clone()) {
+                    order.push(pair.clone());
+                    next.push(pair);
+                    if visited.len() >= MARKOV_BLANKET_CAP {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+
+    Ok(order)
 }

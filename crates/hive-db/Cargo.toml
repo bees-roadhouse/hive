@@ -5,12 +5,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Shared sqlite layer + types for the hive shared-state DB."
+description = "Shared postgres layer + types for the hive shared-state DB."
 
 [dependencies]
-rusqlite = { workspace = true }
-r2d2 = { workspace = true }
-r2d2_sqlite = { workspace = true }
+sqlx = { workspace = true }
+pgvector = { workspace = true }
+tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
@@ -19,3 +19,4 @@ tracing = { workspace = true }
 directories = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+uuid = { workspace = true }

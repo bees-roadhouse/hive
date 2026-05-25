@@ -1,16 +1,15 @@
-//! Shared sqlite layer for the hive shared-state DB.
+//! Shared postgres layer for the hive shared-state DB.
 //!
-//! Frozen against the post-task-8 `~/.hive/hive.db` schema. See
-//! `SCHEMA.md` for the human-readable description and `schema::SCHEMA_SQL`
-//! for the canonical CREATE statements.
+//! Migrated from sqlite + r2d2 + rusqlite to postgres + sqlx (async).
+//! Schema lives in `migrations/0001_initial.sql`; `open_pool` applies any
+//! pending migrations on open.
 
 pub mod enums;
 pub mod error;
 pub mod pool;
 pub mod queries;
-pub mod schema;
 pub mod types;
 
 pub use error::{Error, Result};
-pub use pool::{Pool, default_db_path, open_pool};
-pub use rusqlite::Connection;
+pub use pool::{DEFAULT_DATABASE_URL, default_database_url, open_pool};
+pub use sqlx::PgPool;

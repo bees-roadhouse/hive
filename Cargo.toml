@@ -2,10 +2,23 @@
 resolver = "2"
 members = [
     "crates/hive-db",
-    "crates/hive-cli",
     "crates/hive-api",
-    "crates/hive-ui",
+    "crates/hive-cli",
     "crates/hive-embed",
+    "crates/hive-core",
+    "crates/hive-md",
+    "crates/hive-ui",
+]
+
+# Deferred (still on rusqlite sync API; retired by the api-first shift):
+#   "crates/hive-migrate" ... one-shot sqlite -> postgres copy. Job done; the
+#     canonical hive.db has been on postgres since f82f05f. Migration 0002
+#     handles the uuid-pk flip purely in SQL, so the rust-side helper this
+#     crate scaffolds is no longer on the critical path. Left in-tree for now
+#     in case a future re-import from a sqlite snapshot wants to reuse the
+#     decoders; will need a uuid backfill pass when revived.
+exclude = [
+    "crates/hive-migrate",
 ]
 
 [workspace.package]
@@ -19,11 +32,26 @@ authors = ["Bee's Roadhouse <nate.smith@beesroadhouse.com>"]
 # Workspace crates
 hive-db = { path = "crates/hive-db" }
 hive-embed = { path = "crates/hive-embed" }
+hive-core = { path = "crates/hive-core" }
 
-# Sqlite (bundled with FTS5)
+# Sqlite (legacy: only the excluded hive-migrate crate's sqlite->postgres
+# read path uses these now; hive-cli is an HTTP client and no longer touches sqlite)
 rusqlite = { version = "0.32", features = ["bundled-full", "serde_json", "chrono", "blob"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"
+
+# Postgres (hive-db + hive-api)
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "macros",
+    "chrono",
+    "json",
+    "uuid",
+    "migrate",
+] }
+pgvector = { version = "0.4", features = ["sqlx"] }
 
 # Async runtime (api + ui only)
 tokio = { version = "1", features = ["full"] }
@@ -60,6 +88,13 @@ directories = "5"
 # Utilities
 hex = "0.4"
 sha2 = "0.10"
+uuid = { version = "1", features = ["v7", "serde"] }
+
+# Embedding + reranking (hive-embed)
+fastembed = "5"
+
+# Markdown parsing (hive-md: Obsidian task grammar for journal-canvas dual-write)
+pulldown-cmark = "0.12"
 
 [profile.release]
 lto = "thin"

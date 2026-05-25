@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [development, release]
+  push:
+    branches: [development, release]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        # `bundled-full` builds sqlite from source; takes a few minutes on
+        # cold cache but Swatinem/rust-cache covers warm runs.
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --no-fail-fast
