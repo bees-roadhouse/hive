@@ -9,6 +9,7 @@
 //! network-aware base-URL resolver and the request functions.
 
 mod api;
+mod auth;
 mod cli;
 mod cmd;
 mod format;
@@ -29,6 +30,8 @@ async fn main() {
 async fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Top::Init => cmd::init::run().await?,
+        Top::Login(args) => cmd::login::run(args).await?,
+        Top::Logout => cmd::login::logout().await?,
         Top::Tasks { cmd } => cmd::tasks::run(cmd).await?,
         Top::Journal { cmd } => cmd::journal::run(cmd).await?,
         Top::Notes { cmd } => cmd::notes::run(cmd).await?,

@@ -37,6 +37,12 @@ pub enum Top {
     /// Check connectivity to hive-api (GET /healthz)
     Init,
 
+    /// Authenticate to hive-api and cache an access token (password flow)
+    Login(LoginArgs),
+
+    /// Clear the cached access token
+    Logout,
+
     /// Task tracking
     Tasks {
         #[command(subcommand)]
@@ -72,6 +78,24 @@ pub enum Top {
 
     /// Full-text search across journal + notes (add --hybrid for vector + rerank)
     Search(SearchArgs),
+}
+
+// ---------- login ----------
+
+#[derive(Debug, Args)]
+pub struct LoginArgs {
+    /// Username to authenticate as (password read from HIVE_PASSWORD, or
+    /// prompted interactively when a TTY is available).
+    #[arg(long)]
+    pub username: Option<String>,
+    /// Scopes to request (space-delimited). The AS intersects these with what
+    /// the user is granted; omit to let the server decide.
+    #[arg(long)]
+    pub scope: Option<String>,
+    /// Use the RFC 8628 device-authorization grant instead of the password
+    /// flow. NOT YET IMPLEMENTED (Phase 5) — the flag reserves the surface.
+    #[arg(long)]
+    pub device: bool,
 }
 
 // ---------- tasks ----------
