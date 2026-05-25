@@ -112,7 +112,7 @@ pub async fn backfill_embeddings(
                 pending.len()
             );
         }
-        for ((id, _text, hash), vec) in pending.into_iter().zip(vectors.into_iter()) {
+        for ((id, _text, hash), vec) in pending.into_iter().zip(vectors) {
             store_embedding(pool, table, id, model, &vec, &hash)
                 .await
                 .with_context(|| format!("store_embedding {table}:{id}"))?;

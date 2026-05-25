@@ -194,5 +194,5 @@ pub async fn load_embeddings(
     model: &str,
 ) -> hive_db::Result<Vec<(Uuid, Vec<f32>)>> {
     let (ids, vecs) = hive_db::queries::embeddings::load_all(pool, source_table, model).await?;
-    Ok(ids.into_iter().zip(vecs.into_iter()).collect())
+    Ok(ids.into_iter().zip(vecs).collect())
 }
