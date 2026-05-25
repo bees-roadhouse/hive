@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/hive-db",
     "crates/hive-api",
+    "crates/hive-cli",
     "crates/hive-embed",
     "crates/hive-core",
     "crates/hive-md",
@@ -10,7 +11,6 @@ members = [
 ]
 
 # Deferred (still on rusqlite sync API; retired by the api-first shift):
-#   "crates/hive-cli" ... CLI is hive.py (HTTP-only); rust port off the critical path
 #   "crates/hive-migrate" ... one-shot sqlite -> postgres copy. Job done; the
 #     canonical hive.db has been on postgres since f82f05f. Migration 0002
 #     handles the uuid-pk flip purely in SQL, so the rust-side helper this
@@ -18,7 +18,6 @@ members = [
 #     in case a future re-import from a sqlite snapshot wants to reuse the
 #     decoders; will need a uuid backfill pass when revived.
 exclude = [
-    "crates/hive-cli",
     "crates/hive-migrate",
 ]
 
@@ -35,7 +34,8 @@ hive-db = { path = "crates/hive-db" }
 hive-embed = { path = "crates/hive-embed" }
 hive-core = { path = "crates/hive-core" }
 
-# Sqlite (legacy: hive-cli still uses it for the read-only migration assist path)
+# Sqlite (legacy: only the excluded hive-migrate crate's sqlite->postgres
+# read path uses these now; hive-cli is an HTTP client and no longer touches sqlite)
 rusqlite = { version = "0.32", features = ["bundled-full", "serde_json", "chrono", "blob"] }
 r2d2 = "0.8"
 r2d2_sqlite = "0.25"

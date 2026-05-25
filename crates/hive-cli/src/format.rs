@@ -9,6 +9,27 @@ use std::io::{self, Write};
 
 use serde::Serialize;
 
+/// Render a timestamp string from the API for human-facing output. hive-api
+/// sends TIMESTAMPTZ fields as ISO-8601 (e.g. `2026-05-25T13:43:00Z`); collapse
+/// to `YYYY-MM-DD HH:MM:SS` to match python's `show`/`list` column shape. An
+/// absent/null field renders empty (mirrors python's `row["closed_at"] or ""`).
+pub fn fmt_ts_opt(ts: &Option<String>) -> String {
+    let Some(raw) = ts.as_deref().filter(|s| !s.is_empty()) else {
+        return String::new();
+    };
+    // Best-effort: ISO-8601 -> "date time" by swapping the 'T' and dropping the
+    // zone/fraction. Pass through unchanged if it doesn't look like ISO.
+    let no_zone = raw
+        .split_once('.')
+        .map(|(head, _)| head)
+        .unwrap_or(raw)
+        .trim_end_matches('Z');
+    match no_zone.split_once('T') {
+        Some((date, time)) => format!("{date} {time}"),
+        None => raw.to_string(),
+    }
+}
+
 /// One column in a tabular print.
 pub struct Column<'a, T> {
     pub header: &'a str,

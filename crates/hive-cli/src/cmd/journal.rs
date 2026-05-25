@@ -1,91 +1,54 @@
 use anyhow::Result;
-use chrono::Local;
 
-use hive_db::queries::journal;
-use hive_db::queries::links::{EntityRef, LinkSpec, attach_from_specs};
-use hive_db::types::JournalEntry;
-
+use crate::api::{self, JournalEntry};
 use crate::cli::{JournalAddArgs, JournalCmd, JournalListArgs, JournalSearchArgs};
-use crate::format::{Column, pad_right, print_json, print_table};
+use crate::cmd::links::attach_links;
+use crate::format::{Column, fmt_ts_opt, pad_right, print_json, print_table};
 
-pub fn run(cmd: JournalCmd) -> Result<()> {
-    let pool = super::pool(false)?;
-    let conn = pool.get()?;
+pub async fn run(cmd: JournalCmd) -> Result<()> {
     match cmd {
-        JournalCmd::Add(args) => add(&conn, args),
-        JournalCmd::List(args) => list(&conn, args),
-        JournalCmd::Show { id } => show(&conn, id),
-        JournalCmd::Search(args) => search(&conn, args),
+        JournalCmd::Add(args) => add(args).await,
+        JournalCmd::List(args) => list(args).await,
+        JournalCmd::Show { id } => show(&id).await,
+        JournalCmd::Search(args) => search(args).await,
     }
 }
 
-fn add(conn: &hive_db::Connection, args: JournalAddArgs) -> Result<()> {
-    let entry_date = args
-        .date
-        .clone()
-        .unwrap_or_else(|| Local::now().date_naive().format("%Y-%m-%d").to_string());
-    chrono::NaiveDate::parse_from_str(&entry_date, "%Y-%m-%d").map_err(|_| {
-        hive_db::Error::InvalidFormat {
-            field: "--date",
-            value: entry_date.clone(),
-            expected: "YYYY-MM-DD",
-        }
-    })?;
-    let entry = journal::add(
-        conn,
-        args.ai,
-        &entry_date,
+async fn add(args: JournalAddArgs) -> Result<()> {
+    if let Some(d) = &args.date {
+        chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+            .map_err(|_| anyhow::anyhow!("invalid --date '{d}'. expected YYYY-MM-DD"))?;
+    }
+    let entry = api::add_journal(
+        &args.ai,
+        args.date.as_deref(),
         args.title.as_deref(),
         &args.body,
         args.tags.as_deref(),
-    )?;
+    )
+    .await?;
     println!("added journal entry #{} ({} {})", entry.id, entry.ai, entry.entry_date);
-
-    if !args.link.is_empty() {
-        let specs = args
-            .link
-            .iter()
-            .map(|s| LinkSpec::parse(s))
-            .collect::<hive_db::Result<Vec<_>>>()?;
-        let source = EntityRef {
-            table: hive_db::enums::LinkTable::JournalEntries,
-            id: entry.id,
-        };
-        let msgs = attach_from_specs(conn, &source, &specs)?;
-        for m in msgs {
-            println!("  {m}");
-        }
-    }
+    attach_links(&format!("journal:{}", entry.id), &args.link).await?;
     Ok(())
 }
 
-fn list(conn: &hive_db::Connection, args: JournalListArgs) -> Result<()> {
+async fn list(args: JournalListArgs) -> Result<()> {
     if let Some(d) = &args.from_date {
-        chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|_| {
-            hive_db::Error::InvalidFormat {
-                field: "--from",
-                value: d.clone(),
-                expected: "YYYY-MM-DD",
-            }
-        })?;
+        chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+            .map_err(|_| anyhow::anyhow!("invalid --from '{d}'. expected YYYY-MM-DD"))?;
     }
     if let Some(d) = &args.to_date {
-        chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").map_err(|_| {
-            hive_db::Error::InvalidFormat {
-                field: "--to",
-                value: d.clone(),
-                expected: "YYYY-MM-DD",
-            }
-        })?;
+        chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d")
+            .map_err(|_| anyhow::anyhow!("invalid --to '{d}'. expected YYYY-MM-DD"))?;
     }
-    let filters = journal::ListFilters {
-        ai: args.ai,
-        from_date: args.from_date,
-        to_date: args.to_date,
-        tag: args.tag,
-        limit: Some(args.limit),
-    };
-    let rows = journal::list(conn, &filters)?;
+    let rows = api::list_journal(
+        args.ai.as_deref(),
+        args.from_date.as_deref(),
+        args.to_date.as_deref(),
+        args.tag.as_deref(),
+        args.limit,
+    )
+    .await?;
 
     if args.json {
         print_json(&rows)?;
@@ -108,15 +71,15 @@ fn list(conn: &hive_db::Connection, args: JournalListArgs) -> Result<()> {
     Ok(())
 }
 
-fn show(conn: &hive_db::Connection, id: i64) -> Result<()> {
-    let row = journal::require(conn, id)?;
+async fn show(id: &str) -> Result<()> {
+    let row = api::show_journal(id).await?;
     let title = row.title.clone().unwrap_or_else(|| "(untitled)".into());
     println!("#{}  {}  {}  {}", row.id, row.entry_date, row.ai, title);
     println!("{}", "-".repeat(60));
     let fields: Vec<(&str, String)> = vec![
         ("tags", row.tags.clone().unwrap_or_default()),
-        ("created_at", row.created_at.clone()),
-        ("updated_at", row.updated_at.clone()),
+        ("created_at", fmt_ts_opt(&row.created_at)),
+        ("updated_at", fmt_ts_opt(&row.updated_at)),
     ];
     let label_w = fields.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     for (k, v) in &fields {
@@ -128,14 +91,14 @@ fn show(conn: &hive_db::Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
-fn search(conn: &hive_db::Connection, args: JournalSearchArgs) -> Result<()> {
+async fn search(args: JournalSearchArgs) -> Result<()> {
     if args.hybrid {
         anyhow::bail!(
-            "hybrid search is pending (see DESIGN.md embedder section ... task #4 / hive-embed)"
+            "hybrid search is pending (hive-api /search/semantic returns 501; task #4 / hive-embed)"
         );
     }
     let _ = args.ai; // hybrid-only filter
-    let hits = hive_db::queries::search::journal(conn, &args.query, args.limit)?;
+    let hits = api::search_journal(&args.query, args.limit).await?;
     if hits.is_empty() {
         println!("no matches");
         return Ok(());

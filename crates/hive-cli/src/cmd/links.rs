@@ -1,167 +1,171 @@
 use anyhow::Result;
 
-use hive_db::queries::links::{self, EntityRef};
-
+use crate::api::{self, Link};
 use crate::cli::LinksCmd;
-use crate::format::{Column, pad_right, print_table, truncate};
+use crate::format::{Column, pad_right, print_table};
 
-pub fn run(cmd: LinksCmd) -> Result<()> {
-    let pool = super::pool(false)?;
-    let conn = pool.get()?;
+// Short table names accepted in link specs, mirroring hive-api's
+// `LinkTable::parse_short`. Validated CLI-side so a typo fails before the HTTP
+// round-trip; the API re-validates.
+const LINK_TABLES: &[&str] = &["tasks", "journal", "notes", "wire", "projects"];
+
+pub async fn run(cmd: LinksCmd) -> Result<()> {
     match cmd {
         LinksCmd::Add { source, target, link_type, note } => {
-            add(&conn, &source, &target, link_type.as_deref(), note.as_deref())
+            add(&source, &target, link_type.as_deref(), note.as_deref()).await
         }
-        LinksCmd::List { source } => list_outgoing(&conn, &source),
-        LinksCmd::Incoming { target } => list_incoming(&conn, &target),
-        LinksCmd::Show { reference } => show(&conn, &reference),
+        LinksCmd::List { source } => list_outgoing(&source).await,
+        LinksCmd::Incoming { target } => list_incoming(&target).await,
+        LinksCmd::Show { reference } => show(&reference).await,
         LinksCmd::Remove { id } => {
-            links::remove(&conn, id)?;
+            api::remove_link(&id).await?;
             println!("removed link #{id}");
             Ok(())
         }
-        LinksCmd::Types => types(&conn),
+        LinksCmd::Types => types().await,
     }
 }
 
-fn add(
-    conn: &hive_db::Connection,
+/// Pull an id out of a `{"id": ...}` response, tolerating either a JSON string
+/// (uuid schema) or a number (legacy integer schema).
+fn id_str(v: &serde_json::Value) -> String {
+    match v.get("id") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        _ => "?".to_string(),
+    }
+}
+
+/// Validate a `<table>:<id>` reference CLI-side: known table + non-empty id.
+/// The id is NOT parsed as a uuid ... the server may be on legacy integer PKs,
+/// so we accept any non-empty id and let hive-api validate it.
+fn validate_ref(spec: &str, field: &str) -> Result<()> {
+    let (table, ident) = spec
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("invalid {field} '{spec}'. expected <table>:<id>"))?;
+    if !LINK_TABLES.contains(&table) {
+        let mut valid = LINK_TABLES.to_vec();
+        valid.sort_unstable();
+        anyhow::bail!("invalid {field} table '{table}'. valid: {}", valid.join(", "));
+    }
+    if ident.is_empty() {
+        anyhow::bail!("invalid {field} '{spec}'. id missing");
+    }
+    Ok(())
+}
+
+async fn add(
     source: &str,
     target: &str,
     link_type: Option<&str>,
     note: Option<&str>,
 ) -> Result<()> {
-    let src = EntityRef::parse(source, "--source")?;
-    let tgt = EntityRef::parse(target, "--target")?;
-    links::require_exists(conn, &src, "source")?;
-    links::require_exists(conn, &tgt, "target")?;
-    match links::add(conn, &src, &tgt, link_type, note)? {
-        Some(id) => println!(
-            "added link #{id}: {}:{} -> {}:{} ({})",
-            src.table,
-            src.id,
-            tgt.table,
-            tgt.id,
-            link_type.unwrap_or("-")
-        ),
-        None => anyhow::bail!(
-            "link already exists: {}:{} -> {}:{} (type={})",
-            src.table,
-            src.id,
-            tgt.table,
-            tgt.id,
-            link_type.unwrap_or("NULL")
-        ),
+    validate_ref(source, "--source")?;
+    validate_ref(target, "--target")?;
+    let res = api::add_link(source, target, link_type, note).await?;
+    let id = id_str(&res);
+    println!(
+        "added link #{id}: {source} -> {target} ({})",
+        link_type.unwrap_or("-")
+    );
+    Ok(())
+}
+
+/// Attach `--link` specs (`<table>:<uuid>[:<link_type>]`) to a freshly-created
+/// `source` (`<table>:<uuid>`). Mirrors python `attach_links_from_args`: one
+/// `POST /links` per spec, printing a line per result. Shared by tasks /
+/// journal / notes add commands.
+pub async fn attach_links(source: &str, specs: &[String]) -> Result<()> {
+    for spec in specs {
+        let mut parts = spec.splitn(3, ':');
+        let table = parts.next().unwrap_or("");
+        let ident = parts.next().unwrap_or("");
+        let link_type = parts.next().filter(|s| !s.is_empty());
+        let target = format!("{table}:{ident}");
+        validate_ref(&target, "--link")?;
+        match api::add_link(source, &target, link_type, None).await {
+            Ok(res) => {
+                let id = id_str(&res);
+                println!(
+                    "  linked #{id}: {source} -> {target} ({})",
+                    link_type.unwrap_or("-")
+                );
+            }
+            Err(e) => println!("  {e}"),
+        }
     }
     Ok(())
 }
 
-#[derive(Clone)]
-struct EnrichedLink {
-    id: i64,
-    link_type: String,
-    other: String,
-    title: String,
-    note: String,
-}
-
-fn enrich(
-    conn: &hive_db::Connection,
-    rows: Vec<hive_db::types::Link>,
-    direction: Direction,
-) -> Result<Vec<EnrichedLink>> {
-    let mut out = Vec::with_capacity(rows.len());
-    for r in rows {
-        let (other_table_str, other_id) = match direction {
-            Direction::Out => (r.target_table.as_str(), r.target_id),
-            Direction::In => (r.source_table.as_str(), r.source_id),
-        };
-        let table = hive_db::enums::LinkTable::parse_short(other_table_str)?;
-        let other_ref = EntityRef { table, id: other_id };
-        let label = links::label_for(conn, &other_ref)?.unwrap_or_default();
-        out.push(EnrichedLink {
-            id: r.id,
-            link_type: r.link_type.unwrap_or_else(|| "-".into()),
-            other: format!("{}:{}", other_table_str, other_id),
-            title: truncate(&label, 60),
-            note: r.note.unwrap_or_default(),
-        });
-    }
-    Ok(out)
-}
-
-#[derive(Clone, Copy)]
-enum Direction {
-    Out,
-    In,
-}
-
-fn print_link_rows(rows: &[EnrichedLink]) {
-    let cols: Vec<Column<'_, EnrichedLink>> = vec![
-        Column::new("id", |r: &EnrichedLink| r.id.to_string()),
-        Column::new("type", |r: &EnrichedLink| r.link_type.clone()),
-        Column::new("ref", |r: &EnrichedLink| r.other.clone()),
-        Column::new("title", |r: &EnrichedLink| r.title.clone()),
+fn print_link_rows(rows: &[Link], outgoing: bool) {
+    let cols: Vec<Column<'_, Link>> = vec![
+        Column::new("id", |r: &Link| r.id.to_string()),
+        Column::new("type", |r: &Link| {
+            r.link_type.clone().unwrap_or_else(|| "-".into())
+        }),
+        Column::new("ref", move |r: &Link| {
+            if outgoing {
+                format!("{}:{}", r.target_table, r.target_id)
+            } else {
+                format!("{}:{}", r.source_table, r.source_id)
+            }
+        }),
     ];
-    let trailing: Box<dyn Fn(&EnrichedLink) -> String> = Box::new(|r| r.note.clone());
+    let trailing: Box<dyn Fn(&Link) -> String> =
+        Box::new(|r| r.note.clone().unwrap_or_default());
     print_table(&cols, rows, Some(("note", trailing)));
 }
 
-fn list_outgoing(conn: &hive_db::Connection, source: &str) -> Result<()> {
-    let src = EntityRef::parse(source, "--source")?;
-    links::require_exists(conn, &src, "source")?;
-    let rows = links::outgoing(conn, &src)?;
+async fn list_outgoing(source: &str) -> Result<()> {
+    validate_ref(source, "--source")?;
+    let rows = api::links_outgoing(source).await?;
     if rows.is_empty() {
         println!("no outgoing links");
         return Ok(());
     }
-    let enriched = enrich(conn, rows, Direction::Out)?;
-    print_link_rows(&enriched);
+    print_link_rows(&rows, true);
     Ok(())
 }
 
-fn list_incoming(conn: &hive_db::Connection, target: &str) -> Result<()> {
-    let tgt = EntityRef::parse(target, "--target")?;
-    links::require_exists(conn, &tgt, "target")?;
-    let rows = links::incoming(conn, &tgt)?;
+async fn list_incoming(target: &str) -> Result<()> {
+    validate_ref(target, "--target")?;
+    let rows = api::links_incoming(target).await?;
     if rows.is_empty() {
         println!("no incoming links");
         return Ok(());
     }
-    let enriched = enrich(conn, rows, Direction::In)?;
-    print_link_rows(&enriched);
+    print_link_rows(&rows, false);
     Ok(())
 }
 
-fn show(conn: &hive_db::Connection, reference: &str) -> Result<()> {
-    let ent = EntityRef::parse(reference, "ref")?;
-    let title = links::require_exists(conn, &ent, "entity")?;
-    let out_rows = links::outgoing(conn, &ent)?;
-    let in_rows = links::incoming(conn, &ent)?;
+/// `links show <ref>` ... compose outgoing + incoming (the API has no single
+/// "both directions" endpoint, so the CLI fans out two GETs).
+async fn show(reference: &str) -> Result<()> {
+    validate_ref(reference, "ref")?;
+    let out_rows = api::links_outgoing(reference).await?;
+    let in_rows = api::links_incoming(reference).await?;
 
-    println!("{}:{}  {}", ent.table, ent.id, title);
+    println!("{reference}");
     println!("{}", "-".repeat(60));
 
     println!("outgoing:");
     if out_rows.is_empty() {
         println!("  (none)");
     } else {
-        let enriched = enrich(conn, out_rows, Direction::Out)?;
-        print_link_rows(&enriched);
+        print_link_rows(&out_rows, true);
     }
     println!();
     println!("incoming:");
     if in_rows.is_empty() {
         println!("  (none)");
     } else {
-        let enriched = enrich(conn, in_rows, Direction::In)?;
-        print_link_rows(&enriched);
+        print_link_rows(&in_rows, false);
     }
     Ok(())
 }
 
-fn types(conn: &hive_db::Connection) -> Result<()> {
-    let rows = links::type_counts(conn)?;
+async fn types() -> Result<()> {
+    let rows = api::link_types().await?;
     if rows.is_empty() {
         println!("no links yet");
         return Ok(());

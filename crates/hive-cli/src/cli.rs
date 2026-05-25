@@ -1,16 +1,30 @@
 //! Clap structure mirroring `~/.hive/hive.py`'s argparse grammar.
 //!
 //! Names, defaults, and help text are kept close to the python so callers
-//! that read `--help` see the same shape.
+//! that read `--help` see the same shape. Closed-set fields (owner, ai,
+//! author, severity, statuses) are validated CLI-side against the same valid
+//! sets python uses, so a typo fails fast before any HTTP round-trip; the API
+//! is still the source of truth and re-validates server-side.
+//!
+//! Entity ids are taken as `String` and passed through to the API path
+//! verbatim. The canonical schema uses UUIDv7, but a deployed server may still
+//! be on legacy integer PKs ... not parsing the id here keeps the CLI working
+//! against both, and the server validates/404s an unknown id anyway.
 
 use clap::{Args, Parser, Subcommand};
 
-use hive_db::enums::{Ai, Author, Owner, ProjectStatus, Severity, TaskStatus};
+// Valid sets ... mirror hive_db::enums (kept in lockstep with the API).
+const OWNERS: &[&str] = &["pia", "apis", "cera", "nate", "maggie"];
+const AIS: &[&str] = &["pia", "apis", "cera", "nate"];
+const AUTHORS: &[&str] = &["pia", "apis", "cera", "nate", "maggie"];
+const SEVERITIES: &[&str] = &["critical", "high", "medium", "low", "info"];
+const PROJECT_STATUSES: &[&str] = &["active", "paused", "archived"];
+const TASK_STATUSES: &[&str] = &["open", "in_progress", "blocked", "done", "dropped"];
 
 #[derive(Debug, Parser)]
 #[command(
     name = "hive",
-    about = "Hive shared-state helper (sqlite) for Pia / Apis / Cera",
+    about = "Hive shared-state helper (HTTP client for hive-api) for Pia / Apis / Cera",
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -20,7 +34,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Top {
-    /// Create the database
+    /// Check connectivity to hive-api (GET /healthz)
     Init,
 
     /// Task tracking
@@ -56,7 +70,7 @@ pub enum Top {
     /// Dump a tag-hub knowledge graph as JSON (consumed by hive-ui /graph)
     Graph(GraphArgs),
 
-    /// FTS5 search across journal + notes (add --hybrid for vector + rerank)
+    /// Full-text search across journal + notes (add --hybrid for vector + rerank)
     Search(SearchArgs),
 }
 
@@ -75,23 +89,23 @@ pub enum TasksCmd {
     List(TaskListArgs),
     /// Show one task
     Show {
-        id: i64,
+        id: String,
     },
     /// Update task fields
     Update(TaskUpdateArgs),
     /// Mark task done
     Done {
-        id: i64,
+        id: String,
     },
     /// Mark task blocked
     Block {
-        id: i64,
+        id: String,
         #[arg(long)]
         reason: String,
     },
     /// Mark task dropped (cancelled)
     Drop {
-        id: i64,
+        id: String,
     },
 }
 
@@ -102,7 +116,7 @@ pub enum ProjectCmd {
     /// List projects
     List {
         #[arg(long, value_parser = parse_project_status)]
-        status: Option<ProjectStatus>,
+        status: Option<String>,
     },
     /// Archive a project
     Archive {
@@ -116,7 +130,7 @@ pub struct ProjectAddArgs {
     #[arg(long)]
     pub description: Option<String>,
     #[arg(long, value_parser = parse_owner)]
-    pub owner: Owner,
+    pub owner: String,
 }
 
 #[derive(Debug, Args)]
@@ -128,7 +142,7 @@ pub struct TaskAddArgs {
     #[arg(long)]
     pub body: Option<String>,
     #[arg(long, value_parser = parse_owner)]
-    pub owner: Owner,
+    pub owner: String,
     #[arg(long)]
     pub priority: Option<String>,
     #[arg(long)]
@@ -143,9 +157,9 @@ pub struct TaskListArgs {
     #[arg(long)]
     pub project: Option<String>,
     #[arg(long, value_parser = parse_owner)]
-    pub owner: Option<Owner>,
+    pub owner: Option<String>,
     #[arg(long, value_parser = parse_task_status)]
-    pub status: Option<TaskStatus>,
+    pub status: Option<String>,
     /// Include closed/dropped
     #[arg(long)]
     pub all: bool,
@@ -156,7 +170,7 @@ pub struct TaskListArgs {
 
 #[derive(Debug, Args)]
 pub struct TaskUpdateArgs {
-    pub id: i64,
+    pub id: String,
     #[arg(long)]
     pub status: Option<String>,
     #[arg(long)]
@@ -177,14 +191,14 @@ pub struct TaskUpdateArgs {
 pub enum JournalCmd {
     Add(JournalAddArgs),
     List(JournalListArgs),
-    Show { id: i64 },
+    Show { id: String },
     Search(JournalSearchArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct JournalAddArgs {
     #[arg(long, value_parser = parse_ai)]
-    pub ai: Ai,
+    pub ai: String,
     /// YYYY-MM-DD (default: today)
     #[arg(long)]
     pub date: Option<String>,
@@ -201,7 +215,7 @@ pub struct JournalAddArgs {
 #[derive(Debug, Args)]
 pub struct JournalListArgs {
     #[arg(long, value_parser = parse_ai)]
-    pub ai: Option<Ai>,
+    pub ai: Option<String>,
     #[arg(long = "from")]
     pub from_date: Option<String>,
     #[arg(long = "to")]
@@ -221,8 +235,8 @@ pub struct JournalSearchArgs {
     pub limit: i64,
     /// Filter to one writer (only with --hybrid)
     #[arg(long, value_parser = parse_ai)]
-    pub ai: Option<Ai>,
-    /// Run FTS5 + vector + cross-encoder rerank via hive-embed
+    pub ai: Option<String>,
+    /// Run FTS + vector + cross-encoder rerank via hive-embed
     #[arg(long)]
     pub hybrid: bool,
 }
@@ -233,14 +247,14 @@ pub struct JournalSearchArgs {
 pub enum NotesCmd {
     Add(NotesAddArgs),
     List(NotesListArgs),
-    Show { id: i64 },
+    Show { id: String },
     Search(NotesSearchArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct NotesAddArgs {
     #[arg(long, value_parser = parse_author)]
-    pub author: Author,
+    pub author: String,
     #[arg(long)]
     pub title: Option<String>,
     #[arg(long)]
@@ -256,7 +270,7 @@ pub struct NotesAddArgs {
 #[derive(Debug, Args)]
 pub struct NotesListArgs {
     #[arg(long, value_parser = parse_author)]
-    pub author: Option<Author>,
+    pub author: Option<String>,
     #[arg(long)]
     pub project: Option<String>,
     #[arg(long)]
@@ -275,7 +289,7 @@ pub struct NotesSearchArgs {
     #[arg(long)]
     pub project: Option<String>,
     #[arg(long, value_parser = parse_author)]
-    pub author: Option<Author>,
+    pub author: Option<String>,
     #[arg(long)]
     pub hybrid: bool,
 }
@@ -286,7 +300,7 @@ pub struct NotesSearchArgs {
 pub enum WireCmd {
     Add(WireAddArgs),
     List(WireListArgs),
-    Ack { id: i64 },
+    Ack { id: String },
 }
 
 #[derive(Debug, Args)]
@@ -300,7 +314,7 @@ pub struct WireAddArgs {
     #[arg(long = "external-id")]
     pub external_id: Option<String>,
     #[arg(long, value_parser = parse_severity)]
-    pub severity: Option<Severity>,
+    pub severity: Option<String>,
     #[arg(long)]
     pub affects: Option<String>,
     #[arg(long)]
@@ -314,7 +328,7 @@ pub struct WireListArgs {
     #[arg(long)]
     pub source: Option<String>,
     #[arg(long, value_parser = parse_severity)]
-    pub severity: Option<Severity>,
+    pub severity: Option<String>,
     #[arg(long)]
     pub unacknowledged: bool,
     #[arg(long, default_value_t = 50)]
@@ -355,7 +369,7 @@ pub enum LinksCmd {
     },
     /// Delete a link by id
     Remove {
-        id: i64,
+        id: String,
     },
     /// List distinct link_type values in use
     Types,
@@ -390,21 +404,31 @@ pub struct SearchArgs {
 
 // ---------- value parsers ----------
 
-fn parse_owner(s: &str) -> Result<Owner, String> {
-    s.parse::<Owner>().map_err(|e| e.to_string())
+fn validate(field: &str, s: &str, valid: &[&str]) -> Result<String, String> {
+    if valid.contains(&s) {
+        Ok(s.to_string())
+    } else {
+        let mut sorted = valid.to_vec();
+        sorted.sort_unstable();
+        Err(format!("invalid {field} '{s}'. valid: {}", sorted.join(", ")))
+    }
 }
-fn parse_ai(s: &str) -> Result<Ai, String> {
-    s.parse::<Ai>().map_err(|e| e.to_string())
+
+fn parse_owner(s: &str) -> Result<String, String> {
+    validate("owner", s, OWNERS)
 }
-fn parse_author(s: &str) -> Result<Author, String> {
-    s.parse::<Author>().map_err(|e| e.to_string())
+fn parse_ai(s: &str) -> Result<String, String> {
+    validate("ai", s, AIS)
 }
-fn parse_severity(s: &str) -> Result<Severity, String> {
-    s.parse::<Severity>().map_err(|e| e.to_string())
+fn parse_author(s: &str) -> Result<String, String> {
+    validate("author", s, AUTHORS)
 }
-fn parse_project_status(s: &str) -> Result<ProjectStatus, String> {
-    s.parse::<ProjectStatus>().map_err(|e| e.to_string())
+fn parse_severity(s: &str) -> Result<String, String> {
+    validate("severity", s, SEVERITIES)
 }
-fn parse_task_status(s: &str) -> Result<TaskStatus, String> {
-    s.parse::<TaskStatus>().map_err(|e| e.to_string())
+fn parse_project_status(s: &str) -> Result<String, String> {
+    validate("status", s, PROJECT_STATUSES)
+}
+fn parse_task_status(s: &str) -> Result<String, String> {
+    validate("status", s, TASK_STATUSES)
 }

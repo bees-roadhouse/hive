@@ -1649,6 +1649,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hive-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "hive-core"
 version = "0.1.0"
 dependencies = [

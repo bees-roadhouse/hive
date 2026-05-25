@@ -1,56 +1,65 @@
 use anyhow::Result;
 
-use hive_db::queries::wire::{self, AddArgs, AddResult};
-use hive_db::types::WireEvent;
-
+use crate::api::{self, WireEvent};
 use crate::cli::{WireAddArgs, WireCmd, WireListArgs};
 use crate::format::{Column, print_json, print_table, truncate};
 
-pub fn run(cmd: WireCmd) -> Result<()> {
-    let pool = super::pool(false)?;
-    let conn = pool.get()?;
+pub async fn run(cmd: WireCmd) -> Result<()> {
     match cmd {
-        WireCmd::Add(args) => add(&conn, args),
-        WireCmd::List(args) => list(&conn, args),
+        WireCmd::Add(args) => add(args).await,
+        WireCmd::List(args) => list(args).await,
         WireCmd::Ack { id } => {
-            wire::ack(&conn, id)?;
+            api::ack_wire(&id).await?;
             println!("acknowledged wire event #{id}");
             Ok(())
         }
     }
 }
 
-fn add(conn: &hive_db::Connection, args: WireAddArgs) -> Result<()> {
-    let res = wire::add(
-        conn,
-        AddArgs {
-            source: &args.source,
-            title: &args.title,
-            body: args.body.as_deref(),
-            external_id: args.external_id.as_deref(),
-            severity: args.severity,
-            affects: args.affects.as_deref(),
-            url: args.url.as_deref(),
-            category: args.category.as_deref(),
-        },
-    )?;
-    match res {
-        AddResult::Added(e) => println!("added wire event #{}", e.id),
-        AddResult::AlreadySeen { id } => {
-            println!("wire event #{id} already seen (last_seen_at bumped)")
-        }
+async fn add(args: WireAddArgs) -> Result<()> {
+    let res = api::add_wire(
+        &args.source,
+        &args.title,
+        args.body.as_deref(),
+        args.external_id.as_deref(),
+        args.severity.as_deref(),
+        args.affects.as_deref(),
+        args.url.as_deref(),
+        args.category.as_deref(),
+    )
+    .await?;
+
+    // `/wire` POST returns {"added": <event>} or {"already_seen": {"id": ...}}.
+    if let Some(seen) = res.get("already_seen") {
+        println!(
+            "wire event #{} already seen (last_seen_at bumped)",
+            id_str(seen)
+        );
+    } else if let Some(added) = res.get("added") {
+        println!("added wire event #{}", id_str(added));
+    } else {
+        println!("added wire event");
     }
     Ok(())
 }
 
-fn list(conn: &hive_db::Connection, args: WireListArgs) -> Result<()> {
-    let filters = wire::ListFilters {
-        source: args.source,
-        severity: args.severity,
-        unacknowledged: args.unacknowledged,
-        limit: Some(args.limit),
-    };
-    let rows = wire::list(conn, &filters)?;
+/// Stringify a nested `id` value, tolerating string (uuid) or number (legacy).
+fn id_str(v: &serde_json::Value) -> String {
+    match v.get("id") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        _ => "?".to_string(),
+    }
+}
+
+async fn list(args: WireListArgs) -> Result<()> {
+    let rows = api::list_wire(
+        args.source.as_deref(),
+        args.severity.as_deref(),
+        args.unacknowledged,
+        args.limit,
+    )
+    .await?;
 
     if args.json {
         print_json(&rows)?;
