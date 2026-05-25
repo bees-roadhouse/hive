@@ -1,0 +1,11 @@
+# Pin the Rust toolchain so CI and local dev always match.
+# The CI workflows install dtolnay/rust-toolchain@1.95.0 to match this channel.
+# Bumping the version is a deliberate change (one PR touching this file + the
+# three workflows) — not a silent @stable roll-forward.
+#
+# Why pinned: a floating @stable rolled from 1.93 to 1.95 mid-stream; clippy
+# 1.95 flagged lints 1.93 did not (useless_conversion), reddening an
+# already-merged PR. Pinning makes the toolchain reproducible across CI + local.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
