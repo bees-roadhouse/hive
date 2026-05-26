@@ -396,6 +396,20 @@ pub(crate) async fn post_unauthed<B: Serialize, T: serde::de::DeserializeOwned>(
     Ok(serde_json::from_str(&text)?)
 }
 
+/// POST without a bearer token, returning `(is_success, body_text)` instead of
+/// bailing on a non-2xx. The device-grant poll needs the error BODY (the OAuth
+/// `error` code drives authorization_pending / slow_down / expired_token), so a
+/// 400 isn't a transport failure here. Public to `crate::auth` only.
+pub(crate) async fn post_unauthed_raw<B: Serialize>(
+    url: &str,
+    body: &B,
+) -> anyhow::Result<(bool, String)> {
+    let resp = http_client().post(url).json(body).send().await?;
+    let status = resp.status();
+    let text = resp.text().await?;
+    Ok((status.is_success(), text))
+}
+
 // ---------- health ----------
 
 pub async fn healthz() -> anyhow::Result<Value> {

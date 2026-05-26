@@ -26,6 +26,7 @@
 pub mod ai;
 pub mod claims;
 pub mod config;
+pub mod device;
 pub mod extractor;
 pub mod keys;
 pub mod layer;

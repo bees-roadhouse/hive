@@ -14,18 +14,24 @@ use axum::Json;
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::auth::extractor::MaybeAuthUser;
 use crate::auth::tokens::{self, AccessTokenParams};
-use crate::auth::{mfa, password, policy::AuthPolicy, store};
+use crate::auth::{device, mfa, password, policy::AuthPolicy, store};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/authorize", post(authorize))
         .route("/token", post(token))
+        // RFC 8628 device grant (Phase 5): start the flow (public) + the
+        // verification surface (authenticated human approves/denies).
+        .route("/device_authorization", post(device_authorization))
+        .route("/device", get(device_lookup))
+        .route("/device/approve", post(device_approve))
 }
 
 /// Client ids that are first-party and skip the consent step (§4.5 Gate 2).
@@ -294,7 +300,13 @@ struct TokenRequest {
     // refresh_token grant:
     #[serde(default)]
     refresh_token: Option<String>,
+    // device_code grant (RFC 8628):
+    #[serde(default)]
+    device_code: Option<String>,
 }
+
+/// The device-code grant type URN (RFC 8628).
+const DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
 #[derive(Debug, Serialize)]
 struct TokenResponse {
@@ -318,7 +330,84 @@ async fn token(
     match req.grant_type.as_str() {
         "authorization_code" => token_auth_code(&state, &req, &pol).await,
         "refresh_token" => token_refresh(&state, &req, &pol).await,
+        DEVICE_CODE_GRANT => token_device_code(&state, &req, &pol).await,
         other => Err(OAuthError::unsupported_grant(other)),
+    }
+}
+
+/// Issue a human session + access/refresh tokens for an authenticated user.
+/// Shared by the auth-code and device-code grants (both end here once the user
+/// is established): create the session (recording amr), mint the access JWT.
+async fn issue_session_tokens(
+    state: &AppState,
+    pol: &AuthPolicy,
+    user_id: uuid::Uuid,
+    client_id: &str,
+    scopes: &[String],
+    amr: &[String],
+) -> Result<Json<TokenResponse>, OAuthError> {
+    let (is_admin, visibility) = user_authz(state, user_id).await?;
+    let session_secs = pol.effective_session_secs(None);
+    let issued = store::create_session(&state.pool, user_id, client_id, scopes, amr, session_secs)
+        .await
+        .map_err(OAuthError::server)?;
+    let access = mint_for_session(
+        state,
+        &user_id.to_string(),
+        scopes,
+        is_admin,
+        &visibility,
+        &issued.session_id.to_string(),
+        pol.access_secs_within(session_secs),
+    )?;
+    Ok(Json(TokenResponse {
+        access_token: access,
+        token_type: "Bearer",
+        expires_in: pol.access_secs_within(session_secs),
+        refresh_token: issued.refresh.raw,
+        scope: scopes.join(" "),
+    }))
+}
+
+/// `/token` device-code grant (RFC 8628 §3.4-3.5). Polls a device authorization
+/// by its device_code and maps the lifecycle to the standard OAuth errors;
+/// `authorization_pending` / `slow_down` / `expired_token` / `access_denied`.
+/// On approval, issues tokens for the approving user (reusing the session mint)
+/// and consumes the device row so the code can't be replayed.
+async fn token_device_code(
+    state: &AppState,
+    req: &TokenRequest,
+    pol: &AuthPolicy,
+) -> Result<Json<TokenResponse>, OAuthError> {
+    let device_code = req
+        .device_code
+        .as_deref()
+        .ok_or_else(|| OAuthError::invalid_request("device_code required"))?;
+
+    use crate::auth::device::{self, PollOutcome};
+    match device::poll(&state.pool, device_code)
+        .await
+        .map_err(OAuthError::server)?
+    {
+        PollOutcome::AuthorizationPending => Err(OAuthError::authorization_pending()),
+        PollOutcome::SlowDown => Err(OAuthError::slow_down()),
+        PollOutcome::ExpiredToken => Err(OAuthError::expired_token()),
+        PollOutcome::AccessDenied => Err(OAuthError::access_denied("authorization denied")),
+        PollOutcome::Unknown => Err(OAuthError::invalid_grant("unknown device_code")),
+        PollOutcome::Approved {
+            device_id,
+            user_id,
+            client_id,
+            scopes,
+            amr,
+        } => {
+            let resp = issue_session_tokens(state, pol, user_id, &client_id, &scopes, &amr).await?;
+            // Single redemption: consume the device row after issuing.
+            device::consume(&state.pool, device_id)
+                .await
+                .map_err(OAuthError::server)?;
+            Ok(resp)
+        }
     }
 }
 
@@ -353,40 +442,17 @@ async fn token_auth_code(
         return Err(OAuthError::invalid_grant("PKCE verification failed"));
     }
 
-    // Fetch the user's authz (is_admin + visibility) for the token claims.
-    let (is_admin, visibility) = user_authz(state, row.user_id).await?;
-
-    let session_secs = pol.effective_session_secs(None);
     // amr was decided at /authorize (pwd, or pwd+otp if MFA was required) and
-    // carried on the auth code; record it on the session (§4).
-    let issued = store::create_session(
-        &state.pool,
+    // carried on the auth code; the shared mint records it on the session (§4).
+    issue_session_tokens(
+        state,
+        pol,
         row.user_id,
         &row.client_id,
         &row.scopes,
         &row.amr,
-        session_secs,
     )
     .await
-    .map_err(OAuthError::server)?;
-
-    let access = mint_for_session(
-        state,
-        &row.user_id.to_string(),
-        &row.scopes,
-        is_admin,
-        &visibility,
-        &issued.session_id.to_string(),
-        pol.access_secs_within(session_secs),
-    )?;
-
-    Ok(Json(TokenResponse {
-        access_token: access,
-        token_type: "Bearer",
-        expires_in: pol.access_secs_within(session_secs),
-        refresh_token: issued.refresh.raw,
-        scope: row.scopes.join(" "),
-    }))
 }
 
 async fn token_refresh(
@@ -479,12 +545,168 @@ fn mint_for_session(
     .map_err(|e| OAuthError::Server(e.to_string()))
 }
 
-/// OAuth-style error response (RFC 6749 §5.2 shape).
+// ---------- device authorization grant (RFC 8628, §3.2) ----------
+
+#[derive(Debug, Deserialize)]
+struct DeviceAuthRequest {
+    #[serde(default = "default_device_client")]
+    client_id: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    resource: Option<String>,
+}
+
+fn default_device_client() -> String {
+    "hive-cli".to_string()
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceAuthResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    verification_uri_complete: String,
+    expires_in: i64,
+    interval: i32,
+}
+
+/// `POST /device_authorization` (RFC 8628 §3.1): a public client (the CLI)
+/// starts the flow. Returns the device_code (polled at /token) + the human
+/// user_code + where to approve it. No auth required — approval is the gate.
+async fn device_authorization(
+    State(state): State<AppState>,
+    Json(req): Json<DeviceAuthRequest>,
+) -> Result<Json<DeviceAuthResponse>, OAuthError> {
+    let scopes: Vec<String> = req
+        .scope
+        .as_deref()
+        .map(|s| s.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default();
+
+    let created = device::create(
+        &state.pool,
+        &req.client_id,
+        &scopes,
+        req.resource.as_deref(),
+    )
+    .await
+    .map_err(OAuthError::server)?;
+
+    let issuer = state.auth.config().issuer.trim_end_matches('/').to_string();
+    let verification_uri = format!("{issuer}/device");
+    let verification_uri_complete = format!("{verification_uri}?user_code={}", created.user_code);
+
+    Ok(Json(DeviceAuthResponse {
+        device_code: created.device_code,
+        user_code: created.user_code,
+        verification_uri,
+        verification_uri_complete,
+        expires_in: created.expires_in,
+        interval: created.interval_secs,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceLookupQuery {
+    user_code: String,
+}
+
+/// `GET /device?user_code=...` : the verification surface looks up a pending
+/// device by its user_code so the approval UI can show what's being authorized.
+/// (The browser login/consent chrome is hive-ui's; this returns the facts.)
+async fn device_lookup(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<DeviceLookupQuery>,
+) -> Result<Json<Value>, OAuthError> {
+    let found = device::find_by_user_code(&state.pool, &q.user_code)
+        .await
+        .map_err(OAuthError::server)?
+        .ok_or_else(|| OAuthError::invalid_grant("unknown user_code"))?;
+    Ok(Json(json!({
+        "client_id": found.client_id,
+        "scopes": found.scopes,
+        "status": found.status,
+        "expired": found.expired,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceApproveRequest {
+    user_code: String,
+    /// true = approve, false = deny.
+    #[serde(default = "default_true_approve")]
+    approve: bool,
+}
+
+fn default_true_approve() -> bool {
+    true
+}
+
+/// `POST /device/approve` (RFC 8628 §3.3): an AUTHENTICATED human approves (or
+/// denies) a device by user_code, binding it to themselves. Their own session
+/// already satisfied MFA, so the device inherits that assurance (amr carried
+/// from the human's token). An AI/dev principal can't approve a device for a
+/// human account.
+async fn device_approve(
+    State(state): State<AppState>,
+    auth: MaybeAuthUser,
+    Json(req): Json<DeviceApproveRequest>,
+) -> Result<Json<Value>, OAuthError> {
+    let principal = auth
+        .0
+        .ok_or_else(|| OAuthError::AccessDenied("authentication required to approve".into()))?;
+    if principal.kind != crate::auth::claims::PrincipalType::Human {
+        return Err(OAuthError::AccessDenied(
+            "only a human account can approve a device".into(),
+        ));
+    }
+    let user_id = principal
+        .subject
+        .parse::<uuid::Uuid>()
+        .map_err(|_| OAuthError::AccessDenied("invalid principal".into()))?;
+
+    if !req.approve {
+        let denied = device::deny(&state.pool, &req.user_code)
+            .await
+            .map_err(OAuthError::server)?;
+        if !denied {
+            return Err(OAuthError::invalid_grant(
+                "no pending device for that user_code",
+            ));
+        }
+        return Ok(Json(json!({ "status": "denied" })));
+    }
+
+    // The device inherits the approving human's auth methods. The human reached
+    // this authenticated endpoint, so they completed password (+MFA if enrolled);
+    // record amr=["pwd"] (the device grant doesn't itself add a second factor —
+    // the human's session is the assurance).
+    let amr = vec!["pwd".to_string()];
+    let approved = device::approve(&state.pool, &req.user_code, user_id, &amr)
+        .await
+        .map_err(OAuthError::server)?;
+    if !approved {
+        return Err(OAuthError::invalid_grant(
+            "no pending device for that user_code (already used or expired?)",
+        ));
+    }
+    Ok(Json(json!({ "status": "approved" })))
+}
+
+/// OAuth-style error response (RFC 6749 §5.2 shape; device-grant codes per
+/// RFC 8628 §3.5).
 enum OAuthError {
     InvalidRequest(String),
     InvalidGrant(String),
     UnsupportedGrantType(String),
     AccessDenied(String),
+    /// RFC 8628: the user hasn't approved the device yet — client keeps polling.
+    AuthorizationPending,
+    /// RFC 8628: the client is polling faster than `interval` — back off.
+    SlowDown,
+    /// RFC 8628: the device_code expired — client stops.
+    ExpiredToken,
     Server(String),
 }
 
@@ -501,6 +723,15 @@ impl OAuthError {
     fn access_denied(m: &str) -> Self {
         OAuthError::AccessDenied(m.to_string())
     }
+    fn authorization_pending() -> Self {
+        OAuthError::AuthorizationPending
+    }
+    fn slow_down() -> Self {
+        OAuthError::SlowDown
+    }
+    fn expired_token() -> Self {
+        OAuthError::ExpiredToken
+    }
     fn server(e: impl std::fmt::Display) -> Self {
         OAuthError::Server(e.to_string())
     }
@@ -515,6 +746,23 @@ impl axum::response::IntoResponse for OAuthError {
                 (StatusCode::BAD_REQUEST, "unsupported_grant_type", m)
             }
             OAuthError::AccessDenied(m) => (StatusCode::UNAUTHORIZED, "access_denied", m),
+            // RFC 8628 §3.5: these are HTTP 400 with the OAuth error code; the
+            // polling client branches on the code, not the HTTP status.
+            OAuthError::AuthorizationPending => (
+                StatusCode::BAD_REQUEST,
+                "authorization_pending",
+                "the authorization request is still pending".to_string(),
+            ),
+            OAuthError::SlowDown => (
+                StatusCode::BAD_REQUEST,
+                "slow_down",
+                "polling too frequently; increase the interval".to_string(),
+            ),
+            OAuthError::ExpiredToken => (
+                StatusCode::BAD_REQUEST,
+                "expired_token",
+                "the device_code has expired".to_string(),
+            ),
             OAuthError::Server(m) => {
                 tracing::error!(error = %m, "oauth server error");
                 (
