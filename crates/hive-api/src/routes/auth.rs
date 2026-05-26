@@ -48,10 +48,13 @@ async fn as_metadata(State(state): State<AppState>) -> Json<Value> {
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
         "id_token_signing_alg_values_supported": ["EdDSA"],
-        // Phase marker: authorize+token live (Phase 2), client tokens + enforce
-        // reachable (Phase 3), AI identities + MCP token issuance + the RFC 9728
-        // protected-resource seam (Phase 6). device_authorization + register
-        // remain advertised-but-not-yet-implemented until Phase 5.
-        "x_hive_phase": 6
+        // Phase marker: the 9-phase auth plan is complete. authorize+token
+        // (Phase 2), client tokens + enforce-reachable (Phase 3), TOTP MFA
+        // (Phase 4), device grant (Phase 5, LIVE), AI/MCP identities + tokens +
+        // RFC 9728 (Phase 6), risk rotation (Phase 7), RLS (Phase 8), and the
+        // external-IdP federation seam (Phase 9). `register` (DCR) is the one
+        // advertised-but-deferred endpoint. Federation is a seam — external
+        // auth_mode/authz_mode are inert until a provider adapter is wired.
+        "x_hive_phase": 9
     }))
 }

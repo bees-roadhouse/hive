@@ -33,9 +33,58 @@ impl MfaMode {
     }
 }
 
+/// Where AUTHENTICATION comes from (§6). `builtin` = hive's own AS verifies
+/// password/MFA + issues tokens (today). `external` = an external OIDC IdP is
+/// the AS; hive validates the IdP's tokens. Phase 9 lands the switch + the seam;
+/// `external` is INERT until a provider adapter is wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMode {
+    Builtin,
+    External,
+}
+
+impl AuthMode {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            // accept both the design's name and the lead's alias
+            "builtin" | "internal" => Some(AuthMode::Builtin),
+            "external" => Some(AuthMode::External),
+            _ => None,
+        }
+    }
+
+    pub fn is_external(&self) -> bool {
+        matches!(self, AuthMode::External)
+    }
+}
+
+/// Where AUTHORIZATION (roles/scopes) comes from (§6.1). `internal` = hive's own
+/// grant tables (today). `external` = the IdP's claims, mapped through
+/// `idp_permission_map`. Parallel to `auth_mode`; `external` is INERT until the
+/// map is populated (empty map = deny-by-default, fails closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthzMode {
+    Internal,
+    External,
+}
+
+impl AuthzMode {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "internal" => Some(AuthzMode::Internal),
+            "external" => Some(AuthzMode::External),
+            _ => None,
+        }
+    }
+
+    pub fn is_external(&self) -> bool {
+        matches!(self, AuthzMode::External)
+    }
+}
+
 /// The policy row (seeded by migration 0005). Phase 2 reads the session +
-/// password fields; Phase 4 reads `mfa_mode`. `auth_mode`/`authz_mode` remain
-/// for Phase 9.
+/// password fields; Phase 4 reads `mfa_mode`; Phase 9 reads `auth_mode` +
+/// `authz_mode`.
 #[derive(Debug, Clone)]
 pub struct AuthPolicy {
     pub global_default_session_secs: i64,
@@ -43,30 +92,45 @@ pub struct AuthPolicy {
     pub access_token_secs: i64,
     pub password_min_length: i64,
     pub mfa_mode: MfaMode,
+    pub auth_mode: AuthMode,
+    pub authz_mode: AuthzMode,
 }
 
 impl AuthPolicy {
     pub async fn load(pool: &PgPool) -> Result<Self, hive_db::Error> {
-        let row = sqlx::query_as::<_, (i32, i32, i32, i32, String)>(
+        let row = sqlx::query_as::<_, (i32, i32, i32, i32, String, String, String)>(
             "SELECT global_default_session_secs, global_max_session_secs, \
-             access_token_secs, password_min_length, mfa_mode FROM auth_policy WHERE id = 1",
+             access_token_secs, password_min_length, mfa_mode, auth_mode, authz_mode \
+             FROM auth_policy WHERE id = 1",
         )
         .fetch_one(pool)
         .await?;
-        // HIVE_MFA_MODE env overrides the stored row when set, so an operator can
-        // flip to delegated/off (e.g. when an external IdP is wired) without a DB
-        // write. Falls back to the stored policy, then to internal.
+        // Env overrides let an operator flip modes without a DB write when an
+        // external IdP is wired. Each falls back to the stored row, then a safe
+        // default (builtin/internal).
         let mfa_mode = std::env::var("HIVE_MFA_MODE")
             .ok()
             .and_then(|s| MfaMode::parse(&s))
             .or_else(|| MfaMode::parse(&row.4))
             .unwrap_or(MfaMode::Internal);
+        let auth_mode = std::env::var("HIVE_AUTH_MODE")
+            .ok()
+            .and_then(|s| AuthMode::parse(&s))
+            .or_else(|| AuthMode::parse(&row.5))
+            .unwrap_or(AuthMode::Builtin);
+        let authz_mode = std::env::var("HIVE_AUTHZ_MODE")
+            .ok()
+            .and_then(|s| AuthzMode::parse(&s))
+            .or_else(|| AuthzMode::parse(&row.6))
+            .unwrap_or(AuthzMode::Internal);
         Ok(AuthPolicy {
             global_default_session_secs: row.0 as i64,
             global_max_session_secs: row.1 as i64,
             access_token_secs: row.2 as i64,
             password_min_length: row.3 as i64,
             mfa_mode,
+            auth_mode,
+            authz_mode,
         })
     }
 
@@ -97,6 +161,8 @@ mod tests {
             access_token_secs: 600,             // 10m
             password_min_length: 14,
             mfa_mode: MfaMode::Internal,
+            auth_mode: AuthMode::Builtin,
+            authz_mode: AuthzMode::Internal,
         }
     }
 
@@ -109,6 +175,23 @@ mod tests {
         assert!(MfaMode::Internal.enforces_internal());
         assert!(!MfaMode::Delegated.enforces_internal());
         assert!(!MfaMode::Off.enforces_internal());
+    }
+
+    #[test]
+    fn auth_and_authz_mode_parse() {
+        // auth_mode accepts the design name + the lead's alias.
+        assert_eq!(AuthMode::parse("builtin"), Some(AuthMode::Builtin));
+        assert_eq!(AuthMode::parse("internal"), Some(AuthMode::Builtin));
+        assert_eq!(AuthMode::parse("EXTERNAL"), Some(AuthMode::External));
+        assert_eq!(AuthMode::parse("bogus"), None);
+        assert!(AuthMode::External.is_external());
+        assert!(!AuthMode::Builtin.is_external());
+
+        assert_eq!(AuthzMode::parse("internal"), Some(AuthzMode::Internal));
+        assert_eq!(AuthzMode::parse("external"), Some(AuthzMode::External));
+        assert_eq!(AuthzMode::parse("bogus"), None);
+        assert!(AuthzMode::External.is_external());
+        assert!(!AuthzMode::Internal.is_external());
     }
 
     #[test]
