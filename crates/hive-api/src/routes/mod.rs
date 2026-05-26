@@ -1,9 +1,11 @@
+pub mod ai;
 pub mod auth;
 pub mod events;
 pub mod graph;
 pub mod health;
 pub mod journal;
 pub mod links;
+pub mod mcp;
 pub mod messages;
 pub mod notes;
 pub mod oauth;

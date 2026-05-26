@@ -48,8 +48,10 @@ async fn as_metadata(State(state): State<AppState>) -> Json<Value> {
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
         "id_token_signing_alg_values_supported": ["EdDSA"],
-        // Phase marker: authorize+token live; device_authorization + register
-        // are advertised-but-not-yet-implemented until Phase 5/6.
-        "x_hive_phase": 2
+        // Phase marker: authorize+token live (Phase 2), client tokens + enforce
+        // reachable (Phase 3), AI identities + MCP token issuance + the RFC 9728
+        // protected-resource seam (Phase 6). device_authorization + register
+        // remain advertised-but-not-yet-implemented until Phase 5.
+        "x_hive_phase": 6
     }))
 }
