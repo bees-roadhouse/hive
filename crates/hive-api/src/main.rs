@@ -148,6 +148,9 @@ async fn main() -> anyhow::Result<()> {
         // surface, and the MCP protected-resource seam (RFC 9728).
         .merge(routes::ai::router())
         .merge(routes::mcp::router())
+        // Phase 4: TOTP MFA enrollment + management (login second-factor check
+        // lives in the /authorize flow).
+        .merge(routes::mfa::router())
         .with_state(state)
         // Auth layer: resolves each request to a Principal (dev-bypass or JWT)
         // and stashes it for the AuthUser extractor. Warn-only in Phase 1.

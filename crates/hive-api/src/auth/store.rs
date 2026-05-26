@@ -55,6 +55,26 @@ pub async fn find_user_by_username(
     }))
 }
 
+/// Look up an active user by id (MFA enrollment needs the username for the
+/// otpauth:// label). Returns the same shape as the username lookup.
+pub async fn find_user_by_id(pool: &PgPool, id: Uuid) -> Result<Option<User>, StoreError> {
+    let row = sqlx::query_as::<_, (Uuid, String, bool, Vec<String>, Option<i32>, String)>(
+        "SELECT id, username, is_admin, granted_scopes, session_lifetime_secs, status \
+         FROM users WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| User {
+        id: r.0,
+        username: r.1,
+        is_admin: r.2,
+        granted_scopes: r.3,
+        session_lifetime_secs: r.4.map(|v| v as i64),
+        status: r.5,
+    }))
+}
+
 /// Fetch the argon2id PHC string for a user, if they have a password credential.
 pub async fn password_hash_for(pool: &PgPool, user_id: Uuid) -> Result<Option<String>, StoreError> {
     let row = sqlx::query_as::<_, (String,)>(
@@ -114,13 +134,16 @@ pub struct NewAuthCode<'a> {
     pub scopes: &'a [String],
     pub resource: Option<&'a str>,
     pub expires_at: DateTime<Utc>,
+    /// Auth methods established at /authorize (e.g. ["pwd"] or ["pwd","otp"]),
+    /// carried through to the session + token (§4).
+    pub amr: &'a [String],
 }
 
 pub async fn insert_auth_code(pool: &PgPool, c: &NewAuthCode<'_>) -> Result<(), StoreError> {
     sqlx::query(
         "INSERT INTO authorization_codes \
-         (code, client_id, user_id, redirect_uri, code_challenge, scopes, resource, expires_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+         (code, client_id, user_id, redirect_uri, code_challenge, scopes, resource, expires_at, amr) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
     )
     .bind(c.code)
     .bind(c.client_id)
@@ -130,6 +153,7 @@ pub async fn insert_auth_code(pool: &PgPool, c: &NewAuthCode<'_>) -> Result<(), 
     .bind(c.scopes)
     .bind(c.resource)
     .bind(c.expires_at)
+    .bind(c.amr)
     .execute(pool)
     .await?;
     Ok(())
@@ -143,6 +167,7 @@ pub struct AuthCodeRow {
     pub code_challenge: String,
     pub scopes: Vec<String>,
     pub expires_at: DateTime<Utc>,
+    pub amr: Vec<String>,
 }
 
 /// Atomically consume (delete + return) an authorization code. Single-use:
@@ -151,9 +176,20 @@ pub async fn consume_auth_code(
     pool: &PgPool,
     code: &str,
 ) -> Result<Option<AuthCodeRow>, StoreError> {
-    let row = sqlx::query_as::<_, (String, Uuid, String, String, Vec<String>, DateTime<Utc>)>(
+    let row = sqlx::query_as::<
+        _,
+        (
+            String,
+            Uuid,
+            String,
+            String,
+            Vec<String>,
+            DateTime<Utc>,
+            Vec<String>,
+        ),
+    >(
         "DELETE FROM authorization_codes WHERE code = $1 \
-         RETURNING client_id, user_id, redirect_uri, code_challenge, scopes, expires_at",
+             RETURNING client_id, user_id, redirect_uri, code_challenge, scopes, expires_at, amr",
     )
     .bind(code)
     .fetch_optional(pool)
@@ -165,6 +201,7 @@ pub async fn consume_auth_code(
         code_challenge: r.3,
         scopes: r.4,
         expires_at: r.5,
+        amr: r.6,
     }))
 }
 

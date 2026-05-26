@@ -29,12 +29,14 @@ pub mod config;
 pub mod extractor;
 pub mod keys;
 pub mod layer;
+pub mod mfa;
 pub mod password;
 pub mod policy;
 pub mod resolve;
 pub mod revocation;
 pub mod store;
 pub mod tokens;
+pub mod totp;
 
 #[cfg(feature = "dev")]
 pub mod dev;

@@ -5,29 +5,68 @@
 
 use hive_db::PgPool;
 
+/// The MFA enforcement mode (§4). `internal` = hive prompts for TOTP;
+/// `delegated` = an external IdP owns MFA (don't prompt); `off` = no second
+/// factor (dev / single-user only). The seam that lets "external IdP present →
+/// internal MFA off" be a config flip, not a code change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MfaMode {
+    Internal,
+    Delegated,
+    Off,
+}
+
+impl MfaMode {
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "internal" => Some(MfaMode::Internal),
+            "delegated" => Some(MfaMode::Delegated),
+            "off" => Some(MfaMode::Off),
+            _ => None,
+        }
+    }
+
+    /// Does hive enforce its own TOTP second factor at login? Only `internal`;
+    /// `delegated` (IdP owns MFA) and `off` skip it.
+    pub fn enforces_internal(&self) -> bool {
+        matches!(self, MfaMode::Internal)
+    }
+}
+
 /// The policy row (seeded by migration 0005). Phase 2 reads the session +
-/// password fields; the mode fields are carried for Phase 4/9.
+/// password fields; Phase 4 reads `mfa_mode`. `auth_mode`/`authz_mode` remain
+/// for Phase 9.
 #[derive(Debug, Clone)]
 pub struct AuthPolicy {
     pub global_default_session_secs: i64,
     pub global_max_session_secs: i64,
     pub access_token_secs: i64,
     pub password_min_length: i64,
+    pub mfa_mode: MfaMode,
 }
 
 impl AuthPolicy {
     pub async fn load(pool: &PgPool) -> Result<Self, hive_db::Error> {
-        let row = sqlx::query_as::<_, (i32, i32, i32, i32)>(
+        let row = sqlx::query_as::<_, (i32, i32, i32, i32, String)>(
             "SELECT global_default_session_secs, global_max_session_secs, \
-             access_token_secs, password_min_length FROM auth_policy WHERE id = 1",
+             access_token_secs, password_min_length, mfa_mode FROM auth_policy WHERE id = 1",
         )
         .fetch_one(pool)
         .await?;
+        // HIVE_MFA_MODE env overrides the stored row when set, so an operator can
+        // flip to delegated/off (e.g. when an external IdP is wired) without a DB
+        // write. Falls back to the stored policy, then to internal.
+        let mfa_mode = std::env::var("HIVE_MFA_MODE")
+            .ok()
+            .and_then(|s| MfaMode::parse(&s))
+            .or_else(|| MfaMode::parse(&row.4))
+            .unwrap_or(MfaMode::Internal);
         Ok(AuthPolicy {
             global_default_session_secs: row.0 as i64,
             global_max_session_secs: row.1 as i64,
             access_token_secs: row.2 as i64,
             password_min_length: row.3 as i64,
+            mfa_mode,
         })
     }
 
@@ -57,7 +96,19 @@ mod tests {
             global_max_session_secs: 86400,     // 24h
             access_token_secs: 600,             // 10m
             password_min_length: 14,
+            mfa_mode: MfaMode::Internal,
         }
+    }
+
+    #[test]
+    fn mfa_mode_parse_and_enforce() {
+        assert_eq!(MfaMode::parse("internal"), Some(MfaMode::Internal));
+        assert_eq!(MfaMode::parse("DELEGATED"), Some(MfaMode::Delegated));
+        assert_eq!(MfaMode::parse("off"), Some(MfaMode::Off));
+        assert_eq!(MfaMode::parse("bogus"), None);
+        assert!(MfaMode::Internal.enforces_internal());
+        assert!(!MfaMode::Delegated.enforces_internal());
+        assert!(!MfaMode::Off.enforces_internal());
     }
 
     #[test]
