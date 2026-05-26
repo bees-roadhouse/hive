@@ -55,3 +55,11 @@ impl From<hive_db::Error> for ApiError {
         }
     }
 }
+
+/// The auth store error (incl. the Phase-8 RLS GUC plumbing) folds to Internal —
+/// a SET LOCAL / txn failure is a server fault, not a client one.
+impl From<crate::auth::store::StoreError> for ApiError {
+    fn from(e: crate::auth::store::StoreError) -> Self {
+        ApiError::Internal(e.to_string())
+    }
+}

@@ -56,6 +56,17 @@ pub async fn require(pool: &PgPool, id: Uuid) -> Result<JournalEntry> {
 }
 
 pub async fn list(pool: &PgPool, filters: &ListFilters) -> Result<Vec<JournalEntry>> {
+    list_in(pool, filters).await
+}
+
+/// `list`, but against any executor — a `&PgPool` or a `&mut Transaction`. The
+/// transaction form lets the caller run the query under per-request RLS GUCs
+/// (Phase 8, §5.6) on the same connection the `SET LOCAL` was issued on. Behaves
+/// identically to `list` when handed a pool.
+pub async fn list_in<'e, E>(executor: E, filters: &ListFilters) -> Result<Vec<JournalEntry>>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(format!(
         "SELECT {SELECT_COLS} FROM journal_entries WHERE 1=1"
     ));
@@ -77,6 +88,9 @@ pub async fn list(pool: &PgPool, filters: &ListFilters) -> Result<Vec<JournalEnt
         qb.push(" LIMIT ").push_bind(l);
     }
 
-    let rows = qb.build_query_as::<JournalEntry>().fetch_all(pool).await?;
+    let rows = qb
+        .build_query_as::<JournalEntry>()
+        .fetch_all(executor)
+        .await?;
     Ok(rows)
 }

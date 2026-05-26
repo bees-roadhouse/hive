@@ -8,6 +8,7 @@ use uuid::Uuid;
 use hive_db::enums::Ai;
 use hive_db::queries::{journal, search};
 
+use crate::auth::extractor::MaybeAuthUser;
 use crate::error::ApiError;
 use crate::state::{AppState, HiveEvent};
 
@@ -29,6 +30,7 @@ struct ListQuery {
 
 async fn list(
     State(state): State<AppState>,
+    auth: MaybeAuthUser,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Vec<hive_db::types::JournalEntry>>, ApiError> {
     let filters = journal::ListFilters {
@@ -38,7 +40,16 @@ async fn list(
         tag: q.tag,
         limit: q.limit,
     };
-    let rows = journal::list(&state.pool, &filters).await?;
+    // Phase 8 (§5.6): run the read inside an RLS-armed transaction so the
+    // per-request `app.*` GUCs (visibility + handles for the resolved principal)
+    // land on the same connection. Shadow-safe: with HIVE_RLS_ENFORCE off (or no
+    // principal), the DB policies default-allow and this is behaviorally
+    // identical to the prior `journal::list(&pool, ..)` call.
+    let mut tx = state.rls_begin(auth.0.as_ref()).await?;
+    let rows = journal::list_in(&mut *tx, &filters).await?;
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(Json(rows))
 }
 
