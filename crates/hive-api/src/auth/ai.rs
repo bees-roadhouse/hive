@@ -201,6 +201,27 @@ pub struct IssuedMcpSession {
     pub jti: Uuid,
 }
 
+/// Locate the live (non-revoked) mcp_ai session for an (AI subject, connecting
+/// human) pair — what the risk engine (Phase 7, §5.7) keys a use to. Returns
+/// (session_id, jti). Picks the most recent if more than one is live.
+pub async fn find_live_session(
+    pool: &PgPool,
+    ai_id: Uuid,
+    act_user_id: Uuid,
+) -> Result<Option<(Uuid, Option<Uuid>)>, StoreError> {
+    let row = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
+        "SELECT id, jti FROM sessions \
+         WHERE kind = 'mcp_ai' AND ai_id = $1 AND act_user_id = $2 AND revoked_at IS NULL \
+           AND (expires_at IS NULL OR expires_at > now()) \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(ai_id)
+    .bind(act_user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 /// Create an `mcp_ai` session row for a freshly issued MCP token. `expires_at`
 /// is `None` for the non-expiring class (the default). Records the issuing jti
 /// so revocation by session can find it.

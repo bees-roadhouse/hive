@@ -35,6 +35,7 @@ pub mod password;
 pub mod policy;
 pub mod resolve;
 pub mod revocation;
+pub mod risk;
 pub mod store;
 pub mod tokens;
 pub mod totp;
