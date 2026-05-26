@@ -38,6 +38,11 @@ base64 = { workspace = true }
 argon2 = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
+# Auth (Phase 4): RFC 6238 TOTP via hmac-sha1, at-rest secret encryption, base32.
+hmac = { workspace = true }
+sha1 = { workspace = true }
+base32 = { workspace = true }
+chacha20poly1305 = { workspace = true }
 # Direct DB access for the auth tables (signing_keys now; users/sessions in
 # Phase 2+). hive-db owns the shared schema + migrations; hive-api queries it.
 sqlx = { workspace = true }

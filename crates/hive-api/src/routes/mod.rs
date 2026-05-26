@@ -7,6 +7,7 @@ pub mod journal;
 pub mod links;
 pub mod mcp;
 pub mod messages;
+pub mod mfa;
 pub mod notes;
 pub mod oauth;
 pub mod projects;

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::auth::tokens::{self, AccessTokenParams};
-use crate::auth::{password, policy::AuthPolicy, store};
+use crate::auth::{mfa, password, policy::AuthPolicy, store};
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
@@ -50,17 +50,34 @@ struct AuthorizeRequest {
     /// Consent decision for non-first-party clients. First-party skips this.
     #[serde(default)]
     consent: Option<bool>,
+    /// Second factor (§4): a 6-digit TOTP code. Present on the second leg of the
+    /// two-step login, after a first leg returned `mfa_required`.
+    #[serde(default)]
+    mfa_code: Option<String>,
+    /// Alternatively, a single-use recovery code in place of the TOTP.
+    #[serde(default)]
+    recovery_code: Option<String>,
 }
 
 fn default_challenge_method() -> String {
     "S256".to_string()
 }
 
+/// `/authorize` returns either the authorization code (auth complete) or — when
+/// the user has MFA and didn't present a valid second factor — an
+/// `mfa_required` challenge telling the client to re-submit with a code (§4).
 #[derive(Debug, Serialize)]
-struct AuthorizeResponse {
-    code: String,
-    /// Echoed so the (future browser) client can match its redirect.
-    redirect_uri: String,
+#[serde(untagged)]
+enum AuthorizeResponse {
+    Code {
+        code: String,
+        /// Echoed so the (future browser) client can match its redirect.
+        redirect_uri: String,
+    },
+    MfaRequired {
+        mfa_required: bool,
+        methods: Vec<&'static str>,
+    },
 }
 
 /// `/authorize`: authenticate the user (argon2id), apply consent, and issue a
@@ -101,6 +118,21 @@ async fn authorize(
         return Err(OAuthError::access_denied("consent required"));
     }
 
+    // Second factor (§4): the password is leg one. If the policy enforces
+    // internal MFA AND this user has a CONFIRMED TOTP credential, require a
+    // valid second factor before issuing the code. Returns the resolved amr
+    // (["pwd"] or ["pwd","otp"]). The two-step is: no code → mfa_required
+    // challenge; valid code → proceed.
+    let amr = match resolve_second_factor(&state, &user, &req).await? {
+        SecondFactor::Proceed(amr) => amr,
+        SecondFactor::Required => {
+            return Ok(Json(AuthorizeResponse::MfaRequired {
+                mfa_required: true,
+                methods: vec!["totp", "recovery_code"],
+            }));
+        }
+    };
+
     // Scopes: intersect the requested scopes with what the user is granted.
     // (Wildcard-granted users get whatever they ask for.)
     let requested: Vec<String> = req
@@ -124,15 +156,116 @@ async fn authorize(
             scopes: &granted,
             resource: req.resource.as_deref(),
             expires_at,
+            amr: &amr,
         },
     )
     .await
     .map_err(OAuthError::server)?;
 
-    Ok(Json(AuthorizeResponse {
+    Ok(Json(AuthorizeResponse::Code {
         code,
         redirect_uri: req.redirect_uri,
     }))
+}
+
+/// Outcome of the second-factor decision.
+enum SecondFactor {
+    /// MFA not required (or just satisfied); proceed with these auth methods.
+    Proceed(Vec<String>),
+    /// MFA required but no valid factor presented yet — challenge the client.
+    Required,
+}
+
+/// The login state machine's MFA branch (§4), kept in one place so the decision
+/// isn't scattered. Returns Proceed(["pwd"]) when MFA doesn't apply,
+/// Proceed(["pwd","otp"]) when a valid second factor was presented, or Required
+/// when the user must supply one. A *wrong* factor is an error (access_denied),
+/// rate-limited + lockout-aware.
+async fn resolve_second_factor(
+    state: &AppState,
+    user: &store::User,
+    req: &AuthorizeRequest,
+) -> Result<SecondFactor, OAuthError> {
+    let pol = AuthPolicy::load(&state.pool)
+        .await
+        .map_err(OAuthError::server)?;
+
+    // delegated (IdP owns MFA) / off → hive doesn't prompt. One branch.
+    if !pol.mfa_mode.enforces_internal() {
+        if matches!(pol.mfa_mode, crate::auth::policy::MfaMode::Off) {
+            tracing::warn!(user = %user.username, "HIVE_MFA_MODE=off — second factor skipped");
+        }
+        return Ok(SecondFactor::Proceed(vec!["pwd".to_string()]));
+    }
+
+    let cred = mfa::get_credential(&state.pool, user.id)
+        .await
+        .map_err(OAuthError::server)?;
+    let Some(cred) = cred.filter(|c| c.is_confirmed()) else {
+        // No confirmed credential => MFA doesn't gate this user (yet).
+        return Ok(SecondFactor::Proceed(vec!["pwd".to_string()]));
+    };
+
+    // A factor must be presented. None yet → challenge.
+    let presented_totp = req
+        .mfa_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let presented_recovery = req
+        .recovery_code
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if presented_totp.is_none() && presented_recovery.is_none() {
+        return Ok(SecondFactor::Required);
+    }
+
+    // Locked out from too many failures?
+    if cred.is_locked() {
+        return Err(OAuthError::access_denied(
+            "too many failed codes; try again later",
+        ));
+    }
+
+    // Recovery code path (single-use), else TOTP.
+    if let Some(rc) = presented_recovery {
+        let ok = mfa::redeem_recovery_code(&state.pool, user.id, rc)
+            .await
+            .map_err(OAuthError::server)?;
+        if ok {
+            let _ = mfa::record_success(&state.pool, user.id).await;
+            return Ok(SecondFactor::Proceed(vec![
+                "pwd".to_string(),
+                "otp".to_string(),
+            ]));
+        }
+        let _ = mfa::record_failure(&state.pool, user.id).await;
+        return Err(OAuthError::access_denied("invalid recovery code"));
+    }
+
+    let code = presented_totp.unwrap();
+    let secret = crate::auth::totp::decrypt_secret(&cred.secret_enc)
+        .map_err(|e| OAuthError::Server(e.to_string()))?;
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    if crate::auth::totp::verify(&secret, code, now) {
+        let _ = mfa::record_success(&state.pool, user.id).await;
+        Ok(SecondFactor::Proceed(vec![
+            "pwd".to_string(),
+            "otp".to_string(),
+        ]))
+    } else {
+        let locked = mfa::record_failure(&state.pool, user.id)
+            .await
+            .map_err(OAuthError::server)?;
+        if locked {
+            Err(OAuthError::access_denied(
+                "invalid code; account temporarily locked",
+            ))
+        } else {
+            Err(OAuthError::access_denied("invalid code"))
+        }
+    }
 }
 
 /// Intersect requested scopes with the user's granted set. A user granted `*`
@@ -224,12 +357,14 @@ async fn token_auth_code(
     let (is_admin, visibility) = user_authz(state, row.user_id).await?;
 
     let session_secs = pol.effective_session_secs(None);
+    // amr was decided at /authorize (pwd, or pwd+otp if MFA was required) and
+    // carried on the auth code; record it on the session (§4).
     let issued = store::create_session(
         &state.pool,
         row.user_id,
         &row.client_id,
         &row.scopes,
-        &["pwd".to_string()],
+        &row.amr,
         session_secs,
     )
     .await
