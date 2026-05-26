@@ -28,6 +28,7 @@ pub mod claims;
 pub mod config;
 pub mod device;
 pub mod extractor;
+pub mod federation;
 pub mod keys;
 pub mod layer;
 pub mod mfa;

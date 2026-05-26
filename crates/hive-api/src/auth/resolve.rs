@@ -47,6 +47,48 @@ pub fn resolve_permissions(claims: &Claims) -> ResolvedPermissions {
     }
 }
 
+/// The mode-aware chokepoint (Phase 9, §6.1). This is the single place that
+/// decides whether authority comes from hive's own baked claims (internal) or an
+/// external IdP's claims via `idp_permission_map` (external). It does NOT
+/// duplicate the internal logic — it delegates to `resolve_permissions` for the
+/// internal branch and to `federation::resolve_external` for the external one.
+///
+/// External is INERT until a provider is wired: with `authz_mode = external` but
+/// an empty map (and a builtin token carrying no IdP role claim), the external
+/// resolver denies — fails closed. dev principals always short-circuit to no-
+/// authority here too (a forged dev JWT gains nothing) regardless of mode.
+pub async fn resolve_permissions_mode_aware(
+    pool: &hive_db::PgPool,
+    authz_mode: super::policy::AuthzMode,
+    claims: &Claims,
+) -> ResolvedPermissions {
+    // dev type never gains authority via a real JWT, in either mode.
+    if claims.principal_kind() == PrincipalType::Dev {
+        return ResolvedPermissions::none();
+    }
+
+    if super::federation::use_external_authz(authz_mode) {
+        // External authZ (§6.1): map the token's IdP role/group claim through
+        // idp_permission_map. `provider`/`claim` come from the token's issuer
+        // context; Phase 9 reads them generically (a builtin token yields no
+        // claim values, so this denies — correct, it isn't an IdP token).
+        let provider = "external";
+        let claim = "groups";
+        let values = super::federation::external_claim_values(claims, claim);
+        match super::federation::resolve_external(pool, provider, claim, &values).await {
+            Ok(perms) => perms,
+            Err(e) => {
+                // A map-lookup failure must not silently widen access — deny.
+                tracing::warn!(error = %e, "external authz resolution failed; denying");
+                ResolvedPermissions::none()
+            }
+        }
+    } else {
+        // Internal: today's path, unchanged.
+        resolve_permissions(claims)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
