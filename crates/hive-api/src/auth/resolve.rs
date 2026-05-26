@@ -21,10 +21,13 @@ use super::claims::{Claims, PrincipalType, ResolvedPermissions};
 ///   `hive_admin`, `hive_visibility`). The AS read the user's record once at
 ///   mint time and baked the resolved permissions in (§6.1), so the RS stays
 ///   stateless — no per-request DB hit.
-/// - AI principals still resolve to deny-by-default until Phase 6 lands
-///   `ai_access_grants` + the per-AI intersection. Safe under warn-only; once
-///   enforce flips (Phase 3) only humans + dev can act, which is correct for
-///   Phase 2 (no AI issuance exists yet).
+/// - AI principals (Phase 6) resolve from the token's baked claims too. The AS
+///   computed the **intersection** (the grant ∩ the connecting human's own
+///   permissions, §3.4) at mint time and baked the result into `scope` /
+///   `hive_visibility`, so the RS rebuilds it statelessly here — same as the
+///   human path. The intersection ceiling lives at issue time; RLS (Phase 8)
+///   re-enforces it at query time. `hive_admin` is never set on an AI token
+///   (mint forces it false), so even a baked-admin claim can't elevate an AI.
 ///
 /// Phase 9 adds the `external` (IdP-claim) branch behind `auth_policy.authz_mode`;
 /// because everything reads this one function's output, that's a local change.
@@ -34,8 +37,13 @@ pub fn resolve_permissions(claims: &Claims) -> ResolvedPermissions {
         PrincipalType::Dev => ResolvedPermissions::none(),
         // Humans: trust the AS-baked claims (resolved once at mint).
         PrincipalType::Human => ResolvedPermissions::from_claims(claims),
-        // AI: deny until Phase 6 (ai_access_grants + intersection).
-        PrincipalType::Ai => ResolvedPermissions::none(),
+        // AI: the AS baked the intersection at mint (§3.4). Force is_admin off
+        // regardless of the claim — an AI is never an admin (§5.5).
+        PrincipalType::Ai => {
+            let mut perms = ResolvedPermissions::from_claims(claims);
+            perms.is_admin = false;
+            perms
+        }
     }
 }
 
@@ -74,10 +82,14 @@ mod tests {
     }
 
     #[test]
-    fn ai_resolves_to_deny_until_phase6() {
+    fn ai_resolves_from_baked_intersection_but_never_admin() {
+        // Phase 6: an AI token carries the AS-baked intersection in its claims;
+        // resolve reads it like a human — EXCEPT is_admin is forced off, even
+        // though claims_with_type sets hive_admin=true. An AI is never admin.
         let ai = resolve_permissions(&claims_with_type(Some("ai")));
-        assert!(ai.scopes.is_empty());
-        assert!(!ai.is_admin);
+        assert!(ai.has_scope("hive.read"));
+        assert!(ai.has_scope("hive.write"));
+        assert!(!ai.is_admin, "an AI principal must never resolve to admin");
     }
 
     #[test]

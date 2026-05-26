@@ -41,6 +41,13 @@ pub struct AuthConfig {
 }
 
 impl AuthConfig {
+    /// The canonical MCP resource URI (RFC 8707/9728, §3.3): the issuer with a
+    /// `/mcp` path, no trailing slash, no fragment. This is the audience an AI's
+    /// MCP token is bound to and the `resource` MCP clients request.
+    pub fn mcp_resource(&self) -> String {
+        format!("{}/mcp", self.issuer.trim_end_matches('/'))
+    }
+
     /// Build from env + the bind address. `issuer`/`audience` default to the
     /// bind-derived localhost URL when `HIVE_PUBLIC_URL` is unset (dev), and to
     /// the public URL in production.

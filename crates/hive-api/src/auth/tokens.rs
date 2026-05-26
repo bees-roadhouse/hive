@@ -63,6 +63,65 @@ pub fn mint_access_token(
     jsonwebtoken::encode(&header, &claims, &key.encoding)
 }
 
+/// Parameters for minting an MCP token for an AI principal (§3.4). `ai_subject`
+/// is the AI identity; `act_subject` is the connecting human (RFC 8693 actor).
+/// `scopes` is the already-computed intersection (grant ∩ the human's own
+/// permissions). The token is non-expiring by default (`exp_secs = None`) per
+/// Nate's `mcp_token_no_expiry`; an owner can opt into expiry via `Some(secs)`.
+pub struct McpTokenParams<'a> {
+    pub issuer: &'a str,
+    /// Canonical MCP resource URI this token is bound to (RFC 8707 audience).
+    pub audience: &'a str,
+    /// The AI identity's id (the token `sub`).
+    pub ai_subject: &'a str,
+    /// The connecting human's id (the `act` actor claim).
+    pub act_subject: &'a str,
+    pub scopes: &'a [String],
+    pub data_visibility: &'a str,
+    pub session_id: &'a str,
+    /// The token id — also the revocation handle (§5.5). The caller generates it
+    /// so it can persist the same value on the session row.
+    pub jti: &'a str,
+    pub now: i64,
+    /// `None` => non-expiring (the default MCP class); `Some(secs)` => opt-in TTL.
+    pub exp_secs: Option<i64>,
+}
+
+/// Mint a signed EdDSA MCP access token for an AI acting for a human (§3.4).
+/// `sub` = AI, `act` = the human (RFC 8693). `exp` is omitted entirely for the
+/// non-expiring class — the only off-switch is revocation by `jti` (§5.5),
+/// which is why the RS checks the revocation set on every AI-token validation.
+/// `principal_type = "ai"` so `resolve_permissions` routes it correctly.
+pub fn mint_mcp_token(
+    key: &SigningKey,
+    p: &McpTokenParams<'_>,
+) -> Result<String, jsonwebtoken::errors::Error> {
+    let _ = p.session_id; // linked server-side via the session row + jti.
+    let claims = Claims {
+        iss: p.issuer.to_string(),
+        sub: p.ai_subject.to_string(),
+        principal_type: Some("ai".to_string()),
+        act: Some(p.act_subject.to_string()),
+        aud: Some(p.audience.to_string()),
+        exp: p.exp_secs.map(|s| p.now + s),
+        iat: Some(p.now),
+        nbf: Some(p.now),
+        jti: Some(p.jti.to_string()),
+        scope: if p.scopes.is_empty() {
+            None
+        } else {
+            Some(p.scopes.join(" "))
+        },
+        // AI tokens are never admin: an AI can't exceed its owner's reach, and
+        // admin is a human-only authority (§5.5 owner-vs-admin).
+        hive_admin: false,
+        hive_visibility: Some(p.data_visibility.to_string()),
+    };
+    let mut header = Header::new(Algorithm::EdDSA);
+    header.kid = Some(key.kid.clone());
+    jsonwebtoken::encode(&header, &claims, &key.encoding)
+}
+
 /// A freshly generated opaque refresh token: the raw value (returned to the
 /// client once) and its sha256 hash (what we store).
 pub struct RefreshToken {

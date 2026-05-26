@@ -104,7 +104,16 @@ async fn main() -> anyhow::Result<()> {
     // flips it). See crates/hive-api/src/auth/.
     let auth_config = AuthConfig::from_env(args.bind);
     let signing_key = auth::keys::load_or_create_active(&pool).await?;
-    let auth_state = AuthState::new(auth_config.clone(), signing_key);
+    // Phase 6: load the revoked-jti set so non-expiring MCP tokens are checked
+    // against it from the first request (§5.5). A DB error here is non-fatal —
+    // start empty and let the next restart reload (revokes still land in DB).
+    let revocations = auth::revocation::RevocationSet::load(&pool)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "could not load revocations; starting with empty set");
+            auth::revocation::RevocationSet::empty()
+        });
+    let auth_state = AuthState::with_revocations(auth_config.clone(), signing_key, revocations);
     tracing::info!(
         issuer = %auth_config.issuer,
         mode = ?auth_config.mode,
@@ -135,6 +144,10 @@ async fn main() -> anyhow::Result<()> {
         .merge(routes::health::router())
         .merge(routes::auth::router())
         .merge(routes::oauth::router())
+        // Phase 6: AI identities + grants + MCP token issuance + revocation
+        // surface, and the MCP protected-resource seam (RFC 9728).
+        .merge(routes::ai::router())
+        .merge(routes::mcp::router())
         .with_state(state)
         // Auth layer: resolves each request to a Principal (dev-bypass or JWT)
         // and stashes it for the AuthUser extractor. Warn-only in Phase 1.
