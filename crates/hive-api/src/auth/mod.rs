@@ -36,6 +36,7 @@ pub mod policy;
 pub mod resolve;
 pub mod revocation;
 pub mod risk;
+pub mod rls;
 pub mod store;
 pub mod tokens;
 pub mod totp;

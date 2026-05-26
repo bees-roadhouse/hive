@@ -15,6 +15,44 @@ pub struct AppState {
     pub auth: AuthState,
 }
 
+impl AppState {
+    /// Begin a transaction with the RLS GUCs applied for `principal` (Phase 8,
+    /// §5.6). Content routes that opt into row-level data authorization run their
+    /// query on the returned transaction so the per-request `app.*` GUCs land on
+    /// the SAME connection the query uses (SET LOCAL is connection/txn-scoped).
+    ///
+    /// Shadow-safe: when `HIVE_RLS_ENFORCE` is off (default) `apply` sets
+    /// `app.rls_enforce='off'`, so the default-allow policies behave exactly as
+    /// today. `principal = None` (warn-mode, no token) also stays permissive —
+    /// nothing is armed, the DB policies default-allow.
+    pub async fn rls_begin(
+        &self,
+        principal: Option<&crate::auth::claims::Principal>,
+    ) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, crate::auth::store::StoreError> {
+        let mut tx = self.pool.begin().await?;
+        match principal {
+            Some(p) => {
+                let ctx = crate::auth::rls::compute_context(&self.pool, p).await?;
+                crate::auth::rls::apply(&mut tx, &ctx).await?;
+            }
+            None => {
+                // No principal (warn-mode / tokenless): leave the policies in
+                // default-allow by explicitly marking unenforced (resets any GUC
+                // inherited on a pooled connection).
+                crate::auth::rls::apply(
+                    &mut tx,
+                    &crate::auth::rls::RlsContext {
+                        visibility: crate::auth::claims::DataVisibility::Shared,
+                        handles: Vec::new(),
+                    },
+                )
+                .await?;
+            }
+        }
+        Ok(tx)
+    }
+}
+
 /// Canonical event payload for the SSE stream + downstream subscribers.
 ///
 /// `kind` is the high-level event name (e.g. `task.created`, `journal.created`,
