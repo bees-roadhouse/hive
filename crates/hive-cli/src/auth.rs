@@ -8,9 +8,10 @@
 //!   2. a cached token file under the config dir (written by `hive login`).
 //!
 //! `hive login` runs the password -> `/authorize` (PKCE) -> `/token` flow and
-//! caches the resulting access token. The full RFC 8628 device-authorization
-//! grant (§3.2) is Phase 5: `login` carries a `--device` seam that is wired to
-//! a not-yet-implemented stub so the surface exists without the build.
+//! caches the resulting access token. `hive login --device` (Phase 5) runs the
+//! RFC 8628 device-authorization grant: it requests a device+user code, prints
+//! where to approve it, and polls `/token` honoring the interval + slow_down
+//! until the human approves in a browser.
 //!
 //! Security note: the cached file holds an access token (short-lived per
 //! policy, §2). The design's end state is the OS keychain (§3.2); the file is
@@ -203,14 +204,114 @@ pub async fn login(username: &str, password: &str, scope: Option<&str>) -> anyho
     Ok(())
 }
 
-/// RFC 8628 device-authorization grant. Phase 5 deliverable; the seam exists
-/// now so `hive login --device` has a defined surface. Returns an explicit
-/// not-implemented error rather than silently doing nothing.
-pub async fn login_device(_scope: Option<&str>) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "device-grant login (RFC 8628) is not implemented yet (Phase 5). \
-         Use `hive login --username <u>` for the password flow, or set HIVE_TOKEN."
+#[derive(Serialize)]
+struct DeviceAuthBody<'a> {
+    client_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct DeviceAuthResp {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    #[serde(default)]
+    verification_uri_complete: Option<String>,
+    #[serde(default)]
+    interval: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct DeviceTokenBody<'a> {
+    grant_type: &'a str,
+    device_code: &'a str,
+    client_id: &'a str,
+}
+
+/// An OAuth error body `{error, error_description}` — the device poll branches
+/// on `error` (authorization_pending / slow_down / expired_token / ...).
+#[derive(Deserialize)]
+struct OAuthErrorBody {
+    error: String,
+}
+
+const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+
+/// RFC 8628 device-authorization grant (§3.2). Requests a device+user code,
+/// prints the verification URL + user_code, and polls /token at the server's
+/// interval (backing off +5s on slow_down) until the human approves. Caches the
+/// access token on success.
+pub async fn login_device(scope: Option<&str>) -> anyhow::Result<()> {
+    let base = api::api_base();
+
+    let auth: DeviceAuthResp = api::post_unauthed(
+        &format!("{base}/device_authorization"),
+        &DeviceAuthBody {
+            client_id: CLIENT_ID,
+            scope,
+        },
     )
+    .await
+    .map_err(|e| anyhow::anyhow!("device authorization request failed: {e}"))?;
+
+    // Tell the human where to go. Prefer the complete URL (carries the code).
+    println!("To authorize this device, open:");
+    if let Some(complete) = &auth.verification_uri_complete {
+        println!("  {complete}");
+    }
+    println!(
+        "  {}  and enter code:  {}",
+        auth.verification_uri, auth.user_code
+    );
+    println!("Waiting for approval...");
+
+    let mut interval = auth.interval.unwrap_or(5).max(1);
+    let url = format!("{base}/token");
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+
+        let body = DeviceTokenBody {
+            grant_type: DEVICE_GRANT,
+            device_code: &auth.device_code,
+            client_id: CLIENT_ID,
+        };
+        match api::post_unauthed_raw(&url, &body).await? {
+            // Success: a token JSON body.
+            (true, text) => {
+                let token: TokenResp = serde_json::from_str(&text)
+                    .map_err(|e| anyhow::anyhow!("malformed token response: {e}"))?;
+                let _ = token.refresh_token;
+                let path = write_token_file(&token.access_token)?;
+                let ttl = token
+                    .expires_in
+                    .map(|s| format!(" (expires in {s}s)"))
+                    .unwrap_or_default();
+                println!("device approved{ttl}; token cached at {}", path.display());
+                return Ok(());
+            }
+            // Error: branch on the OAuth error code (RFC 8628 §3.5).
+            (false, text) => {
+                let err = serde_json::from_str::<OAuthErrorBody>(&text)
+                    .map(|e| e.error)
+                    .unwrap_or_else(|_| "server_error".to_string());
+                match err.as_str() {
+                    "authorization_pending" => continue,
+                    "slow_down" => {
+                        interval += 5;
+                        continue;
+                    }
+                    "expired_token" => {
+                        anyhow::bail!(
+                            "the code expired before approval; run `hive login --device` again"
+                        )
+                    }
+                    "access_denied" => anyhow::bail!("authorization was denied"),
+                    other => anyhow::bail!("device login failed: {other}"),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
