@@ -104,13 +104,13 @@ pub fn App() -> impl IntoView {
     // for the duration of this SSR render (Phase 3, §3.1).
     provide_context(session_from_request());
 
-    // Stylesheet href: cargo-leptos compiles `style/main.css` and drops the
-    // bundled artifact at `/pkg/hive-ui.css` (output-name from Cargo.toml).
-    // The legacy `/style/main.css` ServeDir mount in `main.rs` is still
-    // there as a fallback so the login/who-not-found hand-rolled HTML
-    // (which links `/style/main.css` directly) keeps working.
+    // Link the source stylesheet directly. `main.rs` always serves
+    // `/style/main.css`; `/pkg/hive-ui.css` only exists after `cargo leptos
+    // build` with `LEPTOS_SITE_ROOT` pointed at the site output. Running the
+    // bin standalone (or with a missing site dir) 404'd the pkg path and
+    // left the page unstyled white.
     view! {
-        <Stylesheet id="hive-ui-css" href="/pkg/hive-ui.css"/>
+        <Stylesheet id="hive-ui-css" href="/style/main.css"/>
         <Title text="hive-canvas"/>
 
         <Router>

@@ -6,6 +6,18 @@ test.describe("hive-ui SSR smoke", () => {
     await expect(page.locator("a.hive-brand")).toHaveText("hive");
   });
 
+  test("journal stylesheet loads (cream canvas, not blank white)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    const bg = await page.evaluate(
+      () => getComputedStyle(document.body).backgroundColor,
+    );
+    // #f5efe2 → rgb(245, 239, 226)
+    expect(bg).toBe("rgb(245, 239, 226)");
+    await expect(page.locator("ol.feed-list .entry-body").first()).toBeVisible();
+  });
+
   test("tasks filter is URL-driven GET form with selected owner", async ({
     page,
   }) => {

@@ -9,26 +9,28 @@
 html, body {
     margin: 0;
     padding: 0;
+    min-height: 100%;
     background: #f5efe2;
     color: #2a2520;
-    font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    font-family: Georgia, "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, serif;
     line-height: 1.65;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
 }
 
 main {
-    max-width: 720px;
+    max-width: 42rem;
     margin: 0 auto;
-    padding: 2rem 1.5rem 6rem;
+    padding: 2.5rem 1.75rem 8rem;
 }
 
 /* ── top bar ─────────────────────────────────────────────────────────── */
 
 .hive-topbar {
-    max-width: 720px;
+    max-width: 42rem;
     margin: 0 auto;
-    padding: 1.25rem 1.5rem 0.75rem;
+    padding: 1.25rem 1.75rem 0.75rem;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
     display: flex;
     flex-wrap: wrap;
     align-items: baseline;
@@ -82,6 +84,7 @@ main {
     flex-wrap: wrap;
     gap: 0.75rem 1.25rem;
     align-items: center;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
 }
 
 .writer-chips {
@@ -228,8 +231,9 @@ main {
 
 .entry-body {
     color: #2a2520;
-    font-size: 1rem;
-    line-height: 1.7;
+    font-size: 1.0625rem;
+    line-height: 1.75;
+    letter-spacing: 0.01em;
 }
 
 .entry-body h1,
