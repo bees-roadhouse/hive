@@ -54,8 +54,10 @@ async fn main() -> anyhow::Result<()> {
     // Exclude /journal/new from the leptos route list — it's served by our
     // own hand-rolled axum handlers below (mirroring /login). Without the
     // exclusion the leptos `/journal/:id` route would swallow it.
-    let routes =
-        leptos_axum::generate_route_list_with_exclusions(App, Some(vec!["/journal/new".into()]));
+    let routes = leptos_axum::generate_route_list_with_exclusions(
+        App,
+        Some(vec!["/journal/new".into(), "/who/:slug".into()]),
+    );
 
     let style_dir = ServeDir::new("style");
 
@@ -69,7 +71,14 @@ async fn main() -> anyhow::Result<()> {
     let auth_routes: Router = Router::new()
         .route("/login", get(login_form).post(login_submit))
         .route("/logout", post(logout).get(logout))
-        .route("/journal/new", get(compose_form).post(compose_submit));
+        .route("/journal/new", get(compose_form).post(compose_submit))
+        // `/who/:slug` is the AI-vs-human disambiguator for `@slug` mentions.
+        // It looks the slug up server-side and redirects to /ai/:slug or
+        // /people/:slug ... the mention renderer doesn't know which side
+        // a bare `@slug` belongs to (the resolver records it post-write,
+        // but the rendered prose doesn't carry the discriminator without
+        // per-entry enrichment fetches).
+        .route("/who/{slug}", get(who_redirect));
 
     let app: Router = Router::<LeptosOptions>::new()
         .leptos_routes(&conf, routes, move || shell(conf_for_shell.clone()))
@@ -346,6 +355,51 @@ async fn compose_submit(headers: HeaderMap, Form(form): Form<ComposeForm>) -> Re
     };
     let to = format!("/journal/new?error={}", percent_encode(&msg));
     Redirect::to(&to).into_response()
+}
+
+// ---------- /who/:slug disambiguator ----------
+
+/// GET /who/:slug — resolve a bare `@slug` mention to its canonical detail
+/// page. Looks up the people directory and `Redirect::permanent` to either
+/// `/ai/<slug>` (kind = ai) or `/people/<slug>` (kind = human). If neither
+/// matches, render a small "no such handle" page.
+async fn who_redirect(axum::extract::Path(slug): axum::extract::Path<String>) -> Response {
+    // Try the AI directory first, then humans. The kind discriminator is
+    // now the API path itself (`/ai` vs `/people`) so we probe both. We hit
+    // the API directly (rather than the client helper in `api.rs`) because
+    // this handler runs outside the leptos render context, so the
+    // SessionId-from-context plumbing doesn't apply.
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return who_not_found(&slug).into_response(),
+    };
+    let base = api::api_base();
+    for (path_prefix, target_prefix) in [("/ai", "/ai"), ("/people", "/people")] {
+        let url = format!("{base}{path_prefix}/{slug}");
+        if let Ok(resp) = client.get(&url).send().await
+            && resp.status().is_success()
+        {
+            return Redirect::permanent(&format!("{target_prefix}/{slug}")).into_response();
+        }
+    }
+    who_not_found(&slug).into_response()
+}
+
+fn who_not_found(slug: &str) -> Html<String> {
+    Html(format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"/>\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>\
+         <title>hive · no such handle</title>\
+         <link rel=\"stylesheet\" href=\"/style/main.css\"/></head>\
+         <body><main class=\"who-page\"><p class=\"entry-back\"><a href=\"/people\">← people</a> <a href=\"/ai\">ai</a></p>\
+         <h1>no such handle</h1>\
+         <p>no person or ai is registered with the slug <code>{slug}</code>.</p>\
+         </main></body></html>",
+        slug = html_escape(slug)
+    ))
 }
 
 /// Minimal HTML-escape for the error message echoed into the login page.

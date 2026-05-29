@@ -1,9 +1,14 @@
 pub mod entry;
 pub mod entry_article;
+pub mod events;
 pub mod home;
 pub mod journal;
+pub mod note_detail;
 pub mod notes;
+pub mod people;
 pub mod search;
 pub mod side_panel;
+pub mod sidecar;
+pub mod task_detail;
 pub mod tasks;
 pub mod wire;

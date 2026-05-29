@@ -6,11 +6,15 @@ use leptos_router::{StaticSegment, path};
 use crate::api::SessionId;
 use crate::auth::SESSION_COOKIE;
 use crate::pages::entry::EntryPage;
+use crate::pages::events::{EventDetailPage, EventsPage};
 use crate::pages::home::HomePage;
 use crate::pages::journal::JournalPage;
+use crate::pages::note_detail::NoteDetailPage;
 use crate::pages::notes::NotesPage;
+use crate::pages::people::{AiDetailPage, AiListPage, PeopleListPage, PersonDetailPage};
 use crate::pages::search::SearchPage;
 use crate::pages::side_panel::{PanelToggle, SidePanel};
+use crate::pages::task_detail::TaskDetailPage;
 use crate::pages::tasks::TasksPage;
 use crate::pages::wire::WirePage;
 
@@ -96,7 +100,15 @@ pub fn App() -> impl IntoView {
                     <Route path=StaticSegment("journal") view=JournalPage/>
                     <Route path=path!("/journal/:id") view=EntryPage/>
                     <Route path=StaticSegment("tasks") view=TasksPage/>
+                    <Route path=path!("/tasks/:slug") view=TaskDetailPage/>
                     <Route path=StaticSegment("notes") view=NotesPage/>
+                    <Route path=path!("/notes/:slug") view=NoteDetailPage/>
+                    <Route path=StaticSegment("events") view=EventsPage/>
+                    <Route path=path!("/events/:slug") view=EventDetailPage/>
+                    <Route path=StaticSegment("people") view=PeopleListPage/>
+                    <Route path=path!("/people/:slug") view=PersonDetailPage/>
+                    <Route path=StaticSegment("ai") view=AiListPage/>
+                    <Route path=path!("/ai/:slug") view=AiDetailPage/>
                     <Route path=StaticSegment("wire") view=WirePage/>
                 </Routes>
             </main>
