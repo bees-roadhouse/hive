@@ -90,6 +90,13 @@ async fn add(
             "tags": e.tags,
         })),
     );
+
+    // Universal-mention pipeline (best-effort projection): extract prose
+    // mentions + inline-task anchors from the body, resolve them, write rows
+    // into `links` / `task_anchors`. Errors are logged in the hook itself ...
+    // the entry creation already succeeded and is not rolled back.
+    crate::mentions::project_body(&state.pool, "journal_entries", e.id, &e.body).await;
+
     Ok(Json(e))
 }
 

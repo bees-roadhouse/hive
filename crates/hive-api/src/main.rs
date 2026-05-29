@@ -7,6 +7,7 @@
 
 mod auth;
 mod error;
+mod mentions;
 mod routes;
 mod state;
 
