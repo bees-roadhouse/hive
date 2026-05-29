@@ -527,6 +527,140 @@ main {
 }
 .entry-detail .entry-tags .tag:hover { color: #8a5a30; }
 
+/* ── inline mentions inside entry prose ─────────────────────────────── */
+/* Mentions read as quiet, dotted-underlined links so the eye separates
+ * them from regular markdown links (which use a solid underline). */
+
+.entry-body .mention {
+    color: #8a5a30;
+    text-decoration: underline;
+    text-decoration-style: dotted;
+    text-decoration-color: rgba(138, 90, 48, 0.55);
+    text-underline-offset: 2px;
+}
+.entry-body .mention:hover {
+    text-decoration-color: #8a5a30;
+}
+
+.entry-body .mention-broken {
+    color: #9a8e78;
+    text-decoration: line-through wavy rgba(154, 142, 120, 0.75);
+}
+
+/* ── entry-detail sidecars (below the prose) ────────────────────────── */
+/* Secondary chrome ... low visual weight, no cards, just thin dividers.
+ * `<details>` summaries reuse the small uppercase tracked style from
+ * the side-panel sections so the typography is coherent. */
+
+.sidecars {
+    margin: 3rem 0 0 0;
+    padding-top: 1.5rem;
+    border-top: 1px solid #e0d6c2;
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+}
+
+.sidecar {
+    border: 0;
+    padding: 0;
+}
+
+.sidecar > summary {
+    cursor: pointer;
+    list-style: none;
+    margin-bottom: 0.4rem;
+    user-select: none;
+}
+.sidecar > summary::-webkit-details-marker { display: none; }
+.sidecar > summary::marker { content: ''; }
+
+.sidecar > summary > .panel-section-title {
+    display: inline;
+}
+
+.sidecar-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    line-height: 1.45;
+}
+
+.sidecar-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.5rem;
+    padding: 0.25rem 0;
+    font-size: 0.88rem;
+}
+
+.sidecar-row + .sidecar-row {
+    border-top: 1px dotted #e0d6c2;
+}
+
+.sidecar-badge {
+    font-size: 0.65rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #7a6e5a;
+}
+
+.sidecar-owner {
+    color: #8a5a30;
+    font-weight: 600;
+    font-size: 0.78rem;
+}
+
+.sidecar-title-text {
+    color: #2a2520;
+    flex: 1 1 auto;
+    min-width: 0;
+    word-break: break-word;
+    text-decoration: underline;
+    text-decoration-color: rgba(138, 90, 48, 0.35);
+    text-underline-offset: 2px;
+}
+.sidecar-title-text:hover { text-decoration-color: #8a5a30; }
+
+.sidecar-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+}
+
+.sidecar-group + .sidecar-group {
+    margin-top: 0.4rem;
+}
+
+.sidecar-group-label {
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: #7a6e5a;
+}
+
+.sidecar-group-list {
+    list-style: none;
+    margin: 0;
+    padding: 0 0 0 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+}
+
+.sidecar-empty {
+    margin: 0.2rem 0 0 0;
+    color: #9a8e78;
+    font-style: italic;
+    font-size: 0.85rem;
+}
+
 /* ── compose form (/journal/new ... hand-rolled axum HTML) ───────────── */
 
 .compose-page {
