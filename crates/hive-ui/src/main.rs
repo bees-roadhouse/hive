@@ -78,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
         // a bare `@slug` belongs to (the resolver records it post-write,
         // but the rendered prose doesn't carry the discriminator without
         // per-entry enrichment fetches).
-        .route("/who/{slug}", get(who_redirect));
+        .route("/who/:slug", get(who_redirect));
 
     let app: Router = Router::<LeptosOptions>::new()
         .leptos_routes(&conf, routes, move || shell(conf_for_shell.clone()))
