@@ -1,16 +1,25 @@
 //! Universal mention pipeline: prose mentions (`@slug`, `[[type:slug]]`,
-//! `[[slug]]`) in a journal entry / note body get resolved to entities and
-//! projected into the `links` table as `link_type='mention'` rows.
+//! `[[slug-or-title]]`) in a journal entry / note body get resolved to
+//! entities and projected into the `links` table as `link_type='mention'`
+//! rows.
+//!
+//! Resolver shape (post-0013):
+//!
+//! - `@slug` ... checks `ai.slug` first (pia/apis/cera live there now), then
+//!   `people.slug` (humans). The `target_table` on the resolved row is
+//!   `'ai'` or `'people'` and that's the discriminator downstream.
+//! - `[[type:slug]]` ... typed lookup against the right table. The parser
+//!   accepts a title after the type prefix and slugifies it before we get
+//!   here, so the resolver only sees a slug.
+//! - `[[slug-or-title]]` ... fuzzy. The parser pre-slugifies a non-slug
+//!   inner so we only do exact slug matches at this layer. Tries the four
+//!   entity tables (`tasks`, `notes`, `journal_entries`, `wire_events`);
+//!   single-table hit wins; multi-table tie ⇒ unresolved.
 //!
 //! Wiring lives in the `add` handlers for journal + notes. Errors here are
 //! LOGGED, never propagated ... the hook is a projection, not a constraint.
 //! Re-running on the same body produces no duplicates (ON CONFLICT DO NOTHING
 //! on the unique source/target tuple).
-//!
-//! Schema note: the resolver assumes `slug` columns exist on `tasks`,
-//! `notes`, `journal_entries`, and `wire_events`. A parallel migration agent
-//! owns those columns; until they land, the SQL here errors at runtime and
-//! the post-write hook logs a warning ... the entry itself still saves.
 
 use std::collections::HashMap;
 
@@ -44,10 +53,13 @@ pub async fn resolve_mentions(pool: &PgPool, mentions: &[EntityMention]) -> Vec<
 
     // Bucket slugs by the table we need to query.
     //
-    // - Person mentions → people
-    // - Typed(t) mentions → that one table
-    // - Fuzzy mentions → ALL five tables (people/tasks/notes/wire_events/journal_entries)
-    //   tried; first single hit wins; multi-table hit → unresolved.
+    // - `@slug` (Person) → ai (preferred) + people (fallback). Tried in
+    //   that order at resolve time.
+    // - Typed(t) → that one entity table.
+    // - Fuzzy → the four entity tables (tasks/notes/journal_entries/
+    //   wire_events). Persons/ais are NOT included in fuzzy: they have
+    //   their own grammar (`@slug`). Single-table hit wins; tie ⇒
+    //   unresolved.
     let mut wanted: HashMap<&'static str, Vec<String>> = HashMap::new();
     let mut want = |table: &'static str, slug: &str| {
         wanted.entry(table).or_default().push(slug.to_string());
@@ -55,10 +67,12 @@ pub async fn resolve_mentions(pool: &PgPool, mentions: &[EntityMention]) -> Vec<
 
     for m in mentions {
         match m.kind {
-            MentionKind::Person => want("people", &m.slug),
+            MentionKind::Person => {
+                want("ai", &m.slug);
+                want("people", &m.slug);
+            }
             MentionKind::Typed(t) => want(table_for_typed(t), &m.slug),
             MentionKind::Fuzzy => {
-                want("people", &m.slug);
                 want("tasks", &m.slug);
                 want("notes", &m.slug);
                 want("journal_entries", &m.slug);
@@ -97,12 +111,22 @@ pub async fn resolve_mentions(pool: &PgPool, mentions: &[EntityMention]) -> Vec<
     for m in mentions {
         let target = match m.kind {
             MentionKind::Person => {
-                found
-                    .get(&("people", m.slug.clone()))
-                    .map(|id| ResolvedTarget {
-                        table: "people",
+                // AI first (pia/apis/cera live there post-0013), then humans.
+                // The two tables share the `@slug` grammar but are queried
+                // independently ... `target_table` carries the discriminator.
+                if let Some(id) = found.get(&("ai", m.slug.clone())) {
+                    Some(ResolvedTarget {
+                        table: "ai",
                         id: *id,
                     })
+                } else {
+                    found
+                        .get(&("people", m.slug.clone()))
+                        .map(|id| ResolvedTarget {
+                            table: "people",
+                            id: *id,
+                        })
+                }
             }
             MentionKind::Typed(t) => {
                 let table = table_for_typed(t);
@@ -112,7 +136,7 @@ pub async fn resolve_mentions(pool: &PgPool, mentions: &[EntityMention]) -> Vec<
             }
             MentionKind::Fuzzy => {
                 let mut hits: Vec<ResolvedTarget> = Vec::new();
-                for table in ["people", "tasks", "notes", "journal_entries", "wire_events"] {
+                for table in ["tasks", "notes", "journal_entries", "wire_events"] {
                     if let Some(id) = found.get(&(table, m.slug.clone())) {
                         hits.push(ResolvedTarget { table, id: *id });
                     }

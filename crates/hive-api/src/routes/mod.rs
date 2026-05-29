@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod ai_identities;
 pub mod auth;
 pub mod events;
 pub mod graph;
@@ -10,6 +11,7 @@ pub mod messages;
 pub mod mfa;
 pub mod notes;
 pub mod oauth;
+pub mod people;
 pub mod projects;
 pub mod search;
 pub mod semantic;

@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod anchors;
 pub mod embeddings;
 pub mod events;

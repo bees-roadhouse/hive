@@ -191,3 +191,71 @@ fn multiple_at_mentions_on_one_line() {
         .collect();
     assert_eq!(slugs, vec!["one", "two", "three"]);
 }
+
+// ----- title-aware fuzzy resolver (parser side) -----
+
+#[test]
+fn fuzzy_accepts_multi_word_title_and_slugifies() {
+    // `[[Multi Word Title]]` ... the parser normalizes the inner via the
+    // shared derive_slug rule (lowercase, non-alnum → '-', collapse, trim).
+    let body = "See [[Multi Word Title]] for details.";
+    let parsed = parse(body);
+    assert_eq!(parsed.entity_mentions.len(), 1);
+    let m = &parsed.entity_mentions[0];
+    assert_eq!(m.slug, "multi-word-title");
+    assert_eq!(m.raw, "[[Multi Word Title]]");
+    assert!(matches!(m.kind, MentionKind::Fuzzy));
+}
+
+#[test]
+fn fuzzy_title_with_punctuation_slugifies() {
+    // Matches the load-bearing example from the task: a journal entry titled
+    // "Fix the Traefik 60s issue" gets slug "fix-the-traefik-60s-issue" on
+    // insert. The parser must emit the same slug from the title form.
+    let body = "ref [[Fix the Traefik 60s issue]]";
+    let parsed = parse(body);
+    assert_eq!(parsed.entity_mentions.len(), 1);
+    assert_eq!(parsed.entity_mentions[0].slug, "fix-the-traefik-60s-issue");
+    assert!(matches!(parsed.entity_mentions[0].kind, MentionKind::Fuzzy));
+}
+
+#[test]
+fn typed_link_still_resolves_with_literal_slug() {
+    // `[[type:slug]]` unchanged: the typed prefix routes to the right table.
+    let body = "see [[task:fix-traefik]]";
+    let parsed = parse(body);
+    assert_eq!(parsed.entity_mentions.len(), 1);
+    let m = &parsed.entity_mentions[0];
+    assert!(matches!(m.kind, MentionKind::Typed(TypedKind::Task)));
+    assert_eq!(m.slug, "fix-traefik");
+}
+
+#[test]
+fn typed_link_accepts_a_title_after_the_prefix() {
+    // `[[task:Fix the Traefik]]` ... the typed prefix wins over the all-table
+    // fuzzy, and the title gets slugified the same way as the fuzzy path.
+    let body = "see [[task:Fix the Traefik]]";
+    let parsed = parse(body);
+    assert_eq!(parsed.entity_mentions.len(), 1);
+    let m = &parsed.entity_mentions[0];
+    assert!(matches!(m.kind, MentionKind::Typed(TypedKind::Task)));
+    assert_eq!(m.slug, "fix-the-traefik");
+}
+
+#[test]
+fn fuzzy_with_only_punctuation_inner_drops() {
+    // After slugify the inner is empty ... no mention.
+    let body = "[[!!!]] and [[ - - - ]]";
+    let parsed = parse(body);
+    assert!(parsed.entity_mentions.is_empty());
+}
+
+#[test]
+fn fuzzy_inner_starting_with_digit_drops() {
+    // Slugs can't start with a digit. `[[2026 plan]]` slugifies to "2026-plan"
+    // which violates the constraint, so we drop it rather than mint a slug
+    // the schema would reject anyway.
+    let body = "[[2026 plan]]";
+    let parsed = parse(body);
+    assert!(parsed.entity_mentions.is_empty());
+}
