@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::enums::{Owner, TaskStatus};
 use crate::error::{Error, Result};
 use crate::queries::projects;
-use crate::slug::{derive_slug, resolve_collision};
+use crate::slug::derive_slug;
 use crate::types::Task;
 
 const SELECT_COLS: &str = "id, project, title, body, owner, status, priority, due, block_reason, \
@@ -53,7 +53,9 @@ pub async fn add(
     due: Option<&str>,
 ) -> Result<Task> {
     projects::require(pool, project).await?;
-    let slug = derive_task_slug(pool, title).await;
+    // Slug is informational post-0014 (no UNIQUE constraint); just derive the
+    // base form and accept collisions. The resolver picks newest-on-tie.
+    let slug = derive_slug(title, "task");
     let task = sqlx::query_as::<_, Task>(
         "INSERT INTO tasks (project, title, body, owner, priority, due, slug) \
          VALUES ($1, $2, $3, $4, $5, $6, $7) \
@@ -72,20 +74,6 @@ pub async fn add(
     Ok(task)
 }
 
-async fn derive_task_slug(pool: &PgPool, title: &str) -> String {
-    let base = derive_slug(title, "task");
-    resolve_collision(&base, |candidate| async move {
-        let exists =
-            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM tasks WHERE slug = $1)")
-                .bind(candidate)
-                .fetch_one(pool)
-                .await
-                .unwrap_or(false);
-        !exists
-    })
-    .await
-}
-
 pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Task>> {
     Ok(
         sqlx::query_as::<_, Task>(&format!("SELECT {SELECT_COLS} FROM tasks WHERE id = $1"))
@@ -95,16 +83,31 @@ pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Task>> {
     )
 }
 
+/// Slug-based lookup. Post-0014, slug is no longer UNIQUE on this table, so
+/// a slug can match multiple rows. We return the newest match (created_at
+/// DESC, id DESC tiebreak) ... the same rule the mention resolver uses, so
+/// API + prose stay consistent.
 pub async fn find_by_slug<'e, E>(executor: E, slug: &str) -> Result<Option<Task>>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
-    Ok(
-        sqlx::query_as::<_, Task>(&format!("SELECT {SELECT_COLS} FROM tasks WHERE slug = $1"))
-            .bind(slug)
-            .fetch_optional(executor)
-            .await?,
-    )
+    find_latest_by_slug(executor, slug).await
+}
+
+/// Explicit "newest match" lookup. Same behavior as `find_by_slug` ... kept
+/// as an explicit name so callers signal intent (the slug is informational,
+/// pick the most recent row that wears it).
+pub async fn find_latest_by_slug<'e, E>(executor: E, slug: &str) -> Result<Option<Task>>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    Ok(sqlx::query_as::<_, Task>(&format!(
+        "SELECT {SELECT_COLS} FROM tasks WHERE slug = $1 \
+         ORDER BY created_at DESC, id DESC LIMIT 1"
+    ))
+    .bind(slug)
+    .fetch_optional(executor)
+    .await?)
 }
 
 pub async fn require(pool: &PgPool, id: Uuid) -> Result<Task> {

@@ -1,5 +1,6 @@
 use chrono::{Datelike, Duration, Local, NaiveDate, Weekday};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use uuid::Uuid;
 
 use crate::{EntityMention, MentionKind, ParsedBody, ParsedTask, PersonRef, TagRef, TypedKind};
 
@@ -250,7 +251,8 @@ fn collect_tags_in(fragment: &str) -> Vec<String> {
 }
 
 fn collect_entity_mentions_in(fragment: &str, line_index: usize, out: &mut Vec<EntityMention>) {
-    // @slug mentions (people).
+    // @slug mentions (people). Person slugs stay UNIQUE per identity table;
+    // no UUID/alias machinery needed at this layer.
     for (start, slug) in find_at_slugs(fragment) {
         if start > 0 && fragment.as_bytes()[start - 1] == b'@' {
             continue; // `@@slug` escape
@@ -259,6 +261,8 @@ fn collect_entity_mentions_in(fragment: &str, line_index: usize, out: &mut Vec<E
             kind: MentionKind::Person,
             raw: format!("@{slug}"),
             slug,
+            target_id: None,
+            alias: None,
             line_index,
         });
     }
@@ -304,7 +308,27 @@ fn parse_wikilink_inner(inner: &str, raw: &str, line_index: usize) -> Option<Ent
     if trimmed.is_empty() {
         return None;
     }
-    if let Some((kind_str, body_str)) = trimmed.split_once(':') {
+    // Split on the first `|` for the alias. Everything after the first pipe
+    // (up to the close, which `find_close_wikilink` already bounded) is the
+    // alias verbatim. A second pipe inside the alias is treated as literal
+    // text ... the alias is just a display string.
+    let (head_raw, alias) = match trimmed.split_once('|') {
+        Some((h, a)) => {
+            let alias_trimmed = a.trim();
+            let alias = if alias_trimmed.is_empty() {
+                None
+            } else {
+                Some(alias_trimmed.to_string())
+            };
+            (h.trim(), alias)
+        }
+        None => (trimmed, None),
+    };
+    if head_raw.is_empty() {
+        return None;
+    }
+
+    if let Some((kind_str, body_str)) = head_raw.split_once(':') {
         let kind_str = kind_str.trim();
         let body_str = body_str.trim();
         let typed = match kind_str {
@@ -316,6 +340,25 @@ fn parse_wikilink_inner(inner: &str, raw: &str, line_index: usize) -> Option<Ent
         };
         if body_str.is_empty() {
             return None;
+        }
+        // UUID-first: the compose picker writes `[[type:<uuid>|<title>]]`.
+        if let Ok(id) = Uuid::parse_str(body_str) {
+            // Fall back slug = slugified alias (if present) so the resolver
+            // can still try slug-based lookup if the UUID is gone. Otherwise
+            // the slug is just the typed kind name as a non-matching
+            // placeholder.
+            let slug = alias
+                .as_deref()
+                .and_then(slugify_title)
+                .unwrap_or_else(|| typed.as_str().to_string());
+            return Some(EntityMention {
+                kind: MentionKind::Typed(typed),
+                raw: raw.to_string(),
+                slug,
+                target_id: Some(id),
+                alias,
+                line_index,
+            });
         }
         // Typed mentions accept either a literal slug or a title; the
         // resolver normalizes the latter via the same derive_slug rule the
@@ -329,22 +372,41 @@ fn parse_wikilink_inner(inner: &str, raw: &str, line_index: usize) -> Option<Ent
             kind: MentionKind::Typed(typed),
             raw: raw.to_string(),
             slug,
+            target_id: None,
+            alias,
             line_index,
         })
     } else {
-        // Fuzzy wikilink: accept any printable inner text (no newlines, no
-        // nested `[[`, both already enforced by `find_close_wikilink`). If
-        // the input is already a slug, keep it byte-exact; otherwise treat
-        // it as a title and slugify with the shared rule.
-        let slug = if is_slug(trimmed) {
-            trimmed.to_string()
+        // Fuzzy wikilink: a UUID-shaped identifier still binds to a target.
+        if let Ok(id) = Uuid::parse_str(head_raw) {
+            let slug = alias
+                .as_deref()
+                .and_then(slugify_title)
+                .unwrap_or_else(|| "fuzzy".to_string());
+            return Some(EntityMention {
+                kind: MentionKind::Fuzzy,
+                raw: raw.to_string(),
+                slug,
+                target_id: Some(id),
+                alias,
+                line_index,
+            });
+        }
+        // Accept any printable inner text (no newlines, no nested `[[`,
+        // both already enforced by `find_close_wikilink`). If the input is
+        // already a slug, keep it byte-exact; otherwise treat it as a
+        // title and slugify with the shared rule.
+        let slug = if is_slug(head_raw) {
+            head_raw.to_string()
         } else {
-            slugify_title(trimmed)?
+            slugify_title(head_raw)?
         };
         Some(EntityMention {
             kind: MentionKind::Fuzzy,
             raw: raw.to_string(),
             slug,
+            target_id: None,
+            alias,
             line_index,
         })
     }

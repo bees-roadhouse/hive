@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::enums::Author;
 use crate::error::{Error, Result};
 use crate::queries::projects;
-use crate::slug::{derive_slug, resolve_collision};
+use crate::slug::derive_slug;
 use crate::types::Note;
 
 const SELECT_COLS: &str = "id, author, title, body, tags, project, created_at, updated_at, slug";
@@ -28,7 +28,13 @@ pub async fn add(
     if let Some(p) = project {
         projects::require(pool, p).await?;
     }
-    let slug = derive_note_slug(pool, title).await;
+    // Slug is informational post-0014 (no UNIQUE constraint); derive once
+    // from the title (or fall back to "note") and accept collisions.
+    let base_title = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("note");
+    let slug = derive_slug(base_title, "note");
     let row = sqlx::query_as::<_, Note>(
         "INSERT INTO notes (author, title, body, tags, project, slug) \
          VALUES ($1, $2, $3, $4, $5, $6) \
@@ -45,24 +51,6 @@ pub async fn add(
     Ok(row)
 }
 
-async fn derive_note_slug(pool: &PgPool, title: Option<&str>) -> String {
-    let base_title = title
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .unwrap_or("note");
-    let base = derive_slug(base_title, "note");
-    resolve_collision(&base, |candidate| async move {
-        let exists =
-            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM notes WHERE slug = $1)")
-                .bind(candidate)
-                .fetch_one(pool)
-                .await
-                .unwrap_or(false);
-        !exists
-    })
-    .await
-}
-
 pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Note>> {
     Ok(
         sqlx::query_as::<_, Note>(&format!("SELECT {SELECT_COLS} FROM notes WHERE id = $1"))
@@ -72,16 +60,26 @@ pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Note>> {
     )
 }
 
+/// Slug-based lookup. Post-0014, slug is no longer UNIQUE on this table, so
+/// a slug can match multiple rows. We return the newest match.
 pub async fn find_by_slug<'e, E>(executor: E, slug: &str) -> Result<Option<Note>>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
-    Ok(
-        sqlx::query_as::<_, Note>(&format!("SELECT {SELECT_COLS} FROM notes WHERE slug = $1"))
-            .bind(slug)
-            .fetch_optional(executor)
-            .await?,
-    )
+    find_latest_by_slug(executor, slug).await
+}
+
+pub async fn find_latest_by_slug<'e, E>(executor: E, slug: &str) -> Result<Option<Note>>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    Ok(sqlx::query_as::<_, Note>(&format!(
+        "SELECT {SELECT_COLS} FROM notes WHERE slug = $1 \
+         ORDER BY created_at DESC, id DESC LIMIT 1"
+    ))
+    .bind(slug)
+    .fetch_optional(executor)
+    .await?)
 }
 
 pub async fn require(pool: &PgPool, id: Uuid) -> Result<Note> {
