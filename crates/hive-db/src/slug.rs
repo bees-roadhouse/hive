@@ -1,14 +1,18 @@
-//! Slug derivation + collision resolution.
+//! Slug derivation.
 //!
-//! One rule across every sluggable table (people, events, tasks, notes,
+//! One rule across every sluggable table (people, ai, events, tasks, notes,
 //! journal_entries) so the mention resolver (`@slug` / `[[type:slug]]`) has
 //! a single regex: `^[a-z][a-z0-9_-]*$`.
 //!
 //! The derivation matches the SQL backfill in migration 0012: lowercase,
 //! non-alnum → '-', collapse runs, trim '-' from ends, prefix `<fallback>-`
-//! if empty or starts with a digit. Collisions get resolved with a numeric
-//! suffix loop (`-2`, `-3`, ...) by the caller, hitting the UNIQUE
-//! constraint each iteration.
+//! if empty or starts with a digit.
+//!
+//! Post-0014 the content tables (tasks, notes, events, journal_entries) no
+//! longer require UNIQUE slugs ... two rows can share one. The compose
+//! picker anchors prose mentions by UUID (`[[type:<uuid>|<title>]]`) and the
+//! resolver picks newest-on-tie for slug fallbacks. Identity tables (people,
+//! ai) keep UNIQUE slugs.
 
 /// Derive a base slug from a free-form title. Non-alnum collapses to `-`,
 /// runs collapse (the `+` in the regex), and `-` is trimmed from both ends.
@@ -39,29 +43,6 @@ pub fn derive_slug(title: &str, fallback: &str) -> String {
     } else {
         trimmed
     }
-}
-
-/// Append `-2`, `-3`, ... to `base` until `is_free` reports the candidate is
-/// not taken. The caller supplies the existence check ... usually a SELECT 1
-/// against the target table's UNIQUE index. Bounded to 1000 attempts so a
-/// pathological table can't spin forever.
-pub async fn resolve_collision<F, Fut>(base: &str, mut is_free: F) -> String
-where
-    F: FnMut(String) -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let mut candidate = base.to_string();
-    let mut counter: u32 = 1;
-    while !is_free(candidate.clone()).await {
-        counter += 1;
-        candidate = format!("{base}-{counter}");
-        if counter > 1000 {
-            // Give up cleanly ... the caller will hit the DB UNIQUE constraint
-            // and surface a real conflict rather than wedge in a tight loop.
-            break;
-        }
-    }
-    candidate
 }
 
 #[cfg(test)]

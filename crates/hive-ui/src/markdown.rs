@@ -2,15 +2,22 @@
 //! written by us (CLI, UI compose, or an AI we run), so raw HTML passes
 //! through. Add a sanitizer here if untrusted writers ever land.
 //!
-//! In addition to plain markdown, this module recognizes three mention
+//! In addition to plain markdown, this module recognizes these mention
 //! syntaxes inside body text (NOT inside code spans / fenced blocks):
 //!
 //!  - `@slug` ... a person mention; renders as a link to `/people/<slug>`.
-//!  - `[[type:slug]]` ... a typed entity reference; renders as a link
-//!    to `/<type-route>/<slug>`.
-//!  - `[[freeform]]` ... a wikilink-style reference resolved via the
-//!    entry's `links` table rows; falls back to a
+//!  - `[[type:identifier]]` ... a typed entity reference; renders as a
+//!    link to `/<type-route>/<identifier>`. `identifier` is either a UUID
+//!    (the canonical anchor the compose picker writes) or a slug.
+//!  - `[[type:identifier|alias]]` ... same as above plus a display label.
+//!  - `[[freeform]]` / `[[freeform|alias]]` ... a wikilink-style reference
+//!    resolved via the entry's `links` table rows; falls back to a
 //!    `<span class="mention-broken">` when unresolved.
+//!
+//! Visible-text precedence (resolved or broken):
+//!  1. The alias from the source (`|alias` chunk), if present.
+//!  2. The resolved entity's title from `MentionContext`, if present.
+//!  3. The cleaned identifier (slug with `type:` prefix stripped).
 //!
 //! `#tag` is intentionally left alone in the body ... tag chips on the
 //! entry meta line already cover tags. The mention pass runs as a
@@ -338,54 +345,73 @@ fn render_at_mention(raw: &str, slug: &str, ctx: &MentionContext) -> String {
     }
 }
 
-/// Render a `[[...]]` wikilink. Three shapes:
-///   - `[[type:slug]]` ... typed reference; link to `/<type-route>/<slug>`.
-///   - `[[freeform]]` ... resolved via the context; fallback to broken.
+/// Render a `[[...]]` wikilink. Shapes accepted:
+///   - `[[type:identifier]]` ... typed reference; link to
+///     `/<type-route>/<identifier>`.
+///   - `[[type:identifier|alias]]` ... same plus an alias for display.
+///   - `[[freeform]]` / `[[freeform|alias]]` ... freeform; resolved via the
+///     context, fallback to broken.
 ///
 /// Returns `None` if the inner is empty or malformed.
 ///
-/// Visible-text rule (natural prose): the `type:` prefix is stripped from
-/// the rendered text. Resolved mentions use the entity's `target_title`
-/// instead. Broken mentions render as `<span class="mention-broken">slug</span>`
-/// (no `[[ ]]` brackets, no `type:` prefix).
+/// Visible-text precedence:
+///   1. Alias from the source (`|alias`).
+///   2. Resolved entity title from `MentionContext`.
+///   3. Cleaned identifier (slug with `type:` prefix stripped).
 fn render_wikilink(raw: &str, inner: &str, ctx: &MentionContext) -> Option<String> {
     let inner_trimmed = inner.trim();
     if inner_trimmed.is_empty() {
         return None;
     }
+    // Split on the first `|` for the alias. Empty alias after trim ⇒ no alias.
+    let (head, alias) = match inner_trimmed.split_once('|') {
+        Some((h, a)) => {
+            let a = a.trim();
+            (h.trim(), if a.is_empty() { None } else { Some(a) })
+        }
+        None => (inner_trimmed, None),
+    };
+    if head.is_empty() {
+        return None;
+    }
+
     // Context lookup wins regardless of shape ... lets the resolver
     // override the default routing for typed slugs too.
     if let Some(r) = ctx.resolved.get(raw) {
+        // Display precedence: alias > resolved.display > resolved.display
+        // (the fallback chain collapses to one branch here; alias replaces
+        // the resolved display when present).
+        let display = alias.unwrap_or(r.display.as_str());
         return Some(format!(
             r#"<a class="mention {kind}" href="{href}">{display}</a>"#,
             kind = escape_attr(&r.kind_class),
             href = escape_attr(&r.href),
-            display = escape_html(&r.display),
+            display = escape_html(display),
         ));
     }
-    if let Some((kind, slug)) = inner_trimmed.split_once(':') {
+    if let Some((kind, slug)) = head.split_once(':') {
         let kind = kind.trim();
         let slug = slug.trim();
         if !kind.is_empty() && !slug.is_empty() && is_valid_slug(slug) {
             let route = type_route(kind);
+            // Visible text: alias (if present) else the cleaned identifier
+            // (which can be a slug OR a UUID; either is a routable handle).
+            let label = alias.unwrap_or(slug);
             return Some(format!(
                 r#"<a class="mention mention-{kind_class}" href="/{route}/{slug}">{label}</a>"#,
                 kind_class = escape_attr(kind),
                 route = escape_attr(route),
                 slug = escape_attr(slug),
-                // Natural prose: drop the `type:` prefix from the visible text.
-                // The href and grammar stay; only the inner text changes.
-                label = escape_html(slug),
+                label = escape_html(label),
             ));
         }
     }
     // Unresolved freeform / broken `[[type:slug]]` where the slug failed
-    // validation. Strip the `type:` prefix from the visible text for the
-    // broken span too ... no brackets, no prefix, just the cleaned slug.
-    let visible = match inner_trimmed.split_once(':') {
+    // validation. Display precedence: alias > cleaned identifier.
+    let visible = alias.unwrap_or_else(|| match head.split_once(':') {
         Some((_, rest)) => rest.trim(),
-        None => inner_trimmed,
-    };
+        None => head,
+    });
     Some(format!(
         r#"<span class="mention-broken">{visible}</span>"#,
         visible = escape_html(visible),
@@ -552,5 +578,68 @@ mod tests {
     fn tilde_fence_protects_mentions() {
         let html = render_markdown("~~~\n@pia\n~~~");
         assert!(!html.contains(r#"class="mention"#), "got: {html}");
+    }
+
+    #[test]
+    fn alias_overrides_default_label() {
+        // `[[task:slug|Display Label]]` ... the alias becomes the visible
+        // text; the href still routes by identifier.
+        let html = render_markdown("see [[task:fix-traefik|Fix Traefik]] today");
+        assert!(
+            html.contains(
+                r#"<a class="mention mention-task" href="/tasks/fix-traefik">Fix Traefik</a>"#
+            ),
+            "got: {html}"
+        );
+    }
+
+    #[test]
+    fn alias_overrides_resolved_display() {
+        // Even with a resolved context, the alias from the source wins
+        // (it captures the human's intent at write time).
+        let mut ctx = MentionContext::empty();
+        ctx.resolved.insert(
+            "[[task:fix-traefik|Custom Label]]".to_string(),
+            ResolvedMention {
+                href: "/tasks/fix-traefik".to_string(),
+                display: "Resolved Title".to_string(),
+                kind_class: "mention-task".to_string(),
+            },
+        );
+        let html = render_markdown_with("see [[task:fix-traefik|Custom Label]]", &ctx);
+        assert!(html.contains(">Custom Label<"), "got: {html}");
+        assert!(!html.contains("Resolved Title"), "got: {html}");
+    }
+
+    #[test]
+    fn uuid_identifier_routes_by_uuid() {
+        // UUIDs are valid slug-shape (alnum + `-`); they route through the
+        // type route just like a slug would.
+        let uuid_str = "019e745e-c480-7b1b-846c-9108b9af1b19";
+        let body = format!("see [[task:{uuid_str}|Fix the build]] please");
+        let html = render_markdown(&body);
+        assert!(
+            html.contains(&format!(r#"href="/tasks/{uuid_str}""#)),
+            "got: {html}"
+        );
+        assert!(html.contains(">Fix the build<"), "got: {html}");
+    }
+
+    #[test]
+    fn alias_on_broken_freeform_takes_precedence() {
+        // Unresolved freeform with an alias ... broken span shows the alias,
+        // not the raw identifier.
+        let html = render_markdown("see [[some random ref|Better Label]] more");
+        assert!(
+            html.contains(r#"<span class="mention-broken">Better Label</span>"#),
+            "got: {html}"
+        );
+    }
+
+    #[test]
+    fn empty_alias_falls_back_to_default() {
+        let html = render_markdown("see [[task:fix-traefik|]] today");
+        // Empty alias is treated as absent; default cleaned label wins.
+        assert!(html.contains(">fix-traefik<"), "got: {html}");
     }
 }

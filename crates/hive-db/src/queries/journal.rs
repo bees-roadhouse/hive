@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use crate::enums::Ai;
 use crate::error::{Error, Result};
-use crate::slug::{derive_slug, resolve_collision};
+use crate::slug::derive_slug;
 use crate::types::JournalEntry;
 
 const SELECT_COLS: &str = "id, ai, entry_date, title, body, tags, created_at, updated_at, slug";
@@ -18,8 +18,9 @@ pub struct ListFilters {
 }
 
 /// Insert a journal entry. Derives a slug from the title (falling back to
-/// `<ai>-entry`) and resolves UNIQUE collisions with a numeric suffix loop.
-/// Callers that want an explicit slug should use `add_with_slug`.
+/// `<ai>-entry`). Slug is no longer UNIQUE on this table (post-0014); we
+/// accept collisions and the resolver picks newest-on-tie. Callers that
+/// want an explicit slug should use `add_with_slug`.
 pub async fn add(
     pool: &PgPool,
     ai: Ai,
@@ -28,7 +29,7 @@ pub async fn add(
     body: &str,
     tags: Option<&str>,
 ) -> Result<JournalEntry> {
-    let slug = derive_journal_slug(pool, ai, title).await;
+    let slug = derive_journal_slug(ai, title);
     add_with_slug(pool, ai, entry_date, title, body, tags, &slug).await
 }
 
@@ -57,24 +58,13 @@ pub async fn add_with_slug(
     Ok(row)
 }
 
-async fn derive_journal_slug(pool: &PgPool, ai: Ai, title: Option<&str>) -> String {
+fn derive_journal_slug(ai: Ai, title: Option<&str>) -> String {
     let base_title = title
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .map(str::to_string)
         .unwrap_or_else(|| format!("{}-entry", ai.as_str()));
-    let base = derive_slug(&base_title, "entry");
-    resolve_collision(&base, |candidate| async move {
-        let exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM journal_entries WHERE slug = $1)",
-        )
-        .bind(candidate)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(false);
-        !exists
-    })
-    .await
+    derive_slug(&base_title, "entry")
 }
 
 pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<JournalEntry>> {
@@ -86,12 +76,22 @@ pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<JournalEntry>> {
     .await?)
 }
 
+/// Slug-based lookup. Post-0014, slug is no longer UNIQUE on this table, so
+/// a slug can match multiple rows. We return the newest match.
 pub async fn find_by_slug<'e, E>(executor: E, slug: &str) -> Result<Option<JournalEntry>>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
+    find_latest_by_slug(executor, slug).await
+}
+
+pub async fn find_latest_by_slug<'e, E>(executor: E, slug: &str) -> Result<Option<JournalEntry>>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
     Ok(sqlx::query_as::<_, JournalEntry>(&format!(
-        "SELECT {SELECT_COLS} FROM journal_entries WHERE slug = $1"
+        "SELECT {SELECT_COLS} FROM journal_entries WHERE slug = $1 \
+         ORDER BY created_at DESC, id DESC LIMIT 1"
     ))
     .bind(slug)
     .fetch_optional(executor)

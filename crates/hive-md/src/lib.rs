@@ -46,22 +46,40 @@ pub struct TagRef {
 
 /// One mention extracted from prose. Locked grammar:
 ///
-/// | Syntax           | `MentionKind`            |
-/// |------------------|--------------------------|
-/// | `@slug`          | `Person`                 |
-/// | `[[type:slug]]`  | `Typed(TypedKind)`       |
-/// | `[[slug]]`       | `Fuzzy`                  |
+/// | Syntax                       | `MentionKind`            |
+/// |------------------------------|--------------------------|
+/// | `@slug`                      | `Person`                 |
+/// | `[[type:identifier]]`        | `Typed(TypedKind)`       |
+/// | `[[type:identifier\|alias]]` | `Typed(TypedKind)`       |
+/// | `[[slug-or-title]]`          | `Fuzzy`                  |
+/// | `[[slug-or-title\|alias]]`   | `Fuzzy`                  |
+///
+/// `identifier` is either a UUID (the canonical anchor the compose picker
+/// writes) or a slug/title (legacy + hand-typed prose). `alias` is the
+/// human-readable label captured at write time; the renderer prefers it
+/// when present, then falls back to the resolved entity title.
 ///
 /// `#tag` is intentionally NOT a mention ... existing `tag_refs` already
 /// covers it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct EntityMention {
     pub kind: MentionKind,
-    /// The exact source token, e.g. `@pia`, `[[task:abc-1]]`, `[[home]]`.
-    /// Retained for `links.note` so the UI can render the unresolved raw text
-    /// if needed.
+    /// The exact source token, e.g. `@pia`, `[[task:abc-1]]`, `[[home]]`,
+    /// `[[task:<uuid>|Fix the build]]`. Retained for `links.note` so the UI
+    /// can render the unresolved raw text if needed.
     pub raw: String,
+    /// The slug derived from the identifier when the identifier is NOT a
+    /// UUID. When the identifier IS a UUID, this still carries a slug-shaped
+    /// fallback (we slugify the alias if present, else the UUID's hex form
+    /// is unsuitable so we leave a sentinel slug ... see `slug` discussion
+    /// in `parse.rs`). The resolver checks `target_id` first.
     pub slug: String,
+    /// The UUID anchor when the identifier parsed as a UUID. `None` for
+    /// hand-typed `[[type:slug]]` / `[[title]]` prose.
+    pub target_id: Option<uuid::Uuid>,
+    /// The pipe-delimited alias from the source token, if present. The
+    /// renderer prefers this over the resolved entity title.
+    pub alias: Option<String>,
     pub line_index: usize,
 }
 

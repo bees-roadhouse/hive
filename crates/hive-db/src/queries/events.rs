@@ -7,7 +7,7 @@ use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
-use crate::slug::{derive_slug, resolve_collision};
+use crate::slug::derive_slug;
 use crate::types::Event;
 
 const SELECT_COLS: &str = "id, slug, title, body, starts_at, ends_at, location, tags, \
@@ -21,9 +21,9 @@ pub struct ListFilters {
     pub limit: Option<i64>,
 }
 
-/// Insert an event. If `slug` is `Some`, accept it as-is (DB UNIQUE will
-/// reject collisions); if `None`, derive from `title` and resolve with the
-/// usual `-2`, `-3` suffix loop.
+/// Insert an event. If `slug` is `Some`, accept it as-is; if `None`, derive
+/// from `title`. Slug is no longer UNIQUE on this table (post-0014); we
+/// accept collisions and the resolver picks newest-on-tie.
 #[allow(clippy::too_many_arguments)]
 pub async fn add(
     pool: &PgPool,
@@ -37,7 +37,7 @@ pub async fn add(
 ) -> Result<Event> {
     let resolved_slug = match slug {
         Some(s) => s.to_string(),
-        None => derive_event_slug(pool, title).await,
+        None => derive_slug(title, "event"),
     };
     let row = sqlx::query_as::<_, Event>(
         "INSERT INTO events (slug, title, body, starts_at, ends_at, location, tags) \
@@ -55,20 +55,6 @@ pub async fn add(
     .fetch_one(pool)
     .await?;
     Ok(row)
-}
-
-async fn derive_event_slug(pool: &PgPool, title: &str) -> String {
-    let base = derive_slug(title, "event");
-    resolve_collision(&base, |candidate| async move {
-        let exists =
-            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM events WHERE slug = $1)")
-                .bind(candidate)
-                .fetch_one(pool)
-                .await
-                .unwrap_or(false);
-        !exists
-    })
-    .await
 }
 
 pub async fn get<'e, E>(executor: E, id: Uuid) -> Result<Option<Event>>
@@ -90,16 +76,26 @@ pub async fn require(pool: &PgPool, id: Uuid) -> Result<Event> {
     })
 }
 
+/// Slug-based lookup. Post-0014, slug is no longer UNIQUE on this table, so
+/// a slug can match multiple rows. We return the newest match.
 pub async fn find_by_slug<'e, E>(executor: E, slug: &str) -> Result<Option<Event>>
 where
     E: sqlx::Executor<'e, Database = Postgres>,
 {
-    Ok(
-        sqlx::query_as::<_, Event>(&format!("SELECT {SELECT_COLS} FROM events WHERE slug = $1"))
-            .bind(slug)
-            .fetch_optional(executor)
-            .await?,
-    )
+    find_latest_by_slug(executor, slug).await
+}
+
+pub async fn find_latest_by_slug<'e, E>(executor: E, slug: &str) -> Result<Option<Event>>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    Ok(sqlx::query_as::<_, Event>(&format!(
+        "SELECT {SELECT_COLS} FROM events WHERE slug = $1 \
+         ORDER BY created_at DESC, id DESC LIMIT 1"
+    ))
+    .bind(slug)
+    .fetch_optional(executor)
+    .await?)
 }
 
 pub async fn list(pool: &PgPool, filters: &ListFilters) -> Result<Vec<Event>> {

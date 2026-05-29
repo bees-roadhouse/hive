@@ -22,11 +22,10 @@ use crate::pages::sidecar::{EntitySidecars, build_mention_context};
 
 #[component]
 pub fn PeopleListPage() -> impl IntoView {
-    let data =
-        Resource::new(
-            || (),
-            |_| async move { fetch_people().await.map_err(|e| e.to_string()) },
-        );
+    let data = Resource::new(
+        || (),
+        |_| async move { fetch_people().await.map_err(|e| e.to_string()) },
+    );
     view! {
         <header class="canvas-header">
             <h1>"people"</h1>
