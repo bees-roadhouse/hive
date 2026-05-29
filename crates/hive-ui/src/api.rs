@@ -93,6 +93,44 @@ pub struct Link {
     pub source_slug: Option<String>,
 }
 
+/// Mirrors `hive_db::types::Person`. Both AIs (`kind = "ai"`) and humans
+/// (`kind = "human"`) live in this row shape until the split-ai migration
+/// carves AIs out into their own table.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Person {
+    pub id: Uuid,
+    pub slug: String,
+    pub display_name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+/// Mirrors `hive_db::types::Event`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Event {
+    pub id: Uuid,
+    pub slug: String,
+    pub title: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    pub starts_at: String,
+    #[serde(default)]
+    pub ends_at: Option<String>,
+    #[serde(default)]
+    pub location: Option<String>,
+    #[serde(default)]
+    pub tags: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
 /// Mirrors `hive_db::types::WireEvent`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WireEvent {
@@ -479,6 +517,40 @@ pub async fn fetch_links_incoming(target_table: &str, target_id: &str) -> Vec<Li
             Vec::new()
         }
     }
+}
+
+/// Fetch a single task by id or slug. The hive-api `/tasks/{id_or_slug}`
+/// endpoint accepts either ... the slug-fallback is what makes the
+/// `[[task:slug]]` mention click land on a real row.
+pub async fn fetch_task_by_slug(id_or_slug: &str) -> anyhow::Result<Task> {
+    fetch_one(&format!("/tasks/{id_or_slug}")).await
+}
+
+/// Fetch a single note by id or slug.
+pub async fn fetch_note_by_slug(id_or_slug: &str) -> anyhow::Result<Note> {
+    fetch_one(&format!("/notes/{id_or_slug}")).await
+}
+
+/// Fetch a single event by id or slug.
+pub async fn fetch_event_by_slug(id_or_slug: &str) -> anyhow::Result<Event> {
+    fetch_one(&format!("/events/{id_or_slug}")).await
+}
+
+/// Fetch the people directory, optionally filtered by `kind` (`ai` or
+/// `human`). Empty kind => both.
+pub async fn fetch_people(kind: &str) -> anyhow::Result<Vec<Person>> {
+    fetch_list("/people", &[("kind", kind)]).await
+}
+
+/// Fetch a single person by slug (or uuid). Works for both AIs and humans;
+/// the kind discriminator is on the row itself.
+pub async fn fetch_person(slug: &str) -> anyhow::Result<Person> {
+    fetch_one(&format!("/people/{slug}")).await
+}
+
+/// Event list (optionally tag-filtered).
+pub async fn fetch_events(tag: &str, limit: i64) -> anyhow::Result<Vec<Event>> {
+    fetch_list("/events", &[("tag", tag), ("limit", &limit.to_string())]).await
 }
 
 /// Tasks extracted from the given journal entry via task_anchors.

@@ -318,8 +318,10 @@ fn utf8_char_len(b: u8) -> usize {
 }
 
 /// Render an `@slug` mention. If the resolution map has it, use the rich
-/// href + display name; otherwise default to `/people/<slug>` and show
-/// `@<slug>` as the link text.
+/// href + display name. Otherwise route through `/who/<slug>` ... the
+/// disambiguator looks up the slug in the `ai` then `people` table and
+/// redirects to the right detail page. The visible text stays `@slug`
+/// (natural prose: the `@` reads correctly inline).
 fn render_at_mention(raw: &str, slug: &str, ctx: &MentionContext) -> String {
     if let Some(r) = ctx.resolved.get(raw) {
         format!(
@@ -330,7 +332,7 @@ fn render_at_mention(raw: &str, slug: &str, ctx: &MentionContext) -> String {
         )
     } else {
         format!(
-            r#"<a class="mention mention-person" href="/people/{slug}">@{slug}</a>"#,
+            r#"<a class="mention mention-person" href="/who/{slug}">@{slug}</a>"#,
             slug = escape_attr(slug),
         )
     }
@@ -341,6 +343,11 @@ fn render_at_mention(raw: &str, slug: &str, ctx: &MentionContext) -> String {
 ///   - `[[freeform]]` ... resolved via the context; fallback to broken.
 ///
 /// Returns `None` if the inner is empty or malformed.
+///
+/// Visible-text rule (natural prose): the `type:` prefix is stripped from
+/// the rendered text. Resolved mentions use the entity's `target_title`
+/// instead. Broken mentions render as `<span class="mention-broken">slug</span>`
+/// (no `[[ ]]` brackets, no `type:` prefix).
 fn render_wikilink(raw: &str, inner: &str, ctx: &MentionContext) -> Option<String> {
     let inner_trimmed = inner.trim();
     if inner_trimmed.is_empty() {
@@ -366,14 +373,22 @@ fn render_wikilink(raw: &str, inner: &str, ctx: &MentionContext) -> Option<Strin
                 kind_class = escape_attr(kind),
                 route = escape_attr(route),
                 slug = escape_attr(slug),
-                label = escape_html(inner_trimmed),
+                // Natural prose: drop the `type:` prefix from the visible text.
+                // The href and grammar stay; only the inner text changes.
+                label = escape_html(slug),
             ));
         }
     }
-    // Unresolved freeform.
+    // Unresolved freeform / broken `[[type:slug]]` where the slug failed
+    // validation. Strip the `type:` prefix from the visible text for the
+    // broken span too ... no brackets, no prefix, just the cleaned slug.
+    let visible = match inner_trimmed.split_once(':') {
+        Some((_, rest)) => rest.trim(),
+        None => inner_trimmed,
+    };
     Some(format!(
-        r#"<span class="mention-broken">[[{inner}]]</span>"#,
-        inner = escape_html(inner_trimmed),
+        r#"<span class="mention-broken">{visible}</span>"#,
+        visible = escape_html(visible),
     ))
 }
 
@@ -434,9 +449,11 @@ mod tests {
 
     #[test]
     fn at_mention_renders_as_link() {
+        // `@slug` routes through the /who/:slug disambiguator (the renderer
+        // doesn't know if `slug` is an AI or a human at this layer).
         let html = render_markdown("hi @pia, see you");
         assert!(
-            html.contains(r#"<a class="mention mention-person" href="/people/pia">@pia</a>"#),
+            html.contains(r#"<a class="mention mention-person" href="/who/pia">@pia</a>"#),
             "got: {html}"
         );
     }
@@ -450,10 +467,13 @@ mod tests {
 
     #[test]
     fn typed_wikilink_renders_with_route() {
+        // Visible text is the clean slug (no `type:` prefix); href still
+        // routes by type. This is the "natural prose" rendering ... the
+        // link reads like "fix-traefik" rather than "task:fix-traefik".
         let html = render_markdown("see [[task:fix-traefik]] for details");
         assert!(
             html.contains(
-                r#"<a class="mention mention-task" href="/tasks/fix-traefik">task:fix-traefik</a>"#
+                r#"<a class="mention mention-task" href="/tasks/fix-traefik">fix-traefik</a>"#
             ),
             "got: {html}"
         );
@@ -461,9 +481,22 @@ mod tests {
 
     #[test]
     fn unresolved_freeform_renders_broken() {
+        // Broken freeform: no brackets in the visible text either.
         let html = render_markdown("see [[some random ref]] for more");
         assert!(
-            html.contains(r#"<span class="mention-broken">[[some random ref]]</span>"#),
+            html.contains(r#"<span class="mention-broken">some random ref</span>"#),
+            "got: {html}"
+        );
+    }
+
+    #[test]
+    fn broken_typed_mention_strips_prefix() {
+        // `[[task:doesnotexist]]` ... if the slug failed validation (rare:
+        // weird chars), the broken span should still strip the `task:` prefix.
+        // Using a deliberately invalid slug here to exercise the fallback path.
+        let html = render_markdown("see [[task:not a slug]] anyway");
+        assert!(
+            html.contains(r#"<span class="mention-broken">not a slug</span>"#),
             "got: {html}"
         );
     }

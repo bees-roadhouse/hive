@@ -14,6 +14,23 @@ pub async fn list(pool: &PgPool) -> Result<Vec<Person>> {
     Ok(rows)
 }
 
+/// List filtered by `kind` (`ai` or `human`). When `kind` is None, all
+/// people are returned (same as `list`). Sorted by slug within the kind.
+pub async fn list_filtered(pool: &PgPool, kind: Option<&str>) -> Result<Vec<Person>> {
+    let rows = match kind {
+        Some(k) => {
+            sqlx::query_as::<_, Person>(&format!(
+                "SELECT {SELECT_COLS} FROM people WHERE kind = $1 ORDER BY slug"
+            ))
+            .bind(k)
+            .fetch_all(pool)
+            .await?
+        }
+        None => list(pool).await?,
+    };
+    Ok(rows)
+}
+
 pub async fn get_by_slug(pool: &PgPool, slug: &str) -> Result<Option<Person>> {
     Ok(
         sqlx::query_as::<_, Person>(&format!("SELECT {SELECT_COLS} FROM people WHERE slug = $1"))
