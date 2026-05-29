@@ -73,6 +73,11 @@ async fn add(
                 "tags": n.tags,
             })),
         );
+
+    // Universal-mention pipeline: project links from prose in this note's
+    // body. Best-effort (errors logged, never propagated).
+    crate::mentions::project_body(&state.pool, "notes", n.id, &n.body).await;
+
     Ok(Json(n))
 }
 

@@ -1845,6 +1845,7 @@ dependencies = [
  "directories",
  "futures-util",
  "hive-db",
+ "hive-md",
  "hmac",
  "jsonwebtoken",
  "rand 0.8.6",

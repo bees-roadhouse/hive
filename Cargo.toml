@@ -33,6 +33,7 @@ authors = ["Bee's Roadhouse <nate.smith@beesroadhouse.com>"]
 hive-db = { path = "crates/hive-db" }
 hive-embed = { path = "crates/hive-embed" }
 hive-core = { path = "crates/hive-core" }
+hive-md = { path = "crates/hive-md" }
 
 # Sqlite (legacy: only the excluded hive-migrate crate's sqlite->postgres
 # read path uses these now; hive-cli is an HTTP client and no longer touches sqlite)
