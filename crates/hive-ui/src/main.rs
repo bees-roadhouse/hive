@@ -13,9 +13,9 @@ mod pages;
 use std::net::SocketAddr;
 
 use axum::Router;
-use axum::extract::Form;
+use axum::extract::{Form, Query};
 use axum::http::{HeaderMap, header};
-use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::response::{Html, IntoResponse, Json, Redirect, Response};
 use axum::routing::{get, post};
 use leptos::config::LeptosOptions;
 use leptos_axum::LeptosRoutes;
@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let style_dir = ServeDir::new("style");
+    let static_dir = ServeDir::new("static");
 
     let conf_for_shell = conf.clone();
     // Auth routes (Phase 3, §3.1): the OAuth password+PKCE flow runs entirely
@@ -72,6 +73,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/login", get(login_form).post(login_submit))
         .route("/logout", post(logout).get(logout))
         .route("/journal/new", get(compose_form).post(compose_submit))
+        // `/api/recent` is the typeahead source for the compose-time picker
+        // (vanilla JS at /static/compose-picker.js). One endpoint per page,
+        // server-side fan-out to the per-type hive-api endpoints, JSON out.
+        .route("/api/recent", get(api_recent))
         // `/who/:slug` is the AI-vs-human disambiguator for `@slug` mentions.
         // It looks the slug up server-side and redirects to /ai/:slug or
         // /people/:slug ... the mention renderer doesn't know which side
@@ -83,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
     let app: Router = Router::<LeptosOptions>::new()
         .leptos_routes(&conf, routes, move || shell(conf_for_shell.clone()))
         .nest_service("/style", style_dir)
+        .nest_service("/static", static_dir)
         .with_state(conf)
         .merge(auth_routes);
 
@@ -261,7 +267,9 @@ async fn compose_form(axum::extract::RawQuery(query): axum::extract::RawQuery) -
          <a class=\"compose-cancel\" href=\"/\">cancel</a>\
          <button type=\"submit\">save</button>\
          </div>\
-         </form></main></body></html>"
+         </form></main>\
+         <script src=\"/static/compose-picker.js\" defer></script>\
+         </body></html>"
     ))
 }
 
@@ -400,6 +408,235 @@ fn who_not_found(slug: &str) -> Html<String> {
          </main></body></html>",
         slug = html_escape(slug)
     ))
+}
+
+// ---------- /api/recent (compose-time picker backend) ----------
+
+#[derive(Debug, Deserialize)]
+struct RecentQuery {
+    #[serde(rename = "type")]
+    ty: String,
+    #[serde(default)]
+    q: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RecentRow {
+    id: String,
+    title: String,
+    meta: String,
+    created_at: String,
+}
+
+/// GET /api/recent?type=<task|note|event|journal|person|ai>&q=<substring>
+///
+/// Single endpoint for the compose-picker.js typeahead. Server-side
+/// fan-out to the per-type hive-api endpoints, case-insensitive title
+/// filter applied in Rust (so the upstream stays untouched), sorted by
+/// `created_at DESC`, capped at 20.
+async fn api_recent(headers: HeaderMap, Query(q): Query<RecentQuery>) -> Response {
+    let token = session_from_headers(&headers).and_then(|sid| auth::access_token_for(&sid));
+    let needle = q.q.as_deref().unwrap_or("").trim().to_lowercase();
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "api_recent: build client failed");
+            return Json(Vec::<RecentRow>::new()).into_response();
+        }
+    };
+
+    let rows = match q.ty.as_str() {
+        "task" => fetch_recent_tasks(&client, token.as_deref()).await,
+        "note" => fetch_recent_notes(&client, token.as_deref()).await,
+        "event" => fetch_recent_events(&client, token.as_deref()).await,
+        "journal" => fetch_recent_journal(&client, token.as_deref()).await,
+        "person" => fetch_recent_people(&client, token.as_deref()).await,
+        "ai" => fetch_recent_ai(&client, token.as_deref()).await,
+        _ => Vec::new(),
+    };
+
+    let mut filtered: Vec<RecentRow> = if needle.is_empty() {
+        rows
+    } else {
+        rows.into_iter()
+            .filter(|r| r.title.to_lowercase().contains(&needle))
+            .collect()
+    };
+
+    // Sort created_at desc. Empty strings sort last by reversing later.
+    filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    filtered.truncate(20);
+
+    Json(filtered).into_response()
+}
+
+async fn api_get_json(
+    client: &reqwest::Client,
+    path: &str,
+    token: Option<&str>,
+) -> Option<serde_json::Value> {
+    let url = format!("{}{}", api::api_base(), path);
+    let mut req = client.get(&url);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => resp.json::<serde_json::Value>().await.ok(),
+        Ok(resp) => {
+            tracing::debug!(status = %resp.status(), %url, "api_recent: non-success");
+            None
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, %url, "api_recent: fetch failed");
+            None
+        }
+    }
+}
+
+fn json_str<'a>(v: &'a serde_json::Value, key: &str) -> &'a str {
+    v.get(key).and_then(|x| x.as_str()).unwrap_or("")
+}
+
+async fn fetch_recent_tasks(client: &reqwest::Client, token: Option<&str>) -> Vec<RecentRow> {
+    // `all=true` so closed tasks show up too ... the picker is a reference
+    // surface, not a worklist.
+    let v = match api_get_json(client, "/tasks?all=true", token).await {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let arr = match v.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    arr.iter()
+        .map(|t| {
+            let owner = json_str(t, "owner");
+            let status = json_str(t, "status");
+            RecentRow {
+                id: json_str(t, "id").to_string(),
+                title: json_str(t, "title").to_string(),
+                meta: format!("@{owner} · {status}"),
+                created_at: json_str(t, "created_at").to_string(),
+            }
+        })
+        .collect()
+}
+
+async fn fetch_recent_notes(client: &reqwest::Client, token: Option<&str>) -> Vec<RecentRow> {
+    let v = match api_get_json(client, "/notes?limit=50", token).await {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let arr = match v.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    arr.iter()
+        .map(|n| {
+            let author = json_str(n, "author");
+            RecentRow {
+                id: json_str(n, "id").to_string(),
+                title: json_str(n, "title").to_string(),
+                meta: format!("@{author}"),
+                created_at: json_str(n, "created_at").to_string(),
+            }
+        })
+        .collect()
+}
+
+async fn fetch_recent_events(client: &reqwest::Client, token: Option<&str>) -> Vec<RecentRow> {
+    let v = match api_get_json(client, "/events?limit=50", token).await {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let arr = match v.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    arr.iter()
+        .map(|e| {
+            let starts = json_str(e, "starts_at");
+            // Trim to YYYY-MM-DD for the meta line.
+            let day = starts.get(..10).unwrap_or(starts);
+            RecentRow {
+                id: json_str(e, "id").to_string(),
+                title: json_str(e, "title").to_string(),
+                meta: day.to_string(),
+                created_at: json_str(e, "created_at").to_string(),
+            }
+        })
+        .collect()
+}
+
+async fn fetch_recent_journal(client: &reqwest::Client, token: Option<&str>) -> Vec<RecentRow> {
+    let v = match api_get_json(client, "/journal?limit=50", token).await {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let arr = match v.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    arr.iter()
+        .map(|j| {
+            let ai = json_str(j, "ai");
+            let date = json_str(j, "entry_date");
+            let title = json_str(j, "title");
+            let title = if title.is_empty() {
+                "(untitled)"
+            } else {
+                title
+            };
+            RecentRow {
+                id: json_str(j, "id").to_string(),
+                title: title.to_string(),
+                meta: format!("@{ai} · {date}"),
+                created_at: json_str(j, "created_at").to_string(),
+            }
+        })
+        .collect()
+}
+
+async fn fetch_recent_people(client: &reqwest::Client, token: Option<&str>) -> Vec<RecentRow> {
+    let v = match api_get_json(client, "/people", token).await {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let arr = match v.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    arr.iter()
+        .map(|p| RecentRow {
+            id: json_str(p, "id").to_string(),
+            title: json_str(p, "display_name").to_string(),
+            meta: String::new(),
+            created_at: json_str(p, "created_at").to_string(),
+        })
+        .collect()
+}
+
+async fn fetch_recent_ai(client: &reqwest::Client, token: Option<&str>) -> Vec<RecentRow> {
+    let v = match api_get_json(client, "/ai", token).await {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let arr = match v.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    arr.iter()
+        .map(|a| RecentRow {
+            id: json_str(a, "id").to_string(),
+            title: json_str(a, "display_name").to_string(),
+            meta: String::new(),
+            created_at: json_str(a, "created_at").to_string(),
+        })
+        .collect()
 }
 
 /// Minimal HTML-escape for the error message echoed into the login page.
