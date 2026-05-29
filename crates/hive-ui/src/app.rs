@@ -81,8 +81,11 @@ fn Nav() -> impl IntoView {
     // will surface them per-entry in a follow-up.
     view! {
         <nav class="hive-topbar">
-            <a class="hive-brand" href="/">"hive"</a>
-            <a class="hive-new" href="/journal/new">"+ new"</a>
+            <a class="hive-brand" href="/" rel="external">"hive"</a>
+            <a class="hive-new" href="/journal/new" rel="external">"+ new"</a>
+            <a class="hive-nav-link" href="/tasks" rel="external">"tasks"</a>
+            <a class="hive-nav-link" href="/notes" rel="external">"notes"</a>
+            <a class="hive-nav-link" href="/wire" rel="external">"wire"</a>
             <form class="hive-search" method="get" action="/journal/search">
                 <input type="search" name="q" placeholder="search journal" aria-label="search journal" />
             </form>

@@ -26,7 +26,7 @@ pub fn EntryArticle(entry: JournalEntry, current_writer: String) -> impl IntoVie
         <li class="entry">
             <header class="entry-header">
                 <h2 class="entry-title">
-                    <a class="entry-title-link" href=entry_href>{title}</a>
+                    <a class="entry-title-link" href=entry_href rel="external">{title}</a>
                 </h2>
                 <p class="entry-meta">
                     <span class="entry-writer">{entry.ai}</span>
@@ -58,7 +58,7 @@ pub fn render_tag_chips(tags: &str, current_writer: &str) -> AnyView {
         <span class="entry-tags">
             {chips.into_iter().map(|t| {
                 let href = build_query("/", &writer, &t);
-                view! { <a class="tag" href=href>"#"{t}</a> }
+                view! { <a class="tag" href=href rel="external">"#"{t}</a> }
             }).collect_view()}
         </span>
     }

@@ -35,7 +35,7 @@ pub fn PanelToggle() -> impl IntoView {
             params.replace("side", "open".to_string());
             ("≡".to_string(), build_url(&path, &params))
         };
-        view! { <a class="hive-panel-toggle" href=href aria-label="toggle side panel">{label}</a> }
+        view! { <a class="hive-panel-toggle" href=href rel="external" aria-label="toggle side panel">{label}</a> }
     };
 
     view! { {toggle} }
@@ -60,11 +60,11 @@ pub fn SidePanel() -> impl IntoView {
         let close_url = build_url(&path, &close_params);
 
         view! {
-            <a class="panel-backdrop" href=close_url.clone() aria-label="close side panel"></a>
+            <a class="panel-backdrop" href=close_url.clone() rel="external" aria-label="close side panel"></a>
             <aside class="hive-panel" aria-label="side panel">
                 <header class="panel-header">
                     <h1 class="panel-title">"hive"</h1>
-                    <a class="panel-close" href=close_url>"× close"</a>
+                    <a class="panel-close" href=close_url rel="external">"× close"</a>
                 </header>
                 <PanelTasks writer=writer.clone()/>
                 <PanelNotes writer=writer/>
@@ -110,11 +110,12 @@ fn PanelTaskList(tasks: Vec<Task>) -> impl IntoView {
             {tasks.into_iter().map(|t| {
                 let status_class = format!("panel-badge status-{}", t.status);
                 let due = t.due.clone().unwrap_or_default();
+                let href = format!("/tasks/{}", t.slug.clone().unwrap_or_else(|| t.id.to_string()));
                 view! {
                     <li class="panel-row">
                         <span class=status_class>{t.status}</span>
                         <span class="panel-owner">{t.owner}</span>
-                        <span class="panel-title-text">{t.title}</span>
+                        <a class="panel-title-text" href=href rel="external">{t.title}</a>
                         {(!due.is_empty()).then(|| view! { <span class="panel-due">{due}</span> })}
                     </li>
                 }
@@ -155,11 +156,12 @@ fn PanelNoteList(notes: Vec<Note>) -> impl IntoView {
             {notes.into_iter().map(|n| {
                 let title = n.title.clone().unwrap_or_else(|| "(untitled)".to_string());
                 let preview: String = n.body.chars().take(140).collect();
+                let href = format!("/notes/{}", n.slug.clone().unwrap_or_else(|| n.id.to_string()));
                 view! {
                     <li class="panel-row panel-row-stack">
                         <div class="panel-row-head">
                             <span class="panel-owner">{n.author}</span>
-                            <span class="panel-title-text">{title}</span>
+                            <a class="panel-title-text" href=href rel="external">{title}</a>
                         </div>
                         <p class="panel-preview">{preview}</p>
                     </li>

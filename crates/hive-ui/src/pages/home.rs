@@ -84,7 +84,7 @@ pub fn HomePage() -> impl IntoView {
                 />
             </form>
             {any_filter_active.then(|| view! {
-                <a class="clear-filters" href="/">"× clear filters"</a>
+                <a class="clear-filters" href="/" rel="external">"× clear filters"</a>
             })}
         </section>
 
@@ -116,8 +116,12 @@ fn WriterChip(
 ) -> impl IntoView {
     let active = current_writer == value;
     let href = build_query("/", &value, &current_tag);
+    // rel="external" tells leptos_router to NOT intercept this click. We want
+    // a full SSR round-trip so the page re-renders with the new query params
+    // ... the wasm-side `fetch_journal_filtered` is a stub-and-error today.
+    // Promote to client-side nav once the api helpers become `#[server]`.
     view! {
-        <a class="chip" class:active=active href=href>{label}</a>
+        <a class="chip" class:active=active href=href rel="external">{label}</a>
     }
 }
 

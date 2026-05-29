@@ -30,6 +30,7 @@ main {
     margin: 0 auto;
     padding: 1.25rem 1.5rem 0.75rem;
     display: flex;
+    flex-wrap: wrap;
     align-items: baseline;
     gap: 1rem;
 }
@@ -51,6 +52,13 @@ main {
     text-decoration: none;
 }
 .hive-auth:hover { color: #8a5a30; }
+
+.hive-nav-link {
+    font-size: 0.85rem;
+    color: #7a6e5a;
+    text-decoration: none;
+}
+.hive-nav-link:hover { color: #8a5a30; }
 
 .hive-new {
     font-size: 1.05rem;
@@ -397,7 +405,8 @@ main {
 }
 
 .filters select,
-.filters input[type="text"] {
+.filters input[type="text"],
+.filters button {
     font: inherit;
     padding: 0.25rem 0.5rem;
     border: 1px solid #d6c9a8;
@@ -405,6 +414,21 @@ main {
     background: #fffdf8;
     color: #2a2520;
 }
+
+.filter-apply {
+    cursor: pointer;
+}
+
+.filter-apply:hover {
+    border-color: #8a5a30;
+    color: #8a5a30;
+}
+
+.filter-clear {
+    color: #9a8e78;
+    text-decoration: none;
+}
+.filter-clear:hover { color: #8a5a30; }
 
 .task-list,
 .note-list,
@@ -454,6 +478,17 @@ main {
 .sev-info { color: #7a6e5a; }
 
 .wire-title a { color: #2a2520; }
+
+.row-link {
+    color: inherit;
+    text-decoration: none;
+}
+.row-link:hover {
+    color: #8a5a30;
+    text-decoration: underline;
+    text-decoration-color: rgba(138, 90, 48, 0.35);
+    text-underline-offset: 2px;
+}
 
 .note-row {
     padding: 0.85rem 0;
@@ -750,6 +785,7 @@ main {
 
 .hive-search {
     flex: 0 1 18rem;
+    min-width: 12rem;
     margin: 0;
 }
 

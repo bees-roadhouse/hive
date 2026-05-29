@@ -45,6 +45,8 @@ pub struct JournalEntry {
     pub body: String,
     pub tags: Option<String>,
     pub created_at: Option<String>,
+    #[serde(default)]
+    pub slug: Option<String>,
 }
 
 /// Mirrors `hive_db::types::Task` (TIMESTAMPTZ fields arrive as ISO-8601
@@ -63,6 +65,8 @@ pub struct Task {
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub closed_at: Option<String>,
+    #[serde(default)]
+    pub slug: Option<String>,
 }
 
 /// Mirrors `hive_db::types::Note`.
@@ -77,6 +81,8 @@ pub struct Note {
     pub project: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
+    #[serde(default)]
+    pub slug: Option<String>,
 }
 
 /// Mirrors `hive_db::types::Link`. Used by the entry detail page to
@@ -484,6 +490,7 @@ pub async fn fetch_journal_search(q: &str, limit: i64) -> anyhow::Result<Vec<Jou
             body: snippet_to_html(&h.snippet),
             tags: h.tags,
             created_at: None,
+            slug: None,
         })
         .collect())
 }
@@ -619,14 +626,15 @@ pub async fn fetch_events(tag: &str, limit: i64) -> anyhow::Result<Vec<Event>> {
 }
 
 /// Tasks extracted from the given journal entry via task_anchors.
-///
-/// TODO(parallel-agent): the hive-api doesn't expose task_anchors yet.
-/// Expected endpoint: `GET /journal/:id/tasks` returns `Vec<Task>` for
-/// any rows in `task_anchors` that point at this entry. Until that
-/// lands, return empty and the sidecar shows empty-state.
 #[cfg(feature = "ssr")]
-pub async fn fetch_task_anchors(_journal_entry_id: &str) -> Vec<Task> {
-    Vec::new()
+pub async fn fetch_task_anchors(journal_entry_id: &str) -> Vec<Task> {
+    match fetch_list::<Task>(&format!("/journal/{journal_entry_id}/tasks"), &[]).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::debug!(%err, %journal_entry_id, "fetch_task_anchors failed; rendering empty");
+            Vec::new()
+        }
+    }
 }
 
 // ---------- wasm/hydrate stubs ----------
