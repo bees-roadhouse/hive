@@ -3,9 +3,10 @@ use uuid::Uuid;
 
 use crate::enums::Ai;
 use crate::error::{Error, Result};
+use crate::slug::{derive_slug, resolve_collision};
 use crate::types::JournalEntry;
 
-const SELECT_COLS: &str = "id, ai, entry_date, title, body, tags, created_at, updated_at";
+const SELECT_COLS: &str = "id, ai, entry_date, title, body, tags, created_at, updated_at, slug";
 
 #[derive(Debug, Default, Clone)]
 pub struct ListFilters {
@@ -16,6 +17,9 @@ pub struct ListFilters {
     pub limit: Option<i64>,
 }
 
+/// Insert a journal entry. Derives a slug from the title (falling back to
+/// `<ai>-entry`) and resolves UNIQUE collisions with a numeric suffix loop.
+/// Callers that want an explicit slug should use `add_with_slug`.
 pub async fn add(
     pool: &PgPool,
     ai: Ai,
@@ -24,19 +28,53 @@ pub async fn add(
     body: &str,
     tags: Option<&str>,
 ) -> Result<JournalEntry> {
+    let slug = derive_journal_slug(pool, ai, title).await;
+    add_with_slug(pool, ai, entry_date, title, body, tags, &slug).await
+}
+
+pub async fn add_with_slug(
+    pool: &PgPool,
+    ai: Ai,
+    entry_date: &str,
+    title: Option<&str>,
+    body: &str,
+    tags: Option<&str>,
+    slug: &str,
+) -> Result<JournalEntry> {
     let row = sqlx::query_as::<_, JournalEntry>(
-        "INSERT INTO journal_entries (ai, entry_date, title, body, tags) \
-         VALUES ($1, $2, $3, $4, $5) \
-         RETURNING id, ai, entry_date, title, body, tags, created_at, updated_at",
+        "INSERT INTO journal_entries (ai, entry_date, title, body, tags, slug) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         RETURNING id, ai, entry_date, title, body, tags, created_at, updated_at, slug",
     )
     .bind(ai.as_str())
     .bind(entry_date)
     .bind(title)
     .bind(body)
     .bind(tags)
+    .bind(slug)
     .fetch_one(pool)
     .await?;
     Ok(row)
+}
+
+async fn derive_journal_slug(pool: &PgPool, ai: Ai, title: Option<&str>) -> String {
+    let base_title = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}-entry", ai.as_str()));
+    let base = derive_slug(&base_title, "entry");
+    resolve_collision(&base, |candidate| async move {
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM journal_entries WHERE slug = $1)",
+        )
+        .bind(candidate)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(false);
+        !exists
+    })
+    .await
 }
 
 pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<JournalEntry>> {
@@ -45,6 +83,18 @@ pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<JournalEntry>> {
     ))
     .bind(id)
     .fetch_optional(pool)
+    .await?)
+}
+
+pub async fn find_by_slug<'e, E>(executor: E, slug: &str) -> Result<Option<JournalEntry>>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    Ok(sqlx::query_as::<_, JournalEntry>(&format!(
+        "SELECT {SELECT_COLS} FROM journal_entries WHERE slug = $1"
+    ))
+    .bind(slug)
+    .fetch_optional(executor)
     .await?)
 }
 

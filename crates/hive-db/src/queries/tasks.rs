@@ -4,10 +4,11 @@ use uuid::Uuid;
 use crate::enums::{Owner, TaskStatus};
 use crate::error::{Error, Result};
 use crate::queries::projects;
+use crate::slug::{derive_slug, resolve_collision};
 use crate::types::Task;
 
 const SELECT_COLS: &str = "id, project, title, body, owner, status, priority, due, block_reason, \
-     created_at, updated_at, closed_at";
+     created_at, updated_at, closed_at, slug";
 
 #[derive(Debug, Default, Clone)]
 pub struct ListFilters {
@@ -52,11 +53,12 @@ pub async fn add(
     due: Option<&str>,
 ) -> Result<Task> {
     projects::require(pool, project).await?;
+    let slug = derive_task_slug(pool, title).await;
     let task = sqlx::query_as::<_, Task>(
-        "INSERT INTO tasks (project, title, body, owner, priority, due) \
-         VALUES ($1, $2, $3, $4, $5, $6) \
+        "INSERT INTO tasks (project, title, body, owner, priority, due, slug) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
          RETURNING id, project, title, body, owner, status, priority, due, block_reason, \
-                   created_at, updated_at, closed_at",
+                   created_at, updated_at, closed_at, slug",
     )
     .bind(project)
     .bind(title)
@@ -64,9 +66,24 @@ pub async fn add(
     .bind(owner.as_str())
     .bind(priority)
     .bind(due)
+    .bind(&slug)
     .fetch_one(pool)
     .await?;
     Ok(task)
+}
+
+async fn derive_task_slug(pool: &PgPool, title: &str) -> String {
+    let base = derive_slug(title, "task");
+    resolve_collision(&base, |candidate| async move {
+        let exists =
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM tasks WHERE slug = $1)")
+                .bind(candidate)
+                .fetch_one(pool)
+                .await
+                .unwrap_or(false);
+        !exists
+    })
+    .await
 }
 
 pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Task>> {
@@ -74,6 +91,18 @@ pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Task>> {
         sqlx::query_as::<_, Task>(&format!("SELECT {SELECT_COLS} FROM tasks WHERE id = $1"))
             .bind(id)
             .fetch_optional(pool)
+            .await?,
+    )
+}
+
+pub async fn find_by_slug<'e, E>(executor: E, slug: &str) -> Result<Option<Task>>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    Ok(
+        sqlx::query_as::<_, Task>(&format!("SELECT {SELECT_COLS} FROM tasks WHERE slug = $1"))
+            .bind(slug)
+            .fetch_optional(executor)
             .await?,
     )
 }

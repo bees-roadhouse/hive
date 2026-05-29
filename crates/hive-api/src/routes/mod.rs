@@ -13,5 +13,6 @@ pub mod oauth;
 pub mod projects;
 pub mod search;
 pub mod semantic;
+pub mod stream;
 pub mod tasks;
 pub mod wire;

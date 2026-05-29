@@ -1,5 +1,6 @@
 pub mod anchors;
 pub mod embeddings;
+pub mod events;
 pub mod graph;
 pub mod journal;
 pub mod links;

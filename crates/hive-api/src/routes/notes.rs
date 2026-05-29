@@ -14,8 +14,9 @@ use crate::state::{AppState, HiveEvent};
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/notes", get(list).post(add))
-        .route("/notes/{id}", get(show))
         .route("/notes/search", get(search_endpoint))
+        // {id_or_slug} ... UUID first, slug fallback. /search matched above.
+        .route("/notes/{id_or_slug}", get(show))
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,9 +78,16 @@ async fn add(
 
 async fn show(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(id_or_slug): Path<String>,
 ) -> Result<Json<hive_db::types::Note>, ApiError> {
-    let n = notes::require(&state.pool, id).await?;
+    if let Ok(id) = Uuid::parse_str(&id_or_slug)
+        && let Some(n) = notes::get(&state.pool, id).await?
+    {
+        return Ok(Json(n));
+    }
+    let n = notes::find_by_slug(&state.pool, &id_or_slug)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("note {id_or_slug}")))?;
     Ok(Json(n))
 }
 

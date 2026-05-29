@@ -8,6 +8,7 @@ pub mod enums;
 pub mod error;
 pub mod pool;
 pub mod queries;
+pub mod slug;
 pub mod types;
 
 pub use error::{Error, Result};

@@ -4,9 +4,10 @@ use uuid::Uuid;
 use crate::enums::Author;
 use crate::error::{Error, Result};
 use crate::queries::projects;
+use crate::slug::{derive_slug, resolve_collision};
 use crate::types::Note;
 
-const SELECT_COLS: &str = "id, author, title, body, tags, project, created_at, updated_at";
+const SELECT_COLS: &str = "id, author, title, body, tags, project, created_at, updated_at, slug";
 
 #[derive(Debug, Default, Clone)]
 pub struct ListFilters {
@@ -27,19 +28,39 @@ pub async fn add(
     if let Some(p) = project {
         projects::require(pool, p).await?;
     }
+    let slug = derive_note_slug(pool, title).await;
     let row = sqlx::query_as::<_, Note>(
-        "INSERT INTO notes (author, title, body, tags, project) \
-         VALUES ($1, $2, $3, $4, $5) \
-         RETURNING id, author, title, body, tags, project, created_at, updated_at",
+        "INSERT INTO notes (author, title, body, tags, project, slug) \
+         VALUES ($1, $2, $3, $4, $5, $6) \
+         RETURNING id, author, title, body, tags, project, created_at, updated_at, slug",
     )
     .bind(author.as_str())
     .bind(title)
     .bind(body)
     .bind(tags)
     .bind(project)
+    .bind(&slug)
     .fetch_one(pool)
     .await?;
     Ok(row)
+}
+
+async fn derive_note_slug(pool: &PgPool, title: Option<&str>) -> String {
+    let base_title = title
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("note");
+    let base = derive_slug(base_title, "note");
+    resolve_collision(&base, |candidate| async move {
+        let exists =
+            sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM notes WHERE slug = $1)")
+                .bind(candidate)
+                .fetch_one(pool)
+                .await
+                .unwrap_or(false);
+        !exists
+    })
+    .await
 }
 
 pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Note>> {
@@ -47,6 +68,18 @@ pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<Note>> {
         sqlx::query_as::<_, Note>(&format!("SELECT {SELECT_COLS} FROM notes WHERE id = $1"))
             .bind(id)
             .fetch_optional(pool)
+            .await?,
+    )
+}
+
+pub async fn find_by_slug<'e, E>(executor: E, slug: &str) -> Result<Option<Note>>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    Ok(
+        sqlx::query_as::<_, Note>(&format!("SELECT {SELECT_COLS} FROM notes WHERE slug = $1"))
+            .bind(slug)
+            .fetch_optional(executor)
             .await?,
     )
 }
