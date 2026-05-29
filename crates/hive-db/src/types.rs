@@ -114,7 +114,22 @@ pub struct Person {
     pub id: Uuid,
     pub slug: String,
     pub display_name: String,
-    /// `ai` or `human` (CHECK-constrained at the schema level).
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// AI directory row (migration 0013). Independent from `ai_identities` (the
+/// auth-side grants table from migration 0006): this is the directory of
+/// AIs that can be `@`-mentioned, journal-tagged, or attributed; that one
+/// is "which human granted which scopes to which AI for what session."
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Ai {
+    pub id: Uuid,
+    pub slug: String,
+    pub display_name: String,
+    /// `assistant` | `agent` | `persona` (CHECK-constrained at the schema
+    /// level). Independent from `ai_identities.kind`.
     pub kind: String,
     pub notes: Option<String>,
     pub created_at: DateTime<Utc>,

@@ -146,9 +146,14 @@ async fn main() -> anyhow::Result<()> {
         .merge(routes::health::router())
         .merge(routes::auth::router())
         .merge(routes::oauth::router())
+        // The AI directory (`ai` table from migration 0013): pia/apis/cera
+        // as first-class entities, paired with `/people` (humans). Distinct
+        // from the auth-side `ai_identities` routes below.
+        .merge(routes::ai::router())
+        .merge(routes::people::router())
         // Phase 6: AI identities + grants + MCP token issuance + revocation
         // surface, and the MCP protected-resource seam (RFC 9728).
-        .merge(routes::ai::router())
+        .merge(routes::ai_identities::router())
         .merge(routes::mcp::router())
         // Phase 4: TOTP MFA enrollment + management (login second-factor check
         // lives in the /authorize flow).

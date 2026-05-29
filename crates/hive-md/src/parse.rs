@@ -304,9 +304,9 @@ fn parse_wikilink_inner(inner: &str, raw: &str, line_index: usize) -> Option<Ent
     if trimmed.is_empty() {
         return None;
     }
-    if let Some((kind_str, slug_str)) = trimmed.split_once(':') {
+    if let Some((kind_str, body_str)) = trimmed.split_once(':') {
         let kind_str = kind_str.trim();
-        let slug_str = slug_str.trim();
+        let body_str = body_str.trim();
         let typed = match kind_str {
             "task" => TypedKind::Task,
             "note" => TypedKind::Note,
@@ -314,25 +314,64 @@ fn parse_wikilink_inner(inner: &str, raw: &str, line_index: usize) -> Option<Ent
             "journal" => TypedKind::Journal,
             _ => return None,
         };
-        if !is_slug(slug_str) {
+        if body_str.is_empty() {
             return None;
         }
+        // Typed mentions accept either a literal slug or a title; the
+        // resolver normalizes the latter via the same derive_slug rule the
+        // sluggable tables use on insert.
+        let slug = if is_slug(body_str) {
+            body_str.to_string()
+        } else {
+            slugify_title(body_str)?
+        };
         Some(EntityMention {
             kind: MentionKind::Typed(typed),
             raw: raw.to_string(),
-            slug: slug_str.to_string(),
+            slug,
             line_index,
         })
     } else {
-        if !is_slug(trimmed) {
-            return None;
-        }
+        // Fuzzy wikilink: accept any printable inner text (no newlines, no
+        // nested `[[`, both already enforced by `find_close_wikilink`). If
+        // the input is already a slug, keep it byte-exact; otherwise treat
+        // it as a title and slugify with the shared rule.
+        let slug = if is_slug(trimmed) {
+            trimmed.to_string()
+        } else {
+            slugify_title(trimmed)?
+        };
         Some(EntityMention {
             kind: MentionKind::Fuzzy,
             raw: raw.to_string(),
-            slug: trimmed.to_string(),
+            slug,
             line_index,
         })
+    }
+}
+
+/// Lowercase, non-alnum → '-', collapse runs, trim '-' from ends. Returns
+/// None if the result would be empty or start with a digit (the slug
+/// constraint at the schema level). Matches `hive_db::slug::derive_slug`
+/// but kept local so `hive-md` stays dependency-free of `hive-db`.
+fn slugify_title(s: &str) -> Option<String> {
+    let lower = s.to_ascii_lowercase();
+    let mut out = String::with_capacity(lower.len());
+    let mut prev_dash = false;
+    for ch in lower.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() || trimmed.starts_with(|c: char| c.is_ascii_digit()) {
+        None
+    } else {
+        Some(trimmed)
     }
 }
 
