@@ -70,7 +70,8 @@ main {
     flex-wrap: wrap;
 }
 
-.writer-chips button {
+.writer-chips button,
+.writer-chips .chip {
     appearance: none;
     background: transparent;
     border: 1px solid transparent;
@@ -80,13 +81,25 @@ main {
     padding: 0.25rem 0.75rem;
     border-radius: 999px;
     cursor: pointer;
+    text-decoration: none;
     transition: background 120ms, color 120ms, border-color 120ms;
 }
-.writer-chips button:hover { color: #2a2520; }
-.writer-chips button.active {
+.writer-chips button:hover,
+.writer-chips .chip:hover { color: #2a2520; }
+.writer-chips button.active,
+.writer-chips .chip.active {
     background: #e6dcc2;
     color: #2a2520;
     border-color: #d6c9a8;
+}
+
+/* The tag filter is a GET form: Enter submits, no JS. Style it as a single
+ * inline element so it fits the chip row visually. */
+.tag-form {
+    flex: 1;
+    min-width: 12rem;
+    display: flex;
+    margin: 0;
 }
 
 .tag-input {
@@ -104,6 +117,26 @@ main {
 .tag-input:focus {
     outline: none;
     border-bottom-color: #8a5a30;
+}
+
+.clear-filters {
+    font-size: 0.8rem;
+    color: #9a8e78;
+    text-decoration: none;
+    white-space: nowrap;
+}
+.clear-filters:hover { color: #8a5a30; }
+
+/* In-entry tag chips link back to a filtered feed. Inherit the muted color
+ * of `.tag` but kill the default underline so they read as quiet chips. */
+.entry-tags a.tag {
+    text-decoration: none;
+}
+.entry-tags a.tag:hover {
+    color: #8a5a30;
+    text-decoration: underline;
+    text-decoration-color: rgba(138, 90, 48, 0.35);
+    text-underline-offset: 2px;
 }
 
 /* ── feed: one entry per item, no card chrome ────────────────────────── */
