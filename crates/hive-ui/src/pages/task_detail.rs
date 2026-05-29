@@ -30,7 +30,7 @@ pub fn TaskDetailPage() -> impl IntoView {
             }
             let task = fetch_task_by_slug(&slug).await.map_err(|e| e.to_string())?;
             let task_id = task.id.to_string();
-            let (outgoing, incoming) = tokio::join!(
+            let (outgoing, incoming) = futures::join!(
                 fetch_links_outgoing("tasks", &task_id),
                 fetch_links_incoming("tasks", &task_id),
             );

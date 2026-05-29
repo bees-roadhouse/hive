@@ -6,9 +6,24 @@
 //!      intersects `HIVE_DHCP_NAME_SEARCH_DOMAIN_NETWORK_AWARENESS`.
 //!   3. `HIVE_PUBLIC_URL` ... fallback when off-LAN.
 //!   4. `http://localhost:7878` ... last-resort default.
+//!
+//! ## Dual-target shape
+//!
+//! Types in this module (the Serde structs, `SessionId`) are shared across the
+//! ssr and hydrate builds ... pages reference them as ordinary Rust types on
+//! both sides. The `fetch_*` functions only have working bodies under the
+//! `ssr` feature ... the wasm/hydrate side gets stub bodies that return an
+//! error. In practice Leptos's `Resource` resolves on the server during SSR
+//! and serializes the result into the page, so the client never re-runs the
+//! fetcher on the initial render. Once hydration lands and a Resource's
+//! signal changes on the client, that's when a proper `#[server]` RPC would
+//! kick in ... which is the next layer of work.
 
+#[cfg(feature = "ssr")]
 use std::collections::HashSet;
+#[cfg(feature = "ssr")]
 use std::sync::OnceLock;
+#[cfg(feature = "ssr")]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -167,6 +182,7 @@ pub struct WireEvent {
     pub last_seen_at: Option<String>,
 }
 
+#[cfg(feature = "ssr")]
 fn system_search_domains() -> Vec<String> {
     use std::process::Command;
     let raw: String = if cfg!(target_os = "windows") {
@@ -214,6 +230,7 @@ fn system_search_domains() -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "ssr")]
 pub fn api_base() -> &'static str {
     static BASE: OnceLock<String> = OnceLock::new();
     BASE.get_or_init(|| {
@@ -251,6 +268,7 @@ pub fn api_base() -> &'static str {
     })
 }
 
+#[cfg(feature = "ssr")]
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -264,6 +282,7 @@ fn http_client() -> &'static reqwest::Client {
 /// The session id for the current SSR render, from Leptos context. `None` when
 /// no `App`-provided context exists (e.g. in unit tests) or the user isn't
 /// logged in.
+#[cfg(feature = "ssr")]
 fn current_session() -> Option<String> {
     leptos::prelude::use_context::<SessionId>().and_then(|s| s.0)
 }
@@ -274,6 +293,7 @@ fn current_session() -> Option<String> {
 /// Auth (Phase 3, §3.1): attaches the session's bearer token when logged in.
 /// On a 401 (access token expired/revoked under enforce mode) it rotates the
 /// refresh token once and retries — transparent token refresh.
+#[cfg(feature = "ssr")]
 async fn fetch_list<T: serde::de::DeserializeOwned>(
     path: &str,
     params: &[(&str, &str)],
@@ -318,6 +338,7 @@ async fn fetch_list<T: serde::de::DeserializeOwned>(
 }
 
 /// Issue a GET, attaching the bearer token when present.
+#[cfg(feature = "ssr")]
 async fn send_get(url: &str, token: Option<&str>) -> anyhow::Result<reqwest::Response> {
     let mut req = http_client().get(url);
     if let Some(t) = token {
@@ -328,6 +349,7 @@ async fn send_get(url: &str, token: Option<&str>) -> anyhow::Result<reqwest::Res
 
 /// Minimal percent-encoding for query values (filters are short alnum/dash
 /// tokens, but tags can carry spaces or commas).
+#[cfg(feature = "ssr")]
 fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -343,6 +365,7 @@ fn urlencode(s: &str) -> String {
 
 /// GET a hive-api endpoint that returns a single JSON object. Same auth +
 /// transparent-refresh shape as `fetch_list`.
+#[cfg(feature = "ssr")]
 async fn fetch_one<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T> {
     let url = format!("{}{}", api_base(), path);
 
@@ -375,17 +398,20 @@ async fn fetch_one<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result
 /// Unfiltered journal fetch. Kept for parity with `fetch_journal_filtered`
 /// and future call sites. Hidden behind allow(dead_code) because no current
 /// page uses it; remove the attr when one does.
+#[cfg(feature = "ssr")]
 #[allow(dead_code)]
 pub async fn fetch_journal(limit: i64) -> anyhow::Result<Vec<JournalEntry>> {
     fetch_list("/journal", &[("limit", &limit.to_string())]).await
 }
 
 /// Fetch a single journal entry by its id.
+#[cfg(feature = "ssr")]
 pub async fn fetch_journal_entry(id: &str) -> anyhow::Result<JournalEntry> {
     fetch_one(&format!("/journal/{id}")).await
 }
 
 /// Filtered journal list. `ai` and `tag` are optional (empty = unfiltered).
+#[cfg(feature = "ssr")]
 pub async fn fetch_journal_filtered(
     ai: &str,
     tag: &str,
@@ -399,6 +425,7 @@ pub async fn fetch_journal_filtered(
 }
 
 /// Task list. `owner` and `status` are optional; `all=true` includes closed.
+#[cfg(feature = "ssr")]
 pub async fn fetch_tasks(owner: &str, status: &str, all: bool) -> anyhow::Result<Vec<Task>> {
     fetch_list(
         "/tasks",
@@ -412,6 +439,7 @@ pub async fn fetch_tasks(owner: &str, status: &str, all: bool) -> anyhow::Result
 }
 
 /// Note list. `author` and `tag` are optional.
+#[cfg(feature = "ssr")]
 pub async fn fetch_notes(author: &str, tag: &str, limit: i64) -> anyhow::Result<Vec<Note>> {
     fetch_list(
         "/notes",
@@ -429,6 +457,7 @@ pub async fn fetch_notes(author: &str, tag: &str, limit: i64) -> anyhow::Result<
 /// `EntryArticle` visual can render them. The snippet's `[..]` highlight
 /// markers are converted to `<mark>..</mark>` and inlined into `body`;
 /// pulldown_cmark passes the raw HTML through on the trusted-content path.
+#[cfg(feature = "ssr")]
 pub async fn fetch_journal_search(q: &str, limit: i64) -> anyhow::Result<Vec<JournalEntry>> {
     #[derive(Debug, Deserialize)]
     struct JournalHit {
@@ -462,6 +491,7 @@ pub async fn fetch_journal_search(q: &str, limit: i64) -> anyhow::Result<Vec<Jou
 /// Convert the FTS5 snippet's `[term]` highlight markers into `<mark>term</mark>`.
 /// Everything else passes through verbatim; the markdown renderer treats the
 /// result as inline HTML (trusted-content path).
+#[cfg(feature = "ssr")]
 fn snippet_to_html(snippet: &str) -> String {
     let mut out = String::with_capacity(snippet.len() + 16);
     let mut in_mark = false;
@@ -486,6 +516,7 @@ fn snippet_to_html(snippet: &str) -> String {
 
 /// Wire-event list. `source` and `severity` are optional; `unacknowledged=true`
 /// hides acked events.
+#[cfg(feature = "ssr")]
 pub async fn fetch_wire(
     source: &str,
     severity: &str,
@@ -510,6 +541,7 @@ pub async fn fetch_wire(
 ///
 /// Degrades to `Ok(vec![])` on any error ... the sidecar is secondary
 /// chrome and shouldn't block the page render.
+#[cfg(feature = "ssr")]
 pub async fn fetch_links_outgoing(source_table: &str, source_id: &str) -> Vec<Link> {
     let source = format!("{source_table}:{source_id}");
     match fetch_list::<Link>("/links", &[("source", &source)]).await {
@@ -524,6 +556,7 @@ pub async fn fetch_links_outgoing(source_table: &str, source_id: &str) -> Vec<Li
 /// Incoming links to the given target entity (i.e. backlinks).
 ///
 /// Degrades to `Ok(vec![])` on any error.
+#[cfg(feature = "ssr")]
 pub async fn fetch_links_incoming(target_table: &str, target_id: &str) -> Vec<Link> {
     let target = format!("{target_table}:{target_id}");
     match fetch_list::<Link>("/links/incoming", &[("target", &target)]).await {
@@ -538,41 +571,49 @@ pub async fn fetch_links_incoming(target_table: &str, target_id: &str) -> Vec<Li
 /// Fetch a single task by id or slug. The hive-api `/tasks/{id_or_slug}`
 /// endpoint accepts either ... the slug-fallback is what makes the
 /// `[[task:slug]]` mention click land on a real row.
+#[cfg(feature = "ssr")]
 pub async fn fetch_task_by_slug(id_or_slug: &str) -> anyhow::Result<Task> {
     fetch_one(&format!("/tasks/{id_or_slug}")).await
 }
 
 /// Fetch a single note by id or slug.
+#[cfg(feature = "ssr")]
 pub async fn fetch_note_by_slug(id_or_slug: &str) -> anyhow::Result<Note> {
     fetch_one(&format!("/notes/{id_or_slug}")).await
 }
 
 /// Fetch a single event by id or slug.
+#[cfg(feature = "ssr")]
 pub async fn fetch_event_by_slug(id_or_slug: &str) -> anyhow::Result<Event> {
     fetch_one(&format!("/events/{id_or_slug}")).await
 }
 
 /// Fetch the humans directory. (AIs live at `/ai` ... see `fetch_ai_list`.)
+#[cfg(feature = "ssr")]
 pub async fn fetch_people() -> anyhow::Result<Vec<Person>> {
     fetch_list("/people", &[]).await
 }
 
 /// Fetch a single human by slug (or uuid).
+#[cfg(feature = "ssr")]
 pub async fn fetch_person(slug: &str) -> anyhow::Result<Person> {
     fetch_one(&format!("/people/{slug}")).await
 }
 
 /// Fetch the AI directory (assistants, agents, personas).
+#[cfg(feature = "ssr")]
 pub async fn fetch_ai_list() -> anyhow::Result<Vec<Ai>> {
     fetch_list("/ai", &[]).await
 }
 
 /// Fetch a single AI by slug (or uuid).
+#[cfg(feature = "ssr")]
 pub async fn fetch_ai_by_slug(slug: &str) -> anyhow::Result<Ai> {
     fetch_one(&format!("/ai/{slug}")).await
 }
 
 /// Event list (optionally tag-filtered).
+#[cfg(feature = "ssr")]
 pub async fn fetch_events(tag: &str, limit: i64) -> anyhow::Result<Vec<Event>> {
     fetch_list("/events", &[("tag", tag), ("limit", &limit.to_string())]).await
 }
@@ -583,6 +624,93 @@ pub async fn fetch_events(tag: &str, limit: i64) -> anyhow::Result<Vec<Event>> {
 /// Expected endpoint: `GET /journal/:id/tasks` returns `Vec<Task>` for
 /// any rows in `task_anchors` that point at this entry. Until that
 /// lands, return empty and the sidecar shows empty-state.
+#[cfg(feature = "ssr")]
 pub async fn fetch_task_anchors(_journal_entry_id: &str) -> Vec<Task> {
     Vec::new()
 }
+
+// ---------- wasm/hydrate stubs ----------
+//
+// On wasm32 (hydrate feature) the fetch_* functions get one-line stubs that
+// return an empty error. Pages compile against the same names as on the
+// server. In practice these are never actually invoked: Leptos's `Resource`
+// resolves during SSR and serializes the value into the page, so the client
+// reads the resolved value rather than re-running the closure. Pages that
+// drive a Resource off a client-side signal (e.g. JournalPage's ai/tag
+// dropdowns) will need a `#[server]` round-trip layered on top of these
+// stubs in a follow-up.
+
+#[cfg(not(feature = "ssr"))]
+mod wasm_stubs {
+    use super::*;
+
+    fn stub_err<T>() -> anyhow::Result<T> {
+        anyhow::bail!(
+            "hive-api fetcher called on the wasm/hydrate side; not yet wired to a #[server] round-trip"
+        )
+    }
+
+    pub async fn fetch_journal_entry(_id: &str) -> anyhow::Result<JournalEntry> {
+        stub_err()
+    }
+    pub async fn fetch_journal_filtered(
+        _ai: &str,
+        _tag: &str,
+        _limit: i64,
+    ) -> anyhow::Result<Vec<JournalEntry>> {
+        stub_err()
+    }
+    pub async fn fetch_tasks(_owner: &str, _status: &str, _all: bool) -> anyhow::Result<Vec<Task>> {
+        stub_err()
+    }
+    pub async fn fetch_notes(_author: &str, _tag: &str, _limit: i64) -> anyhow::Result<Vec<Note>> {
+        stub_err()
+    }
+    pub async fn fetch_journal_search(_q: &str, _limit: i64) -> anyhow::Result<Vec<JournalEntry>> {
+        stub_err()
+    }
+    pub async fn fetch_wire(
+        _source: &str,
+        _severity: &str,
+        _unacknowledged: bool,
+        _limit: i64,
+    ) -> anyhow::Result<Vec<WireEvent>> {
+        stub_err()
+    }
+    pub async fn fetch_links_outgoing(_source_table: &str, _source_id: &str) -> Vec<Link> {
+        Vec::new()
+    }
+    pub async fn fetch_links_incoming(_target_table: &str, _target_id: &str) -> Vec<Link> {
+        Vec::new()
+    }
+    pub async fn fetch_task_by_slug(_id_or_slug: &str) -> anyhow::Result<Task> {
+        stub_err()
+    }
+    pub async fn fetch_note_by_slug(_id_or_slug: &str) -> anyhow::Result<Note> {
+        stub_err()
+    }
+    pub async fn fetch_event_by_slug(_id_or_slug: &str) -> anyhow::Result<Event> {
+        stub_err()
+    }
+    pub async fn fetch_people() -> anyhow::Result<Vec<Person>> {
+        stub_err()
+    }
+    pub async fn fetch_person(_slug: &str) -> anyhow::Result<Person> {
+        stub_err()
+    }
+    pub async fn fetch_ai_list() -> anyhow::Result<Vec<Ai>> {
+        stub_err()
+    }
+    pub async fn fetch_ai_by_slug(_slug: &str) -> anyhow::Result<Ai> {
+        stub_err()
+    }
+    pub async fn fetch_events(_tag: &str, _limit: i64) -> anyhow::Result<Vec<Event>> {
+        stub_err()
+    }
+    pub async fn fetch_task_anchors(_journal_entry_id: &str) -> Vec<Task> {
+        Vec::new()
+    }
+}
+
+#[cfg(not(feature = "ssr"))]
+pub use wasm_stubs::*;

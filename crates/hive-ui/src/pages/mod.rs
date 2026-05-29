@@ -1,3 +1,4 @@
+pub mod compose;
 pub mod entry;
 pub mod entry_article;
 pub mod events;

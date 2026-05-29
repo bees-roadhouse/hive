@@ -83,7 +83,7 @@ pub fn PersonDetailPage() -> impl IntoView {
             }
             let person = fetch_person(&slug).await.map_err(|e| e.to_string())?;
             let person_id = person.id.to_string();
-            let (recent_journal, outgoing, incoming) = tokio::join!(
+            let (recent_journal, outgoing, incoming) = futures::join!(
                 fetch_journal_filtered(&person.slug, "", 10),
                 fetch_links_outgoing("people", &person_id),
                 fetch_links_incoming("people", &person_id),
@@ -209,7 +209,7 @@ pub fn AiDetailPage() -> impl IntoView {
             }
             let ai = fetch_ai_by_slug(&slug).await.map_err(|e| e.to_string())?;
             let ai_id = ai.id.to_string();
-            let (recent_journal, outgoing, incoming) = tokio::join!(
+            let (recent_journal, outgoing, incoming) = futures::join!(
                 fetch_journal_filtered(&ai.slug, "", 10),
                 fetch_links_outgoing("ai", &ai_id),
                 fetch_links_incoming("ai", &ai_id),
