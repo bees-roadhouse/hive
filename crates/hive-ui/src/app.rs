@@ -9,6 +9,8 @@ use crate::pages::entry::EntryPage;
 use crate::pages::home::HomePage;
 use crate::pages::journal::JournalPage;
 use crate::pages::notes::NotesPage;
+use crate::pages::search::SearchPage;
+use crate::pages::side_panel::{PanelToggle, SidePanel};
 use crate::pages::tasks::TasksPage;
 use crate::pages::wire::WirePage;
 
@@ -63,9 +65,13 @@ fn Nav() -> impl IntoView {
         <nav class="hive-topbar">
             <a class="hive-brand" href="/">"hive"</a>
             <a class="hive-new" href="/journal/new">"+ new"</a>
+            <form class="hive-search" method="get" action="/journal/search">
+                <input type="search" name="q" placeholder="search journal" aria-label="search journal" />
+            </form>
             <span class="hive-spacer"></span>
             <a class="hive-auth" href="/login" rel="external">"log in"</a>
             <a class="hive-auth" href="/logout" rel="external">"log out"</a>
+            <PanelToggle/>
         </nav>
     }
 }
@@ -86,6 +92,7 @@ pub fn App() -> impl IntoView {
             <main>
                 <Routes fallback=|| view! { <p>"not found"</p> }>
                     <Route path=StaticSegment("") view=HomePage/>
+                    <Route path=path!("/journal/search") view=SearchPage/>
                     <Route path=StaticSegment("journal") view=JournalPage/>
                     <Route path=path!("/journal/:id") view=EntryPage/>
                     <Route path=StaticSegment("tasks") view=TasksPage/>
@@ -93,6 +100,7 @@ pub fn App() -> impl IntoView {
                     <Route path=StaticSegment("wire") view=WirePage/>
                 </Routes>
             </main>
+            <SidePanel/>
         </Router>
     }
 }
