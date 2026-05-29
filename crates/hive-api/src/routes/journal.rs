@@ -15,8 +15,10 @@ use crate::state::{AppState, HiveEvent};
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/journal", get(list).post(add))
-        .route("/journal/{id}", get(show))
         .route("/journal/search", get(search_endpoint))
+        // {id_or_slug} ... UUID parsed first, slug fallback. /search is matched
+        // above so it doesn't fall into this catch-all.
+        .route("/journal/{id_or_slug}", get(show))
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,9 +97,16 @@ async fn add(
 
 async fn show(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(id_or_slug): Path<String>,
 ) -> Result<Json<hive_db::types::JournalEntry>, ApiError> {
-    let e = journal::require(&state.pool, id).await?;
+    if let Ok(id) = Uuid::parse_str(&id_or_slug)
+        && let Some(e) = journal::get(&state.pool, id).await?
+    {
+        return Ok(Json(e));
+    }
+    let e = journal::find_by_slug(&state.pool, &id_or_slug)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("journal_entry {id_or_slug}")))?;
     Ok(Json(e))
 }
 

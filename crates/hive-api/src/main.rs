@@ -141,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(routes::search::router())
         .merge(routes::semantic::router())
         .merge(routes::events::router())
+        .merge(routes::stream::router())
         .merge(routes::health::router())
         .merge(routes::auth::router())
         .merge(routes::oauth::router())

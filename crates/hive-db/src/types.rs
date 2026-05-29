@@ -36,6 +36,10 @@ pub struct Task {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
+    /// Human-typeable slug for `[[task:slug]]` mentions. Nullable until the
+    /// follow-up NOT-NULL migration lands; new rows always get one derived
+    /// from the title via `slug::derive_slug`.
+    pub slug: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -48,6 +52,8 @@ pub struct JournalEntry {
     pub tags: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// See `Task::slug`. `[[journal:slug]]` reference target.
+    pub slug: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -58,6 +64,22 @@ pub struct Note {
     pub body: String,
     pub tags: Option<String>,
     pub project: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// See `Task::slug`. `[[note:slug]]` reference target.
+    pub slug: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Event {
+    pub id: Uuid,
+    pub slug: String,
+    pub title: String,
+    pub body: Option<String>,
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: Option<DateTime<Utc>>,
+    pub location: Option<String>,
+    pub tags: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

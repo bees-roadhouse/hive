@@ -14,7 +14,9 @@ use crate::state::{AppState, HiveEvent};
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/tasks", get(list).post(add))
-        .route("/tasks/{id}", get(show).patch(update))
+        // GET takes UUID or slug; PATCH still requires UUID (mutations resolve
+        // the slug client-side first if needed).
+        .route("/tasks/{id_or_slug}", get(show).patch(update))
         .route("/tasks/{id}/done", post(done))
         .route("/tasks/{id}/block", post(block))
         .route("/tasks/{id}/drop", post(drop))
@@ -82,9 +84,16 @@ async fn add(
 
 async fn show(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(id_or_slug): Path<String>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
-    let t = tasks::require(&state.pool, id).await?;
+    if let Ok(id) = Uuid::parse_str(&id_or_slug)
+        && let Some(t) = tasks::get(&state.pool, id).await?
+    {
+        return Ok(Json(t));
+    }
+    let t = tasks::find_by_slug(&state.pool, &id_or_slug)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("task {id_or_slug}")))?;
     Ok(Json(t))
 }
 
@@ -112,9 +121,10 @@ where
 
 async fn update(
     State(state): State<AppState>,
-    Path(id): Path<Uuid>,
+    Path(id_or_slug): Path<String>,
     Json(body): Json<UpdateBody>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
+    let id = resolve_task_id(&state, &id_or_slug).await?;
     let fields = tasks::UpdateFields {
         status: body.status,
         priority: body.priority,
@@ -194,4 +204,18 @@ async fn drop(
             })),
         );
     Ok(Json(t))
+}
+
+/// Resolve a `{id_or_slug}` path param to a task id. UUID parse first,
+/// `find_by_slug` fallback. Returns NotFound if neither matches.
+async fn resolve_task_id(state: &AppState, id_or_slug: &str) -> Result<Uuid, ApiError> {
+    if let Ok(id) = Uuid::parse_str(id_or_slug)
+        && tasks::get(&state.pool, id).await?.is_some()
+    {
+        return Ok(id);
+    }
+    let t = tasks::find_by_slug(&state.pool, id_or_slug)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("task {id_or_slug}")))?;
+    Ok(t.id)
 }
