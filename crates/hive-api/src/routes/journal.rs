@@ -6,7 +6,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use hive_db::enums::Ai;
-use hive_db::queries::{journal, search};
+use hive_db::queries::{journal, search, tasks};
 
 use crate::auth::extractor::MaybeAuthUser;
 use crate::error::ApiError;
@@ -16,6 +16,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/journal", get(list).post(add))
         .route("/journal/search", get(search_endpoint))
+        .route("/journal/{id}/tasks", get(tasks_for_entry))
         // {id_or_slug} ... UUID parsed first, slug fallback. /search is matched
         // above so it doesn't fall into this catch-all.
         .route("/journal/{id_or_slug}", get(show))
@@ -69,6 +70,7 @@ async fn add(
     State(state): State<AppState>,
     Json(body): Json<AddBody>,
 ) -> Result<Json<hive_db::types::JournalEntry>, ApiError> {
+    let entry_body = assign_missing_task_block_ids(&body.body);
     let date = body.date.clone().unwrap_or_else(|| {
         chrono::Local::now()
             .date_naive()
@@ -80,7 +82,7 @@ async fn add(
         body.ai,
         &date,
         body.title.as_deref(),
-        &body.body,
+        &entry_body,
         body.tags.as_deref(),
     )
     .await?;
@@ -115,6 +117,49 @@ async fn show(
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("journal_entry {id_or_slug}")))?;
     Ok(Json(e))
+}
+
+fn assign_missing_task_block_ids(body: &str) -> String {
+    let parsed = hive_md::parse(body);
+    let mut next = parsed
+        .tasks
+        .iter()
+        .filter_map(|t| t.block_id.as_deref())
+        .filter_map(|id| id.strip_prefix("task"))
+        .filter_map(|n| n.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1;
+
+    hive_md::assign_block_ids(body, || {
+        let id = format!("task{next}");
+        next += 1;
+        id
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::assign_missing_task_block_ids;
+
+    #[test]
+    fn assigns_missing_task_block_ids_without_rewriting_existing_ones() {
+        let body = "- [ ] first\n- [x] second ^task4\n- [ ] third";
+        let out = assign_missing_task_block_ids(body);
+
+        assert_eq!(
+            out,
+            "- [ ] first ^task5\n- [x] second ^task4\n- [ ] third ^task6"
+        );
+    }
+}
+
+async fn tasks_for_entry(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<hive_db::types::Task>>, ApiError> {
+    let rows = tasks::list_for_journal_entry(&state.pool, id).await?;
+    Ok(Json(rows))
 }
 
 #[derive(Debug, Deserialize)]

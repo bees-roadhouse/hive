@@ -138,6 +138,20 @@ pub async fn list(pool: &PgPool, filters: &ListFilters) -> Result<Vec<Task>> {
     Ok(rows)
 }
 
+pub async fn list_for_journal_entry(pool: &PgPool, journal_entry_id: Uuid) -> Result<Vec<Task>> {
+    Ok(sqlx::query_as::<_, Task>(&format!(
+        "SELECT t.{cols} \
+         FROM task_anchors a \
+         JOIN tasks t ON t.id = a.task_id \
+         WHERE a.journal_entry_id = $1 \
+         ORDER BY a.block_id",
+        cols = SELECT_COLS.replace(", ", ", t.")
+    ))
+    .bind(journal_entry_id)
+    .fetch_all(pool)
+    .await?)
+}
+
 pub async fn update(pool: &PgPool, id: Uuid, fields: &UpdateFields) -> Result<()> {
     if fields.is_empty() {
         return Err(Error::InvalidFormat {

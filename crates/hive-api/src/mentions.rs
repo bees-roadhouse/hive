@@ -24,13 +24,19 @@
 //! on the unique source/target tuple).
 
 use std::collections::HashMap;
+use std::str::FromStr;
 
 use hive_md::{EntityMention, MentionKind, TypedKind};
 use sqlx::{PgPool, Row};
 use tracing::warn;
 use uuid::Uuid;
 
-use hive_db::queries::anchors;
+use hive_db::enums::Owner;
+use hive_db::error::Error as DbError;
+use hive_db::queries::{anchors, projects, tasks};
+use hive_db::types::Task;
+
+const JOURNAL_INBOX_PROJECT: &str = "journal-inbox";
 
 /// A mention that resolved to a concrete entity (or didn't).
 #[derive(Debug, Clone)]
@@ -333,48 +339,60 @@ fn truncate_raw(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
-/// Project inline tasks parsed from a journal entry into `task_anchors` rows.
-/// Each parsed task that has a `block_id` AND a real task row (matched by
-/// title for now) gets an anchor.
-///
-/// TODO(handoff): this is the half-shipped version. We project anchors for
-/// tasks that ALREADY exist with a matching title; we do NOT yet create new
-/// task rows from inline `- [ ]` lines. The full pipeline ... auto-create
-/// tasks for new inline checkboxes, with project derived from the surrounding
-/// context ... needs:
-///
-///   1. A project default for journal-derived tasks (likely `journal-inbox`).
-///   2. Title de-dup heuristics so editing a line text doesn't create a new
-///      task; the block_id is the stable anchor, but linking by title on
-///      first sight is the bootstrap path.
-///   3. UI affordance for "this inline task became real task #X" so Nate sees
-///      the projection happen.
-///
-/// Leaving this minimal until the slug / project bits stabilize. The
-/// `task_anchors` upsert path itself IS idempotent and exercised below ... so
-/// once we start creating tasks, the anchor write happens here without
-/// further changes.
+/// Project inline tasks parsed from a journal entry into real task rows plus
+/// `task_anchors` rows. Existing task titles are reused; otherwise a task is
+/// created in `journal-inbox` and linked back to the entry.
 pub async fn upsert_task_anchors(
     pool: &PgPool,
     journal_entry_id: Uuid,
     parsed: &hive_md::ParsedBody,
 ) -> sqlx::Result<usize> {
     let mut written = 0usize;
+    let mut project_ready = false;
     for t in &parsed.tasks {
         let Some(block_id) = &t.block_id else {
             continue;
         };
-        // Look up an existing task by exact title. This is the bootstrap
-        // path; once the full slug+project pipeline ships, we'll create the
-        // task row here too.
+
         let row: Option<(Uuid,)> =
             sqlx::query_as("SELECT id FROM tasks WHERE title = $1 ORDER BY created_at LIMIT 1")
                 .bind(&t.text)
                 .fetch_optional(pool)
                 .await?;
-        let Some((task_id,)) = row else {
-            continue;
+        let (task_id, created) = match row {
+            Some((task_id,)) => (task_id, false),
+            None => {
+                if !project_ready {
+                    if let Err(e) = ensure_journal_inbox_project(pool).await {
+                        warn!(error = %e, "journal-inbox project ensure failed");
+                        continue;
+                    }
+                    project_ready = true;
+                }
+                match create_task_from_inline(pool, t).await {
+                    Ok(task) => (task.id, true),
+                    Err(e) => {
+                        warn!(
+                            %journal_entry_id,
+                            block_id,
+                            title = %t.text,
+                            error = %e,
+                            "inline task creation failed"
+                        );
+                        continue;
+                    }
+                }
+            }
         };
+
+        if created
+            && let Err(e) = upsert_task_link(pool, journal_entry_id, task_id, "spawned_in").await
+        {
+            warn!(%journal_entry_id, %task_id, error = %e, "spawned_in link upsert failed");
+        }
+        if let Err(e) = upsert_task_link(pool, journal_entry_id, task_id, "inline_in").await {
+            warn!(%journal_entry_id, %task_id, error = %e, "inline_in link upsert failed");
+        }
         if let Err(e) = anchors::upsert(pool, task_id, journal_entry_id, block_id).await {
             warn!(
                 %journal_entry_id,
@@ -386,8 +404,74 @@ pub async fn upsert_task_anchors(
         } else {
             written += 1;
         }
+
+        if t.checked
+            && let Err(e) = tasks::mark_done(pool, task_id).await
+        {
+            warn!(%journal_entry_id, %task_id, error = %e, "inline checked task mark_done failed");
+        }
     }
     Ok(written)
+}
+
+async fn ensure_journal_inbox_project(pool: &PgPool) -> hive_db::error::Result<()> {
+    if projects::get(pool, JOURNAL_INBOX_PROJECT).await?.is_some() {
+        return Ok(());
+    }
+
+    match projects::add(
+        pool,
+        JOURNAL_INBOX_PROJECT,
+        Some("Tasks created from inline journal checkboxes."),
+        Owner::Nate,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(DbError::AlreadyExists(_)) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+async fn create_task_from_inline(
+    pool: &PgPool,
+    inline: &hive_md::ParsedTask,
+) -> hive_db::error::Result<Task> {
+    let owner = inline
+        .owner
+        .as_deref()
+        .and_then(|o| Owner::from_str(o).ok())
+        .unwrap_or(Owner::Nate);
+    let due = inline.due.map(|d| d.format("%Y-%m-%d").to_string());
+    tasks::add(
+        pool,
+        JOURNAL_INBOX_PROJECT,
+        &inline.text,
+        None,
+        owner,
+        inline.priority.as_deref(),
+        due.as_deref(),
+    )
+    .await
+}
+
+async fn upsert_task_link(
+    pool: &PgPool,
+    journal_entry_id: Uuid,
+    task_id: Uuid,
+    link_type: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO links (source_table, source_id, target_table, target_id, link_type) \
+         VALUES ('journal_entries', $1, 'tasks', $2, $3) \
+         ON CONFLICT (source_table, source_id, target_table, target_id, link_type) DO NOTHING",
+    )
+    .bind(journal_entry_id)
+    .bind(task_id)
+    .bind(link_type)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Run the full post-write projection for a freshly-inserted journal entry

@@ -82,6 +82,7 @@ str_enum!(
         Apis => "apis",
         Cera => "cera",
         Nate => "nate",
+        Maggie => "maggie",
     }
 );
 
