@@ -258,6 +258,10 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+/// Unfiltered journal fetch ... kept for parity with `fetch_journal_filtered`
+/// and future call sites (compose / detail). Hidden behind allow(dead_code)
+/// because no current page uses it; remove the attr when one does.
+#[allow(dead_code)]
 pub async fn fetch_journal(limit: i64) -> anyhow::Result<Vec<JournalEntry>> {
     fetch_list("/journal", &[("limit", &limit.to_string())]).await
 }
@@ -299,6 +303,66 @@ pub async fn fetch_notes(author: &str, tag: &str, limit: i64) -> anyhow::Result<
         ],
     )
     .await
+}
+
+/// FTS5 journal search. Hits `GET /journal/search?q=...&limit=...` and remaps
+/// the snippet-bearing `JournalHit` rows into `JournalEntry` so the same
+/// `EntryArticle` visual can render them. The snippet's `[..]` highlight
+/// markers are converted to `<mark>..</mark>` and inlined into `body`;
+/// pulldown_cmark passes the raw HTML through on the trusted-content path.
+pub async fn fetch_journal_search(q: &str, limit: i64) -> anyhow::Result<Vec<JournalEntry>> {
+    #[derive(Debug, Deserialize)]
+    struct JournalHit {
+        id: Uuid,
+        ai: String,
+        entry_date: String,
+        title: Option<String>,
+        tags: Option<String>,
+        snippet: String,
+    }
+
+    let hits: Vec<JournalHit> = fetch_list(
+        "/journal/search",
+        &[("q", q), ("limit", &limit.to_string())],
+    )
+    .await?;
+    Ok(hits
+        .into_iter()
+        .map(|h| JournalEntry {
+            id: h.id,
+            ai: h.ai,
+            entry_date: Some(h.entry_date),
+            title: h.title,
+            body: snippet_to_html(&h.snippet),
+            tags: h.tags,
+            created_at: None,
+        })
+        .collect())
+}
+
+/// Convert the FTS5 snippet's `[term]` highlight markers into `<mark>term</mark>`.
+/// Everything else passes through verbatim; the markdown renderer treats the
+/// result as inline HTML (trusted-content path).
+fn snippet_to_html(snippet: &str) -> String {
+    let mut out = String::with_capacity(snippet.len() + 16);
+    let mut in_mark = false;
+    for ch in snippet.chars() {
+        match ch {
+            '[' if !in_mark => {
+                out.push_str("<mark>");
+                in_mark = true;
+            }
+            ']' if in_mark => {
+                out.push_str("</mark>");
+                in_mark = false;
+            }
+            _ => out.push(ch),
+        }
+    }
+    if in_mark {
+        out.push_str("</mark>");
+    }
+    out
 }
 
 /// Wire-event list. `source` and `severity` are optional; `unacknowledged=true`

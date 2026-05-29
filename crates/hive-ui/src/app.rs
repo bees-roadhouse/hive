@@ -1,13 +1,15 @@
 use leptos::prelude::*;
 use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
-use leptos_router::StaticSegment;
 use leptos_router::components::{Route, Router, Routes};
+use leptos_router::{StaticSegment, path};
 
 use crate::api::SessionId;
 use crate::auth::SESSION_COOKIE;
 use crate::pages::home::HomePage;
 use crate::pages::journal::JournalPage;
 use crate::pages::notes::NotesPage;
+use crate::pages::search::SearchPage;
+use crate::pages::side_panel::{PanelToggle, SidePanel};
 use crate::pages::tasks::TasksPage;
 use crate::pages::wire::WirePage;
 
@@ -61,9 +63,13 @@ fn Nav() -> impl IntoView {
     view! {
         <nav class="hive-topbar">
             <a class="hive-brand" href="/">"hive"</a>
+            <form class="hive-search" method="get" action="/journal/search">
+                <input type="search" name="q" placeholder="search journal" aria-label="search journal" />
+            </form>
             <span class="hive-spacer"></span>
             <a class="hive-auth" href="/login" rel="external">"log in"</a>
             <a class="hive-auth" href="/logout" rel="external">"log out"</a>
+            <PanelToggle/>
         </nav>
     }
 }
@@ -84,12 +90,14 @@ pub fn App() -> impl IntoView {
             <main>
                 <Routes fallback=|| view! { <p>"not found"</p> }>
                     <Route path=StaticSegment("") view=HomePage/>
+                    <Route path=path!("/journal/search") view=SearchPage/>
                     <Route path=StaticSegment("journal") view=JournalPage/>
                     <Route path=StaticSegment("tasks") view=TasksPage/>
                     <Route path=StaticSegment("notes") view=NotesPage/>
                     <Route path=StaticSegment("wire") view=WirePage/>
                 </Routes>
             </main>
+            <SidePanel/>
         </Router>
     }
 }

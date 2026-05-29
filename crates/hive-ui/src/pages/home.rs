@@ -6,9 +6,9 @@
 //! structure emerges from the prose itself.
 
 use leptos::prelude::*;
-use pulldown_cmark::{Parser, html};
 
 use crate::api::{JournalEntry, fetch_journal_filtered};
+use crate::pages::entry_article::EntryArticle;
 
 /// Writers we surface as one-click chips. The "all" chip is implicit (empty
 /// filter). Order is editorial — Pia first because she writes the most.
@@ -90,59 +90,6 @@ fn Feed(entries: Vec<JournalEntry>) -> impl IntoView {
         <ol class="feed-list">
             {entries.into_iter().map(|e| view! { <EntryArticle entry=e/> }).collect_view()}
         </ol>
-    }
-    .into_any()
-}
-
-#[component]
-fn EntryArticle(entry: JournalEntry) -> impl IntoView {
-    let when = entry.entry_date.clone().unwrap_or_default();
-    let title = entry.title.clone().unwrap_or_else(|| "(untitled)".to_string());
-    let tags_raw = entry.tags.clone().unwrap_or_default();
-    let body_html = render_markdown(&entry.body);
-
-    view! {
-        <li class="entry">
-            <header class="entry-header">
-                <h2 class="entry-title">{title}</h2>
-                <p class="entry-meta">
-                    <span class="entry-writer">{entry.ai}</span>
-                    <span class="entry-sep">"·"</span>
-                    <span class="entry-date">{when}</span>
-                    {render_tag_chips(&tags_raw)}
-                </p>
-            </header>
-            <div class="entry-body" inner_html=body_html></div>
-        </li>
-    }
-}
-
-/// Render markdown source to HTML. Trusted-content path — we let raw HTML
-/// pass through because every entry is written by us (CLI, UI compose, or
-/// an AI we run). Add a sanitizer here if untrusted writers ever land.
-fn render_markdown(src: &str) -> String {
-    let parser = Parser::new(src);
-    let mut out = String::with_capacity(src.len());
-    html::push_html(&mut out, parser);
-    out
-}
-
-/// Split a comma-separated tags field into rendered `#tag` chips. Returns
-/// nothing if the field is empty (skips the leading separator too).
-fn render_tag_chips(tags: &str) -> AnyView {
-    let chips: Vec<String> = tags
-        .split(',')
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
-        .collect();
-    if chips.is_empty() {
-        return view! {}.into_any();
-    }
-    view! {
-        <span class="entry-sep">"·"</span>
-        <span class="entry-tags">
-            {chips.into_iter().map(|t| view! { <span class="tag">"#"{t}</span> }).collect_view()}
-        </span>
     }
     .into_any()
 }
