@@ -127,7 +127,7 @@ pub fn EventDetailPage() -> impl IntoView {
                 .await
                 .map_err(|e| e.to_string())?;
             let event_id = event.id.to_string();
-            let (outgoing, incoming) = tokio::join!(
+            let (outgoing, incoming) = futures::join!(
                 fetch_links_outgoing("events", &event_id),
                 fetch_links_incoming("events", &event_id),
             );

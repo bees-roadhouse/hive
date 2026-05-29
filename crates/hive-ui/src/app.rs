@@ -1,10 +1,12 @@
 use leptos::prelude::*;
-use leptos_meta::{MetaTags, Stylesheet, Title, provide_meta_context};
+#[cfg(feature = "ssr")]
+use leptos_meta::MetaTags;
+use leptos_meta::{Stylesheet, Title, provide_meta_context};
 use leptos_router::components::{Route, Router, Routes};
 use leptos_router::{StaticSegment, path};
 
 use crate::api::SessionId;
-use crate::auth::SESSION_COOKIE;
+use crate::pages::compose::ComposePage;
 use crate::pages::entry::EntryPage;
 use crate::pages::events::{EventDetailPage, EventsPage};
 use crate::pages::home::HomePage;
@@ -22,6 +24,12 @@ use crate::pages::wire::WirePage;
 /// context by leptos_axum) and surface it as `SessionId`. Synchronous: the
 /// parts are already in context by the time `App` renders. Returns an empty
 /// `SessionId` when there's no request context (unit tests) or no cookie.
+///
+/// SSR-only: the request parts only exist on the server side. On the
+/// hydrate side the session id was already used when the server rendered
+/// the page and we don't need it again (the SSR-resolved Resource values
+/// are baked into the hydration data).
+#[cfg(feature = "ssr")]
 fn session_from_request() -> SessionId {
     let Some(parts) = use_context::<http::request::Parts>() else {
         return SessionId::default();
@@ -34,12 +42,18 @@ fn session_from_request() -> SessionId {
     let sid = cookie_header
         .split(';')
         .filter_map(|kv| kv.split_once('='))
-        .find(|(k, _)| k.trim() == SESSION_COOKIE)
+        .find(|(k, _)| k.trim() == crate::auth::SESSION_COOKIE)
         .map(|(_, v)| v.trim().to_string())
         .filter(|s| !s.is_empty());
     SessionId(sid)
 }
 
+#[cfg(not(feature = "ssr"))]
+fn session_from_request() -> SessionId {
+    SessionId::default()
+}
+
+#[cfg(feature = "ssr")]
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
         <!DOCTYPE html>
@@ -87,8 +101,13 @@ pub fn App() -> impl IntoView {
     // for the duration of this SSR render (Phase 3, §3.1).
     provide_context(session_from_request());
 
+    // Stylesheet href: cargo-leptos compiles `style/main.css` and drops the
+    // bundled artifact at `/pkg/hive-ui.css` (output-name from Cargo.toml).
+    // The legacy `/style/main.css` ServeDir mount in `main.rs` is still
+    // there as a fallback so the login/who-not-found hand-rolled HTML
+    // (which links `/style/main.css` directly) keeps working.
     view! {
-        <Stylesheet id="hive-ui-css" href="/style/main.css"/>
+        <Stylesheet id="hive-ui-css" href="/pkg/hive-ui.css"/>
         <Title text="hive-canvas"/>
 
         <Router>
@@ -97,6 +116,7 @@ pub fn App() -> impl IntoView {
                 <Routes fallback=|| view! { <p>"not found"</p> }>
                     <Route path=StaticSegment("") view=HomePage/>
                     <Route path=path!("/journal/search") view=SearchPage/>
+                    <Route path=path!("/journal/new") view=ComposePage/>
                     <Route path=StaticSegment("journal") view=JournalPage/>
                     <Route path=path!("/journal/:id") view=EntryPage/>
                     <Route path=StaticSegment("tasks") view=TasksPage/>

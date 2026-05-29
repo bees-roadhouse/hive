@@ -1,14 +1,11 @@
-//! hive-ui ... leptos 0.7 SSR axum server for the journal-canvas.
+//! hive-ui ... leptos 0.7 isomorphic axum server for the journal-canvas.
 //!
-//! v0 scope: one route (`/`) renders the 5 most-recent journal entries
-//! fetched live from hive-api. The markdown canvas, checkbox component,
-//! and structured views land in follow-up commits.
-
-mod api;
-mod app;
-mod auth;
-mod markdown;
-mod pages;
+//! The library at `hive_ui::*` carries the actual UI (the `App` component,
+//! the pages, the api client). This bin wires it into axum: serves the SSR
+//! HTML through `leptos_axum::LeptosRoutes`, exposes the hand-rolled `/login`,
+//! `/logout`, POST `/journal/new`, `/api/recent`, `/who/:slug` endpoints, and
+//! mounts the cargo-leptos site output (`target/site/pkg/...`) so the WASM
+//! bundle reaches the browser.
 
 use std::net::SocketAddr;
 
@@ -23,8 +20,10 @@ use serde::Deserialize;
 use tower_http::services::ServeDir;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-use crate::app::{App, shell};
-use crate::auth::SESSION_COOKIE;
+use hive_ui::api;
+use hive_ui::app::{App, shell};
+use hive_ui::auth;
+use hive_ui::auth::SESSION_COOKIE;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -36,11 +35,20 @@ async fn main() -> anyhow::Result<()> {
         .with(fmt::layer())
         .init();
 
-    let port: u16 = std::env::var("HIVE_UI_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8091);
-    let addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], port));
+    // Address resolution: cargo-leptos sets `LEPTOS_SITE_ADDR` when it
+    // spawns the bin (so the leptos dev server can reverse-proxy). When
+    // running standalone (`cargo run`) we fall back to `HIVE_UI_PORT`.
+    let addr: SocketAddr = if let Ok(site_addr) = std::env::var("LEPTOS_SITE_ADDR") {
+        site_addr
+            .parse()
+            .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8091)))
+    } else {
+        let port: u16 = std::env::var("HIVE_UI_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8091);
+        SocketAddr::from(([0, 0, 0, 0], port))
+    };
 
     let conf = LeptosOptions::builder()
         .output_name("hive-ui")
@@ -51,16 +59,26 @@ async fn main() -> anyhow::Result<()> {
         .env(leptos::config::Env::DEV)
         .build();
 
-    // Exclude /journal/new from the leptos route list — it's served by our
-    // own hand-rolled axum handlers below (mirroring /login). Without the
-    // exclusion the leptos `/journal/:id` route would swallow it.
-    let routes = leptos_axum::generate_route_list_with_exclusions(
-        App,
-        Some(vec!["/journal/new".into(), "/who/:slug".into()]),
-    );
+    // `/who/:slug` is a hand-rolled axum redirect (the slug-disambiguator), so
+    // we exclude it from the leptos route table. `/journal/new` is now a real
+    // leptos route (ComposePage); the POST handler below shares the path but
+    // axum's method routing keeps them separate.
+    let routes =
+        leptos_axum::generate_route_list_with_exclusions(App, Some(vec!["/who/:slug".into()]));
 
+    // The legacy `style/main.css` is still served at `/style/main.css`
+    // because the hand-rolled login/who-not-found HTML links to it directly.
+    // cargo-leptos puts the compiled stylesheet at `target/site/pkg/hive-ui.css`
+    // (referenced from the Leptos `<Stylesheet>` in `App`).
     let style_dir = ServeDir::new("style");
     let static_dir = ServeDir::new("static");
+    // cargo-leptos site output: `target/site/pkg/{hive-ui.js,hive-ui.wasm,hive-ui.css}`.
+    // Leptos's `<HydrationScripts/>` (in `app::shell`) emits a loader script
+    // that passes the wasm path explicitly to wasm-bindgen's init function,
+    // so the file naming stays internally consistent (`hive-ui.wasm`, not
+    // the wasm-bindgen default `_bg.wasm`).
+    let site_root = std::env::var("LEPTOS_SITE_ROOT").unwrap_or_else(|_| "target/site".to_string());
+    let pkg_dir = ServeDir::new(format!("{site_root}/pkg"));
 
     let conf_for_shell = conf.clone();
     // Auth routes (Phase 3, §3.1): the OAuth password+PKCE flow runs entirely
@@ -72,9 +90,12 @@ async fn main() -> anyhow::Result<()> {
     let auth_routes: Router = Router::new()
         .route("/login", get(login_form).post(login_submit))
         .route("/logout", post(logout).get(logout))
-        .route("/journal/new", get(compose_form).post(compose_submit))
-        // `/api/recent` is the typeahead source for the compose-time picker
-        // (vanilla JS at /static/compose-picker.js). One endpoint per page,
+        // POST /journal/new is the form-submit handler; the GET form itself
+        // is a Leptos route (pages::compose::ComposePage). Axum's method
+        // routing lets both share the same path.
+        .route("/journal/new", post(compose_submit))
+        // `/api/recent` is the typeahead source for the compose-time entity
+        // picker (the hydrated ComposePage). One endpoint per page,
         // server-side fan-out to the per-type hive-api endpoints, JSON out.
         .route("/api/recent", get(api_recent))
         // `/who/:slug` is the AI-vs-human disambiguator for `@slug` mentions.
@@ -89,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
         .leptos_routes(&conf, routes, move || shell(conf_for_shell.clone()))
         .nest_service("/style", style_dir)
         .nest_service("/static", static_dir)
+        .nest_service("/pkg", pkg_dir)
         .with_state(conf)
         .merge(auth_routes);
 
@@ -203,10 +225,13 @@ fn session_from_headers(headers: &HeaderMap) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-// ---------- compose handlers (/journal/new) ----------
+// ---------- compose POST handler (/journal/new) ----------
+//
+// The GET form is now a hydrated Leptos route (pages::compose::ComposePage).
+// This handler only handles the form submit: validate, forward to hive-api,
+// redirect home (or back to the form with ?error=...).
 
 const COMPOSE_WRITERS: &[&str] = &["pia", "apis", "cera", "nate", "maggie"];
-const COMPOSE_DEFAULT_WRITER: &str = "nate";
 
 #[derive(Debug, Deserialize)]
 struct ComposeForm {
@@ -215,62 +240,6 @@ struct ComposeForm {
     title: String,
     body: String,
     tags: Option<String>,
-}
-
-/// GET /journal/new — server-rendered compose form. Mirrors `login_form`.
-async fn compose_form(axum::extract::RawQuery(query): axum::extract::RawQuery) -> Html<String> {
-    let error = query
-        .as_deref()
-        .and_then(|q| {
-            q.split('&')
-                .filter_map(|kv| kv.split_once('='))
-                .find(|(k, _)| *k == "error")
-                .map(|(_, v)| percent_decode(v))
-        })
-        .unwrap_or_default();
-    let error_block = if error.is_empty() {
-        String::new()
-    } else {
-        format!("<p class=\"error\">{}</p>", html_escape(&error))
-    };
-
-    let today = chrono::Local::now()
-        .date_naive()
-        .format("%Y-%m-%d")
-        .to_string();
-
-    let writer_options = COMPOSE_WRITERS
-        .iter()
-        .map(|w| {
-            let selected = if *w == COMPOSE_DEFAULT_WRITER {
-                " selected"
-            } else {
-                ""
-            };
-            format!("<option value=\"{w}\"{selected}>{w}</option>")
-        })
-        .collect::<String>();
-
-    Html(format!(
-        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"/>\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>\
-         <title>hive · new entry</title>\
-         <link rel=\"stylesheet\" href=\"/style/main.css\"/></head>\
-         <body><main class=\"compose-page\"><h1>new entry</h1>{error_block}\
-         <form method=\"post\" action=\"/journal/new\" class=\"compose-form\">\
-         <label>writer <select name=\"ai\" required>{writer_options}</select></label>\
-         <label>date <input name=\"date\" type=\"date\" value=\"{today}\"/></label>\
-         <label>title <input name=\"title\" type=\"text\" required/></label>\
-         <label>body <textarea name=\"body\" rows=\"14\" required></textarea></label>\
-         <label>tags <input name=\"tags\" type=\"text\" placeholder=\"comma-separated, e.g. immich,traefik\"/></label>\
-         <div class=\"compose-actions\">\
-         <a class=\"compose-cancel\" href=\"/\">cancel</a>\
-         <button type=\"submit\">save</button>\
-         </div>\
-         </form></main>\
-         <script src=\"/static/compose-picker.js\" defer></script>\
-         </body></html>"
-    ))
 }
 
 /// POST /journal/new — validate, forward to hive-api, redirect.

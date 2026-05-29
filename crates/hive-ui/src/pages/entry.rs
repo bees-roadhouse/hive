@@ -48,7 +48,7 @@ pub fn EntryPage() -> impl IntoView {
             // failure, so a missing endpoint doesn't sink the page.
             let entry = fetch_journal_entry(&id).await.map_err(|e| e.to_string())?;
             let entry_id = entry.id.to_string();
-            let (outgoing, incoming, anchored_tasks) = tokio::join!(
+            let (outgoing, incoming, anchored_tasks) = futures::join!(
                 fetch_links_outgoing("journal_entries", &entry_id),
                 fetch_links_incoming("journal_entries", &entry_id),
                 fetch_task_anchors(&entry_id),

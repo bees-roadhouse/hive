@@ -5,40 +5,126 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "leptos 0.7 SSR web canvas for the hive shared-state DB (journal-canvas)"
+description = "leptos 0.7 isomorphic web canvas for the hive shared-state DB (journal-canvas)"
+
+# The crate is dual-target: a server-side lib + bin under `ssr`, a
+# wasm/hydrate bundle under `hydrate`. cargo-leptos drives both passes;
+# `cargo run -p hive-ui --features ssr` boots the axum server standalone.
+
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [[bin]]
 name = "hive-ui"
 path = "src/main.rs"
+required-features = ["ssr"]
+
+[features]
+default = []
+# Server-side render + axum bin. Pulls in the full hive-api client, the
+# OAuth session store, and the tower stack.
+ssr = [
+    "leptos/ssr",
+    "leptos_meta/ssr",
+    "leptos_router/ssr",
+    "dep:leptos_axum",
+    "dep:axum",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:tokio",
+    "dep:reqwest",
+    "dep:tracing-subscriber",
+    "dep:http",
+    "dep:sha2",
+    "dep:rand",
+    "dep:chrono",
+]
+# Browser hydration: compiles to wasm32, exports `hydrate()`, and runs
+# under cargo-leptos's pkg pipeline. leptos_meta + leptos_router don't
+# carry an explicit `hydrate` feature ... the hydrate behavior is the
+# default when `ssr` is absent.
+hydrate = [
+    "leptos/hydrate",
+    "dep:wasm-bindgen",
+    "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+    "dep:web-sys",
+    "dep:console_error_panic_hook",
+]
 
 [dependencies]
-# Leptos 0.7 SSR stack. Pin axum/tower-http locally to 0.7-era versions
-# because leptos_axum 0.7.x is built against axum 0.7, while the rest of
-# the hive workspace runs axum 0.8 (the api crate). Promote to workspace
-# deps when leptos 0.8 stabilizes against axum 0.8.
-leptos = { version = "0.7.8", features = ["ssr"] }
-leptos_axum = "0.7.8"
-leptos_meta = { version = "0.7.8", features = ["ssr"] }
-leptos_router = { version = "0.7.8", features = ["ssr"] }
-axum = { version = "0.7", features = ["macros"] }
-tower = { version = "0.5" }
-tower-http = { version = "0.6", features = ["fs", "trace"] }
-tokio = { workspace = true }
-reqwest = { workspace = true }
+# Leptos 0.7 dual stack. `ssr` / `hydrate` features above flip the sub-
+# features on these for each build pass. Pin axum/tower-http locally to
+# 0.7-era versions because leptos_axum 0.7.x is built against axum 0.7,
+# while the rest of the hive workspace runs axum 0.8 (the api crate).
+# Promote to workspace deps when leptos 0.8 stabilizes against axum 0.8.
+leptos = { version = "0.7.8", default-features = false }
+leptos_meta = { version = "0.7.8", default-features = false }
+leptos_router = { version = "0.7.8", default-features = false }
+leptos_axum = { version = "0.7.8", optional = true }
+
+# Server-only (gated by `ssr`).
+axum = { version = "0.7", features = ["macros"], optional = true }
+tower = { version = "0.5", optional = true }
+tower-http = { version = "0.6", features = ["fs", "trace"], optional = true }
+tokio = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+http = { version = "1", optional = true }
+sha2 = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+
+# Always-on (compiles on both targets ... pure Rust, no syscalls).
+# `futures` (just the macros + util slice we use) replaces `tokio::join!`
+# in the page Resource closures so they compile on wasm where tokio isn't
+# available.
 serde = { workspace = true }
 serde_json = { workspace = true }
-chrono = { workspace = true }
+chrono = { workspace = true, optional = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
 uuid = { workspace = true }
-# Auth Phase 3 (§3.1): server-side OAuth password+PKCE flow + session-cookie
-# store. `http` for reading request Parts (the session cookie) out of the leptos
-# SSR context; pinned to the 1.x axum 0.7 ships.
-http = "1"
+anyhow = { workspace = true }
 base64 = { workspace = true }
-sha2 = { workspace = true }
-rand = { workspace = true }
-# Markdown → HTML rendering for the journal feed. Trusted-content path
-# (entries are authored by us via CLI/UI), so we let raw HTML through.
 pulldown-cmark = { workspace = true }
+futures = { version = "0.3", default-features = false, features = ["async-await"] }
+
+# Wasm-only (gated by `hydrate`).
+wasm-bindgen = { version = "0.2", optional = true }
+wasm-bindgen-futures = { version = "0.4", optional = true }
+js-sys = { version = "0.3", optional = true }
+web-sys = { version = "0.3", features = [
+    "Request",
+    "RequestInit",
+    "RequestCredentials",
+    "Response",
+    "Window",
+    "HtmlTextAreaElement",
+], optional = true }
+console_error_panic_hook = { version = "0.1", optional = true }
+
+# uuid's v7 generator needs a CSPRNG, and on wasm32 that means the `js`
+# feature (browser crypto). Layered as a target-specific augmentation so
+# the server build doesn't pull js-sys.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { workspace = true, features = ["js"] }
+
+# ---------- cargo-leptos config ----------
+#
+# cargo-leptos picks up the two passes (server + wasm) from these keys.
+# Output lands under `target/site/` with the `hive-ui` package name; the
+# axum server in `main.rs` reads from the same site_root and serves
+# `/pkg/hive-ui_bg.wasm` + `/pkg/hive-ui.js` from there.
+
+[package.metadata.leptos]
+output-name = "hive-ui"
+site-root = "target/site"
+site-pkg-dir = "pkg"
+style-file = "style/main.css"
+assets-dir = "static"
+site-addr = "127.0.0.1:8091"
+reload-port = 3001
+bin-features = ["ssr"]
+bin-default-features = false
+lib-features = ["hydrate"]
+lib-default-features = false
+browserquery = "defaults"
