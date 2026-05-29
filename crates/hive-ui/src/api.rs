@@ -64,6 +64,35 @@ pub struct Note {
     pub updated_at: Option<String>,
 }
 
+/// Mirrors `hive_db::types::Link`. Used by the entry detail page to
+/// surface outgoing mentions + incoming backlinks as sidecars beneath
+/// the prose.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Link {
+    pub id: Uuid,
+    pub source_table: String,
+    pub source_id: Uuid,
+    pub target_table: String,
+    pub target_id: Uuid,
+    #[serde(default)]
+    pub link_type: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    // Enrichment fields the API MAY add when known (target/source titles
+    // joined in). Optional so we degrade gracefully if the link-pipeline
+    // agent hasn't shipped enrichment yet.
+    #[serde(default)]
+    pub target_title: Option<String>,
+    #[serde(default)]
+    pub target_slug: Option<String>,
+    #[serde(default)]
+    pub source_title: Option<String>,
+    #[serde(default)]
+    pub source_slug: Option<String>,
+}
+
 /// Mirrors `hive_db::types::WireEvent`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WireEvent {
@@ -419,4 +448,45 @@ pub async fn fetch_wire(
         ],
     )
     .await
+}
+
+/// Outgoing links from the given source entity. The hive-api `/links`
+/// endpoint expects a single `source=<table>:<id>` query param. Returns
+/// the rows AS-IS; the caller groups by `target_table` for the sidecar.
+///
+/// Degrades to `Ok(vec![])` on any error ... the sidecar is secondary
+/// chrome and shouldn't block the page render.
+pub async fn fetch_links_outgoing(source_table: &str, source_id: &str) -> Vec<Link> {
+    let source = format!("{source_table}:{source_id}");
+    match fetch_list::<Link>("/links", &[("source", &source)]).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::debug!(%err, "fetch_links_outgoing failed; rendering empty");
+            Vec::new()
+        }
+    }
+}
+
+/// Incoming links to the given target entity (i.e. backlinks).
+///
+/// Degrades to `Ok(vec![])` on any error.
+pub async fn fetch_links_incoming(target_table: &str, target_id: &str) -> Vec<Link> {
+    let target = format!("{target_table}:{target_id}");
+    match fetch_list::<Link>("/links/incoming", &[("target", &target)]).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::debug!(%err, "fetch_links_incoming failed; rendering empty");
+            Vec::new()
+        }
+    }
+}
+
+/// Tasks extracted from the given journal entry via task_anchors.
+///
+/// TODO(parallel-agent): the hive-api doesn't expose task_anchors yet.
+/// Expected endpoint: `GET /journal/:id/tasks` returns `Vec<Task>` for
+/// any rows in `task_anchors` that point at this entry. Until that
+/// lands, return empty and the sidecar shows empty-state.
+pub async fn fetch_task_anchors(_journal_entry_id: &str) -> Vec<Task> {
+    Vec::new()
 }
