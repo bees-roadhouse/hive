@@ -7,6 +7,7 @@
 mod api;
 mod app;
 mod auth;
+mod markdown;
 mod pages;
 
 use std::net::SocketAddr;
@@ -17,7 +18,7 @@ use axum::http::{HeaderMap, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use leptos::config::LeptosOptions;
-use leptos_axum::{LeptosRoutes, generate_route_list};
+use leptos_axum::LeptosRoutes;
 use serde::Deserialize;
 use tower_http::services::ServeDir;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -50,7 +51,11 @@ async fn main() -> anyhow::Result<()> {
         .env(leptos::config::Env::DEV)
         .build();
 
-    let routes = generate_route_list(App);
+    // Exclude /journal/new from the leptos route list — it's served by our
+    // own hand-rolled axum handlers below (mirroring /login). Without the
+    // exclusion the leptos `/journal/:id` route would swallow it.
+    let routes =
+        leptos_axum::generate_route_list_with_exclusions(App, Some(vec!["/journal/new".into()]));
 
     let style_dir = ServeDir::new("style");
 
@@ -58,9 +63,13 @@ async fn main() -> anyhow::Result<()> {
     // Auth routes (Phase 3, §3.1): the OAuth password+PKCE flow runs entirely
     // server-side, so /login + /logout are plain axum handlers, separate from
     // the leptos-rendered views. They carry no LeptosOptions state.
+    //
+    // The compose flow (/journal/new GET + POST) mirrors that pattern — also
+    // hand-rolled, also stateless, also nothing for leptos to render.
     let auth_routes: Router = Router::new()
         .route("/login", get(login_form).post(login_submit))
-        .route("/logout", post(logout).get(logout));
+        .route("/logout", post(logout).get(logout))
+        .route("/journal/new", get(compose_form).post(compose_submit));
 
     let app: Router = Router::<LeptosOptions>::new()
         .leptos_routes(&conf, routes, move || shell(conf_for_shell.clone()))
@@ -177,6 +186,166 @@ fn session_from_headers(headers: &HeaderMap) -> Option<String> {
         .find(|(k, _)| k.trim() == SESSION_COOKIE)
         .map(|(_, v)| v.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+// ---------- compose handlers (/journal/new) ----------
+
+const COMPOSE_WRITERS: &[&str] = &["pia", "apis", "cera", "nate", "maggie"];
+const COMPOSE_DEFAULT_WRITER: &str = "nate";
+
+#[derive(Debug, Deserialize)]
+struct ComposeForm {
+    ai: String,
+    date: Option<String>,
+    title: String,
+    body: String,
+    tags: Option<String>,
+}
+
+/// GET /journal/new — server-rendered compose form. Mirrors `login_form`.
+async fn compose_form(axum::extract::RawQuery(query): axum::extract::RawQuery) -> Html<String> {
+    let error = query
+        .as_deref()
+        .and_then(|q| {
+            q.split('&')
+                .filter_map(|kv| kv.split_once('='))
+                .find(|(k, _)| *k == "error")
+                .map(|(_, v)| percent_decode(v))
+        })
+        .unwrap_or_default();
+    let error_block = if error.is_empty() {
+        String::new()
+    } else {
+        format!("<p class=\"error\">{}</p>", html_escape(&error))
+    };
+
+    let today = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let writer_options = COMPOSE_WRITERS
+        .iter()
+        .map(|w| {
+            let selected = if *w == COMPOSE_DEFAULT_WRITER {
+                " selected"
+            } else {
+                ""
+            };
+            format!("<option value=\"{w}\"{selected}>{w}</option>")
+        })
+        .collect::<String>();
+
+    Html(format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"/>\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>\
+         <title>hive · new entry</title>\
+         <link rel=\"stylesheet\" href=\"/style/main.css\"/></head>\
+         <body><main class=\"compose-page\"><h1>new entry</h1>{error_block}\
+         <form method=\"post\" action=\"/journal/new\" class=\"compose-form\">\
+         <label>writer <select name=\"ai\" required>{writer_options}</select></label>\
+         <label>date <input name=\"date\" type=\"date\" value=\"{today}\"/></label>\
+         <label>title <input name=\"title\" type=\"text\" required/></label>\
+         <label>body <textarea name=\"body\" rows=\"14\" required></textarea></label>\
+         <label>tags <input name=\"tags\" type=\"text\" placeholder=\"comma-separated, e.g. immich,traefik\"/></label>\
+         <div class=\"compose-actions\">\
+         <a class=\"compose-cancel\" href=\"/\">cancel</a>\
+         <button type=\"submit\">save</button>\
+         </div>\
+         </form></main></body></html>"
+    ))
+}
+
+/// POST /journal/new — validate, forward to hive-api, redirect.
+async fn compose_submit(headers: HeaderMap, Form(form): Form<ComposeForm>) -> Response {
+    let ai = form.ai.trim();
+    if !COMPOSE_WRITERS.contains(&ai) {
+        let to = format!("/journal/new?error={}", percent_encode("invalid writer"));
+        return Redirect::to(&to).into_response();
+    }
+
+    let title = form.title.trim();
+    let body = form.body.trim();
+    if title.is_empty() || body.is_empty() {
+        let to = format!(
+            "/journal/new?error={}",
+            percent_encode("title and body are required")
+        );
+        return Redirect::to(&to).into_response();
+    }
+
+    let date_owned = form
+        .date
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let tags_owned = form
+        .tags
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let mut payload = serde_json::Map::new();
+    payload.insert("ai".into(), serde_json::Value::String(ai.to_string()));
+    payload.insert("title".into(), serde_json::Value::String(title.to_string()));
+    payload.insert("body".into(), serde_json::Value::String(body.to_string()));
+    if let Some(d) = date_owned {
+        payload.insert("date".into(), serde_json::Value::String(d));
+    }
+    if let Some(t) = tags_owned {
+        payload.insert("tags".into(), serde_json::Value::String(t));
+    }
+
+    let url = format!("{}/journal", api::api_base());
+    let token = session_from_headers(&headers).and_then(|sid| auth::access_token_for(&sid));
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build();
+    let client = match client {
+        Ok(c) => c,
+        Err(e) => {
+            let to = format!("/journal/new?error={}", percent_encode(&e.to_string()));
+            return Redirect::to(&to).into_response();
+        }
+    };
+
+    let mut req = client.post(&url).json(&payload);
+    if let Some(t) = token {
+        req = req.bearer_auth(t);
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let to = format!("/journal/new?error={}", percent_encode(&e.to_string()));
+            return Redirect::to(&to).into_response();
+        }
+    };
+
+    let status = resp.status();
+    if status.is_success() {
+        return Redirect::to("/").into_response();
+    }
+
+    // Surface the api's error text when we have one; fall back to the status.
+    let body_text = resp.text().await.unwrap_or_default();
+    let msg = if body_text.is_empty() {
+        status.to_string()
+    } else {
+        // Try to pull error_description / error / message out of a JSON body.
+        match serde_json::from_str::<serde_json::Value>(&body_text) {
+            Ok(v) => v
+                .get("error_description")
+                .or_else(|| v.get("error"))
+                .or_else(|| v.get("message"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or(body_text),
+            Err(_) => body_text,
+        }
+    };
+    let to = format!("/journal/new?error={}", percent_encode(&msg));
+    Redirect::to(&to).into_response()
 }
 
 /// Minimal HTML-escape for the error message echoed into the login page.

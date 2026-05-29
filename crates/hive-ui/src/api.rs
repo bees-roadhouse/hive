@@ -258,8 +258,47 @@ fn urlencode(s: &str) -> String {
     out
 }
 
+/// GET a hive-api endpoint that returns a single JSON object. Same auth +
+/// transparent-refresh shape as `fetch_list`.
+async fn fetch_one<T: serde::de::DeserializeOwned>(path: &str) -> anyhow::Result<T> {
+    let url = format!("{}{}", api_base(), path);
+
+    let session = current_session();
+    let token = session.as_deref().and_then(crate::auth::access_token_for);
+
+    let resp = send_get(&url, token.as_deref()).await?;
+    let status = resp.status();
+
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        if let Some(sid) = session.as_deref()
+            && let Some(fresh) = crate::auth::refresh(sid).await
+        {
+            let resp = send_get(&url, Some(&fresh)).await?;
+            let status = resp.status();
+            if !status.is_success() {
+                anyhow::bail!("GET {url} returned {status} (after refresh)");
+            }
+            return Ok(resp.json().await?);
+        }
+        anyhow::bail!("GET {url} returned 401 (not authenticated — please log in)");
+    }
+
+    if !status.is_success() {
+        anyhow::bail!("GET {url} returned {status}");
+    }
+    Ok(resp.json().await?)
+}
+
+/// Plain unfiltered journal list. Kept as a public helper for external
+/// callers / future routes; the current UI uses `fetch_journal_filtered`.
+#[allow(dead_code)]
 pub async fn fetch_journal(limit: i64) -> anyhow::Result<Vec<JournalEntry>> {
     fetch_list("/journal", &[("limit", &limit.to_string())]).await
+}
+
+/// Fetch a single journal entry by its id.
+pub async fn fetch_journal_entry(id: &str) -> anyhow::Result<JournalEntry> {
+    fetch_one(&format!("/journal/{id}")).await
 }
 
 /// Filtered journal list. `ai` and `tag` are optional (empty = unfiltered).

@@ -1,3 +1,4 @@
+pub mod entry;
 pub mod home;
 pub mod journal;
 pub mod notes;

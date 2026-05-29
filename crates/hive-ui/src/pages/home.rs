@@ -13,9 +13,9 @@
 
 use leptos::prelude::*;
 use leptos_router::hooks::use_query_map;
-use pulldown_cmark::{Parser, html};
 
 use crate::api::{JournalEntry, fetch_journal_filtered};
+use crate::markdown::render_markdown;
 
 /// Writers we surface as one-click chips. The "all" chip is implicit (no
 /// `writer` param). Order is editorial — Pia first because she writes the most.
@@ -149,7 +149,9 @@ fn EntryArticle(entry: JournalEntry, current_writer: String) -> impl IntoView {
     view! {
         <li class="entry">
             <header class="entry-header">
-                <h2 class="entry-title">{title}</h2>
+                <h2 class="entry-title">
+                    <a class="entry-title-link" href={format!("/journal/{}", entry.id)}>{title}</a>
+                </h2>
                 <p class="entry-meta">
                     <span class="entry-writer">{entry.ai}</span>
                     <span class="entry-sep">"·"</span>
@@ -160,16 +162,6 @@ fn EntryArticle(entry: JournalEntry, current_writer: String) -> impl IntoView {
             <div class="entry-body" inner_html=body_html></div>
         </li>
     }
-}
-
-/// Render markdown source to HTML. Trusted-content path — we let raw HTML
-/// pass through because every entry is written by us (CLI, UI compose, or
-/// an AI we run). Add a sanitizer here if untrusted writers ever land.
-fn render_markdown(src: &str) -> String {
-    let parser = Parser::new(src);
-    let mut out = String::with_capacity(src.len());
-    html::push_html(&mut out, parser);
-    out
 }
 
 /// Split a comma-separated tags field into rendered `#tag` chips. Each chip
