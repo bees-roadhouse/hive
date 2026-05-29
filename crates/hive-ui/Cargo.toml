@@ -39,3 +39,6 @@ http = "1"
 base64 = { workspace = true }
 sha2 = { workspace = true }
 rand = { workspace = true }
+# Markdown → HTML rendering for the journal feed. Trusted-content path
+# (entries are authored by us via CLI/UI), so we let raw HTML through.
+pulldown-cmark = { workspace = true }

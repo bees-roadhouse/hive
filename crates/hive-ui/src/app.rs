@@ -53,17 +53,17 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
 
 #[component]
 fn Nav() -> impl IntoView {
+    // Minimal top bar: brand on the left, auth tucked into the corner. The
+    // journal feed (home) handles its own chip/filter chrome — the global
+    // nav stays out of the writing's way. Tasks/notes/wire keep their routes
+    // (/tasks, /notes, /wire) for direct URL access; the side-panel toggle
+    // will surface them per-entry in a follow-up.
     view! {
-        <nav class="hive-nav">
-            <a href="/">"links"</a>
-            <a href="/journal">"journal"</a>
-            <a href="/tasks">"tasks"</a>
-            <a href="/notes">"notes"</a>
-            <a href="/wire">"wire"</a>
-            // /login + /logout are plain axum routes (the OAuth flow runs
-            // server-side), not leptos-router views — hence full-page links.
-            <a class="hive-nav-auth" href="/login" rel="external">"login"</a>
-            <a class="hive-nav-auth" href="/logout" rel="external">"logout"</a>
+        <nav class="hive-topbar">
+            <a class="hive-brand" href="/">"hive"</a>
+            <span class="hive-spacer"></span>
+            <a class="hive-auth" href="/login" rel="external">"log in"</a>
+            <a class="hive-auth" href="/logout" rel="external">"log out"</a>
         </nav>
     }
 }
