@@ -166,7 +166,7 @@ async fn show(
     Ok(Json(e))
 }
 
-fn assign_missing_task_block_ids(body: &str) -> String {
+pub(crate) fn assign_missing_task_block_ids(body: &str) -> String {
     let parsed = hive_md::parse(body);
     let mut next = parsed
         .tasks

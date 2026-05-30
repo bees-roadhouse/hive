@@ -67,7 +67,18 @@ The projection layer creates or binds the task. The entry is durable audit
 trail ... same as if Nate typed it.
 
 CLI migration: `hive tasks add` → journal synthesis when `HIVE_INPUT_MODE=enforce`
-(follow-up).
+(or `HIVE_JOURNAL_INPUT=1` in legacy). MCP agents use the `journal_add` tool
+(see [mcp.md](./mcp.md)).
+
+## MCP tools
+
+`POST /mcp` exposes JSON-RPC tools backed by hive-db (not HTTP loopback).
+Canonical writes: **`journal_add` only** under enforce mode. Read tools:
+`journal_list`, `journal_search`, `journal_get`, `tasks_list`, `notes_list`,
+`wire_list`, `wire_ack`, `search`.
+
+Local dev without a bearer token: `HIVE_MCP_OPEN=1` while auth is in warn mode.
+Full setup: [mcp.md](./mcp.md).
 
 ## Wire subsystem
 

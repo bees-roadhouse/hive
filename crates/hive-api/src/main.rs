@@ -8,6 +8,7 @@
 mod auth;
 mod error;
 mod input_policy;
+mod mcp;
 mod mentions;
 mod routes;
 mod state;
