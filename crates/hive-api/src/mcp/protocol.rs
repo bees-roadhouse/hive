@@ -18,11 +18,7 @@ struct JsonRpcRequest {
 }
 
 /// Dispatch one JSON-RPC payload (single request or batch array).
-pub async fn handle_jsonrpc(
-    state: &AppState,
-    principal: Option<&Principal>,
-    body: &str,
-) -> Value {
+pub async fn handle_jsonrpc(state: &AppState, principal: Option<&Principal>, body: &str) -> Value {
     let trimmed = body.trim();
     if trimmed.is_empty() {
         return error_response(None, -32600, "empty request body");

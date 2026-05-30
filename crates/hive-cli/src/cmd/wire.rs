@@ -111,7 +111,9 @@ async fn sources_list(enabled_only: bool, json: bool) -> Result<()> {
         Column::new("name", |r: &api::WireSource| r.name.clone()),
         Column::new("kind", |r: &api::WireSource| r.kind.clone()),
         Column::new("tag", |r: &api::WireSource| r.source_tag.clone()),
-        Column::new("interval", |r: &api::WireSource| r.poll_interval_secs.to_string()),
+        Column::new("interval", |r: &api::WireSource| {
+            r.poll_interval_secs.to_string()
+        }),
     ];
     let trailing: Box<dyn Fn(&api::WireSource) -> String> = Box::new(|r| r.url.clone());
     print_table(&cols, &rows, Some(("url", trailing)));

@@ -90,10 +90,7 @@ fn to_tool_err(e: ApiError) -> String {
 
 async fn journal_add(state: &AppState, args: &Value) -> Result<Value, String> {
     let body = required_str(args, "body")?;
-    let ai_str = args
-        .get("ai")
-        .and_then(Value::as_str)
-        .unwrap_or("pia");
+    let ai_str = args.get("ai").and_then(Value::as_str).unwrap_or("pia");
     let ai = Ai::from_str(ai_str).map_err(|e| to_tool_err(e.into()))?;
     let entry_body = assign_missing_task_block_ids(&body);
     let date = optional_str(args, "date").unwrap_or_else(|| {
@@ -142,7 +139,10 @@ async fn journal_list(
         tag: optional_str(args, "tag"),
         limit: optional_i64(args, "limit"),
     };
-    let mut tx = state.rls_begin(principal).await.map_err(|e| to_tool_err(e.into()))?;
+    let mut tx = state
+        .rls_begin(principal)
+        .await
+        .map_err(|e| to_tool_err(e.into()))?;
     let rows = journal::list_in(&mut *tx, &filters)
         .await
         .map_err(|e| to_tool_err(e.into()))?;
@@ -162,7 +162,9 @@ async fn journal_search(state: &AppState, args: &Value) -> Result<Value, String>
 async fn journal_get(state: &AppState, args: &Value) -> Result<Value, String> {
     let id_or_slug = required_str(args, "id_or_slug")?;
     if let Ok(id) = Uuid::parse_str(&id_or_slug)
-        && let Some(e) = journal::get(&state.pool, id).await.map_err(|e| to_tool_err(e.into()))?
+        && let Some(e) = journal::get(&state.pool, id)
+            .await
+            .map_err(|e| to_tool_err(e.into()))?
     {
         return serde_json::to_value(e).map_err(|e| e.to_string());
     }
@@ -182,7 +184,9 @@ async fn tasks_list(state: &AppState, args: &Value) -> Result<Value, String> {
         status,
         all: args.get("all").and_then(Value::as_bool).unwrap_or(false),
     };
-    let rows = tasks::list(&state.pool, &filters).await.map_err(|e| to_tool_err(e.into()))?;
+    let rows = tasks::list(&state.pool, &filters)
+        .await
+        .map_err(|e| to_tool_err(e.into()))?;
     Ok(json!(rows))
 }
 
@@ -194,7 +198,9 @@ async fn notes_list(state: &AppState, args: &Value) -> Result<Value, String> {
         tag: optional_str(args, "tag"),
         limit: optional_i64(args, "limit"),
     };
-    let rows = notes::list(&state.pool, &filters).await.map_err(|e| to_tool_err(e.into()))?;
+    let rows = notes::list(&state.pool, &filters)
+        .await
+        .map_err(|e| to_tool_err(e.into()))?;
     Ok(json!(rows))
 }
 
@@ -209,14 +215,18 @@ async fn wire_list(state: &AppState, args: &Value) -> Result<Value, String> {
             .unwrap_or(false),
         limit: optional_i64(args, "limit"),
     };
-    let rows = wire::list(&state.pool, &filters).await.map_err(|e| to_tool_err(e.into()))?;
+    let rows = wire::list(&state.pool, &filters)
+        .await
+        .map_err(|e| to_tool_err(e.into()))?;
     Ok(json!(rows))
 }
 
 async fn wire_ack(state: &AppState, args: &Value) -> Result<Value, String> {
     let id_str = required_str(args, "id")?;
     let id = Uuid::parse_str(&id_str).map_err(|e| format!("invalid id: {e}"))?;
-    wire::ack(&state.pool, id).await.map_err(|e| to_tool_err(e.into()))?;
+    wire::ack(&state.pool, id)
+        .await
+        .map_err(|e| to_tool_err(e.into()))?;
     state
         .emitter
         .emit(HiveEvent::now("wire.acked", "wire_events", id));
@@ -246,9 +256,7 @@ fn required_str(args: &Value, field: &str) -> Result<String, String> {
 }
 
 fn optional_str(args: &Value, field: &str) -> Option<String> {
-    args.get(field)
-        .and_then(Value::as_str)
-        .map(str::to_string)
+    args.get(field).and_then(Value::as_str).map(str::to_string)
 }
 
 fn optional_i64(args: &Value, field: &str) -> Option<i64> {
@@ -268,120 +276,120 @@ where
 
 fn tool_definitions() -> Vec<Value> {
     vec![
-    json!({
-        "name": "journal_add",
-        "description": "Create a journal entry (canonical write surface). Tasks, notes, and links project from the body.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "ai": { "type": "string", "description": "Author: pia, apis, cera, nate, maggie (default pia)" },
-                "body": { "type": "string", "description": "Markdown body with checkboxes and [[[note ...]]] blocks" },
-                "title": { "type": "string" },
-                "date": { "type": "string", "description": "YYYY-MM-DD (default today)" },
-                "tags": { "type": "string", "description": "Comma-separated tags" }
-            },
-            "required": ["body"]
-        }
-    }),
-    json!({
-        "name": "journal_list",
-        "description": "List journal entries with optional filters.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "ai": { "type": "string" },
-                "from": { "type": "string", "description": "YYYY-MM-DD" },
-                "to": { "type": "string", "description": "YYYY-MM-DD" },
-                "tag": { "type": "string" },
-                "limit": { "type": "integer" }
+        json!({
+            "name": "journal_add",
+            "description": "Create a journal entry (canonical write surface). Tasks, notes, and links project from the body.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ai": { "type": "string", "description": "Author: pia, apis, cera, nate, maggie (default pia)" },
+                    "body": { "type": "string", "description": "Markdown body with checkboxes and [[[note ...]]] blocks" },
+                    "title": { "type": "string" },
+                    "date": { "type": "string", "description": "YYYY-MM-DD (default today)" },
+                    "tags": { "type": "string", "description": "Comma-separated tags" }
+                },
+                "required": ["body"]
             }
-        }
-    }),
-    json!({
-        "name": "journal_search",
-        "description": "Full-text search journal entries.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "q": { "type": "string" },
-                "limit": { "type": "integer" }
-            },
-            "required": ["q"]
-        }
-    }),
-    json!({
-        "name": "journal_get",
-        "description": "Fetch one journal entry by UUID or slug.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "id_or_slug": { "type": "string" }
-            },
-            "required": ["id_or_slug"]
-        }
-    }),
-    json!({
-        "name": "tasks_list",
-        "description": "List tasks (read-only under journal-canonical enforce mode).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "project": { "type": "string" },
-                "owner": { "type": "string" },
-                "status": { "type": "string" },
-                "all": { "type": "boolean" }
+        }),
+        json!({
+            "name": "journal_list",
+            "description": "List journal entries with optional filters.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "ai": { "type": "string" },
+                    "from": { "type": "string", "description": "YYYY-MM-DD" },
+                    "to": { "type": "string", "description": "YYYY-MM-DD" },
+                    "tag": { "type": "string" },
+                    "limit": { "type": "integer" }
+                }
             }
-        }
-    }),
-    json!({
-        "name": "notes_list",
-        "description": "List notes (read-only under journal-canonical enforce mode).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "author": { "type": "string" },
-                "project": { "type": "string" },
-                "tag": { "type": "string" },
-                "limit": { "type": "integer" }
+        }),
+        json!({
+            "name": "journal_search",
+            "description": "Full-text search journal entries.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "q": { "type": "string" },
+                    "limit": { "type": "integer" }
+                },
+                "required": ["q"]
             }
-        }
-    }),
-    json!({
-        "name": "wire_list",
-        "description": "List wire events (CVE, outages, RSS ingest).",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "source": { "type": "string" },
-                "severity": { "type": "string" },
-                "unacknowledged": { "type": "boolean" },
-                "limit": { "type": "integer" }
+        }),
+        json!({
+            "name": "journal_get",
+            "description": "Fetch one journal entry by UUID or slug.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id_or_slug": { "type": "string" }
+                },
+                "required": ["id_or_slug"]
             }
-        }
-    }),
-    json!({
-        "name": "wire_ack",
-        "description": "Acknowledge a wire event by UUID.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "id": { "type": "string", "description": "Wire event UUID" }
-            },
-            "required": ["id"]
-        }
-    }),
-    json!({
-        "name": "search",
-        "description": "Combined full-text search across journal entries and notes.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "q": { "type": "string" },
-                "limit": { "type": "integer" }
-            },
-            "required": ["q"]
-        }
-    }),
+        }),
+        json!({
+            "name": "tasks_list",
+            "description": "List tasks (read-only under journal-canonical enforce mode).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string" },
+                    "owner": { "type": "string" },
+                    "status": { "type": "string" },
+                    "all": { "type": "boolean" }
+                }
+            }
+        }),
+        json!({
+            "name": "notes_list",
+            "description": "List notes (read-only under journal-canonical enforce mode).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "author": { "type": "string" },
+                    "project": { "type": "string" },
+                    "tag": { "type": "string" },
+                    "limit": { "type": "integer" }
+                }
+            }
+        }),
+        json!({
+            "name": "wire_list",
+            "description": "List wire events (CVE, outages, RSS ingest).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string" },
+                    "severity": { "type": "string" },
+                    "unacknowledged": { "type": "boolean" },
+                    "limit": { "type": "integer" }
+                }
+            }
+        }),
+        json!({
+            "name": "wire_ack",
+            "description": "Acknowledge a wire event by UUID.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Wire event UUID" }
+                },
+                "required": ["id"]
+            }
+        }),
+        json!({
+            "name": "search",
+            "description": "Combined full-text search across journal entries and notes.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "q": { "type": "string" },
+                    "limit": { "type": "integer" }
+                },
+                "required": ["q"]
+            }
+        }),
     ]
 }
 
