@@ -16,6 +16,17 @@ pub struct ParsedBody {
     /// Code spans and fenced code blocks are skipped at the lexer level so
     /// shell commands quoted in journal/note prose don't pollute this list.
     pub entity_mentions: Vec<EntityMention>,
+    /// Note spawn blocks: `[[[note title …]]]` … `[[[/note]]]`.
+    pub note_spawns: Vec<ParsedNoteSpawn>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ParsedNoteSpawn {
+    pub line_index: usize,
+    pub title: String,
+    pub project: Option<String>,
+    pub tags: Option<String>,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

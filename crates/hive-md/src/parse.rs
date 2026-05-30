@@ -2,7 +2,10 @@ use chrono::{Datelike, Duration, Local, NaiveDate, Weekday};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use uuid::Uuid;
 
-use crate::{EntityMention, MentionKind, ParsedBody, ParsedTask, PersonRef, TagRef, TypedKind};
+use crate::{
+    EntityMention, MentionKind, ParsedBody, ParsedNoteSpawn, ParsedTask, PersonRef, TagRef,
+    TypedKind,
+};
 
 pub fn parse(body: &str) -> ParsedBody {
     let today = Local::now().date_naive();
@@ -19,28 +22,30 @@ pub(crate) fn parse_with_today(body: &str, today: NaiveDate) -> ParsedBody {
     // blocks. People paste shell commands with `@` and `[[` in them ... if we
     // scan inside those, we'd hallucinate mentions. Code regions are inviolate.
     let code_ranges = code_byte_ranges(body);
-
-    // Line-index lookup: for each byte offset in `body`, what line is it on?
-    // Cheap to compute up-front; let us classify any byte offset.
     let line_starts = compute_line_starts(body);
+    let (note_spawns, note_line_ranges) = parse_note_spawns(body);
+    let mask_ranges = merge_byte_ranges(
+        &code_ranges,
+        &note_line_byte_ranges(body, &line_starts, &note_line_ranges),
+    );
 
     for (line_index, line) in body.split('\n').enumerate() {
-        // Task-line parsing is line-based and intentionally not gated by the
-        // code-range mask: a `- [ ]` line inside a fenced block isn't really a
-        // task in markdown semantics, but the existing tests + journal canvas
-        // grammar treats every `- [ ]` line in the body as a task. Keep that
-        // behavior; the universal mention pipeline is the only thing that
-        // strictly respects code regions.
+        if note_line_ranges
+            .iter()
+            .any(|(start, end)| line_index >= *start && line_index <= *end)
+        {
+            continue;
+        }
         if let Some(task) = parse_task_line(line, line_index, today) {
             tasks.push(task);
         }
     }
 
     // Persons / tags / mentions: scan the whole body byte-stream, skip code
-    // regions, attribute each find to its line.
+    // and note-block regions, attribute each find to its line.
     scan_outside_code(
         body,
-        &code_ranges,
+        &mask_ranges,
         &line_starts,
         |line_index, line, offset_in_line| {
             // `line` here is the substring of `body` that lies on `line_index` and
@@ -89,7 +94,118 @@ pub(crate) fn parse_with_today(body: &str, today: NaiveDate) -> ParsedBody {
         person_refs,
         tag_refs,
         entity_mentions,
+        note_spawns,
     }
+}
+
+const NOTE_BLOCK_CLOSE: &str = "[[[/note]]]";
+const NOTE_BLOCK_OPEN: &str = "[[[note";
+
+/// Parse `[[[note title project:… tags:…]]]` … `[[[/note]]]` blocks.
+/// Returns spawns plus inclusive line-index ranges (opener through closer).
+fn parse_note_spawns(body: &str) -> (Vec<ParsedNoteSpawn>, Vec<(usize, usize)>) {
+    let lines: Vec<&str> = body.split('\n').collect();
+    let mut spawns = Vec::new();
+    let mut line_ranges = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        if let Some(header) = parse_note_opener(trimmed) {
+            let open_line = i;
+            i += 1;
+            let mut body_lines = Vec::new();
+            let mut close_line = None;
+            while i < lines.len() {
+                if lines[i].trim() == NOTE_BLOCK_CLOSE {
+                    close_line = Some(i);
+                    i += 1;
+                    break;
+                }
+                body_lines.push(lines[i].to_string());
+                i += 1;
+            }
+            if let Some(end_line) = close_line {
+                let (title, project, tags) = parse_note_header(&header);
+                if !title.is_empty() {
+                    spawns.push(ParsedNoteSpawn {
+                        line_index: open_line,
+                        title,
+                        project,
+                        tags,
+                        body: body_lines.join("\n").trim().to_string(),
+                    });
+                    line_ranges.push((open_line, end_line));
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    (spawns, line_ranges)
+}
+
+fn parse_note_opener(line: &str) -> Option<String> {
+    let line = line.trim();
+    let after = line.strip_prefix(NOTE_BLOCK_OPEN)?;
+    let after = after.strip_prefix(':').unwrap_or(after).trim_start();
+    let header = after.strip_suffix("]]]")?;
+    let header = header.trim();
+    if header.is_empty() {
+        return None;
+    }
+    Some(header.to_string())
+}
+
+fn parse_note_header(header: &str) -> (String, Option<String>, Option<String>) {
+    let mut title_parts = Vec::new();
+    let mut project = None;
+    let mut tags = None;
+    for token in header.split_whitespace() {
+        if let Some(rest) = token.strip_prefix("project:") {
+            if !rest.is_empty() {
+                project = Some(rest.to_string());
+            }
+        } else if let Some(rest) = token.strip_prefix("tags:") {
+            if !rest.is_empty() {
+                tags = Some(rest.to_string());
+            }
+        } else {
+            title_parts.push(token);
+        }
+    }
+    (title_parts.join(" "), project, tags)
+}
+
+fn note_line_byte_ranges(
+    body: &str,
+    line_starts: &[usize],
+    line_ranges: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let len = body.len();
+    line_ranges
+        .iter()
+        .map(|&(start_line, end_line)| {
+            let start = line_starts.get(start_line).copied().unwrap_or(0);
+            let end = line_starts.get(end_line + 1).copied().unwrap_or(len);
+            (start, end)
+        })
+        .collect()
+}
+
+fn merge_byte_ranges(a: &[(usize, usize)], b: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut ranges: Vec<(usize, usize)> = a.iter().chain(b.iter()).copied().collect();
+    ranges.sort_by_key(|r| r.0);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        if let Some(last) = merged.last_mut()
+            && r.0 <= last.1
+        {
+            last.1 = last.1.max(r.1);
+            continue;
+        }
+        merged.push(r);
+    }
+    merged
 }
 
 /// Byte ranges inside `body` that fall in a code span or a fenced/indented

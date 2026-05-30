@@ -490,23 +490,34 @@ struct NoteSpawnSpec {
     body: String,
 }
 
-/// Scan journal prose for `#note title` blocks and create note rows plus
+impl From<&hive_md::ParsedNoteSpawn> for NoteSpawnSpec {
+    fn from(s: &hive_md::ParsedNoteSpawn) -> Self {
+        Self {
+            title: s.title.clone(),
+            project: s.project.clone(),
+            tags: s.tags.clone(),
+            body: s.body.clone(),
+        }
+    }
+}
+
+/// Scan journal prose for `[[[note …]]]` blocks and create note rows plus
 /// `spawned_in` links back to the entry. Idempotent on title match within the
 /// same entry (skips if a spawned_in link to a note with the same title exists).
 pub async fn upsert_note_spawns(
     pool: &PgPool,
     journal_entry_id: Uuid,
     ai: Ai,
-    body: &str,
+    spawns: &[hive_md::ParsedNoteSpawn],
 ) -> sqlx::Result<usize> {
     let author = ai_as_author(ai);
-    let specs = parse_note_spawns(body);
-    if specs.is_empty() {
+    if spawns.is_empty() {
         return Ok(0);
     }
 
     let mut written = 0usize;
-    for spec in specs {
+    for raw in spawns {
+        let spec = NoteSpawnSpec::from(raw);
         if note_spawn_exists(pool, journal_entry_id, &spec.title).await? {
             continue;
         }
@@ -552,67 +563,6 @@ pub async fn upsert_note_spawns(
 
 fn ai_as_author(ai: Ai) -> Author {
     Author::from_str(ai.as_str()).unwrap_or(Author::Nate)
-}
-
-fn parse_note_spawns(body: &str) -> Vec<NoteSpawnSpec> {
-    let mut specs = Vec::new();
-    let mut current: Option<NoteSpawnSpec> = None;
-    let mut body_lines: Vec<String> = Vec::new();
-
-    let flush = |current: &mut Option<NoteSpawnSpec>,
-                 body_lines: &mut Vec<String>,
-                 specs: &mut Vec<NoteSpawnSpec>| {
-        if let Some(mut spec) = current.take() {
-            spec.body = body_lines.join("\n").trim().to_string();
-            if !spec.title.is_empty() {
-                specs.push(spec);
-            }
-        }
-        body_lines.clear();
-    };
-
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed
-            .strip_prefix("#note:")
-            .or_else(|| trimmed.strip_prefix("#note "))
-        {
-            flush(&mut current, &mut body_lines, &mut specs);
-            let (title, project, tags) = parse_note_header(rest.trim());
-            current = Some(NoteSpawnSpec {
-                title,
-                project,
-                tags,
-                body: String::new(),
-            });
-            continue;
-        }
-        if current.is_some() {
-            body_lines.push(line.to_string());
-        }
-    }
-    flush(&mut current, &mut body_lines, &mut specs);
-    specs
-}
-
-fn parse_note_header(header: &str) -> (String, Option<String>, Option<String>) {
-    let mut title_parts = Vec::new();
-    let mut project = None;
-    let mut tags = None;
-    for token in header.split_whitespace() {
-        if let Some(rest) = token.strip_prefix("project:") {
-            if !rest.is_empty() {
-                project = Some(rest.to_string());
-            }
-        } else if let Some(rest) = token.strip_prefix("tags:") {
-            if !rest.is_empty() {
-                tags = Some(rest.to_string());
-            }
-        } else {
-            title_parts.push(token);
-        }
-    }
-    (title_parts.join(" "), project, tags)
 }
 
 async fn note_spawn_exists(
@@ -668,7 +618,7 @@ pub async fn project_body(pool: &PgPool, source_table: &str, source_id: Uuid, bo
     if source_table == "journal_entries" {
         if let Ok(Some(entry)) = journal::get(pool, source_id).await {
             let ai = Ai::from_str(&entry.ai).unwrap_or(Ai::Nate);
-            if let Err(e) = upsert_note_spawns(pool, source_id, ai, body).await {
+            if let Err(e) = upsert_note_spawns(pool, source_id, ai, &parsed.note_spawns).await {
                 warn!(%source_id, error = %e, "note spawn projection failed");
             }
         }

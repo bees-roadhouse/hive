@@ -59,14 +59,15 @@ pub fn synthesize_note_add(
 ) -> (String, String, String) {
     let ai = ai_for_owner(author);
     let note_title = title.unwrap_or("note");
-    let mut header = format!("#note {note_title}");
+    let mut header_parts = vec![note_title.to_string()];
     if let Some(p) = project {
-        header.push_str(&format!(" project:{p}"));
+        header_parts.push(format!("project:{p}"));
     }
     if let Some(t) = tags {
-        header.push_str(&format!(" tags:{t}"));
+        header_parts.push(format!("tags:{t}"));
     }
-    let journal_body = format!("{header}\n\n{}", body.trim());
+    let opener = format!("[[[note {}]]]", header_parts.join(" "));
+    let journal_body = format!("{opener}\n\n{}\n[[[/note]]]", body.trim());
     let journal_title = format!("note: {note_title}");
     (ai, journal_title, journal_body)
 }
@@ -116,6 +117,7 @@ mod tests {
             Some("food"),
         );
         assert_eq!(title, "note: dinner");
-        assert!(body.starts_with("#note dinner project:home tags:food"));
+        assert!(body.starts_with("[[[note dinner project:home tags:food]]]"));
+        assert!(body.contains("[[[/note]]]"));
     }
 }

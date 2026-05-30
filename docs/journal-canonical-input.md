@@ -25,21 +25,22 @@ Auth, OAuth, MFA, and admin routes are unchanged.
 On `POST /journal` (and on `PATCH /journal/{id}` re-projection):
 
 1. Assign stable `^taskN` block ids to checkbox lines missing anchors.
-2. Parse body (`hive-md`): entity mentions + inline tasks + `#note` spawn blocks.
+2. Parse body (`hive-md`): entity mentions + inline tasks + `[[[note …]]]` spawn blocks.
 3. Resolve mentions → `links` rows (`link_type='mentions'`).
 4. For each checkbox with a block id:
    - Reuse task by title match, or create (respecting `proj:` on the line).
    - Write `spawned_in` (on create), `inline_in`, and `task_anchors`.
    - Checked `- [x]` → `tasks.status=done` + `closed_by` link.
    - Dropped `- [-]` → `tasks.status=dropped`.
-5. For each `#note title` block → create `notes` row + `spawned_in` link.
+5. For each `[[[note title …]]]` … `[[[/note]]]` block → create `notes` row + `spawned_in` link.
 
 ### What emerges from journal vs what does not
 
 | Entity | Created from journal? | How |
 |--------|----------------------|-----|
-| **Tasks** | yes | Inline `- [ ]` / `- [x]` / `- [-]` checkboxes; `proj:`, `@owner`, `due:`, `pri:` tokens |
-| **Notes** | yes | `#note title` blocks (optional `project:` / `tags:` on header line) |
+| **Tasks** | yes | Inline `- [ ]` / `- [x]` / `- [-]` checkboxes only; `proj:`, `@owner`, `due:`, `pri:` tokens |
+| **Notes** | yes | `[[[note title project:… tags:…]]]` … `[[[/note]]]` blocks |
+| **Tags** | classify only | Inline `#tag` folksonomy (never spawns a row) |
 | **Links** | yes | `@slug`, `[[type:id]]`, `[[slug]]` mentions → `link_type='mentions'`; task lifecycle links (`spawned_in`, `inline_in`, `closed_by`) from checkboxes |
 | **People / AI** | **no** (link only) | `@slug` resolves to existing `people` or `ai` rows; does not create humans or agents |
 | **Wire events** | **no** (link only) | `[[event:…]]` resolves to existing `wire_events`; new events come from **wire ingest** (`POST /wire`, RSS worker) |

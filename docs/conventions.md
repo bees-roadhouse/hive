@@ -18,6 +18,20 @@ Six standard values. Anything else is a custom one-off and should probably be pr
 
 `spawned_in` fires once at birth. `inline_in` is a living binding ... if the checkbox stays, the link stays.
 
+## note spawn blocks
+
+Notes use triple-bracket blocks. Tasks use checkboxes only. Inline `#tag` is folksonomy, not spawn syntax.
+
+```text
+[[[note dinner plans project:home tags:food]]]
+Reservations at 7pm.
+[[[/note]]]
+```
+
+- Opener: `[[[note TITLE …]]]` on one line. Optional `project:` and `tags:` tokens on the opener.
+- Closer: `[[[/note]]]` on its own line.
+- Projection creates a `notes` row and a `spawned_in` link (journal entry → note).
+
 ## obsidian-style checklist syntax
 
 Canonical journal embedding. The renderer recognizes:
