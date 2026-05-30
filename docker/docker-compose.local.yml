@@ -51,6 +51,21 @@ services:
     ports:
       - "127.0.0.1:7878:7878"
 
+  hive-wire-ingest:
+    build:
+      context: ..
+      dockerfile: docker/Containerfile.hive-wire-ingest.local
+    image: hive-wire-ingest:local
+    container_name: hive-wire-ingest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://hive:hive@postgres:5432/hive
+      WIRE_INGEST_INTERVAL_SECS: 300
+      RUST_LOG: info,hive_wire_ingest=info
+
 volumes:
   hive-data:
     name: hive-data

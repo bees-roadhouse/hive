@@ -58,6 +58,7 @@ async fn add(
     State(state): State<AppState>,
     Json(b): Json<AddBody>,
 ) -> Result<Json<messages::Message>, ApiError> {
+    state.guard_structured_write("POST /messages")?;
     // surface validation as 400 before hitting the db
     if b.sender_ai.trim().is_empty() {
         return Err(ApiError::BadRequest("sender_ai must not be empty".into()));
@@ -104,6 +105,7 @@ async fn mark_read(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<messages::Message>, ApiError> {
+    state.guard_structured_write("POST /messages/{id}/read")?;
     let m = messages::mark_read(&state.pool, id).await?;
     state
         .emitter

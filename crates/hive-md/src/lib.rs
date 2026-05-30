@@ -24,12 +24,16 @@ pub struct ParsedTask {
     pub line_index: usize,
     pub text: String,
     pub checked: bool,
+    /// Obsidian `- [-]` dropped checkbox (distinct from done).
+    pub dropped: bool,
     pub owner: Option<String>,
     pub due: Option<NaiveDate>,
     pub raw_due: Option<String>,
     pub priority: Option<String>,
     pub tags: Vec<String>,
     pub persons: Vec<String>,
+    /// Optional `proj:foo` token on the task line (journal projection).
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

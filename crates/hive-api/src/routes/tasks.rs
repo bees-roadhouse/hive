@@ -59,6 +59,7 @@ async fn add(
     State(state): State<AppState>,
     Json(body): Json<AddBody>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
+    state.guard_structured_write("POST /tasks")?;
     let t = tasks::add(
         &state.pool,
         &body.project,
@@ -124,6 +125,7 @@ async fn update(
     Path(id_or_slug): Path<String>,
     Json(body): Json<UpdateBody>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
+    state.guard_structured_write("PATCH /tasks/{id}")?;
     let id = resolve_task_id(&state, &id_or_slug).await?;
     let fields = tasks::UpdateFields {
         status: body.status,
@@ -153,6 +155,7 @@ async fn done(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
+    state.guard_structured_write("POST /tasks/{id}/done")?;
     tasks::mark_done(&state.pool, id).await?;
     let t = tasks::require(&state.pool, id).await?;
     state.emitter.emit(
@@ -174,6 +177,7 @@ async fn block(
     Path(id): Path<Uuid>,
     Json(body): Json<BlockBody>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
+    state.guard_structured_write("POST /tasks/{id}/block")?;
     let reason = body.reason.clone();
     tasks::mark_blocked(&state.pool, id, &body.reason).await?;
     let t = tasks::require(&state.pool, id).await?;
@@ -193,6 +197,7 @@ async fn drop(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<hive_db::types::Task>, ApiError> {
+    state.guard_structured_write("POST /tasks/{id}/drop")?;
     tasks::mark_dropped(&state.pool, id).await?;
     let t = tasks::require(&state.pool, id).await?;
     state

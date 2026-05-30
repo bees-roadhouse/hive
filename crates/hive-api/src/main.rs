@@ -7,6 +7,7 @@
 
 mod auth;
 mod error;
+mod input_policy;
 mod mentions;
 mod routes;
 mod state;
@@ -124,10 +125,17 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "dev")]
     auth::dev::log_startup_banner(&auth_config);
 
+    let input_mode = input_policy::InputMode::from_env();
+    tracing::info!(
+        ?input_mode,
+        "journal-canonical input mode (HIVE_INPUT_MODE)"
+    );
+
     let state = AppState {
         pool,
         emitter,
         auth: auth_state.clone(),
+        input_mode,
     };
 
     let app: Router = Router::new()
@@ -137,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
         .merge(routes::messages::router())
         .merge(routes::notes::router())
         .merge(routes::wire::router())
+        .merge(routes::wire_sources::router())
         .merge(routes::links::router())
         .merge(routes::graph::router())
         .merge(routes::search::router())

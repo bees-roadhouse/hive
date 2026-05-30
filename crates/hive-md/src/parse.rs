@@ -479,6 +479,7 @@ pub(crate) struct TaskLineShape<'a> {
     pub indent: &'a str,
     pub bullet: char,
     pub checked: bool,
+    pub dropped: bool,
     pub body: &'a str,
 }
 
@@ -503,9 +504,10 @@ pub(crate) fn match_task_shape(line: &str) -> Option<TaskLineShape<'_>> {
         return None;
     }
     let mark = chars.next()?;
-    let checked = match mark {
-        ' ' => false,
-        'x' | 'X' => true,
+    let (checked, dropped) = match mark {
+        ' ' => (false, false),
+        'x' | 'X' => (true, false),
+        '-' => (false, true),
         _ => return None,
     };
     if chars.next() != Some(']') {
@@ -520,6 +522,7 @@ pub(crate) fn match_task_shape(line: &str) -> Option<TaskLineShape<'_>> {
         indent,
         bullet,
         checked,
+        dropped,
         body: &line[consumed..],
     })
 }
@@ -533,6 +536,7 @@ fn parse_task_line(line: &str, line_index: usize, today: NaiveDate) -> Option<Pa
     let mut due = None;
     let mut raw_due = None;
     let mut priority = None;
+    let mut project = None;
     let mut tags = Vec::new();
     let mut persons = Vec::new();
 
@@ -563,6 +567,11 @@ fn parse_task_line(line: &str, line_index: usize, today: NaiveDate) -> Option<Pa
             && matches!(rest, "high" | "medium" | "low")
         {
             priority = Some(rest.to_string());
+        } else if let Some(rest) = token.strip_prefix("proj:")
+            && project.is_none()
+            && !rest.is_empty()
+        {
+            project = Some(rest.to_string());
         }
     }
 
@@ -573,12 +582,14 @@ fn parse_task_line(line: &str, line_index: usize, today: NaiveDate) -> Option<Pa
         line_index,
         text,
         checked: shape.checked,
+        dropped: shape.dropped,
         owner,
         due,
         raw_due,
         priority,
         tags,
         persons,
+        project,
     })
 }
 
@@ -593,7 +604,8 @@ fn strip_marker_tokens(s: &str) -> String {
             !(tok.starts_with('@')
                 || tok.starts_with('#')
                 || tok.starts_with("due:")
-                || tok.starts_with("pri:"))
+                || tok.starts_with("pri:")
+                || tok.starts_with("proj:"))
         })
         .collect();
     kept.join(" ")

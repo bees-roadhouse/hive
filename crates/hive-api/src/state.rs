@@ -7,12 +7,21 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::auth::AuthState;
+use crate::error::ApiError;
+use crate::input_policy::{self, InputMode};
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub emitter: EventEmitter,
     pub auth: AuthState,
+    pub input_mode: InputMode,
+}
+
+impl AppState {
+    pub fn guard_structured_write(&self, surface: &str) -> Result<(), ApiError> {
+        input_policy::guard_structured_write(self.input_mode, surface)
+    }
 }
 
 impl AppState {

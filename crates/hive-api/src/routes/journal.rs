@@ -1,3 +1,6 @@
+//! Journal routes — **canonical content input** (`POST /journal`).
+//! Structured rows (tasks, notes, links) project from the body; they are not
+//! written directly when `HIVE_INPUT_MODE=enforce`.
 use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -6,7 +9,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use hive_db::enums::Ai;
-use hive_db::queries::{journal, search, tasks};
+use hive_db::queries::{journal, notes, search, tasks};
 
 use crate::auth::extractor::MaybeAuthUser;
 use crate::error::ApiError;
@@ -17,9 +20,10 @@ pub fn router() -> Router<AppState> {
         .route("/journal", get(list).post(add))
         .route("/journal/search", get(search_endpoint))
         .route("/journal/{id}/tasks", get(tasks_for_entry))
+        .route("/journal/{id}/notes", get(notes_for_entry))
         // {id_or_slug} ... UUID parsed first, slug fallback. /search is matched
         // above so it doesn't fall into this catch-all.
-        .route("/journal/{id_or_slug}", get(show))
+        .route("/journal/{id_or_slug}", get(show).patch(update))
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +108,49 @@ async fn add(
     Ok(Json(e))
 }
 
+#[derive(Debug, Deserialize)]
+struct PatchBody {
+    title: Option<String>,
+    body: Option<String>,
+    tags: Option<String>,
+    date: Option<String>,
+    clear_title: Option<bool>,
+    clear_tags: Option<bool>,
+}
+
+async fn update(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<PatchBody>,
+) -> Result<Json<hive_db::types::JournalEntry>, ApiError> {
+    journal::require(&state.pool, id).await?;
+    let entry_body = body.body.as_ref().map(|b| assign_missing_task_block_ids(b));
+    let fields = journal::UpdateFields {
+        title: body
+            .clear_title
+            .filter(|&v| v)
+            .map(|_| None)
+            .or_else(|| body.title.map(Some)),
+        body: entry_body,
+        tags: body
+            .clear_tags
+            .filter(|&v| v)
+            .map(|_| None)
+            .or_else(|| body.tags.map(Some)),
+        entry_date: body.date,
+    };
+    let e = journal::update(&state.pool, id, &fields).await?;
+    state.emitter.emit(
+        HiveEvent::now("journal.updated", "journal_entries", e.id).with_extra(serde_json::json!({
+            "ai": e.ai,
+            "title": e.title,
+            "entry_date": e.entry_date,
+        })),
+    );
+    crate::mentions::project_body(&state.pool, "journal_entries", e.id, &e.body).await;
+    Ok(Json(e))
+}
+
 async fn show(
     State(state): State<AppState>,
     Path(id_or_slug): Path<String>,
@@ -159,6 +206,14 @@ async fn tasks_for_entry(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<hive_db::types::Task>>, ApiError> {
     let rows = tasks::list_for_journal_entry(&state.pool, id).await?;
+    Ok(Json(rows))
+}
+
+async fn notes_for_entry(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<hive_db::types::Note>>, ApiError> {
+    let rows = notes::list_for_journal_entry(&state.pool, id).await?;
     Ok(Json(rows))
 }
 

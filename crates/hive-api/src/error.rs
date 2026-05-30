@@ -15,6 +15,9 @@ pub enum ApiError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+
     #[error("internal: {0}")]
     Internal(String),
 }
@@ -31,6 +34,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             ApiError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             ApiError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
+            ApiError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             ApiError::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
         let body = ErrorBody {

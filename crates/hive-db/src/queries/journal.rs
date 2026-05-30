@@ -144,3 +144,55 @@ where
         .await?;
     Ok(rows)
 }
+
+#[derive(Debug, Default, Clone)]
+pub struct UpdateFields {
+    pub title: Option<Option<String>>,
+    pub body: Option<String>,
+    pub tags: Option<Option<String>>,
+    pub entry_date: Option<String>,
+}
+
+pub async fn update(pool: &PgPool, id: Uuid, fields: &UpdateFields) -> Result<JournalEntry> {
+    if fields.title.is_none()
+        && fields.body.is_none()
+        && fields.tags.is_none()
+        && fields.entry_date.is_none()
+    {
+        return Err(Error::InvalidFormat {
+            field: "update",
+            value: "(none)".into(),
+            expected: "at least one field to update",
+        });
+    }
+
+    let mut qb: QueryBuilder<Postgres> =
+        QueryBuilder::new("UPDATE journal_entries SET updated_at = now()");
+    let mut first = true;
+    let push = |qb: &mut QueryBuilder<Postgres>, first: &mut bool| {
+        if *first {
+            *first = false;
+        } else {
+            qb.push(", ");
+        }
+    };
+    if let Some(title) = &fields.title {
+        push(&mut qb, &mut first);
+        qb.push("title = ").push_bind(title.clone());
+    }
+    if let Some(body) = &fields.body {
+        push(&mut qb, &mut first);
+        qb.push("body = ").push_bind(body.clone());
+    }
+    if let Some(tags) = &fields.tags {
+        push(&mut qb, &mut first);
+        qb.push("tags = ").push_bind(tags.clone());
+    }
+    if let Some(entry_date) = &fields.entry_date {
+        push(&mut qb, &mut first);
+        qb.push("entry_date = ").push_bind(entry_date.clone());
+    }
+    qb.push(" WHERE id = ").push_bind(id);
+    qb.push(" RETURNING id, ai, entry_date, title, body, tags, created_at, updated_at, slug");
+    Ok(qb.build_query_as::<JournalEntry>().fetch_one(pool).await?)
+}

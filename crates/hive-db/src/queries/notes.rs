@@ -110,3 +110,18 @@ pub async fn list(pool: &PgPool, filters: &ListFilters) -> Result<Vec<Note>> {
     let rows = qb.build_query_as::<Note>().fetch_all(pool).await?;
     Ok(rows)
 }
+
+pub async fn list_for_journal_entry(pool: &PgPool, journal_entry_id: Uuid) -> Result<Vec<Note>> {
+    Ok(sqlx::query_as::<_, Note>(&format!(
+        "SELECT n.{cols} \
+         FROM links l \
+         JOIN notes n ON n.id = l.target_id \
+         WHERE l.source_table = 'journal_entries' AND l.source_id = $1 \
+           AND l.target_table = 'notes' AND l.link_type = 'spawned_in' \
+         ORDER BY n.created_at, n.id",
+        cols = SELECT_COLS.replace(", ", ", n.")
+    ))
+    .bind(journal_entry_id)
+    .fetch_all(pool)
+    .await?)
+}

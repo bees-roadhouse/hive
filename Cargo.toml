@@ -8,6 +8,7 @@ members = [
     "crates/hive-core",
     "crates/hive-md",
     "crates/hive-ui",
+    "crates/hive-wire-ingest",
 ]
 
 # Deferred (still on rusqlite sync API; retired by the api-first shift):
@@ -113,6 +114,9 @@ fastembed = "5"
 
 # Markdown parsing (hive-md: Obsidian task grammar for journal-canvas dual-write)
 pulldown-cmark = "0.12"
+
+# RSS polling (hive-wire-ingest)
+rss = "2.0"
 
 [profile.release]
 lto = "thin"

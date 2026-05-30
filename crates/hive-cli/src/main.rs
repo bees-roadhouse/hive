@@ -13,6 +13,7 @@ mod auth;
 mod cli;
 mod cmd;
 mod format;
+mod journal_input;
 
 use clap::Parser;
 

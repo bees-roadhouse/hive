@@ -1,7 +1,7 @@
 //! Universal mention pipeline: prose mentions (`@slug`, `[[type:identifier]]`,
 //! `[[type:identifier|alias]]`, `[[slug-or-title]]`) in a journal entry /
 //! note body get resolved to entities and projected into the `links` table
-//! as `link_type='mention'` rows.
+//! as `link_type='mentions'` rows.
 //!
 //! Resolver shape (post-0014):
 //!
@@ -31,9 +31,9 @@ use sqlx::{PgPool, Row};
 use tracing::warn;
 use uuid::Uuid;
 
-use hive_db::enums::Owner;
+use hive_db::enums::{Ai, Author, Owner};
 use hive_db::error::Error as DbError;
-use hive_db::queries::{anchors, projects, tasks};
+use hive_db::queries::{anchors, journal, notes, projects, tasks};
 use hive_db::types::Task;
 
 const JOURNAL_INBOX_PROJECT: &str = "journal-inbox";
@@ -303,7 +303,7 @@ pub async fn upsert_mention_links(
         let note = truncate_raw(&r.mention.raw, 256);
         let res = sqlx::query(
             "INSERT INTO links (source_table, source_id, target_table, target_id, link_type, note) \
-             VALUES ($1, $2, $3, $4, 'mention', $5) \
+             VALUES ($1, $2, $3, $4, 'mentions', $5) \
              ON CONFLICT (source_table, source_id, target_table, target_id, link_type) \
              DO NOTHING",
         )
@@ -405,10 +405,17 @@ pub async fn upsert_task_anchors(
             written += 1;
         }
 
-        if t.checked
-            && let Err(e) = tasks::mark_done(pool, task_id).await
+        if t.checked {
+            if let Err(e) = upsert_task_link(pool, journal_entry_id, task_id, "closed_by").await {
+                warn!(%journal_entry_id, %task_id, error = %e, "closed_by link upsert failed");
+            }
+            if let Err(e) = tasks::mark_done(pool, task_id).await {
+                warn!(%journal_entry_id, %task_id, error = %e, "inline checked task mark_done failed");
+            }
+        } else if t.dropped
+            && let Err(e) = tasks::mark_dropped(pool, task_id).await
         {
-            warn!(%journal_entry_id, %task_id, error = %e, "inline checked task mark_done failed");
+            warn!(%journal_entry_id, %task_id, error = %e, "inline dropped task mark_dropped failed");
         }
     }
     Ok(written)
@@ -443,9 +450,10 @@ async fn create_task_from_inline(
         .and_then(|o| Owner::from_str(o).ok())
         .unwrap_or(Owner::Nate);
     let due = inline.due.map(|d| d.format("%Y-%m-%d").to_string());
+    let project = inline.project.as_deref().unwrap_or(JOURNAL_INBOX_PROJECT);
     tasks::add(
         pool,
-        JOURNAL_INBOX_PROJECT,
+        project,
         &inline.text,
         None,
         owner,
@@ -474,6 +482,178 @@ async fn upsert_task_link(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct NoteSpawnSpec {
+    title: String,
+    project: Option<String>,
+    tags: Option<String>,
+    body: String,
+}
+
+/// Scan journal prose for `#note title` blocks and create note rows plus
+/// `spawned_in` links back to the entry. Idempotent on title match within the
+/// same entry (skips if a spawned_in link to a note with the same title exists).
+pub async fn upsert_note_spawns(
+    pool: &PgPool,
+    journal_entry_id: Uuid,
+    ai: Ai,
+    body: &str,
+) -> sqlx::Result<usize> {
+    let author = ai_as_author(ai);
+    let specs = parse_note_spawns(body);
+    if specs.is_empty() {
+        return Ok(0);
+    }
+
+    let mut written = 0usize;
+    for spec in specs {
+        if note_spawn_exists(pool, journal_entry_id, &spec.title).await? {
+            continue;
+        }
+        let note = match notes::add(
+            pool,
+            author,
+            Some(&spec.title),
+            &spec.body,
+            spec.project.as_deref(),
+            spec.tags.as_deref(),
+        )
+        .await
+        {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(
+                    %journal_entry_id,
+                    title = %spec.title,
+                    error = %e,
+                    "note spawn from journal failed"
+                );
+                continue;
+            }
+        };
+        if let Err(e) = upsert_note_link(pool, journal_entry_id, note.id, "spawned_in").await {
+            warn!(%journal_entry_id, note_id = %note.id, error = %e, "note spawned_in link failed");
+            continue;
+        }
+        if let Err(e) = upsert_mention_links(
+            pool,
+            "notes",
+            note.id,
+            &resolve_mentions(pool, &hive_md::parse(&spec.body).entity_mentions).await,
+        )
+        .await
+        {
+            warn!(note_id = %note.id, error = %e, "note spawn mention projection failed");
+        }
+        written += 1;
+    }
+    Ok(written)
+}
+
+fn ai_as_author(ai: Ai) -> Author {
+    Author::from_str(ai.as_str()).unwrap_or(Author::Nate)
+}
+
+fn parse_note_spawns(body: &str) -> Vec<NoteSpawnSpec> {
+    let mut specs = Vec::new();
+    let mut current: Option<NoteSpawnSpec> = None;
+    let mut body_lines: Vec<String> = Vec::new();
+
+    let flush = |current: &mut Option<NoteSpawnSpec>,
+                 body_lines: &mut Vec<String>,
+                 specs: &mut Vec<NoteSpawnSpec>| {
+        if let Some(mut spec) = current.take() {
+            spec.body = body_lines.join("\n").trim().to_string();
+            if !spec.title.is_empty() {
+                specs.push(spec);
+            }
+        }
+        body_lines.clear();
+    };
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed
+            .strip_prefix("#note:")
+            .or_else(|| trimmed.strip_prefix("#note "))
+        {
+            flush(&mut current, &mut body_lines, &mut specs);
+            let (title, project, tags) = parse_note_header(rest.trim());
+            current = Some(NoteSpawnSpec {
+                title,
+                project,
+                tags,
+                body: String::new(),
+            });
+            continue;
+        }
+        if current.is_some() {
+            body_lines.push(line.to_string());
+        }
+    }
+    flush(&mut current, &mut body_lines, &mut specs);
+    specs
+}
+
+fn parse_note_header(header: &str) -> (String, Option<String>, Option<String>) {
+    let mut title_parts = Vec::new();
+    let mut project = None;
+    let mut tags = None;
+    for token in header.split_whitespace() {
+        if let Some(rest) = token.strip_prefix("project:") {
+            if !rest.is_empty() {
+                project = Some(rest.to_string());
+            }
+        } else if let Some(rest) = token.strip_prefix("tags:") {
+            if !rest.is_empty() {
+                tags = Some(rest.to_string());
+            }
+        } else {
+            title_parts.push(token);
+        }
+    }
+    (title_parts.join(" "), project, tags)
+}
+
+async fn note_spawn_exists(
+    pool: &PgPool,
+    journal_entry_id: Uuid,
+    title: &str,
+) -> sqlx::Result<bool> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT 1 FROM links l \
+         JOIN notes n ON n.id = l.target_id \
+         WHERE l.source_table = 'journal_entries' AND l.source_id = $1 \
+           AND l.target_table = 'notes' AND l.link_type = 'spawned_in' \
+           AND n.title = $2 \
+         LIMIT 1",
+    )
+    .bind(journal_entry_id)
+    .bind(title)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+async fn upsert_note_link(
+    pool: &PgPool,
+    journal_entry_id: Uuid,
+    note_id: Uuid,
+    link_type: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "INSERT INTO links (source_table, source_id, target_table, target_id, link_type) \
+         VALUES ('journal_entries', $1, 'notes', $2, $3) \
+         ON CONFLICT (source_table, source_id, target_table, target_id, link_type) DO NOTHING",
+    )
+    .bind(journal_entry_id)
+    .bind(note_id)
+    .bind(link_type)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Run the full post-write projection for a freshly-inserted journal entry
 /// or note body. Errors are logged, never propagated. The caller already
 /// committed the entity row; this is a best-effort projection.
@@ -485,11 +665,15 @@ pub async fn project_body(pool: &PgPool, source_table: &str, source_id: Uuid, bo
         warn!(source_table, %source_id, error = %e, "mention link projection failed");
     }
 
-    // task_anchors only applies to journal_entries (the table where inline
-    // tasks live with their block ids).
-    if source_table == "journal_entries"
-        && let Err(e) = upsert_task_anchors(pool, source_id, &parsed).await
-    {
-        warn!(%source_id, error = %e, "task_anchors projection failed");
+    if source_table == "journal_entries" {
+        if let Ok(Some(entry)) = journal::get(pool, source_id).await {
+            let ai = Ai::from_str(&entry.ai).unwrap_or(Ai::Nate);
+            if let Err(e) = upsert_note_spawns(pool, source_id, ai, body).await {
+                warn!(%source_id, error = %e, "note spawn projection failed");
+            }
+        }
+        if let Err(e) = upsert_task_anchors(pool, source_id, &parsed).await {
+            warn!(%source_id, error = %e, "task_anchors projection failed");
+        }
     }
 }

@@ -316,7 +316,49 @@ pub struct NotesSearchArgs {
 pub enum WireCmd {
     Add(WireAddArgs),
     List(WireListArgs),
-    Ack { id: String },
+    Ack {
+        id: String,
+    },
+    /// RSS / external feed configuration (hive-wire-ingest)
+    Sources {
+        #[command(subcommand)]
+        cmd: WireSourcesCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WireSourcesCmd {
+    /// List configured wire sources
+    List {
+        #[arg(long)]
+        enabled_only: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Add a wire source
+    Add(WireSourceAddArgs),
+    /// Remove a wire source by id
+    Remove { id: String },
+}
+
+#[derive(Debug, Args)]
+pub struct WireSourceAddArgs {
+    #[arg(long)]
+    pub name: String,
+    #[arg(long, default_value = "rss")]
+    pub kind: String,
+    #[arg(long)]
+    pub url: String,
+    #[arg(long, default_value_t = 3600)]
+    pub poll_interval_secs: i32,
+    #[arg(long)]
+    pub source_tag: String,
+    #[arg(long)]
+    pub category: Option<String>,
+    #[arg(long)]
+    pub affects: Option<String>,
+    #[arg(long, value_parser = parse_severity)]
+    pub default_severity: Option<String>,
 }
 
 #[derive(Debug, Args)]

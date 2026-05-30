@@ -1,0 +1,24 @@
+FROM rust:1.93-slim-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        pkg-config build-essential ca-certificates libpq-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo build --release -p hive-wire-ingest --locked
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libpq5 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/hive-wire-ingest /usr/local/bin/hive-wire-ingest
+
+ENV DATABASE_URL=postgres://hive:hive@postgres:5432/hive
+ENV WIRE_INGEST_INTERVAL_SECS=300
+
+ENTRYPOINT ["/usr/local/bin/hive-wire-ingest"]

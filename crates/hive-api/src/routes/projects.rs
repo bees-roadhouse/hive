@@ -40,6 +40,7 @@ async fn add(
     State(state): State<AppState>,
     Json(body): Json<AddBody>,
 ) -> Result<Json<hive_db::types::Project>, ApiError> {
+    state.guard_structured_write("POST /projects")?;
     let p = projects::add(
         &state.pool,
         &body.name,
@@ -61,6 +62,7 @@ async fn archive(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    state.guard_structured_write("POST /projects/{name}/archive")?;
     projects::archive(&state.pool, &name).await?;
     let p = projects::require(&state.pool, &name).await?;
     state.emitter.emit(

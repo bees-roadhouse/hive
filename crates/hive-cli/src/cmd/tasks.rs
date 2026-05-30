@@ -19,8 +19,23 @@ pub async fn run(cmd: TasksCmd) -> Result<()> {
         TasksCmd::Show { id } => show(&id).await,
         TasksCmd::Update(args) => update(args).await,
         TasksCmd::Done { id } => {
-            api::task_done(&id).await?;
-            println!("closed task #{id}");
+            if crate::journal_input::use_journal_input() {
+                let row = api::show_task(&id).await?;
+                let (ai, title, body) =
+                    crate::journal_input::synthesize_task_done(&row.owner, &row.title);
+                let entry = api::add_journal(
+                    &ai,
+                    None,
+                    Some(&title),
+                    &body,
+                    Some("backend-input,task-done"),
+                )
+                .await?;
+                println!("closed task #{id} via journal #{}", entry.id);
+            } else {
+                api::task_done(&id).await?;
+                println!("closed task #{id}");
+            }
             Ok(())
         }
         TasksCmd::Block { id, reason } => {
@@ -29,8 +44,23 @@ pub async fn run(cmd: TasksCmd) -> Result<()> {
             Ok(())
         }
         TasksCmd::Drop { id } => {
-            api::task_drop(&id).await?;
-            println!("dropped task #{id}");
+            if crate::journal_input::use_journal_input() {
+                let row = api::show_task(&id).await?;
+                let (ai, title, body) =
+                    crate::journal_input::synthesize_task_drop(&row.owner, &row.title);
+                let entry = api::add_journal(
+                    &ai,
+                    None,
+                    Some(&title),
+                    &body,
+                    Some("backend-input,task-drop"),
+                )
+                .await?;
+                println!("dropped task #{id} via journal #{}", entry.id);
+            } else {
+                api::task_drop(&id).await?;
+                println!("dropped task #{id}");
+            }
             Ok(())
         }
     }
@@ -67,6 +97,32 @@ async fn archive_project(name: &str) -> Result<()> {
 }
 
 async fn add(args: TaskAddArgs) -> Result<()> {
+    if crate::journal_input::use_journal_input() {
+        let (ai, title, body) = crate::journal_input::synthesize_task_add(
+            &args.owner,
+            &args.project,
+            &args.title,
+            args.body.as_deref(),
+            args.priority.as_deref(),
+            args.due.as_deref(),
+        );
+        let entry = api::add_journal(&ai, None, Some(&title), &body, Some("backend-input")).await?;
+        let spawned = api::journal_tasks(&entry.id.0).await?;
+        if let Some(task) = spawned.first() {
+            println!(
+                "added task #{}: {} (via journal #{})",
+                task.id, task.title, entry.id
+            );
+            attach_links(&format!("tasks:{}", task.id), &args.link).await?;
+        } else {
+            println!(
+                "journal entry #{} created; no inline task projected yet",
+                entry.id
+            );
+        }
+        return Ok(());
+    }
+
     let task = api::add_task(
         &args.project,
         &args.title,

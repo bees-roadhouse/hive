@@ -18,3 +18,4 @@ pub mod semantic;
 pub mod stream;
 pub mod tasks;
 pub mod wire;
+pub mod wire_sources;

@@ -65,6 +65,7 @@ async fn add(
     State(state): State<AppState>,
     Json(body): Json<AddBody>,
 ) -> Result<Json<hive_db::types::Event>, ApiError> {
+    state.guard_structured_write("POST /events")?;
     let e = events::add(
         &state.pool,
         body.slug.as_deref(),

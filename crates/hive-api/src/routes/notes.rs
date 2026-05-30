@@ -54,6 +54,7 @@ async fn add(
     State(state): State<AppState>,
     Json(body): Json<AddBody>,
 ) -> Result<Json<hive_db::types::Note>, ApiError> {
+    state.guard_structured_write("POST /notes")?;
     let n = notes::add(
         &state.pool,
         body.author,

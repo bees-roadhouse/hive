@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::api::{self, WireEvent};
-use crate::cli::{WireAddArgs, WireCmd, WireListArgs};
+use crate::cli::{WireAddArgs, WireCmd, WireListArgs, WireSourceAddArgs, WireSourcesCmd};
 use crate::format::{Column, print_json, print_table, truncate};
 
 pub async fn run(cmd: WireCmd) -> Result<()> {
@@ -13,6 +13,11 @@ pub async fn run(cmd: WireCmd) -> Result<()> {
             println!("acknowledged wire event #{id}");
             Ok(())
         }
+        WireCmd::Sources { cmd } => match cmd {
+            WireSourcesCmd::List { enabled_only, json } => sources_list(enabled_only, json).await,
+            WireSourcesCmd::Add(args) => sources_add(args).await,
+            WireSourcesCmd::Remove { id } => sources_remove(&id).await,
+        },
     }
 }
 
@@ -88,5 +93,49 @@ async fn list(args: WireListArgs) -> Result<()> {
     let trailing: Box<dyn Fn(&WireEvent) -> String> =
         Box::new(|r| r.affects.clone().unwrap_or_default());
     print_table(&cols, &rows, Some(("affects", trailing)));
+    Ok(())
+}
+
+async fn sources_list(enabled_only: bool, json: bool) -> Result<()> {
+    let rows = api::list_wire_sources(enabled_only).await?;
+    if json {
+        print_json(&rows)?;
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("no wire sources");
+        return Ok(());
+    }
+    let cols: Vec<Column<'_, api::WireSource>> = vec![
+        Column::new("id", |r: &api::WireSource| r.id.to_string()),
+        Column::new("name", |r: &api::WireSource| r.name.clone()),
+        Column::new("kind", |r: &api::WireSource| r.kind.clone()),
+        Column::new("tag", |r: &api::WireSource| r.source_tag.clone()),
+        Column::new("interval", |r: &api::WireSource| r.poll_interval_secs.to_string()),
+    ];
+    let trailing: Box<dyn Fn(&api::WireSource) -> String> = Box::new(|r| r.url.clone());
+    print_table(&cols, &rows, Some(("url", trailing)));
+    Ok(())
+}
+
+async fn sources_add(args: WireSourceAddArgs) -> Result<()> {
+    let row = api::add_wire_source(
+        &args.name,
+        &args.kind,
+        &args.url,
+        args.poll_interval_secs,
+        &args.source_tag,
+        args.category.as_deref(),
+        args.affects.as_deref(),
+        args.default_severity.as_deref(),
+    )
+    .await?;
+    println!("added wire source #{}: {}", row.id, row.name);
+    Ok(())
+}
+
+async fn sources_remove(id: &str) -> Result<()> {
+    api::remove_wire_source(id).await?;
+    println!("removed wire source #{id}");
     Ok(())
 }

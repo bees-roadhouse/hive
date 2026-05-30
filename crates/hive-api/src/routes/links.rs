@@ -208,6 +208,7 @@ async fn add(
     State(state): State<AppState>,
     Json(body): Json<AddBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    state.guard_structured_write("POST /links")?;
     let src = EntityRef::parse(&body.source, "source")
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let tgt = EntityRef::parse(&body.target, "target")
@@ -235,6 +236,7 @@ async fn remove(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    state.guard_structured_write("DELETE /links/{id}")?;
     links::remove(&state.pool, id).await?;
     Ok(Json(json!({"removed": true})))
 }

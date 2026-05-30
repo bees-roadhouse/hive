@@ -600,6 +600,16 @@ pub async fn show_journal(id: &str) -> anyhow::Result<JournalEntry> {
     get_json(&url).await
 }
 
+pub async fn journal_tasks(journal_id: &str) -> anyhow::Result<Vec<Task>> {
+    let url = format!("{}/journal/{}/tasks", api_base(), journal_id);
+    get_json(&url).await
+}
+
+pub async fn journal_notes(journal_id: &str) -> anyhow::Result<Vec<Note>> {
+    let url = format!("{}/journal/{}/notes", api_base(), journal_id);
+    get_json(&url).await
+}
+
 pub async fn search_journal(query: &str, limit: i64) -> anyhow::Result<Vec<JournalHit>> {
     let url = build_url(
         "/journal/search",
@@ -744,6 +754,73 @@ pub async fn add_wire(
 pub async fn ack_wire(id: &str) -> anyhow::Result<Value> {
     let url = format!("{}/wire/{}/ack", api_base(), id);
     post_json(&url, &Value::Null).await
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WireSource {
+    pub id: Id,
+    pub name: String,
+    pub kind: String,
+    pub url: String,
+    pub enabled: bool,
+    pub poll_interval_secs: i32,
+    pub source_tag: String,
+    pub category: Option<String>,
+    pub affects: Option<String>,
+    pub default_severity: Option<String>,
+}
+
+pub async fn list_wire_sources(enabled_only: bool) -> anyhow::Result<Vec<WireSource>> {
+    let url = build_url("/wire/sources", &[("enabled_only", flag(enabled_only))]);
+    get_json(&url).await
+}
+
+#[derive(Serialize)]
+struct WireSourceAddBody<'a> {
+    name: &'a str,
+    kind: &'a str,
+    url: &'a str,
+    poll_interval_secs: i32,
+    source_tag: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    category: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    affects: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_severity: Option<&'a str>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn add_wire_source(
+    name: &str,
+    kind: &str,
+    url: &str,
+    poll_interval_secs: i32,
+    source_tag: &str,
+    category: Option<&str>,
+    affects: Option<&str>,
+    default_severity: Option<&str>,
+) -> anyhow::Result<WireSource> {
+    let endpoint = format!("{}/wire/sources", api_base());
+    post_json(
+        &endpoint,
+        &WireSourceAddBody {
+            name,
+            kind,
+            url,
+            poll_interval_secs,
+            source_tag,
+            category,
+            affects,
+            default_severity,
+        },
+    )
+    .await
+}
+
+pub async fn remove_wire_source(id: &str) -> anyhow::Result<Value> {
+    let url = format!("{}/wire/sources/{}", api_base(), id);
+    delete_json(&url).await
 }
 
 // ---------- links ----------

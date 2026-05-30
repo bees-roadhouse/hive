@@ -15,6 +15,35 @@ pub async fn run(cmd: NotesCmd) -> Result<()> {
 }
 
 async fn add(args: NotesAddArgs) -> Result<()> {
+    if crate::journal_input::use_journal_input() {
+        let (ai, title, body) = crate::journal_input::synthesize_note_add(
+            &args.author,
+            args.title.as_deref(),
+            &args.body,
+            args.project.as_deref(),
+            args.tags.as_deref(),
+        );
+        let entry = api::add_journal(
+            &ai,
+            None,
+            Some(&title),
+            &body,
+            Some("backend-input,note-spawn"),
+        )
+        .await?;
+        let spawned = api::journal_notes(&entry.id.0).await?;
+        if let Some(note) = spawned.first() {
+            println!("added note #{} (via journal #{})", note.id, entry.id);
+            attach_links(&format!("notes:{}", note.id), &args.link).await?;
+        } else {
+            println!(
+                "journal entry #{} created; note spawn pending projection",
+                entry.id
+            );
+        }
+        return Ok(());
+    }
+
     let note = api::add_note(
         &args.author,
         args.title.as_deref(),

@@ -12,3 +12,4 @@ pub mod projects;
 pub mod search;
 pub mod tasks;
 pub mod wire;
+pub mod wire_sources;
