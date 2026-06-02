@@ -1,0 +1,25 @@
+{
+  "name": "@hive/api",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch --experimental-strip-types src/server.ts",
+    "start": "node --experimental-strip-types src/server.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "seed": "node --experimental-strip-types src/seed.ts"
+  },
+  "dependencies": {
+    "@hive/shared": "workspace:*",
+    "@hono/node-server": "^1.13.8",
+    "better-sqlite3": "^11.8.1",
+    "hono": "^4.6.20",
+    "nanoid": "^5.0.9"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.7",
+    "typescript": "^5.7.3"
+  }
+}

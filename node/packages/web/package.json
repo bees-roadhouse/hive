@@ -1,0 +1,19 @@
+{
+  "name": "@hive/web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@hive/shared": "workspace:*",
+    "solid-js": "^1.9.5"
+  },
+  "devDependencies": {
+    "vite": "^6.0.11",
+    "vite-plugin-solid": "^2.11.2"
+  }
+}

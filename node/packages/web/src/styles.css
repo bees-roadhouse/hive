@@ -1,0 +1,119 @@
+:root {
+  --bg: #14110c;
+  --panel: #1f1b13;
+  --line: #3a3320;
+  --ink: #f3ead6;
+  --dim: #a99b78;
+  --honey: #f5b301;
+  --accent: #ffd24a;
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+.app { max-width: 1100px; margin: 0 auto; padding: 1rem; }
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 0.75rem;
+}
+header h1 { margin: 0; font-size: 1.6rem; }
+nav { display: flex; gap: 0.25rem; flex: 1; flex-wrap: wrap; }
+nav button { text-transform: capitalize; }
+.actor { color: var(--dim); font-size: 0.85rem; display: flex; gap: 0.4rem; align-items: center; }
+
+button, select, input, textarea {
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0.45rem 0.7rem;
+  font: inherit;
+}
+button { cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+button:hover { border-color: var(--honey); }
+button.active { background: var(--honey); color: #1a1407; border-color: var(--honey); font-weight: 600; }
+button:disabled { opacity: 0.5; cursor: default; }
+
+main { padding: 1.25rem 0; min-height: 60vh; }
+
+.row { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+.row input { flex: 1; min-width: 12rem; }
+
+/* tasks board */
+.board { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.75rem; }
+.col h3 { text-transform: capitalize; color: var(--dim); font-size: 0.85rem; margin: 0 0 0.5rem; }
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--honey);
+  border-radius: 8px;
+  padding: 0.6rem;
+  margin-bottom: 0.5rem;
+  cursor: pointer;
+}
+.card:hover { border-color: var(--accent); }
+.card-title { margin-top: 0.2rem; }
+.pri { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--dim); }
+.pri-urgent { color: #ff7a59; }
+.pri-high { color: var(--accent); }
+.tags { color: var(--dim); font-size: 0.75rem; margin-top: 0.3rem; }
+
+/* decisions */
+.decision-form { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 1.25rem; }
+.decision-form textarea { min-height: 3rem; resize: vertical; }
+.decision {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1rem;
+  margin-bottom: 0.9rem;
+}
+.decision.status-accepted { border-left: 4px solid var(--honey); }
+.decision.status-superseded { opacity: 0.6; }
+.decision.status-rejected { border-left: 4px solid #ff7a59; }
+.decision header { display: flex; align-items: center; gap: 0.5rem; border: none; padding: 0; }
+.decision header h3 { margin: 0; flex: 1; }
+.decision .glyph { font-size: 1.2rem; color: var(--honey); }
+.decision p { margin: 0.5rem 0; line-height: 1.5; }
+.decision footer { margin-top: 0.75rem; margin-bottom: 0; }
+.decision footer button { font-size: 0.78rem; padding: 0.25rem 0.55rem; text-transform: capitalize; }
+
+.badge {
+  background: var(--line);
+  color: var(--accent);
+  border-radius: 999px;
+  padding: 0.1rem 0.55rem;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.note, .entry { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 0.8rem; margin-bottom: 0.6rem; }
+.note h3 { margin: 0 0 0.4rem; }
+.entry time { color: var(--dim); font-size: 0.78rem; }
+
+.hit { display: flex; gap: 0.6rem; align-items: baseline; padding: 0.5rem 0; border-bottom: 1px solid var(--line); }
+.snippet { color: var(--dim); font-size: 0.85rem; }
+.snippet [b], .snippet b { color: var(--accent); }
+
+.wire-row { display: flex; gap: 0.7rem; align-items: center; padding: 0.3rem 0; font-size: 0.85rem; border-bottom: 1px solid var(--line); }
+.wire-row time { color: var(--dim); font-variant-numeric: tabular-nums; }
+.actor-chip { background: var(--line); border-radius: 6px; padding: 0.05rem 0.4rem; color: var(--accent); }
+
+footer { color: var(--dim); font-size: 0.8rem; border-top: 1px solid var(--line); padding-top: 0.75rem; }
+code { color: var(--accent); }
+
+@media (max-width: 720px) {
+  .board { grid-template-columns: 1fr 1fr; }
+}

@@ -17,3 +17,12 @@ Cargo.lock.bak
 
 # Local model cache for hive-embed
 /models
+
+# Node / Solid rewrite (node/)
+node_modules/
+**/node_modules/
+node/packages/*/dist/
+node/data/*.db
+node/data/*.db-shm
+node/data/*.db-wal
+*.tsbuildinfo

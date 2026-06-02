@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash node/dev-setup.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
