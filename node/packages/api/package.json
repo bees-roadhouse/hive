@@ -3,6 +3,11 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "exports": {
+    "./store": "./src/store.ts",
+    "./db": "./src/db.ts",
+    "./embed": "./src/embed.ts"
+  },
   "scripts": {
     "dev": "node --watch --experimental-strip-types src/server.ts",
     "start": "node --experimental-strip-types src/server.ts",

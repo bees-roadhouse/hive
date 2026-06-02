@@ -11,7 +11,9 @@
     "dev": "pnpm --parallel --filter @hive/api --filter @hive/web dev",
     "dev:api": "pnpm --filter @hive/api dev",
     "dev:web": "pnpm --filter @hive/web dev",
-    "build": "pnpm --filter @hive/shared build && pnpm -r --filter @hive/api --filter @hive/web --filter @hive/cli build",
+    "worker": "pnpm --filter @hive/worker start",
+    "worker:once": "pnpm --filter @hive/worker once",
+    "build": "pnpm --filter @hive/shared build && pnpm -r --filter @hive/api --filter @hive/web --filter @hive/cli --filter @hive/worker build",
     "seed": "pnpm --filter @hive/api seed",
     "hive": "pnpm --filter @hive/cli start --"
   },

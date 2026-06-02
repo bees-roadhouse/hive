@@ -4,6 +4,7 @@ import { api, getActor, setActor } from "./api.ts";
 import { Journal } from "./Journal.tsx";
 import { Inbox } from "./Inbox.tsx";
 import { Dashboard } from "./Dashboard.tsx";
+import { Settings } from "./Settings.tsx";
 import { Decisions, Events, SearchPane, Tasks, Wire } from "./Boards.tsx";
 
 const TABS = [
@@ -15,6 +16,7 @@ const TABS = [
   { id: "events", icon: "◷" },
   { id: "search", icon: "⌕" },
   { id: "wire", icon: "⚡" },
+  { id: "settings", icon: "⚙" },
 ] as const;
 type Tab = (typeof TABS)[number]["id"];
 
@@ -81,6 +83,7 @@ export const App: Component = () => {
         <Show when={tab() === "events"}><Events /></Show>
         <Show when={tab() === "search"}><SearchPane /></Show>
         <Show when={tab() === "wire"}><Wire /></Show>
+        <Show when={tab() === "settings"}><Settings /></Show>
       </main>
     </div>
   );

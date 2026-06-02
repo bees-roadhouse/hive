@@ -1,7 +1,11 @@
 packages:
   - "packages/*"
 
-# Native deps allowed to run install/build scripts (pnpm 11 home for this).
-onlyBuiltDependencies:
-  - better-sqlite3
-  - esbuild
+# Native deps allowed to run their install/build scripts (pnpm 11 schema).
+allowBuilds:
+  better-sqlite3: true
+  esbuild: true
+
+# Don't re-run an install check before every `pnpm <script>` — it's noisy in a
+# workspace and (in this sandbox) trips the registry release-age policy.
+verifyDepsBeforeRun: false

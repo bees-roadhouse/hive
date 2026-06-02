@@ -9,8 +9,12 @@ import {
   events,
   inbox,
   journal,
+  outbox,
   search,
+  semanticSearch,
+  sources,
   tasks,
+  workerStatus,
 } from "./store.ts";
 
 // MCP-first: this is the primary surface. Every AI talks to hive through these
@@ -160,6 +164,75 @@ export function buildMcpServer(): McpServer {
     "dashboard",
     { title: "Cross-board stats", inputSchema: {} },
     async () => ok(dashboard()),
+  );
+
+  server.registerTool(
+    "semantic_search",
+    {
+      title: "Semantic search",
+      description: "Vector (embedding) search across journal/tasks/decisions/events.",
+      inputSchema: { q: z.string(), limit: z.number().int().optional() },
+    },
+    async ({ q, limit }) => ok(semanticSearch(q, limit ?? 10)),
+  );
+
+  // ---- worker configuration (sources) + status ----
+  server.registerTool(
+    "sources_list",
+    { title: "List ingest sources", inputSchema: {} },
+    async () => ok(sources.list()),
+  );
+
+  server.registerTool(
+    "sources_add",
+    {
+      title: "Add an ingest source",
+      description: "Register a feed (RSS) for the worker to poll into wire events.",
+      inputSchema: {
+        name: z.string(),
+        url: z.string().url(),
+        kind: z.enum(["rss"]).optional(),
+        category: z.string().optional(),
+        severity: z.enum(["critical", "high", "medium", "low", "info"]).optional(),
+        interval_secs: z.number().int().min(30).optional(),
+        notify: z.enum(ACTOR_NAMES as [string, ...string[]]).optional(),
+      },
+    },
+    async (args) => ok(sources.create(args as any, "mcp")),
+  );
+
+  server.registerTool(
+    "sources_update",
+    {
+      title: "Update an ingest source",
+      inputSchema: {
+        id: z.string(),
+        enabled: z.boolean().optional(),
+        interval_secs: z.number().int().min(30).optional(),
+        severity: z.enum(["critical", "high", "medium", "low", "info"]).optional(),
+        category: z.string().optional(),
+        notify: z.string().optional(),
+      },
+    },
+    async ({ id, ...patch }) => ok(sources.update(id, patch as any, "mcp") ?? { error: "not found" }),
+  );
+
+  server.registerTool(
+    "sources_remove",
+    { title: "Remove an ingest source", inputSchema: { id: z.string() } },
+    async ({ id }) => ok({ removed: sources.remove(id, "mcp") }),
+  );
+
+  server.registerTool(
+    "outbox_list",
+    { title: "List outbound jobs", inputSchema: { limit: z.number().int().optional() } },
+    async ({ limit }) => ok(outbox.list(limit ?? 50)),
+  );
+
+  server.registerTool(
+    "worker_status",
+    { title: "Worker heartbeat + last-run stats", inputSchema: {} },
+    async () => ok(workerStatus()),
   );
 
   return server;

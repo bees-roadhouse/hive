@@ -16,12 +16,44 @@ so it spins up instantly in a fresh container.
 | Package        | What it is                                                    |
 | -------------- | ------------------------------------------------------------- |
 | `@hive/shared` | TypeScript domain types shared by every package              |
-| `@hive/api`    | [Hono](https://hono.dev) HTTP API over SQLite (better-sqlite3) + FTS5 search |
+| `@hive/api`    | [Hono](https://hono.dev) HTTP API over SQLite (better-sqlite3) + FTS5 + an **MCP server** at `POST /mcp` |
 | `@hive/web`    | [Solid.js](https://solidjs.com) + Vite single-page UI        |
 | `@hive/cli`    | `hive` CLI — a stateless HTTP client over the API            |
+| `@hive/worker` | long-running process: polls feeds → wire, drains the outbound queue, refreshes embeddings, DB maintenance |
 
 Run via Node's native TypeScript stripping (`--experimental-strip-types`) — no
 build step needed for dev.
+
+## Journal-first
+
+The journal is the single, write-only input. You write prose; structured items
+(**tasks / decisions / events**) emerge from it by *anchoring* a `{start,end}`
+char span of the body — the entity keeps `origin_entry_id` + `anchor_text` so the
+source sentence shows beside the card. In the UI you select text and tag it (no
+offsets typed); over MCP the author passes spans in `journal_append`.
+`@mentions` of known actors fan out to a per-actor **inbox** (humans *and* AIs).
+
+## MCP-first
+
+`POST /mcp` is a stateless [Streamable HTTP](https://modelcontextprotocol.io)
+MCP server (official SDK). Tools: `journal_append` (with anchors), `journal_list`/
+`_get`, `tasks_list`, `task_set_status`, `decisions_list`, `events_list`,
+`inbox_list`/`_mark_read`, `search`, `semantic_search`, `dashboard`,
+`sources_add`/`_list`/`_update`/`_remove`, `outbox_list`, `worker_status`.
+
+## Worker
+
+```bash
+pnpm worker        # loop (every HIVE_WORKER_TICK secs, default 30)
+pnpm worker:once   # one cycle then exit (CI / demo)
+```
+
+It polls every enabled **source** (RSS) into `feed.item` wire events (optionally
+pinging an inbox), drains the **outbox** (webhooks, with retry/backoff), refreshes
+**embeddings** for semantic search, and runs **maintenance** (WAL checkpoint, FTS
+optimize, prune, vacuum). Sources are configured in the **Settings** tab or via
+MCP. Embeddings use a local offline embedder by default (`hash-ngram-v1`); the
+`embed.ts` seam is where a real transformer drops in.
 
 ## Quick start
 

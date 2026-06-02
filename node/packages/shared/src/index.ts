@@ -176,6 +176,69 @@ export interface SearchHit {
   score: number;
 }
 
+// ---- worker: sources, outbound queue, status ----
+
+export type SourceKind = "rss";
+export type Severity = "critical" | "high" | "medium" | "low" | "info";
+export const SEVERITIES: Severity[] = ["critical", "high", "medium", "low", "info"];
+
+/** An external feed the worker polls into wire events. */
+export interface Source {
+  id: string;
+  name: string;
+  url: string;
+  kind: SourceKind;
+  category: string | null;
+  severity: Severity;
+  interval_secs: number;
+  /** actor to ping in their inbox on new items, or null. */
+  notify: string | null;
+  enabled: boolean;
+  last_polled_at: string | null;
+  last_status: string | null;
+  created_at: string;
+}
+
+export interface NewSource {
+  name: string;
+  url: string;
+  kind?: SourceKind;
+  category?: string | null;
+  severity?: Severity;
+  interval_secs?: number;
+  notify?: string | null;
+  enabled?: boolean;
+}
+export type SourcePatch = Partial<Omit<Source, "id" | "created_at" | "last_polled_at" | "last_status">>;
+
+export type OutboxStatus = "pending" | "done" | "failed";
+export interface OutboxJob {
+  id: string;
+  kind: string;
+  payload: unknown;
+  status: OutboxStatus;
+  attempts: number;
+  last_error: string | null;
+  run_after: string;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface WorkerStatus {
+  heartbeat: string | null;
+  last_run: {
+    at: string;
+    polled: number;
+    ingested: number;
+    outbox: number;
+    embedded: number;
+    maintenance: string[];
+  } | null;
+  sources: { total: number; enabled: number };
+  outbox: { pending: number; failed: number; done: number };
+  embeddings: { count: number; model: string };
+}
+
 // ---- views (server resolves anchors → their entities for the client) ----
 
 export type ResolvedAnchor = Anchor & { entity: Task | Decision | EventItem | null };

@@ -14,21 +14,28 @@ import {
   type Link,
   type NewAnchor,
   type NewJournalEntry,
+  type NewSource,
   type Note,
+  type OutboxJob,
+  type OutboxStatus,
   type Project,
   type ResolvedAnchor,
   type SearchHit,
+  type Severity,
+  type Source,
+  type SourcePatch,
   type Task,
   type TaskPatch,
   type TaskStatus,
   type WireEvent,
+  type WorkerStatus,
   ACTORS,
-  isAi,
   parseMentions,
   TASK_STATUSES,
   DECISION_STATUSES,
 } from "@hive/shared";
 import { db, tx } from "./db.ts";
+import { contentHash, cosine, embed, EMBED_DIM, EMBED_MODEL } from "./embed.ts";
 
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${nanoid(12)}`;
@@ -609,5 +616,274 @@ export function dashboard(): DashboardStats {
     inbox: inboxStats,
     byAuthor,
     recent: wire(12),
+  };
+}
+
+// ============================================================================
+// Worker surface: sources, outbox, embeddings, ingestion, status.
+// ============================================================================
+
+type SourceRow = Omit<Source, "enabled"> & { enabled: number };
+const toSource = (r: SourceRow): Source => ({ ...r, enabled: !!r.enabled });
+
+export const sources = {
+  list: (): Source[] =>
+    (db.prepare("SELECT * FROM sources ORDER BY created_at").all() as SourceRow[]).map(toSource),
+
+  get(sourceId: string): Source | undefined {
+    const r = db.prepare("SELECT * FROM sources WHERE id = ?").get(sourceId) as SourceRow | undefined;
+    return r ? toSource(r) : undefined;
+  },
+
+  create(input: NewSource, actor = "system"): Source {
+    const s: Source = {
+      id: id("src"),
+      name: input.name,
+      url: input.url,
+      kind: input.kind ?? "rss",
+      category: input.category ?? null,
+      severity: input.severity ?? "info",
+      interval_secs: input.interval_secs ?? 900,
+      notify: input.notify ?? null,
+      enabled: input.enabled ?? true,
+      last_polled_at: null,
+      last_status: null,
+      created_at: now(),
+    };
+    db.prepare(
+      `INSERT INTO sources (id, name, url, kind, category, severity, interval_secs, notify, enabled, last_polled_at, last_status, created_at)
+       VALUES (@id, @name, @url, @kind, @category, @severity, @interval_secs, @notify, @enabled, @last_polled_at, @last_status, @created_at)`,
+    ).run({ ...s, enabled: s.enabled ? 1 : 0 });
+    emit("source.added", actor, { id: s.id, name: s.name, url: s.url });
+    return s;
+  },
+
+  update(sourceId: string, patch: SourcePatch, actor = "system"): Source | undefined {
+    const cur = sources.get(sourceId);
+    if (!cur) return undefined;
+    const next: Source = { ...cur, ...patch, id: cur.id };
+    db.prepare(
+      `UPDATE sources SET name=@name, url=@url, kind=@kind, category=@category, severity=@severity,
+       interval_secs=@interval_secs, notify=@notify, enabled=@enabled WHERE id=@id`,
+    ).run({ ...next, enabled: next.enabled ? 1 : 0 });
+    emit("source.updated", actor, { id: next.id });
+    return next;
+  },
+
+  remove(sourceId: string, actor = "system"): boolean {
+    const ok = db.prepare("DELETE FROM sources WHERE id = ?").run(sourceId).changes > 0;
+    if (ok) emit("source.removed", actor, { id: sourceId });
+    return ok;
+  },
+
+  /** Enabled sources whose poll interval has elapsed. */
+  due(): Source[] {
+    const t = Date.now();
+    return sources
+      .list()
+      .filter((s) => s.enabled)
+      .filter((s) => !s.last_polled_at || t - new Date(s.last_polled_at).getTime() >= s.interval_secs * 1000);
+  },
+
+  markPolled(sourceId: string, status: string): void {
+    db.prepare("UPDATE sources SET last_polled_at = ?, last_status = ? WHERE id = ?").run(
+      now(),
+      status,
+      sourceId,
+    );
+  },
+};
+
+/** Ingest fetched feed items into wire events (deduped by guid). */
+export function ingest(
+  source: Source,
+  items: { guid: string; title: string; url?: string; body?: string }[],
+): number {
+  let added = 0;
+  for (const it of items) {
+    const dupe = db
+      .prepare("SELECT 1 FROM wire WHERE kind = 'feed.item' AND payload LIKE ? LIMIT 1")
+      .get(`%${JSON.stringify(it.guid).slice(1, -1)}%`);
+    if (dupe) continue;
+    emit("feed.item", source.name, {
+      guid: it.guid,
+      title: it.title,
+      url: it.url ?? null,
+      body: it.body ?? "",
+      source: source.name,
+      category: source.category,
+      severity: source.severity,
+    });
+    if (source.notify) {
+      inbox.add(source.notify, source.name, "mention", "journal", source.id, null, `${source.name}: ${it.title}`);
+    }
+    added++;
+  }
+  return added;
+}
+
+// ---- outbox ----
+
+const toJob = (r: Omit<OutboxJob, "payload"> & { payload: string }): OutboxJob => ({
+  ...r,
+  payload: json(r.payload),
+});
+
+export const outbox = {
+  enqueue(kind: string, payload: unknown, runAfter = now(), actor = "system"): OutboxJob {
+    const job: OutboxJob = {
+      id: id("out"),
+      kind,
+      payload,
+      status: "pending",
+      attempts: 0,
+      last_error: null,
+      run_after: runAfter,
+      created_at: now(),
+      completed_at: null,
+    };
+    db.prepare(
+      `INSERT INTO outbox (id, kind, payload, status, attempts, last_error, run_after, created_at, completed_at)
+       VALUES (@id, @kind, @payload, @status, @attempts, @last_error, @run_after, @created_at, @completed_at)`,
+    ).run({ ...job, payload: JSON.stringify(job.payload) });
+    emit("outbox.enqueued", actor, { id: job.id, kind });
+    return job;
+  },
+
+  list: (limit = 50): OutboxJob[] =>
+    (db.prepare("SELECT * FROM outbox ORDER BY created_at DESC LIMIT ?").all(limit) as any[]).map(toJob),
+
+  claim(limit = 10): OutboxJob[] {
+    const rows = db
+      .prepare("SELECT * FROM outbox WHERE status = 'pending' AND run_after <= ? ORDER BY run_after LIMIT ?")
+      .all(now(), limit) as any[];
+    return rows.map(toJob);
+  },
+
+  complete(jobId: string): void {
+    db.prepare("UPDATE outbox SET status='done', completed_at=? WHERE id=?").run(now(), jobId);
+  },
+
+  fail(jobId: string, error: string, attempts: number): void {
+    const backoffSecs = Math.min(3600, 2 ** attempts * 30);
+    const runAfter = new Date(Date.now() + backoffSecs * 1000).toISOString();
+    const status: OutboxStatus = attempts >= 5 ? "failed" : "pending";
+    db.prepare("UPDATE outbox SET status=?, attempts=?, last_error=?, run_after=? WHERE id=?").run(
+      status,
+      attempts,
+      error,
+      runAfter,
+      jobId,
+    );
+  },
+
+  counts: () =>
+    ["pending", "done", "failed"].reduce(
+      (acc, s) => {
+        acc[s as OutboxStatus] = (
+          db.prepare("SELECT count(*) n FROM outbox WHERE status = ?").get(s) as { n: number }
+        ).n;
+        return acc;
+      },
+      {} as Record<OutboxStatus, number>,
+    ),
+};
+
+// ---- embeddings + semantic search ----
+
+/** Every text chunk worth embedding, with a change-detection hash. */
+export function embeddableItems(): { kind: string; id: string; title: string; text: string; hash: string }[] {
+  const out: { kind: string; id: string; title: string; text: string; hash: string }[] = [];
+  for (const e of journal.list(1000))
+    out.push({ kind: "journal", id: e.id, title: `${e.author}: ${e.body.slice(0, 40)}`, text: e.body, hash: contentHash(e.body) });
+  for (const t of tasks.list()) {
+    const text = `${t.title} ${t.body}`;
+    out.push({ kind: "task", id: t.id, title: t.title, text, hash: contentHash(text) });
+  }
+  for (const d of decisions.list()) {
+    const text = `${d.title} ${d.context} ${d.decision} ${d.consequences}`;
+    out.push({ kind: "decision", id: d.id, title: d.title, text, hash: contentHash(text) });
+  }
+  for (const ev of events.list()) {
+    const text = `${ev.title} ${ev.body}`;
+    out.push({ kind: "event", id: ev.id, title: ev.title, text, hash: contentHash(text) });
+  }
+  return out;
+}
+
+export const embeddings = {
+  count: () => (db.prepare("SELECT count(*) n FROM embeddings").get() as { n: number }).n,
+
+  upsert(ref_kind: string, ref_id: string, text: string): boolean {
+    const hash = contentHash(text);
+    const existing = db
+      .prepare("SELECT hash FROM embeddings WHERE ref_kind = ? AND ref_id = ?")
+      .get(ref_kind, ref_id) as { hash: string } | undefined;
+    if (existing?.hash === hash) return false; // unchanged
+    const vec = embed(text);
+    db.prepare(
+      `INSERT INTO embeddings (ref_kind, ref_id, model, dim, vec, hash, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(ref_kind, ref_id) DO UPDATE SET model=excluded.model, dim=excluded.dim, vec=excluded.vec, hash=excluded.hash, created_at=excluded.created_at`,
+    ).run(ref_kind, ref_id, EMBED_MODEL, EMBED_DIM, JSON.stringify(vec), hash, now());
+    return true;
+  },
+
+  /** Backfill any missing/stale embeddings; returns how many were (re)computed. */
+  backfill(): number {
+    let n = 0;
+    for (const it of embeddableItems()) if (embeddings.upsert(it.kind, it.id, it.text)) n++;
+    return n;
+  },
+};
+
+/** Rank stored embeddings by cosine similarity to the query. */
+export function semanticSearch(query: string, limit = 10): SearchHit[] {
+  if (!query.trim()) return [];
+  const q = embed(query);
+  const titleOf = new Map(embeddableItems().map((i) => [`${i.kind}:${i.id}`, i.title]));
+  const rows = db.prepare("SELECT ref_kind, ref_id, vec FROM embeddings").all() as {
+    ref_kind: string;
+    ref_id: string;
+    vec: string;
+  }[];
+  return rows
+    .map((r) => ({
+      kind: r.ref_kind as SearchHit["kind"],
+      id: r.ref_id,
+      title: titleOf.get(`${r.ref_kind}:${r.ref_id}`) ?? r.ref_id,
+      snippet: "",
+      score: Math.round(cosine(q, json<number[]>(r.vec)) * 1000) / 1000,
+    }))
+    .filter((h) => h.score > 0.01)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+}
+
+// ---- worker status ----
+
+export function setHeartbeat(): void {
+  db.prepare(
+    "INSERT INTO worker_status (id, heartbeat) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET heartbeat = excluded.heartbeat",
+  ).run(now());
+}
+
+export function setLastRun(stats: NonNullable<WorkerStatus["last_run"]>): void {
+  db.prepare(
+    "INSERT INTO worker_status (id, last_run) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET last_run = excluded.last_run",
+  ).run(JSON.stringify(stats));
+}
+
+export function workerStatus(): WorkerStatus {
+  const row = db.prepare("SELECT heartbeat, last_run FROM worker_status WHERE id = 1").get() as
+    | { heartbeat: string | null; last_run: string | null }
+    | undefined;
+  const all = sources.list();
+  return {
+    heartbeat: row?.heartbeat ?? null,
+    last_run: row?.last_run ? json(row.last_run) : null,
+    sources: { total: all.length, enabled: all.filter((s) => s.enabled).length },
+    outbox: outbox.counts(),
+    embeddings: { count: embeddings.count(), model: EMBED_MODEL },
   };
 }

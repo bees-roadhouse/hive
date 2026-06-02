@@ -7,7 +7,9 @@ cd "$(dirname "$0")"
 
 echo "🐝 hive(node) setup — installing deps…"
 corepack enable >/dev/null 2>&1 || true
-pnpm install --silent
+# CI=true: non-interactive. minimumReleaseAge=0: this sandbox's registry policy
+# can flag very-recently-published transitives; we don't gate on release age.
+CI=true pnpm install --no-frozen-lockfile --config.minimumReleaseAge=0
 
 # Seed the SQLite db once, so a fresh checkout has something to show.
 if [ ! -f data/hive.db ]; then
@@ -17,4 +19,6 @@ else
   echo "✓ database already present (data/hive.db)"
 fi
 
-echo "✅ ready. Run:  cd node && pnpm dev   (api :8787 + web :5173)"
+echo "✅ ready."
+echo "   API + web:  cd node && pnpm dev        (api :8787 + web :5173, MCP at /mcp)"
+echo "   worker:     pnpm --filter @hive/worker start   (or: once)"

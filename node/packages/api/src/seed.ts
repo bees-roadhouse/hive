@@ -2,10 +2,12 @@
 // spans of the prose anchored into tasks / decisions / events. Offsets are
 // computed from the text with a small helper so the entries stay readable.
 import { migrate } from "./db.ts";
-import { journal } from "./store.ts";
+import { journal, outbox, sources } from "./store.ts";
 import type { AnchorKind, AnchorFields } from "@hive/shared";
 
 migrate();
+
+const BASE = process.env.HIVE_API_URL ?? "http://localhost:8787";
 
 /** Anchor the (first) occurrence of `span` within `body`. */
 function at(body: string, span: string, kind: AnchorKind, fields?: AnchorFields) {
@@ -103,4 +105,20 @@ function write(author: string, body: string, spans: ReturnType<typeof at>[], tag
   );
 }
 
-console.log("🌱 seeded hive: journal entries with anchored tasks/decisions/events, inboxes populated.");
+// Worker config: a sample RSS source (served locally by the API) the worker
+// polls into wire events, plus a demo outbound job.
+sources.create(
+  {
+    name: "Bee feed (sample)",
+    url: `${BASE}/api/_fixtures/sample.xml`,
+    kind: "rss",
+    category: "deps",
+    severity: "low",
+    interval_secs: 300,
+    notify: "apis",
+  },
+  "cera",
+);
+outbox.enqueue("log", { note: "hello from the seed — worker will drain this" }, undefined, "cera");
+
+console.log("🌱 seeded hive: journal + anchors, inboxes, a sample feed source, and an outbox job.");

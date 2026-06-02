@@ -142,6 +142,55 @@ export function migrate(): void {
       body,
       tokenize = 'porter unicode61'
     );
+
+    -- Worker config: external feeds the worker polls into wire events.
+    CREATE TABLE IF NOT EXISTS sources (
+      id            TEXT PRIMARY KEY,
+      name          TEXT NOT NULL,
+      url           TEXT NOT NULL,
+      kind          TEXT NOT NULL DEFAULT 'rss',
+      category      TEXT,
+      severity      TEXT NOT NULL DEFAULT 'info',
+      interval_secs INTEGER NOT NULL DEFAULT 900,
+      notify        TEXT,
+      enabled       INTEGER NOT NULL DEFAULT 1,
+      last_polled_at TEXT,
+      last_status   TEXT,
+      created_at    TEXT NOT NULL
+    );
+
+    -- Outbound work queue the worker drains (webhooks, digests, …).
+    CREATE TABLE IF NOT EXISTS outbox (
+      id           TEXT PRIMARY KEY,
+      kind         TEXT NOT NULL,
+      payload      TEXT NOT NULL DEFAULT '{}',
+      status       TEXT NOT NULL DEFAULT 'pending',
+      attempts     INTEGER NOT NULL DEFAULT 0,
+      last_error   TEXT,
+      run_after    TEXT NOT NULL,
+      created_at   TEXT NOT NULL,
+      completed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS outbox_pending ON outbox (status, run_after);
+
+    -- Local embeddings for semantic search (vector stored as JSON float array).
+    CREATE TABLE IF NOT EXISTS embeddings (
+      ref_kind   TEXT NOT NULL,
+      ref_id     TEXT NOT NULL,
+      model      TEXT NOT NULL,
+      dim        INTEGER NOT NULL,
+      vec        TEXT NOT NULL,
+      hash       TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (ref_kind, ref_id)
+    );
+
+    -- Single-row worker heartbeat / last-run stats, surfaced in the GUI.
+    CREATE TABLE IF NOT EXISTS worker_status (
+      id         INTEGER PRIMARY KEY CHECK (id = 1),
+      heartbeat  TEXT,
+      last_run   TEXT
+    );
   `);
 }
 

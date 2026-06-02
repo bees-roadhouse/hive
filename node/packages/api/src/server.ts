@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { getRequestListener } from "@hono/node-server";
 import { Hono } from "hono";
-import type { DecisionPatch, NewJournalEntry, TaskPatch } from "@hive/shared";
+import type { DecisionPatch, NewJournalEntry, NewSource, SourcePatch, TaskPatch } from "@hive/shared";
 import { migrate } from "./db.ts";
 import { handleMcp } from "./mcp.ts";
 import {
@@ -11,10 +11,14 @@ import {
   inbox,
   journal,
   links,
+  outbox,
   projects,
   search,
+  semanticSearch,
+  sources,
   tasks,
   wire,
+  workerStatus,
 } from "./store.ts";
 
 migrate();
@@ -93,11 +97,51 @@ app.post("/api/inbox/item/:id/read", (c) => c.json({ marked: inbox.markRead(c.re
 // ---- misc ----
 app.get("/api/projects", (c) => c.json(projects.list()));
 app.get("/api/links/:id", (c) => c.json(links.forEntity(c.req.param("id"))));
-app.get("/api/search", (c) =>
-  c.json(search(c.req.query("q") ?? "", Number(c.req.query("limit") ?? 25))),
-);
+app.get("/api/search", (c) => {
+  const q = c.req.query("q") ?? "";
+  const limit = Number(c.req.query("limit") ?? 25);
+  // ?mode=semantic uses the local embedder; default is FTS keyword search.
+  return c.json(c.req.query("mode") === "semantic" ? semanticSearch(q, limit) : search(q, limit));
+});
 app.get("/api/wire", (c) => c.json(wire(Number(c.req.query("limit") ?? 100))));
 app.get("/api/dashboard", (c) => c.json(dashboard()));
+
+// ---- worker config: sources (GUI + MCP configurable) ----
+app.get("/api/sources", (c) => c.json(sources.list()));
+app.post("/api/sources", async (c) => {
+  const body = (await c.req.json()) as NewSource;
+  if (!body?.name || !body?.url) return c.json({ error: "name and url required" }, 400);
+  return c.json(sources.create(body, actor(c)), 201);
+});
+app.patch("/api/sources/:id", async (c) => {
+  const patch = (await c.req.json()) as SourcePatch;
+  const s = sources.update(c.req.param("id"), patch, actor(c));
+  return s ? c.json(s) : c.json({ error: "not found" }, 404);
+});
+app.delete("/api/sources/:id", (c) =>
+  sources.remove(c.req.param("id"), actor(c)) ? c.body(null, 204) : c.json({ error: "not found" }, 404),
+);
+
+// ---- worker status + outbox ----
+app.get("/api/worker", (c) => c.json(workerStatus()));
+app.get("/api/outbox", (c) => c.json(outbox.list(Number(c.req.query("limit") ?? 50))));
+
+// A locally-served sample RSS feed so feed ingestion is real (and demoable)
+// without depending on outbound network in the sandbox.
+app.get("/api/_fixtures/sample.xml", (c) => {
+  const items = [
+    ["bee-rss-1", "pgvector 0.8 released", "Postgres vector search gets faster ANN indexes."],
+    ["bee-rss-2", "Solid 2.0 roadmap", "Fine-grained reactivity, same tiny runtime."],
+    ["bee-rss-3", "SQLite ships native JSON5", "Looser JSON parsing lands in the amalgamation."],
+  ];
+  const xml = `<?xml version="1.0"?><rss version="2.0"><channel><title>Bee feed</title>${items
+    .map(
+      ([g, t, d]) =>
+        `<item><guid>${g}</guid><title>${t}</title><link>https://example.com/${g}</link><description>${d}</description></item>`,
+    )
+    .join("")}</channel></rss>`;
+  return c.body(xml, 200, { "content-type": "application/rss+xml" });
+});
 
 // Raw Node server so /mcp gets the un-touched request stream the Streamable
 // HTTP transport needs; everything else is delegated to Hono.

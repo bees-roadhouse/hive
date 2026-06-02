@@ -181,6 +181,27 @@ table.mini .num { text-align: right; }
 
 footer { color: var(--dim); font-size: 0.8rem; border-top: 1px solid var(--line); padding-top: 0.75rem; margin-top: 1rem; }
 code { color: var(--accent); }
+.sm { font-size: 0.78rem; }
+
+/* ---- search segmented toggle ---- */
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.seg button { border: none; border-radius: 0; padding: 0.45rem 0.8rem; }
+.seg button.active { background: var(--honey); color: #1a1407; }
+
+/* ---- settings / worker ---- */
+.settings h3.sec { margin: 1.4rem 0 0.3rem; font-size: 1rem; border-top: 1px solid var(--line); padding-top: 1rem; }
+.worker-status { display: flex; align-items: center; gap: 0.8rem; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 0.9rem 1rem; }
+.ws-dot { width: 11px; height: 11px; border-radius: 50%; background: var(--dim); flex: none; }
+.ws-dot.live { background: #57d977; box-shadow: 0 0 8px #57d977; }
+.ws-stats { margin-left: auto; display: flex; gap: 0.35rem; flex-wrap: wrap; }
+.source-form { display: flex; gap: 0.5rem; flex-wrap: wrap; margin: 0.6rem 0 1rem; }
+.source-form .grow { flex: 1; min-width: 14rem; }
+.source-row { display: flex; align-items: center; gap: 0.7rem; background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 0.6rem 0.8rem; margin-bottom: 0.5rem; }
+.source-row.off { opacity: 0.5; }
+.source-main { flex: 1; min-width: 0; }
+.source-name { display: flex; align-items: center; gap: 0.4rem; }
+.sw input { width: 1.1rem; height: 1.1rem; }
+.badge.st-done { color: #57d977; } .badge.st-failed { color: #ff7a59; } .badge.st-pending { color: var(--accent); }
 
 @media (max-width: 760px) {
   .board, .kpis { grid-template-columns: 1fr 1fr; }

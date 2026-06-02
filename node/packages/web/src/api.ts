@@ -5,10 +5,15 @@ import type {
   InboxItem,
   JournalEntryView,
   NewJournalEntry,
+  NewSource,
+  OutboxJob,
   SearchHit,
+  Source,
+  SourcePatch,
   Task,
   TaskPatch,
   WireEvent,
+  WorkerStatus,
 } from "@hive/shared";
 
 // Vite proxies /api → hive-api in dev (see vite.config.ts).
@@ -46,7 +51,16 @@ export const api = {
   markAllRead: (recipient: string) =>
     req<{ marked: number }>(`/inbox/${recipient}/read`, { method: "POST" }),
 
-  search: (query: string) => req<SearchHit[]>(`/search?q=${encodeURIComponent(query)}`),
+  search: (query: string, mode: "keyword" | "semantic" = "keyword") =>
+    req<SearchHit[]>(`/search?q=${encodeURIComponent(query)}&mode=${mode}`),
   wire: () => req<WireEvent[]>("/wire"),
   dashboard: () => req<DashboardStats>("/dashboard"),
+
+  sources: () => req<Source[]>("/sources"),
+  addSource: (s: NewSource) => req<Source>("/sources", { method: "POST", body: JSON.stringify(s) }),
+  patchSource: (id: string, p: SourcePatch) =>
+    req<Source>(`/sources/${id}`, { method: "PATCH", body: JSON.stringify(p) }),
+  delSource: (id: string) => req<void>(`/sources/${id}`, { method: "DELETE" }),
+  worker: () => req<WorkerStatus>("/worker"),
+  outbox: () => req<OutboxJob[]>("/outbox"),
 };

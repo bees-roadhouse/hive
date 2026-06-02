@@ -174,8 +174,10 @@ export const Events: Component = () => {
 
 export const SearchPane: Component = () => {
   const [q, setQ] = createSignal("");
-  const [hits] = createResource(q, (query) =>
-    query.trim() ? api.search(query) : Promise.resolve([] as SearchHit[]),
+  const [mode, setMode] = createSignal<"keyword" | "semantic">("keyword");
+  const [hits] = createResource(
+    () => ({ q: q(), mode: mode() }),
+    (k) => (k.q.trim() ? api.search(k.q, k.mode) : Promise.resolve([] as SearchHit[])),
   );
   return (
     <section>
@@ -185,13 +187,26 @@ export const SearchPane: Component = () => {
           value={q()}
           onInput={(e) => setQ(e.currentTarget.value)}
         />
+        <div class="seg">
+          <button classList={{ active: mode() === "keyword" }} onClick={() => setMode("keyword")}>
+            keyword
+          </button>
+          <button classList={{ active: mode() === "semantic" }} onClick={() => setMode("semantic")}>
+            semantic
+          </button>
+        </div>
       </div>
+      <p class="dim sm pad">
+        {mode() === "semantic" ? "vector similarity via the local embedder" : "FTS5 keyword match"}
+      </p>
       <For each={hits()}>
         {(h) => (
           <div class="hit">
             <span class="badge">{h.kind}</span>
             <strong>{h.title}</strong>
-            <span class="snippet" innerHTML={h.snippet} />
+            <Show when={h.snippet} fallback={<span class="snippet">score {h.score}</span>}>
+              <span class="snippet" innerHTML={h.snippet} />
+            </Show>
           </div>
         )}
       </For>
