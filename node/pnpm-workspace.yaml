@@ -1,2 +1,7 @@
 packages:
   - "packages/*"
+
+# Native deps allowed to run install/build scripts (pnpm 11 home for this).
+onlyBuiltDependencies:
+  - better-sqlite3
+  - esbuild

@@ -1,81 +1,106 @@
-// Seeds a handful of rows so a fresh `hive` has something to show. Idempotent-ish:
-// it just appends, so run it once on a clean db (the SessionStart hook does this).
+// Seed hive the way it's meant to be used: by writing journal entries, with
+// spans of the prose anchored into tasks / decisions / events. Offsets are
+// computed from the text with a small helper so the entries stay readable.
 import { migrate } from "./db.ts";
-import { decisions, journal, links, notes, tasks } from "./store.ts";
+import { journal } from "./store.ts";
+import type { AnchorKind, AnchorFields } from "@hive/shared";
 
 migrate();
 
-const t1 = tasks.create(
-  {
-    title: "Ship the Node + Solid rewrite of hive",
-    body: "Replace the rust workspace with a fun, single-binary-spirit Node app.",
-    project: "hive",
-    status: "doing",
-    priority: "high",
-    tags: ["rewrite", "node", "solid"],
-  },
-  "cera",
-);
+/** Anchor the (first) occurrence of `span` within `body`. */
+function at(body: string, span: string, kind: AnchorKind, fields?: AnchorFields) {
+  const start = body.indexOf(span);
+  if (start === -1) throw new Error(`seed: span not found: ${span}`);
+  return { start, end: start + span.length, kind, fields };
+}
 
-tasks.create(
-  {
-    title: "Wire up FTS5 search across tasks/notes/journal",
-    project: "hive",
-    status: "done",
-    priority: "normal",
-    tags: ["search"],
-  },
-  "apis",
-);
+function write(author: string, body: string, spans: ReturnType<typeof at>[], tags: string[] = []) {
+  journal.append({ author, body, tags, anchors: spans });
+}
 
-tasks.create(
-  {
-    title: "Decide if pgvector semantic search comes back",
-    body: "fastembed in rust; node could use onnxruntime or a python sidecar.",
-    project: "hive",
-    status: "blocked",
-    priority: "low",
-    tags: ["embeddings", "later"],
-  },
-  "pia",
-);
+{
+  const body =
+    "Synced with @pia on the Node + Solid rewrite of hive. We'll ship the Solid UI this week — that's the next big push for @pia. Decided to stay on SQLite for now; infra-free matters more than scale here.";
+  write(
+    "cera",
+    body,
+    [
+      at(body, "We'll ship the Solid UI this week", "task", {
+        title: "Ship the Solid UI",
+        priority: "high",
+        assignees: ["pia"],
+        status: "doing",
+      }),
+      at(body, "Decided to stay on SQLite for now; infra-free matters more than scale here", "decision", {
+        title: "Stay on SQLite for the fun rewrite",
+        context: "The rust hive runs Postgres + pgvector for scale; this port optimises for zero-infra spin-up.",
+        consequences: "No vector search yet; the whole DB is a single file under data/.",
+        status: "accepted",
+      }),
+    ],
+    ["rewrite", "node"],
+  );
+}
 
-const n1 = notes.create(
-  {
-    title: "Why SQLite for the fun rewrite",
-    body: "Zero infra — spins up instantly in a fresh container. The rust hive uses postgres+pgvector for prod scale; this keeps it to one file.",
-    tags: ["decision", "db"],
-  },
-  "cera",
-);
+{
+  const body =
+    "Made hive MCP-first today. The HTTP MCP server at /mcp is the primary surface now — @apis should wire the agent tools to journal_append next. Demo for @nate is Thursday 3pm.";
+  write(
+    "cera",
+    body,
+    [
+      at(body, "@apis should wire the agent tools to journal_append next", "task", {
+        title: "Wire agent tools to journal_append over MCP",
+        priority: "urgent",
+        assignees: ["apis"],
+      }),
+      at(body, "Demo for @nate is Thursday 3pm", "event", {
+        title: "Demo the journal-first hive",
+        at: "Thursday 3pm",
+        assignees: ["nate"],
+      }),
+    ],
+    ["mcp"],
+  );
+}
 
-journal.create(
-  {
-    body: "Kicked off the Node/Solid port of hive. Kept the domain (tasks, journal, notes, decisions, links, wire) faithful in spirit to the rust crates.",
-    project: "hive",
-    tags: ["log"],
-  },
-  "cera",
-);
+{
+  const body =
+    "Reviewed the inbox design with @maggie. Everyone — humans and AIs — gets their own inbox; @apis and @pia each see what they're assigned. Logged the decision to make the journal strictly write-only so the prose stays the source of truth.";
+  write(
+    "apis",
+    body,
+    [
+      at(body, "Logged the decision to make the journal strictly write-only so the prose stays the source of truth", "decision", {
+        title: "Journal is write-only; prose is source of truth",
+        context: "Structured items must always trace back to an exact span of an entry.",
+        status: "accepted",
+      }),
+    ],
+    ["inbox", "design"],
+  );
+}
 
-const d1 = decisions.create(
-  {
-    title: "Use SQLite (not Postgres) for the fun rewrite",
-    context:
-      "The rust hive runs Postgres + pgvector for prod scale. This port's goal is to spin up instantly in an ephemeral container with zero external services.",
-    decision:
-      "Persist everything in a single SQLite file via better-sqlite3, with FTS5 for search.",
-    consequences:
-      "No semantic/vector search until we add an embedder. Trivially portable; the whole DB is one file under data/.",
-    status: "accepted",
-    project: "hive",
-    tags: ["db", "architecture"],
-  },
-  "cera",
-);
+{
+  const body =
+    "Quick log from @pia: started on the dashboard + reporting view so we can see tasks, decisions and events across the board and drill down. @cera to review the layout.";
+  write(
+    "pia",
+    body,
+    [
+      at(body, "started on the dashboard + reporting view so we can see tasks, decisions and events across the board and drill down", "task", {
+        title: "Build dashboard + reporting view",
+        priority: "high",
+        assignees: ["pia"],
+        status: "doing",
+      }),
+      at(body, "@cera to review the layout", "task", {
+        title: "Review dashboard layout",
+        assignees: ["cera"],
+      }),
+    ],
+    ["dashboard"],
+  );
+}
 
-// A knowledge-graph edge: the rewrite task relates to the design note + decision.
-links.create("task", t1.id, "note", n1.id, "documented-by", "cera");
-links.create("task", t1.id, "decision", d1.id, "decided-by", "cera");
-
-console.log("🌱 seeded hive with starter tasks, a note, a journal entry, and a link.");
+console.log("🌱 seeded hive: journal entries with anchored tasks/decisions/events, inboxes populated.");

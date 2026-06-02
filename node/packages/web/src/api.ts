@@ -1,20 +1,17 @@
 import type {
+  DashboardStats,
   Decision,
-  DecisionPatch,
-  JournalEntry,
-  NewDecision,
+  EventItem,
+  InboxItem,
+  JournalEntryView,
   NewJournalEntry,
-  NewNote,
-  NewTask,
-  Note,
   SearchHit,
   Task,
   TaskPatch,
   WireEvent,
 } from "@hive/shared";
 
-// Vite proxies /api → hive-api in dev (see vite.config.ts), so the browser
-// only ever talks to its own origin.
+// Vite proxies /api → hive-api in dev (see vite.config.ts).
 const ACTOR_KEY = "hive.actor";
 export const getActor = () => localStorage.getItem(ACTOR_KEY) ?? "nate";
 export const setActor = (a: string) => localStorage.setItem(ACTOR_KEY, a);
@@ -29,31 +26,27 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  tasks: (q: { status?: string; project?: string } = {}) => {
+  journal: (limit = 50) => req<JournalEntryView[]>(`/journal?limit=${limit}`),
+  append: (e: NewJournalEntry) =>
+    req<JournalEntryView>("/journal", { method: "POST", body: JSON.stringify(e) }),
+
+  tasks: (q: { status?: string; assignee?: string } = {}) => {
     const p = new URLSearchParams(Object.entries(q).filter(([, v]) => v) as [string, string][]);
     return req<Task[]>(`/tasks?${p}`);
   },
-  addTask: (t: NewTask) => req<Task>("/tasks", { method: "POST", body: JSON.stringify(t) }),
   patchTask: (id: string, p: TaskPatch) =>
     req<Task>(`/tasks/${id}`, { method: "PATCH", body: JSON.stringify(p) }),
-  delTask: (id: string) => req<void>(`/tasks/${id}`, { method: "DELETE" }),
 
-  notes: () => req<Note[]>("/notes"),
-  addNote: (n: NewNote) => req<Note>("/notes", { method: "POST", body: JSON.stringify(n) }),
+  decisions: () => req<Decision[]>("/decisions"),
+  events: () => req<EventItem[]>("/events"),
 
-  journal: () => req<JournalEntry[]>("/journal"),
-  addJournal: (e: NewJournalEntry) =>
-    req<JournalEntry>("/journal", { method: "POST", body: JSON.stringify(e) }),
-
-  decisions: (q: { status?: string } = {}) => {
-    const p = new URLSearchParams(Object.entries(q).filter(([, v]) => v) as [string, string][]);
-    return req<Decision[]>(`/decisions?${p}`);
-  },
-  addDecision: (d: NewDecision) =>
-    req<Decision>("/decisions", { method: "POST", body: JSON.stringify(d) }),
-  patchDecision: (id: string, p: DecisionPatch) =>
-    req<Decision>(`/decisions/${id}`, { method: "PATCH", body: JSON.stringify(p) }),
+  inbox: (recipient: string, unread = false) =>
+    req<InboxItem[]>(`/inbox/${recipient}?unread=${unread ? 1 : 0}`),
+  markRead: (id: string) => req<{ marked: boolean }>(`/inbox/item/${id}/read`, { method: "POST" }),
+  markAllRead: (recipient: string) =>
+    req<{ marked: number }>(`/inbox/${recipient}/read`, { method: "POST" }),
 
   search: (query: string) => req<SearchHit[]>(`/search?q=${encodeURIComponent(query)}`),
   wire: () => req<WireEvent[]>("/wire"),
+  dashboard: () => req<DashboardStats>("/dashboard"),
 };

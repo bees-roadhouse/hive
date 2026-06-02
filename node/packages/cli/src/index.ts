@@ -1,24 +1,22 @@
 #!/usr/bin/env node
-// hive — a small HTTP client over hive-api, in the spirit of the rust hive-cli
-// (stateless, no local db). Usage: `hive <domain> <subcommand> [flags]`.
-import type { Decision, SearchHit, Task } from "@hive/shared";
+// hive — a small HTTP client over hive-api, journal-first edition.
+// (The richer surface is MCP at POST /mcp; this mirrors the common reads + the
+// one write path: journal append.)
+import type { Decision, EventItem, InboxItem, JournalEntryView, SearchHit, Task } from "@hive/shared";
 
 const BASE = process.env.HIVE_API_URL ?? "http://localhost:8787";
 const ACTOR = process.env.HIVE_ACTOR ?? "cli";
+const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
 
 async function api(path: string, init?: RequestInit) {
   const res = await fetch(`${BASE}/api${path}`, {
     ...init,
     headers: { "content-type": "application/json", "x-hive-actor": ACTOR, ...init?.headers },
   });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`${res.status} ${res.statusText}: ${text}`);
-  }
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}: ${await res.text()}`);
   return res.status === 204 ? null : res.json();
 }
 
-/** Parse `--key value` / `--key=value` / `--flag` into a record. */
 function flags(args: string[]): Record<string, string | boolean> {
   const out: Record<string, string | boolean> = {};
   for (let i = 0; i < args.length; i++) {
@@ -32,39 +30,23 @@ function flags(args: string[]): Record<string, string | boolean> {
   return out;
 }
 
-const tags = (v: unknown) => (typeof v === "string" ? v.split(",").map((s) => s.trim()) : undefined);
+const TASK_GLYPH: Record<string, string> = { todo: "○", doing: "◐", blocked: "✖", done: "●" };
 
-function printTask(t: Task) {
-  const mark = { todo: "○", doing: "◐", blocked: "✖", done: "●" }[t.status] ?? "○";
-  console.log(`${mark} [${t.priority}] ${t.title}  ${dim(t.id)}`);
-  if (t.tags.length) console.log(`    ${dim("#" + t.tags.join(" #"))}`);
-}
-const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
+const HELP = `hive — journal-first (fun Node/Solid rewrite)
 
-function printDecision(d: Decision) {
-  const mark =
-    { proposed: "◇", accepted: "◆", rejected: "✖", superseded: "⊘" }[d.status] ?? "◇";
-  console.log(`${mark} [${d.status}] ${d.title}  ${dim(d.id)}`);
-  if (d.decision) console.log(`    → ${d.decision}`);
-}
-
-const HELP = `hive — fun Node/Solid rewrite
-
-  hive tasks [--status= --project=]      list tasks
-  hive tasks add <title> [--project= --priority= --tags=a,b --body=]
-  hive tasks done <id>
-  hive tasks block <id>
-  hive notes                             list notes
-  hive notes add <title> [--tags= --body=]
-  hive journal [--limit=]                list journal
-  hive journal add <body> [--project= --tags=]
-  hive decisions [--status=]             list decisions
-  hive decisions add <title> --decision= [--context= --consequences= --status= --supersedes= --tags=]
-  hive decisions accept <id>
+  hive journal                          recent entries (prose + anchors)
+  hive journal add <prose…> [--tags=a,b]   write an entry (@mention to notify)
+  hive inbox <actor> [--all]            an actor's inbox (unread by default)
+  hive tasks [--status= --assignee=]    tasks that emerged from the journal
+  hive decisions [--status=]
+  hive events
   hive search <query>
-  hive wire                              tail the event log
+  hive dashboard
+  hive wire
 
-env: HIVE_API_URL (default ${BASE}), HIVE_ACTOR (default ${ACTOR})`;
+env: HIVE_API_URL (${BASE}), HIVE_ACTOR (${ACTOR})
+note: tasks/decisions/events are created by anchoring spans of a journal entry,
+      which the GUI or an MCP client (journal_append) does. The CLI writes prose.`;
 
 async function main() {
   const [domain, sub, ...rest] = process.argv.slice(2);
@@ -72,112 +54,79 @@ async function main() {
   const positional = rest.filter((a) => !a.startsWith("--"));
 
   switch (domain) {
-    case "tasks": {
+    case "journal": {
       if (sub === "add") {
-        const t = await api("/tasks", {
+        const e = (await api("/journal", {
           method: "POST",
           body: JSON.stringify({
-            title: positional.join(" ") || f.title,
-            project: f.project,
-            priority: f.priority,
-            body: f.body,
-            tags: tags(f.tags),
+            author: ACTOR,
+            body: positional.join(" "),
+            tags: typeof f.tags === "string" ? f.tags.split(",") : undefined,
           }),
-        });
-        return printTask(t as Task);
+        })) as JournalEntryView;
+        return console.log(`📓 ${dim(e.id)}  ${e.mentions.length ? "→ " + e.mentions.map((m) => "@" + m).join(" ") : ""}`);
       }
-      if (sub === "done" || sub === "block") {
-        const status = sub === "done" ? "done" : "blocked";
-        const t = await api(`/tasks/${positional[0]}`, {
-          method: "PATCH",
-          body: JSON.stringify({ status }),
-        });
-        return printTask(t as Task);
+      const list = (await api("/journal?limit=20")) as JournalEntryView[];
+      for (const e of list) {
+        console.log(`📓 ${dim(e.created_at)} ${e.author}: ${e.body.slice(0, 90)}`);
+        if (e.anchors.length) console.log(dim(`    ${e.anchors.map((a) => a.kind).join(", ")}`));
       }
-      const q = new URLSearchParams();
-      if (typeof f.status === "string") q.set("status", f.status);
-      if (typeof f.project === "string") q.set("project", f.project);
-      const list = (await api(`/tasks?${q}`)) as Task[];
-      if (!list.length) return console.log(dim("no tasks"));
-      return list.forEach(printTask);
-    }
-
-    case "notes": {
-      if (sub === "add") {
-        const n = await api("/notes", {
-          method: "POST",
-          body: JSON.stringify({
-            title: positional.join(" ") || f.title,
-            body: f.body,
-            tags: tags(f.tags),
-          }),
-        });
-        return console.log(`● ${(n as any).title}  ${dim((n as any).id)}`);
-      }
-      const list = (await api("/notes")) as any[];
-      list.forEach((n) => console.log(`● ${n.title}  ${dim(n.id)}`));
       return;
     }
 
-    case "journal": {
-      if (sub === "add") {
-        const e = await api("/journal", {
-          method: "POST",
-          body: JSON.stringify({
-            body: positional.join(" ") || f.body,
-            project: f.project,
-            tags: tags(f.tags),
-          }),
-        });
-        return console.log(`📓 ${dim((e as any).id)} ${(e as any).created_at}`);
-      }
-      const list = (await api(`/journal?limit=${f.limit ?? 20}`)) as any[];
-      list.forEach((e) => console.log(`📓 ${dim(e.created_at)} ${e.body.slice(0, 80)}`));
+    case "inbox": {
+      const who = sub;
+      if (!who) return console.log("usage: hive inbox <actor> [--all]");
+      const list = (await api(`/inbox/${who}?unread=${f.all ? 0 : 1}`)) as InboxItem[];
+      if (!list.length) return console.log(dim(`📭 nothing for ${who}`));
+      for (const i of list)
+        console.log(`${i.read_at ? " " : "•"} [${i.reason}] from ${i.from}: ${i.snippet.slice(0, 70)} ${dim(i.id)}`);
+      return;
+    }
+
+    case "tasks": {
+      const q = new URLSearchParams();
+      if (typeof f.status === "string") q.set("status", f.status);
+      if (typeof f.assignee === "string") q.set("assignee", f.assignee);
+      const list = (await api(`/tasks?${q}`)) as Task[];
+      if (!list.length) return console.log(dim("no tasks"));
+      for (const t of list)
+        console.log(`${TASK_GLYPH[t.status] ?? "○"} [${t.priority}] ${t.title}  ${dim(t.assignees.map((a) => "@" + a).join(" "))}`);
       return;
     }
 
     case "decisions": {
-      if (sub === "add") {
-        const d = await api("/decisions", {
-          method: "POST",
-          body: JSON.stringify({
-            title: positional.join(" ") || f.title,
-            decision: f.decision,
-            context: f.context,
-            consequences: f.consequences,
-            status: f.status,
-            supersedes: f.supersedes,
-            project: f.project,
-            tags: tags(f.tags),
-          }),
-        });
-        return printDecision(d as Decision);
-      }
-      if (sub === "accept") {
-        const d = await api(`/decisions/${positional[0]}`, {
-          method: "PATCH",
-          body: JSON.stringify({ status: "accepted" }),
-        });
-        return printDecision(d as Decision);
-      }
-      const q = new URLSearchParams();
-      if (typeof f.status === "string") q.set("status", f.status);
-      const list = (await api(`/decisions?${q}`)) as Decision[];
-      if (!list.length) return console.log(dim("no decisions"));
-      return list.forEach(printDecision);
+      const q = typeof f.status === "string" ? `?status=${f.status}` : "";
+      const list = (await api(`/decisions${q}`)) as Decision[];
+      for (const d of list) console.log(`◆ [${d.status}] ${d.title}\n    → ${d.decision}`);
+      return;
+    }
+
+    case "events": {
+      const list = (await api("/events")) as EventItem[];
+      for (const e of list) console.log(`◷ ${e.at ? `[${e.at}] ` : ""}${e.title}`);
+      return;
     }
 
     case "search": {
       const query = [sub, ...positional].filter(Boolean).join(" ");
       const hits = (await api(`/search?q=${encodeURIComponent(query)}`)) as SearchHit[];
       if (!hits.length) return console.log(dim("no matches"));
-      hits.forEach((h) => console.log(`[${h.kind}] ${h.title}  ${dim(h.snippet)}`));
+      for (const h of hits) console.log(`[${h.kind}] ${h.title}  ${dim(h.snippet)}`);
+      return;
+    }
+
+    case "dashboard": {
+      const s = (await api("/dashboard")) as any;
+      console.log(`entries ${s.entries} · tasks ${s.tasks.total} · decisions ${s.decisions.total} · events ${s.events}`);
+      console.log("tasks:", s.tasks);
+      console.log("inboxes:", s.inbox.map((i: any) => `${i.recipient}:${i.unread}/${i.total}`).join("  "));
       return;
     }
 
     case "wire": {
-      const list = (await api("/wire")) as any[];
-      list.forEach((e) => console.log(`${dim(e.created_at)} ${e.actor} → ${e.kind}`));
+      const list = (await api("/wire")) as { created_at: string; actor: string; kind: string }[];
+      for (const e of list) console.log(`${dim(e.created_at)} ${e.actor} → ${e.kind}`);
       return;
     }
 

@@ -1,42 +1,143 @@
-// Shared domain types for hive — the state every Bee's Roadhouse AI config
-// (Pia, Apis, Cera, peers) reads and writes: tasks, journal, notes, the
-// knowledge-graph links between them, and the wire event log.
+// hive domain — journal-first edition.
 //
-// This is the fun Node/Solid rewrite, so the model is a faithful-in-spirit
-// distillation of the rust workspace rather than a column-for-column port.
+// The journal is the single, write-only input: people and AIs write entries in
+// natural prose. Structured items (tasks, decisions, events) *emerge* from that
+// prose: each is "anchored" to the exact span of text it came from, so we can
+// always show the original sentence next to the structured card.
+//
+// Mentions (@pia, @nate, …) drive a per-actor inbox — humans and AIs each get
+// one. The whole thing is MCP-first; the HTTP MCP server is the primary surface.
+
+export type ActorKind = "human" | "ai";
+export interface ActorInfo {
+  name: string;
+  kind: ActorKind;
+}
+
+/** The known cast. Mentions resolve against these to drive inboxes. */
+export const ACTORS: ActorInfo[] = [
+  { name: "nate", kind: "human" },
+  { name: "maggie", kind: "human" },
+  { name: "pia", kind: "ai" },
+  { name: "apis", kind: "ai" },
+  { name: "cera", kind: "ai" },
+];
+export const ACTOR_NAMES = ACTORS.map((a) => a.name);
+export const isAi = (name: string) => ACTORS.find((a) => a.name === name)?.kind === "ai";
 
 export type TaskStatus = "todo" | "doing" | "blocked" | "done";
 export type Priority = "low" | "normal" | "high" | "urgent";
-
-/** The kinds of things that can live in the graph and be linked together. */
-export type EntityKind = "task" | "note" | "journal" | "decision" | "project";
-
-/** Lifecycle of a decision record (ADR-style). */
 export type DecisionStatus = "proposed" | "accepted" | "rejected" | "superseded";
 
-export interface Project {
+/** The structured kinds that can be anchored into a journal entry. */
+export type AnchorKind = "task" | "decision" | "event";
+/** Everything addressable in search / inbox / links. */
+export type EntityKind = AnchorKind | "journal" | "note";
+
+export const TASK_STATUSES: TaskStatus[] = ["todo", "doing", "blocked", "done"];
+export const PRIORITIES: Priority[] = ["low", "normal", "high", "urgent"];
+export const DECISION_STATUSES: DecisionStatus[] = [
+  "proposed",
+  "accepted",
+  "rejected",
+  "superseded",
+];
+export const ANCHOR_KINDS: AnchorKind[] = ["task", "decision", "event"];
+
+// ---- journal (the source of truth) ----
+
+export interface JournalEntry {
   id: string;
-  name: string;
+  author: string;
+  body: string;
+  tags: string[];
+  /** actors @mentioned in the body. */
+  mentions: string[];
   created_at: string;
 }
 
+/** A span of an entry's body that produced a structured entity. */
+export interface Anchor {
+  id: string;
+  entry_id: string;
+  start: number;
+  end: number;
+  text: string;
+  kind: AnchorKind;
+  ref_id: string;
+  created_at: string;
+}
+
+// ---- structured entities (all carry their journal origin) ----
+
 export interface Task {
   id: string;
-  project: string | null;
   title: string;
   body: string;
   status: TaskStatus;
   priority: Priority;
   tags: string[];
+  assignees: string[];
+  project: string | null;
+  origin_entry_id: string | null;
+  anchor_text: string | null;
   created_at: string;
   updated_at: string;
 }
 
-export interface JournalEntry {
+export interface Decision {
   id: string;
-  project: string | null;
-  body: string;
+  title: string;
+  context: string;
+  decision: string;
+  consequences: string;
+  status: DecisionStatus;
   tags: string[];
+  assignees: string[];
+  project: string | null;
+  supersedes: string | null;
+  origin_entry_id: string | null;
+  anchor_text: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A happening pulled from prose — a meeting, a ship, a deadline. */
+export interface EventItem {
+  id: string;
+  title: string;
+  body: string;
+  /** when it happens/happened, ISO-ish, free-form. */
+  at: string | null;
+  tags: string[];
+  assignees: string[];
+  origin_entry_id: string | null;
+  anchor_text: string | null;
+  created_at: string;
+}
+
+// ---- inbox (per actor, humans + AIs) ----
+
+export type InboxReason = "mention" | "assignment" | "decision" | "event";
+
+export interface InboxItem {
+  id: string;
+  recipient: string;
+  from: string;
+  reason: InboxReason;
+  ref_kind: EntityKind;
+  ref_id: string;
+  entry_id: string | null;
+  snippet: string;
+  created_at: string;
+  read_at: string | null;
+}
+
+// ---- supporting ----
+
+export interface Project {
+  id: string;
+  name: string;
   created_at: string;
 }
 
@@ -49,26 +150,6 @@ export interface Note {
   updated_at: string;
 }
 
-/**
- * A decision record. Captures *why* a choice was made so the Bees don't
- * relitigate it later: the context, the call, and what it commits us to.
- */
-export interface Decision {
-  id: string;
-  title: string;
-  context: string;
-  decision: string;
-  consequences: string;
-  status: DecisionStatus;
-  project: string | null;
-  /** id of the decision this one supersedes, if any. */
-  supersedes: string | null;
-  tags: string[];
-  created_at: string;
-  updated_at: string;
-}
-
-/** A directed edge in the knowledge graph (e.g. task --relates--> note). */
 export interface Link {
   id: string;
   source_kind: EntityKind;
@@ -79,7 +160,6 @@ export interface Link {
   created_at: string;
 }
 
-/** Append-only event log every peer can tail to stay in sync. */
 export interface WireEvent {
   id: string;
   kind: string;
@@ -88,7 +168,6 @@ export interface WireEvent {
   created_at: string;
 }
 
-/** A unified hit from the cross-entity search index. */
 export interface SearchHit {
   kind: EntityKind;
   id: string;
@@ -97,49 +176,65 @@ export interface SearchHit {
   score: number;
 }
 
-// ---- request payloads (shared by api, web, cli) ----
+// ---- views (server resolves anchors → their entities for the client) ----
 
-export interface NewTask {
-  title: string;
-  body?: string;
-  project?: string | null;
-  status?: TaskStatus;
-  priority?: Priority;
-  tags?: string[];
+export type ResolvedAnchor = Anchor & { entity: Task | Decision | EventItem | null };
+export interface JournalEntryView extends JournalEntry {
+  anchors: ResolvedAnchor[];
 }
 
-export type TaskPatch = Partial<Omit<Task, "id" | "created_at" | "updated_at">>;
+export interface DashboardStats {
+  entries: number;
+  events: number;
+  tasks: { total: number } & Record<TaskStatus, number>;
+  decisions: { total: number } & Record<DecisionStatus, number>;
+  inbox: { recipient: string; kind: ActorKind; unread: number; total: number }[];
+  byAuthor: { author: string; entries: number }[];
+  recent: WireEvent[];
+}
 
-export interface NewNote {
-  title: string;
-  body?: string;
+// ---- write payloads ----
+
+/** Fields the author may attach when anchoring a span. All optional. */
+export interface AnchorFields {
+  title?: string;
+  status?: TaskStatus | DecisionStatus;
+  priority?: Priority;
+  assignees?: string[];
   tags?: string[];
+  project?: string | null;
+  // decision-specific
+  context?: string;
+  decision?: string;
+  consequences?: string;
+  supersedes?: string | null;
+  // event-specific
+  at?: string | null;
+}
+
+export interface NewAnchor {
+  start: number;
+  end: number;
+  kind: AnchorKind;
+  fields?: AnchorFields;
 }
 
 export interface NewJournalEntry {
+  author: string;
   body: string;
-  project?: string | null;
   tags?: string[];
+  anchors?: NewAnchor[];
 }
 
-export interface NewDecision {
-  title: string;
-  context?: string;
-  decision: string;
-  consequences?: string;
-  status?: DecisionStatus;
-  project?: string | null;
-  supersedes?: string | null;
-  tags?: string[];
+export type TaskPatch = Partial<Pick<Task, "status" | "priority" | "assignees" | "title" | "body" | "tags">>;
+export type DecisionPatch = Partial<Pick<Decision, "status" | "title" | "context" | "decision" | "consequences" | "tags" | "assignees">>;
+
+/** Pull @mentions of known actors out of prose. */
+export function parseMentions(text: string): string[] {
+  const found = new Set<string>();
+  for (const m of text.matchAll(/@([a-z][a-z0-9_-]*)/gi)) {
+    const name = m[1].toLowerCase();
+    if (ACTOR_NAMES.includes(name)) found.add(name);
+  }
+  return [...found];
 }
-
-export type DecisionPatch = Partial<Omit<Decision, "id" | "created_at" | "updated_at">>;
-
-export const TASK_STATUSES: TaskStatus[] = ["todo", "doing", "blocked", "done"];
-export const PRIORITIES: Priority[] = ["low", "normal", "high", "urgent"];
-export const DECISION_STATUSES: DecisionStatus[] = [
-  "proposed",
-  "accepted",
-  "rejected",
-  "superseded",
-];
