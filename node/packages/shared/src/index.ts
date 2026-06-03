@@ -32,7 +32,7 @@ export type DecisionStatus = "proposed" | "accepted" | "rejected" | "superseded"
 /** The structured kinds that can be anchored into a journal entry. */
 export type AnchorKind = "task" | "decision" | "event";
 /** Everything addressable in search / inbox / links. */
-export type EntityKind = AnchorKind | "journal" | "note" | "person" | "topic" | "project" | "phase";
+export type EntityKind = AnchorKind | "journal" | "person" | "topic" | "project" | "phase";
 
 export const TASK_STATUSES: TaskStatus[] = ["todo", "doing", "blocked", "done"];
 export const PRIORITIES: Priority[] = ["low", "normal", "high", "urgent"];
@@ -185,15 +185,6 @@ export interface AutocompleteItem {
   id: string;
   slug: string;
   label: string;
-}
-
-export interface Note {
-  id: string;
-  title: string;
-  body: string;
-  tags: string[];
-  created_at: string;
-  updated_at: string;
 }
 
 export interface Link {

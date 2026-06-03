@@ -123,11 +123,24 @@ blockquote.origin { font-size: 0.82rem; }
 .pri-urgent { color: #ff7a59; } .pri-high { color: var(--accent); }
 
 /* ---- tasks board ---- */
+.tasks-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+.tasks-controls { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; padding: 0.5rem 0; }
+.show-done-toggle { display: flex; align-items: center; gap: 0.3rem; font-size: 0.82rem; color: var(--dim); cursor: pointer; }
+.show-done-toggle input { margin: 0; }
 .board { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.75rem; }
 .col h3 { text-transform: capitalize; color: var(--dim); font-size: 0.85rem; margin: 0 0 0.5rem; }
 .card { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--task); border-radius: 8px; padding: 0.6rem; margin-bottom: 0.5rem; cursor: pointer; }
 .card:hover { border-color: var(--accent); }
 .card-title { margin-top: 0.2rem; }
+.card-meta-row { display: flex; align-items: center; justify-content: space-between; gap: 0.3rem; flex-wrap: wrap; }
+/* Due-date badges on task cards */
+.due-badge { font-size: 0.68rem; border-radius: 999px; padding: 0.05rem 0.4rem; background: var(--line); color: var(--dim); }
+.due-badge.overdue { background: rgba(255,90,60,0.18); color: #ff7a59; font-weight: 600; }
+
+/* ---- field wrapper for markdown decision prose ---- */
+.field { margin: 0.5rem 0; line-height: 1.5; }
+.field strong { display: block; font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--dim); margin-bottom: 0.15rem; }
+.field .md { margin: 0; }
 
 /* ---- decisions / events ---- */
 .decision { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1rem; margin-bottom: 0.9rem; }

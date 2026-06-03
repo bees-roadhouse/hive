@@ -30,6 +30,19 @@ const ACTOR_KEY = "hive.actor";
 export const getActor = () => localStorage.getItem(ACTOR_KEY) ?? "nate";
 export const setActor = (a: string) => localStorage.setItem(ACTOR_KEY, a);
 
+// Done-retention: how long (in hours) a DONE task stays visible before it's
+// hidden by default. The Tasks board respects this unless "show done" is toggled.
+const DONE_RETENTION_KEY = "hive.doneRetentionHours";
+const DONE_RETENTION_DEFAULT = 24;
+export const getDoneRetentionHours = (): number => {
+  const raw = localStorage.getItem(DONE_RETENTION_KEY);
+  const n = raw !== null ? Number(raw) : NaN;
+  // Sentinel: Infinity means "always show" (never hide by age).
+  return Number.isFinite(n) && n >= 0 ? n : DONE_RETENTION_DEFAULT;
+};
+export const setDoneRetentionHours = (hours: number): void =>
+  localStorage.setItem(DONE_RETENTION_KEY, String(hours));
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/api${path}`, {
     ...init,

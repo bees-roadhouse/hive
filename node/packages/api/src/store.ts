@@ -21,7 +21,6 @@ import {
   type NewAnchor,
   type NewJournalEntry,
   type NewSource,
-  type Note,
   type OutboxJob,
   type OutboxStatus,
   type Person,
@@ -781,33 +780,6 @@ function parseBracketTokens(
   }
 }
 
-// ---- notes (kept for compat; no longer the prose surface) ----
-
-type NoteRow = Omit<Note, "tags"> & { tags: string };
-export const notes = {
-  list: (): Note[] =>
-    (db.prepare("SELECT * FROM notes ORDER BY updated_at DESC").all() as NoteRow[]).map((r) => ({
-      ...r,
-      tags: json(r.tags),
-    })),
-  create(input: { title: string; body?: string; tags?: string[] }, actor = "system"): Note {
-    const n: Note = {
-      id: id("note"),
-      title: input.title,
-      body: input.body ?? "",
-      tags: input.tags ?? [],
-      created_at: now(),
-      updated_at: now(),
-    };
-    db.prepare(
-      "INSERT INTO notes (id, title, body, tags, created_at, updated_at) VALUES (@id, @title, @body, @tags, @created_at, @updated_at)",
-    ).run({ ...n, tags: JSON.stringify(n.tags) });
-    indexEntity("note", n.id, n.title, n.body, n.tags);
-    emit("note.created", actor, { id: n.id });
-    return n;
-  },
-};
-
 // ---- links (knowledge graph) ----
 
 export const links = {
@@ -860,7 +832,6 @@ export function graph(): GraphData {
     rel: string;
   }[];
   const titleOf = new Map(embeddableItems().map((i) => [`${i.kind}:${i.id}`, i.title]));
-  for (const n of notes.list()) titleOf.set(`note:${n.id}`, n.title);
   for (const p of people.list()) titleOf.set(`person:${p.id}`, p.name);
   for (const t of topics.list()) titleOf.set(`topic:${t.id}`, t.name);
   for (const p of projects.list()) titleOf.set(`project:${p.id}`, p.name);
