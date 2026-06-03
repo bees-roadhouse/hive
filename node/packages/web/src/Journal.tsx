@@ -1,6 +1,16 @@
-// Journal.tsx — calmer read-first experience with focused writing overlay.
-// Load model: show only today's entries on open; each scroll-down reveals the
-// previous calendar day, one at a time. Composer lives in a centered overlay.
+// Journal.tsx — WYSIWYG markdown editor (TipTap) + day-by-day feed.
+//
+// Authoring model (PRESERVED from the textarea version):
+//   • Body is stored + submitted as MARKDOWN. The TipTap tiptap-markdown
+//     extension serialises the ProseMirror doc → markdown string on submit.
+//   • Select-to-tag: capture editor.state.selection text → pending anchor chip.
+//     At submit, recompute {start,end} by scanning the serialised markdown with
+//     body().indexOf(p.text, cursor) — identical to the original post() logic.
+//   • Autocomplete (@/#/+/!/[): keydown-driven dropdown, same trigger logic.
+//     On select, inserts literal `[kind: Label]` text at cursor position.
+//   • Raw-markdown toggle: "rich | source" seg. Source mode = textarea bound to
+//     the same markdown string; switching back calls editor.commands.setContent
+//     to re-parse from markdown.
 import {
   createEffect,
   createMemo,
@@ -21,11 +31,15 @@ import type {
   ResolvedAnchor,
 } from "@hive/shared";
 import { PRIORITIES } from "@hive/shared";
+import { Editor } from "@tiptap/core";
+import StarterKit from "@tiptap/starter-kit";
+import Link from "@tiptap/extension-link";
+import { Markdown as MarkdownExt } from "tiptap-markdown";
 import { api, getActor } from "./api.ts";
 import { liveRev } from "./live.ts";
 import { ANCHOR_GLYPH, relTime } from "./lib.tsx";
 import { Icon } from "./icons.tsx";
-import { JournalBody, Markdown } from "./markdown.tsx";
+import { JournalBody } from "./markdown.tsx";
 import { EntityCard } from "./Boards.tsx";
 
 interface Pending {
@@ -76,12 +90,6 @@ function dayLabel(iso: string): string {
   });
 }
 
-// Auto-grow a textarea to its content height (capped by CSS max-height).
-function autoGrow(el: HTMLTextAreaElement) {
-  el.style.height = "auto";
-  el.style.height = `${el.scrollHeight}px`;
-}
-
 // Group a flat entry list into calendar-day buckets, newest first.
 function groupByDay(
   entries: JournalEntryView[],
@@ -101,12 +109,49 @@ function groupByDay(
   return out;
 }
 
+// Get the currently selected plain text from a TipTap editor.
+function editorSelectionText(editor: Editor): string {
+  const { from, to } = editor.state.selection;
+  if (from === to) return "";
+  return editor.state.doc.textBetween(from, to, " ").trim();
+}
+
+// Find autocomplete trigger context walking left from caret in a string.
+function findTriggerContext(
+  text: string,
+  caret: number,
+): { trigger: string; query: string; triggerPos: number } | null {
+  const limit = Math.max(0, caret - 64);
+  for (let i = caret - 1; i >= limit; i--) {
+    const ch = text[i];
+    if (ch in TRIGGERS) {
+      const before = i === 0 ? "" : text[i - 1];
+      if (before && /\w/.test(before)) continue;
+      return { trigger: ch, query: text.slice(i + 1, caret), triggerPos: i };
+    }
+    if (/\s/.test(ch) && ch !== " ") break;
+  }
+  return null;
+}
+
 export const Journal: Component = () => {
-  // ---- composer state (lives in overlay) ----
-  const [body, setBody] = createSignal("");
-  const [preview, setPreview] = createSignal(false);
+  // ---- editor mode ----
+  // "rich"   → TipTap WYSIWYG div
+  // "source" → raw textarea (markdown source)
+  const [editorMode, setEditorMode] = createSignal<"rich" | "source">("rich");
+
+  // Canonical markdown string — source of truth shared between modes.
+  // Rich mode reads/writes it via TipTap; source mode reads/writes it directly.
+  const [markdownBody, setMarkdownBody] = createSignal("");
+
+  // ---- pending anchors ----
   const [pending, setPending] = createSignal<Pending[]>([]);
-  const [sel, setSel] = createSignal<{ start: number; end: number }>({ start: 0, end: 0 });
+
+  // selectedText: what the user has selected (drives the tag-as buttons).
+  // In rich mode we read from the editor; in source mode from the textarea.
+  const [selectedText, setSelectedText] = createSignal("");
+
+  // ---- anchor drawer ----
   const [open, setOpen] = createSignal<ResolvedAnchor | null>(null);
 
   // ---- overlay ----
@@ -120,30 +165,16 @@ export const Journal: Component = () => {
   let acTimer: ReturnType<typeof setTimeout> | undefined;
 
   // ---- feed state: day-by-day reveal ----
-  //
-  // `buffer` accumulates all entries fetched from the API (newest first).
-  // `visibleDays` is how many calendar-day groups are currently shown in the feed.
-  // The sentinel fires `revealNextDay()` which either bumps visibleDays (if the
-  // buffer already has a next day ready) or fetches more pages until it does.
   const [buffer, setBuffer] = createSignal<JournalEntryView[]>([]);
   const [fetching, setFetching] = createSignal(false);
   const [fetchDone, setFetchDone] = createSignal(false);
   const [visibleDays, setVisibleDays] = createSignal(1);
 
-  // All calendar-day groups in the buffer.
   const allDayGroups = createMemo(() => groupByDay(buffer()));
-
-  // The slice actually rendered: only visibleDays worth.
   const days = createMemo(() => allDayGroups().slice(0, visibleDays()));
-
-  // True when there are buffered day groups not yet shown.
   const hasBufferedDays = createMemo(() => allDayGroups().length > visibleDays());
-
-  // True when there is absolutely nothing more to show or fetch.
   const allDone = createMemo(() => fetchDone() && !hasBufferedDays());
 
-  // Fetch pages from the API until we have at least one new calendar-day group
-  // beyond what's currently in the buffer, or the API is exhausted.
   const fetchUntilNewDay = async (): Promise<boolean> => {
     if (fetchDone()) return false;
     const startDayCount = allDayGroups().length;
@@ -162,17 +193,12 @@ export const Journal: Component = () => {
     }
   };
 
-  // Called by the sentinel: reveal the next older day (fetching if needed).
   const revealNextDay = async () => {
-    if (hasBufferedDays()) {
-      setVisibleDays((n) => n + 1);
-      return;
-    }
+    if (hasBufferedDays()) { setVisibleDays((n) => n + 1); return; }
     const got = await fetchUntilNewDay();
     if (got) setVisibleDays((n) => n + 1);
   };
 
-  // Full reload: clears buffer and resets to showing 1 day (today).
   const reload = async () => {
     setFetchDone(false);
     setBuffer([]);
@@ -187,7 +213,6 @@ export const Journal: Component = () => {
     }
   };
 
-  // Reload on SSE bump (deferred — onMount handles the initial load).
   createEffect(on(liveRev, () => { void reload(); }, { defer: true }));
 
   let sentinel!: HTMLDivElement;
@@ -196,16 +221,12 @@ export const Journal: Component = () => {
   onMount(() => {
     void reload();
 
-    // Sentinel: entering view → reveal next day.
     const scrollObs = new IntersectionObserver(
-      (ents) => {
-        if (ents.some((x) => x.isIntersecting)) void revealNextDay();
-      },
+      (ents) => { if (ents.some((x) => x.isIntersecting)) void revealNextDay(); },
       { rootMargin: "300px" },
     );
     scrollObs.observe(sentinel);
 
-    // Entry fade-in (respects prefers-reduced-motion).
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     let fadeObs: IntersectionObserver | undefined;
     if (!reduced) {
@@ -237,86 +258,118 @@ export const Journal: Component = () => {
     });
   });
 
+  // ---- TipTap editor instance ----
+  let editorDiv!: HTMLDivElement;
+  let editor: Editor | undefined;
+
+  // Initialise TipTap when the overlay opens (the div is mounted).
+  // Destroy on overlay close (onCleanup fires when Show unmounts).
+  const initEditor = () => {
+    editor = new Editor({
+      element: editorDiv,
+      extensions: [
+        StarterKit.configure({
+          // tiptap-markdown handles serialisation; disable the history plugin's
+          // schema additions that clash with tiptap-markdown's list handling.
+          // (Keep defaults for everything else.)
+        }),
+        Link.configure({ openOnClick: false, HTMLAttributes: { rel: "noopener noreferrer" } }),
+        MarkdownExt.configure({
+          html: false,          // Never accept raw HTML from the user.
+          tightLists: true,     // Keep tight lists (no extra <p> inside <li>).
+          transformPastedText: true, // Parse markdown on paste.
+          transformCopiedText: false,
+        }),
+      ],
+      content: markdownBody() || "",
+      editorProps: {
+        attributes: {
+          class: "ProseMirror wysiwyg-editor",
+          "aria-label": "Journal entry editor",
+        },
+      },
+      onUpdate({ editor: ed }) {
+        // Keep markdownBody in sync so submit always has fresh source.
+        const md = (ed.storage.markdown as { getMarkdown(): string }).getMarkdown();
+        setMarkdownBody(md);
+
+        // Drive autocomplete on content change (same as textarea's onInput).
+        const { from } = ed.state.selection;
+        const textBefore = ed.state.doc.textBetween(0, from, "\n");
+        const ctx = findTriggerContext(textBefore, textBefore.length);
+        if (!ctx) { dismissAc(); return; }
+        // Don't re-fire if query unchanged.
+        if (ctx.query === acQuery() && ctx.trigger === acTrigger()) return;
+        setAcTrigger(ctx.trigger);
+        setAcQuery(ctx.query);
+        setAcActive(0);
+        clearTimeout(acTimer);
+        acTimer = setTimeout(async () => {
+          try {
+            const kinds = TRIGGERS[ctx.trigger] ?? ["person"];
+            const items = await api.autocomplete(ctx.query, kinds);
+            setAcItems(items);
+            setAcActive(0);
+          } catch { setAcItems([]); }
+        }, 120);
+      },
+      onSelectionUpdate({ editor: ed }) {
+        // Track selected text for the select-to-tag feature.
+        setSelectedText(editorSelectionText(ed));
+      },
+    });
+  };
+
+  const destroyEditor = () => {
+    editor?.destroy();
+    editor = undefined;
+  };
+
+  // ---- raw textarea ref (source mode only) ----
+  let sourceTA!: HTMLTextAreaElement;
+  const trackSourceSel = () => {
+    if (!sourceTA) return;
+    const t = markdownBody().slice(sourceTA.selectionStart, sourceTA.selectionEnd).trim();
+    setSelectedText(t);
+  };
+
+  // ---- mode switching ----
+  const switchToSource = () => {
+    // Flush editor markdown to signal before swapping mode.
+    if (editor) {
+      const md = (editor.storage.markdown as { getMarkdown(): string }).getMarkdown();
+      setMarkdownBody(md);
+    }
+    setEditorMode("source");
+    queueMicrotask(() => { if (sourceTA) sourceTA.focus(); });
+  };
+
+  const switchToRich = () => {
+    setEditorMode("rich");
+    // Re-parse current markdown into the editor after it mounts.
+    // The editor div remounts inside Show, so we wait a tick.
+    queueMicrotask(() => {
+      if (editor) {
+        editor.commands.setContent(markdownBody(), false);
+        editor.commands.focus("end");
+      }
+    });
+  };
+
   // ---- overlay open/close ----
   const openOverlay = () => {
     setOverlayOpen(true);
-    // Focus the textarea after the overlay DOM mounts.
-    queueMicrotask(() => { if (ta) { ta.focus(); autoGrow(ta); } });
+    setEditorMode("rich");
+    // Editor is mounted inside Show; give DOM a tick.
+    queueMicrotask(() => { editor?.commands.focus("end"); });
   };
 
   const closeOverlay = () => {
     setOverlayOpen(false);
-    setPreview(false);
     dismissAc();
   };
 
-  // ---- textarea ref (mounted only while overlay is open) ----
-  let ta!: HTMLTextAreaElement;
-  const trackSel = () => {
-    if (!ta) return;
-    setSel({ start: ta.selectionStart, end: ta.selectionEnd });
-  };
-  const selectedText = () => body().slice(sel().start, sel().end).trim();
-
-  // Auto-grow whenever body changes (only meaningful when overlay is open).
-  createEffect(on(body, () => { if (ta && overlayOpen()) autoGrow(ta); }));
-
-  // ---- markdown toolbar ----
-  const surround = (pre: string, post = pre) => {
-    if (!ta) return;
-    const s = ta.selectionStart;
-    const e = ta.selectionEnd;
-    const v = body();
-    const chosen = v.slice(s, e) || "text";
-    setBody(v.slice(0, s) + pre + chosen + post + v.slice(e));
-    queueMicrotask(() => {
-      ta.focus();
-      ta.selectionStart = s + pre.length;
-      ta.selectionEnd = s + pre.length + chosen.length;
-      trackSel();
-    });
-  };
-  const prefixLine = (prefix: string) => {
-    if (!ta) return;
-    const s = ta.selectionStart;
-    const v = body();
-    const lineStart = v.lastIndexOf("\n", s - 1) + 1;
-    setBody(v.slice(0, lineStart) + prefix + v.slice(lineStart));
-    queueMicrotask(() => {
-      ta.focus();
-      ta.selectionStart = ta.selectionEnd = s + prefix.length;
-      trackSel();
-    });
-  };
-
-  const mark = (kind: AnchorKind) => {
-    const text = body().slice(sel().start, sel().end).trim();
-    if (!text) return;
-    setPending([
-      ...pending(),
-      { text, kind, title: text.split(/[.\n]/)[0].slice(0, 80), priority: "normal" },
-    ]);
-  };
-  const removePending = (i: number) => setPending(pending().filter((_, j) => j !== i));
-
   // ---- autocomplete ----
-  const findTriggerContext = (
-    text: string,
-    caret: number,
-  ): { trigger: string; query: string; triggerPos: number } | null => {
-    const limit = Math.max(0, caret - 64);
-    for (let i = caret - 1; i >= limit; i--) {
-      const ch = text[i];
-      if (ch in TRIGGERS) {
-        const before = i === 0 ? "" : text[i - 1];
-        if (before && /\w/.test(before)) continue;
-        return { trigger: ch, query: text.slice(i + 1, caret), triggerPos: i };
-      }
-      if (/\s/.test(ch) && ch !== " ") break;
-    }
-    return null;
-  };
-
   const dismissAc = () => {
     setAcItems([]);
     setAcTrigger(null);
@@ -325,10 +378,89 @@ export const Journal: Component = () => {
     clearTimeout(acTimer);
   };
 
-  const onBodyInput = (e: InputEvent & { currentTarget: HTMLTextAreaElement }) => {
+  // Insert `[kind: Label]` literal token at the current cursor position.
+  // Works in both rich mode (TipTap insertContent) and source mode (textarea).
+  const selectAcItem = (item: AutocompleteItem) => {
+    const token = `[${item.kind}: ${item.label}]`;
+    if (editorMode() === "rich" && editor) {
+      const { from } = editor.state.selection;
+      const textBefore = editor.state.doc.textBetween(0, from, "\n");
+      const ctx = findTriggerContext(textBefore, textBefore.length);
+      if (ctx) {
+        // Delete from triggerPos to cursor, then insert token.
+        const deleteFrom = from - (textBefore.length - ctx.triggerPos);
+        editor
+          .chain()
+          .focus()
+          .deleteRange({ from: deleteFrom, to: from })
+          .insertContent(token)
+          .run();
+      } else {
+        editor.chain().focus().insertContent(token).run();
+      }
+    } else if (editorMode() === "source" && sourceTA) {
+      const val = markdownBody();
+      const caret = sourceTA.selectionStart;
+      const ctx = findTriggerContext(val, caret);
+      if (ctx) {
+        const before = val.slice(0, ctx.triggerPos);
+        const after = val.slice(caret);
+        const next = `${before}${token}${after}`;
+        setMarkdownBody(next);
+        queueMicrotask(() => {
+          const pos = before.length + token.length;
+          sourceTA.selectionStart = sourceTA.selectionEnd = pos;
+          sourceTA.focus();
+        });
+      } else {
+        const before = val.slice(0, caret);
+        const after = val.slice(caret);
+        const next = `${before}${token}${after}`;
+        setMarkdownBody(next);
+      }
+    }
+    dismissAc();
+  };
+
+  // keydown for source-mode textarea (autocomplete nav + Esc).
+  const onSourceKeyDown = (e: KeyboardEvent) => {
+    if (acItems().length) {
+      if (e.key === "ArrowDown") { e.preventDefault(); setAcActive((i) => Math.min(i + 1, acItems().length - 1)); return; }
+      if (e.key === "ArrowUp")   { e.preventDefault(); setAcActive((i) => Math.max(i - 1, 0)); return; }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        const item = acItems()[acActive()];
+        if (item) selectAcItem(item);
+        return;
+      }
+      if (e.key === "Escape") { dismissAc(); return; }
+    }
+    if (e.key === "Escape") { e.stopPropagation(); closeOverlay(); }
+  };
+
+  // keydown for rich mode (autocomplete nav inside the editor).
+  // We hook this via a DOM keydown listener on the editor element.
+  const onRichKeyDown = (e: KeyboardEvent) => {
+    if (acItems().length) {
+      if (e.key === "ArrowDown") { e.preventDefault(); setAcActive((i) => Math.min(i + 1, acItems().length - 1)); return; }
+      if (e.key === "ArrowUp")   { e.preventDefault(); setAcActive((i) => Math.max(i - 1, 0)); return; }
+      if (e.key === "Enter" || e.key === "Tab") {
+        // Only intercept if dropdown is showing — let normal Enter/Tab through otherwise.
+        e.preventDefault();
+        const item = acItems()[acActive()];
+        if (item) selectAcItem(item);
+        return;
+      }
+      if (e.key === "Escape") { dismissAc(); return; }
+    }
+    if (e.key === "Escape") { e.stopPropagation(); closeOverlay(); }
+  };
+
+  // Also fire autocomplete on input in source mode.
+  const onSourceInput = (e: InputEvent & { currentTarget: HTMLTextAreaElement }) => {
     const val = e.currentTarget.value;
-    setBody(val);
-    trackSel();
+    setMarkdownBody(val);
+    trackSourceSel();
     const caret = e.currentTarget.selectionStart;
     const ctx = findTriggerContext(val, caret);
     if (!ctx) { dismissAc(); return; }
@@ -342,65 +474,48 @@ export const Journal: Component = () => {
         const items = await api.autocomplete(ctx.query, kinds);
         setAcItems(items);
         setAcActive(0);
-      } catch {
-        setAcItems([]);
-      }
+      } catch { setAcItems([]); }
     }, 120);
   };
 
-  const selectAcItem = (item: AutocompleteItem) => {
-    if (!ta) return;
-    const val = body();
-    const caret = ta.selectionStart;
-    const ctx = findTriggerContext(val, caret);
-    if (!ctx) { dismissAc(); return; }
-    const token = `[${item.kind}: ${item.label}]`;
-    const before = val.slice(0, ctx.triggerPos);
-    const after = val.slice(caret);
-    setBody(`${before}${token}${after}`);
-    dismissAc();
-    queueMicrotask(() => {
-      ta.focus();
-      const pos = before.length + token.length;
-      ta.selectionStart = ta.selectionEnd = pos;
-      trackSel();
-    });
+  // ---- select-to-tag ----
+  const mark = (kind: AnchorKind) => {
+    const text = selectedText();
+    if (!text) return;
+    setPending([
+      ...pending(),
+      { text, kind, title: text.split(/[.\n]/)[0].slice(0, 80), priority: "normal" },
+    ]);
   };
+  const removePending = (i: number) => setPending(pending().filter((_, j) => j !== i));
 
-  const onKeyDown = (e: KeyboardEvent) => {
-    if (acItems().length) {
-      if (e.key === "ArrowDown") {
-        e.preventDefault();
-        setAcActive((i) => Math.min(i + 1, acItems().length - 1));
-        return;
-      } else if (e.key === "ArrowUp") {
-        e.preventDefault();
-        setAcActive((i) => Math.max(i - 1, 0));
-        return;
-      } else if (e.key === "Enter" || e.key === "Tab") {
-        e.preventDefault();
-        const item = acItems()[acActive()];
-        if (item) selectAcItem(item);
-        return;
-      } else if (e.key === "Escape") {
-        dismissAc();
-        return;
-      }
-    }
-    // Esc with no AC open → close overlay.
-    if (e.key === "Escape") {
-      e.stopPropagation();
-      closeOverlay();
-    }
+  // ---- toolbar commands (rich mode only) ----
+  const toolBold   = () => editor?.chain().focus().toggleBold().run();
+  const toolItalic = () => editor?.chain().focus().toggleItalic().run();
+  const toolCode   = () => editor?.chain().focus().toggleCode().run();
+  const toolHeading = () => editor?.chain().focus().toggleHeading({ level: 2 }).run();
+  const toolBullet  = () => editor?.chain().focus().toggleBulletList().run();
+  // Checkbox: insert markdown literal since TaskList extension is not loaded.
+  const toolCheckbox = () => editor?.chain().focus().insertContent("- [ ] ").run();
+  const toolQuote  = () => editor?.chain().focus().toggleBlockquote().run();
+  const toolLink   = () => {
+    const url = window.prompt("URL:");
+    if (url) editor?.chain().focus().setLink({ href: url }).run();
   };
 
   // ---- submit ----
   const post = async () => {
-    if (!body().trim()) return;
+    const md = editorMode() === "rich"
+      ? (editor?.storage.markdown as { getMarkdown(): string } | undefined)?.getMarkdown() ?? markdownBody()
+      : markdownBody();
+    if (!md.trim()) return;
+
+    // Recompute anchor offsets from the serialised markdown at submit time.
+    // Identical logic to the original post() — never desync on edits.
     let cursor = 0;
     const anchors: NewAnchor[] = [];
     for (const p of pending()) {
-      const start = body().indexOf(p.text, cursor);
+      const start = md.indexOf(p.text, cursor);
       if (start === -1) continue;
       const end = start + p.text.length;
       cursor = end;
@@ -411,15 +526,22 @@ export const Journal: Component = () => {
         fields: { title: p.title, ...(p.kind === "task" ? { priority: p.priority } : {}) },
       });
     }
-    await api.append({ author: getActor(), body: body(), anchors });
-    setBody("");
+
+    await api.append({ author: getActor(), body: md, anchors });
+
+    // Reset state.
+    setMarkdownBody("");
     setPending([]);
+    setSelectedText("");
     dismissAc();
+    if (editor) {
+      editor.commands.setContent("", false);
+    }
     setOverlayOpen(false);
-    setPreview(false);
     await reload();
   };
 
+  // ---- render ----
   return (
     <section class="journal">
       {/* ---- journal header + "new entry" button ---- */}
@@ -461,7 +583,6 @@ export const Journal: Component = () => {
           )}
         </For>
 
-        {/* Sentinel: IntersectionObserver fires revealNextDay() */}
         <div ref={sentinel} class="sentinel">
           <Show when={fetching()}>
             <span class="dim sm">gathering…</span>
@@ -475,7 +596,7 @@ export const Journal: Component = () => {
         </div>
       </div>
 
-      {/* ---- floating action button (bottom-right) ---- */}
+      {/* ---- floating action button ---- */}
       <button class="journal-fab" onClick={openOverlay} title="New entry" aria-label="New entry">
         ✦
       </button>
@@ -487,14 +608,25 @@ export const Journal: Component = () => {
             {/* header row */}
             <div class="overlay-head">
               <span class="overlay-title">new entry</span>
-              <div class="seg">
-                <button classList={{ active: !preview() }} onClick={() => setPreview(false)}>
-                  write
+
+              {/* rich | source mode toggle */}
+              <div class="seg wysiwyg-mode-seg">
+                <button
+                  classList={{ active: editorMode() === "rich" }}
+                  onClick={switchToRich}
+                  title="WYSIWYG editor"
+                >
+                  rich
                 </button>
-                <button classList={{ active: preview() }} onClick={() => setPreview(true)}>
-                  preview
+                <button
+                  classList={{ active: editorMode() === "source" }}
+                  onClick={switchToSource}
+                  title="Raw markdown source"
+                >
+                  {"</>"} source
                 </button>
               </div>
+
               <button class="x" onClick={closeOverlay} title="Close (Esc)">✕</button>
             </div>
 
@@ -509,37 +641,82 @@ export const Journal: Component = () => {
               Select text to tag as a task, decision, or event.
             </div>
 
-            {/* editor */}
-            <Show
-              when={!preview()}
-              fallback={
-                <div class="composer-preview overlay-preview">
-                  <Markdown src={body().trim() || "*nothing to preview yet*"} />
-                </div>
-              }
-            >
+            {/* ---- rich mode: TipTap WYSIWYG ---- */}
+            <Show when={editorMode() === "rich"}>
+              {/* toolbar */}
               <div class="md-toolbar">
-                <button title="bold" onClick={() => surround("**")}><b>B</b></button>
-                <button title="italic" onClick={() => surround("_")}><i>I</i></button>
-                <button title="inline code" onClick={() => surround("`")}>{"</>"}</button>
-                <button title="heading" onClick={() => prefixLine("## ")}>H</button>
-                <button title="bullet" onClick={() => prefixLine("- ")}>•</button>
-                <button title="checkbox task" onClick={() => prefixLine("- [ ] ")}>☑</button>
-                <button title="quote" onClick={() => prefixLine("> ")}>❝</button>
-                <button title="link" onClick={() => surround("[", "](https://)")}>🔗</button>
+                <button title="bold"         onClick={toolBold}>   <b>B</b>     </button>
+                <button title="italic"        onClick={toolItalic}> <i>I</i>     </button>
+                <button title="inline code"   onClick={toolCode}>   {"</>"}     </button>
+                <button title="heading"       onClick={toolHeading}>H            </button>
+                <button title="bullet list"   onClick={toolBullet}> •            </button>
+                <button title="checkbox task" onClick={toolCheckbox}>☑           </button>
+                <button title="blockquote"    onClick={toolQuote}>  ❝            </button>
+                <button title="link"          onClick={toolLink}>   🔗           </button>
               </div>
-              {/* composer-editor-wrap keeps the ac-dropdown positioned relative to it */}
+
+              {/* TipTap mount point + autocomplete dropdown */}
+              <div class="composer-editor-wrap wysiwyg-wrap">
+                <div
+                  ref={(el) => {
+                    editorDiv = el;
+                    // onMount fires after ref assignment; initEditor uses editorDiv.
+                    queueMicrotask(() => {
+                      if (!editor) {
+                        initEditor();
+                        // Attach keydown handler for AC nav and Esc.
+                        editorDiv?.addEventListener("keydown", onRichKeyDown);
+                        onCleanup(() => {
+                          editorDiv?.removeEventListener("keydown", onRichKeyDown);
+                          destroyEditor();
+                        });
+                        // Set initial content if returning from source mode.
+                        if (markdownBody()) {
+                          editor?.commands.setContent(markdownBody(), false);
+                        }
+                        editor?.commands.focus("end");
+                      }
+                    });
+                  }}
+                  class="wysiwyg-host"
+                  aria-multiline="true"
+                />
+                <Show when={acItems().length > 0}>
+                  <ul class="ac-dropdown" role="listbox">
+                    <For each={acItems()}>
+                      {(item, i) => (
+                        <li
+                          class="ac-item"
+                          classList={{ "ac-item-active": i() === acActive() }}
+                          role="option"
+                          aria-selected={i() === acActive()}
+                          onMouseDown={(e) => { e.preventDefault(); selectAcItem(item); }}
+                          onMouseEnter={() => setAcActive(i())}
+                        >
+                          <span class="ac-kind-glyph">{KIND_GLYPH[item.kind] ?? "·"}</span>
+                          <span class="ac-label">{item.label}</span>
+                          <span class="ac-kind dim">{item.kind}</span>
+                        </li>
+                      )}
+                    </For>
+                  </ul>
+                </Show>
+              </div>
+            </Show>
+
+            {/* ---- source mode: raw textarea ---- */}
+            <Show when={editorMode() === "source"}>
               <div class="composer-editor-wrap">
                 <textarea
-                  ref={ta}
+                  ref={sourceTA}
                   class="composer-ta overlay-ta"
-                  placeholder="e.g. Synced with @pia — shipping the **Solid UI** this week. Staying on `SQLite`."
-                  value={body()}
-                  onInput={onBodyInput}
-                  onSelect={trackSel}
-                  onMouseUp={trackSel}
-                  onKeyUp={trackSel}
-                  onKeyDown={onKeyDown}
+                  placeholder="Raw markdown source — switch to rich to see it rendered."
+                  value={markdownBody()}
+                  onInput={onSourceInput}
+                  onSelect={trackSourceSel}
+                  onMouseUp={trackSourceSel}
+                  onKeyUp={trackSourceSel}
+                  onKeyDown={onSourceKeyDown}
                 />
                 <Show when={acItems().length > 0}>
                   <ul class="ac-dropdown" role="listbox">
@@ -578,7 +755,7 @@ export const Journal: Component = () => {
                   )}
                 </For>
               </div>
-              <button class="primary" disabled={!body().trim()} onClick={post}>
+              <button class="primary" disabled={!markdownBody().trim()} onClick={post}>
                 write entry
               </button>
             </div>

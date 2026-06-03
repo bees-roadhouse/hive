@@ -637,3 +637,115 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 /* Subtle close animation when the overlay unmounts (Solid removes instantly,
    so we handle the "open → closed" transition via the open animation alone;
    the backdrop click is fast enough that no exit animation is needed.) */
+
+/* ---- wysiwyg editor ---- */
+
+/* Mode toggle in overlay header */
+.wysiwyg-mode-seg { font-size: 0.83rem; }
+.wysiwyg-mode-seg button { padding: 0.35rem 0.7rem; font-size: 0.82rem; }
+
+/* Container that holds the ProseMirror div — scrollable, same sizing as .overlay-ta */
+.wysiwyg-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+/* The div that TipTap attaches to — it wraps the .ProseMirror element */
+.wysiwyg-host {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ProseMirror content-editable area — styled to match the rest of the app */
+.ProseMirror {
+  flex: 1;
+  min-height: 58vh;
+  max-height: none;
+  width: 100%;
+  outline: none;
+  font-size: 1rem;
+  line-height: 1.65;
+  padding: 0.75rem 0.9rem;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--panel2);
+  color: var(--ink);
+  transition: border-color 0.15s;
+  font-family: inherit;
+  /* Overflow to allow long entries */
+  overflow-y: auto;
+  cursor: text;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ProseMirror:focus {
+  border-color: var(--honey);
+}
+
+/* Placeholder when empty */
+.ProseMirror p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  color: var(--dim);
+  pointer-events: none;
+  float: left;
+  height: 0;
+}
+
+/* Prose typography — mirrors .md class so the WYSIWYG matches the feed */
+.ProseMirror > p { margin: 0 0 0.6rem; }
+.ProseMirror > p:last-child { margin-bottom: 0; }
+.ProseMirror h1, .ProseMirror h2, .ProseMirror h3, .ProseMirror h4 {
+  margin: 0.85rem 0 0.4rem; line-height: 1.25;
+}
+.ProseMirror h1 { font-size: 1.3rem; }
+.ProseMirror h2 { font-size: 1.15rem; }
+.ProseMirror h3 { font-size: 1.02rem; }
+.ProseMirror ul, .ProseMirror ol { margin: 0.3rem 0 0.6rem; padding-left: 1.3rem; }
+.ProseMirror li { margin: 0.15rem 0; }
+/* Checkbox task lists */
+.ProseMirror li[data-type="taskItem"] { list-style: none; margin-left: -0.8rem; display: flex; gap: 0.45rem; align-items: baseline; }
+.ProseMirror li[data-type="taskItem"] > label { flex: none; }
+.ProseMirror li[data-type="taskItem"] > label input[type="checkbox"] { accent-color: var(--honey); margin: 0; }
+.ProseMirror li[data-type="taskItem"] > div { flex: 1; }
+/* Inline code */
+.ProseMirror code {
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0.05rem 0.35rem;
+  font-size: 0.88em;
+}
+/* Code block */
+.ProseMirror pre {
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.7rem 0.9rem;
+  overflow-x: auto;
+  margin: 0.5rem 0;
+}
+.ProseMirror pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.9em;
+}
+/* Links */
+.ProseMirror a { color: var(--accent); text-decoration: underline; }
+.ProseMirror a:hover { filter: brightness(1.25); }
+/* Blockquote */
+.ProseMirror blockquote {
+  margin: 0.5rem 0;
+  padding: 0.1rem 0 0.1rem 0.8rem;
+  border-left: 3px solid var(--line);
+  color: var(--dim);
+}
+/* Horizontal rule */
+.ProseMirror hr { border: none; border-top: 1px solid var(--line); margin: 0.9rem 0; }
+/* Selection highlight — honey-tinted */
+.ProseMirror ::selection { background: rgba(245, 179, 1, 0.28); }
+
+/* Ensure the editor-wrap inside the overlay takes remaining height */
+.overlay-panel .wysiwyg-wrap { flex: 1; }
