@@ -2,6 +2,7 @@ import { nanoid } from "nanoid";
 import {
   type Anchor,
   type AnchorFields,
+  type AutocompleteItem,
   type DashboardStats,
   type Decision,
   type DecisionPatch,
@@ -15,6 +16,7 @@ import {
   type InboxReason,
   type JournalEntry,
   type JournalEntryView,
+  type JournalRef,
   type Link,
   type NewAnchor,
   type NewJournalEntry,
@@ -22,6 +24,8 @@ import {
   type Note,
   type OutboxJob,
   type OutboxStatus,
+  type Person,
+  type Phase,
   type Project,
   type ResolvedAnchor,
   type SearchHit,
@@ -31,6 +35,7 @@ import {
   type Task,
   type TaskPatch,
   type TaskStatus,
+  type Topic,
   type WireEvent,
   type WorkerStatus,
   ACTORS,
@@ -55,6 +60,13 @@ const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${nanoid(12)}`;
 const json = <T>(s: string): T => JSON.parse(s) as T;
 const snip = (s: string, n = 140) => (s.length > n ? `${s.slice(0, n)}…` : s);
+
+/** lowercase, spaces→'-', strip non [a-z0-9-] */
+const slugify = (s: string) =>
+  s
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9-]/g, "");
 
 // ---- search index helpers ----
 
@@ -156,13 +168,124 @@ export const inbox = {
 
 export const projects = {
   list: (): Project[] => db.prepare("SELECT * FROM projects ORDER BY name").all() as Project[],
-  ensure(name: string): void {
-    if (db.prepare("SELECT 1 FROM projects WHERE name = ?").get(name)) return;
-    db.prepare("INSERT INTO projects (id, name, created_at) VALUES (?, ?, ?)").run(
-      id("proj"),
-      name,
-      now(),
+
+  get(projectId: string): Project | undefined {
+    return db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId) as Project | undefined;
+  },
+
+  bySlug(slug: string): Project | undefined {
+    return db.prepare("SELECT * FROM projects WHERE slug = ?").get(slug) as Project | undefined;
+  },
+
+  ensure(name: string): Project {
+    const slug = slugify(name);
+    const existing = db.prepare("SELECT * FROM projects WHERE slug = ?").get(slug) as Project | undefined;
+    if (existing) return existing;
+    const p: Project = { id: id("proj"), name, slug, created_at: now() };
+    db.prepare("INSERT INTO projects (id, name, slug, created_at) VALUES (?, ?, ?, ?)").run(
+      p.id, p.name, p.slug, p.created_at,
     );
+    return p;
+  },
+
+  withChildren(projectId: string): Project & { tasks: Task[]; phases: Phase[] } | undefined {
+    const p = projects.get(projectId);
+    if (!p) return undefined;
+    return {
+      ...p,
+      tasks: tasks.list({ project: projectId }),
+      phases: phases.list(projectId),
+    };
+  },
+};
+
+// ---- people ----
+
+export const people = {
+  list: (): Person[] => db.prepare("SELECT * FROM people ORDER BY name").all() as Person[],
+
+  get(personId: string): Person | undefined {
+    return db.prepare("SELECT * FROM people WHERE id = ?").get(personId) as Person | undefined;
+  },
+
+  bySlug(slug: string): Person | undefined {
+    return db.prepare("SELECT * FROM people WHERE slug = ?").get(slug) as Person | undefined;
+  },
+
+  ensure(name: string, kind: "human" | "ai" = "human"): Person {
+    const slug = slugify(name);
+    const existing = db.prepare("SELECT * FROM people WHERE slug = ?").get(slug) as Person | undefined;
+    if (existing) return existing;
+    const p: Person = { id: id("per"), name, slug, kind, created_at: now() };
+    db.prepare("INSERT INTO people (id, name, slug, kind, created_at) VALUES (?, ?, ?, ?, ?)").run(
+      p.id, p.name, p.slug, p.kind, p.created_at,
+    );
+    return p;
+  },
+};
+
+// ---- topics ----
+
+export const topics = {
+  list: (): Topic[] => db.prepare("SELECT * FROM topics ORDER BY name").all() as Topic[],
+
+  get(topicId: string): Topic | undefined {
+    return db.prepare("SELECT * FROM topics WHERE id = ?").get(topicId) as Topic | undefined;
+  },
+
+  bySlug(slug: string): Topic | undefined {
+    return db.prepare("SELECT * FROM topics WHERE slug = ?").get(slug) as Topic | undefined;
+  },
+
+  ensure(name: string): Topic {
+    const slug = slugify(name);
+    const existing = db.prepare("SELECT * FROM topics WHERE slug = ?").get(slug) as Topic | undefined;
+    if (existing) return existing;
+    const t: Topic = { id: id("top"), name, slug, created_at: now() };
+    db.prepare("INSERT INTO topics (id, name, slug, created_at) VALUES (?, ?, ?, ?)").run(
+      t.id, t.name, t.slug, t.created_at,
+    );
+    return t;
+  },
+};
+
+// ---- phases ----
+
+export const phases = {
+  list(projectId?: string): Phase[] {
+    if (projectId) {
+      return db
+        .prepare("SELECT * FROM phases WHERE project = ? ORDER BY position, created_at")
+        .all(projectId) as Phase[];
+    }
+    return db.prepare("SELECT * FROM phases ORDER BY project, position, created_at").all() as Phase[];
+  },
+
+  get(phaseId: string): Phase | undefined {
+    return db.prepare("SELECT * FROM phases WHERE id = ?").get(phaseId) as Phase | undefined;
+  },
+
+  bySlug(slug: string, projectId: string): Phase | undefined {
+    return db
+      .prepare("SELECT * FROM phases WHERE project = ? AND name = ? COLLATE NOCASE")
+      .get(projectId, slug.replace(/-/g, " ")) as Phase | undefined ??
+      db.prepare("SELECT * FROM phases WHERE project = ? AND LOWER(REPLACE(name,' ','-')) = ?")
+        .get(projectId, slug) as Phase | undefined;
+  },
+
+  ensure(projectId: string, name: string): Phase {
+    const existing = db
+      .prepare("SELECT * FROM phases WHERE project = ? AND LOWER(name) = LOWER(?)")
+      .get(projectId, name) as Phase | undefined;
+    if (existing) return existing;
+    const pos = (
+      db.prepare("SELECT COALESCE(MAX(position)+1, 0) AS n FROM phases WHERE project = ?").get(projectId) as { n: number }
+    ).n;
+    const ph: Phase = { id: id("ph"), project: projectId, name, position: pos, created_at: now() };
+    db.prepare("INSERT INTO phases (id, project, name, position, created_at) VALUES (?, ?, ?, ?, ?)").run(
+      ph.id, ph.project, ph.name, ph.position, ph.created_at,
+    );
+    return ph;
   },
 };
 
@@ -172,7 +295,7 @@ type TaskRow = Omit<Task, "tags" | "assignees"> & { tags: string; assignees: str
 const toTask = (r: TaskRow): Task => ({ ...r, tags: json(r.tags), assignees: json(r.assignees) });
 
 export const tasks = {
-  list(filter: { status?: string; assignee?: string; project?: string } = {}): Task[] {
+  list(filter: { status?: string; assignee?: string; project?: string; phase?: string } = {}): Task[] {
     const rows = db
       .prepare(
         "SELECT * FROM tasks ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC",
@@ -182,6 +305,7 @@ export const tasks = {
       .map(toTask)
       .filter((t) => !filter.status || t.status === filter.status)
       .filter((t) => !filter.project || t.project === filter.project)
+      .filter((t) => !filter.phase || t.phase === filter.phase)
       .filter((t) => !filter.assignee || t.assignees.includes(filter.assignee));
   },
 
@@ -191,7 +315,8 @@ export const tasks = {
   },
 
   create(input: Partial<Task> & { title: string }, actor = "system"): Task {
-    if (input.project) projects.ensure(input.project);
+    // Only ensure-by-name when the project value is not already a known project id.
+    if (input.project && !projects.get(input.project)) projects.ensure(input.project);
     const t: Task = {
       id: id("task"),
       title: input.title,
@@ -201,14 +326,16 @@ export const tasks = {
       tags: input.tags ?? [],
       assignees: input.assignees ?? [],
       project: input.project ?? null,
+      phase: input.phase ?? null,
+      due: input.due ?? null,
       origin_entry_id: input.origin_entry_id ?? null,
       anchor_text: input.anchor_text ?? null,
       created_at: now(),
       updated_at: now(),
     };
     db.prepare(
-      `INSERT INTO tasks (id, project, title, body, status, priority, tags, assignees, origin_entry_id, anchor_text, created_at, updated_at)
-       VALUES (@id, @project, @title, @body, @status, @priority, @tags, @assignees, @origin_entry_id, @anchor_text, @created_at, @updated_at)`,
+      `INSERT INTO tasks (id, project, phase, due, title, body, status, priority, tags, assignees, origin_entry_id, anchor_text, created_at, updated_at)
+       VALUES (@id, @project, @phase, @due, @title, @body, @status, @priority, @tags, @assignees, @origin_entry_id, @anchor_text, @created_at, @updated_at)`,
     ).run({ ...t, tags: JSON.stringify(t.tags), assignees: JSON.stringify(t.assignees) });
     indexEntity("task", t.id, t.title, t.body, t.tags);
     emit("task.created", actor, { id: t.id, title: t.title });
@@ -250,7 +377,7 @@ export const decisions = {
   },
 
   create(input: Partial<Decision> & { title: string; decision: string }, actor = "system"): Decision {
-    if (input.project) projects.ensure(input.project);
+    if (input.project && !projects.get(input.project)) projects.ensure(input.project);
     const d: Decision = {
       id: id("dec"),
       title: input.title,
@@ -362,6 +489,45 @@ const anchorsFor = (entryId: string): ResolvedAnchor[] =>
     entryId,
   ) as Anchor[]).map((a) => ({ ...a, entity: entityById(a.kind, a.ref_id) }));
 
+/** Regex to find bracket tokens like [person: Maggie Bierly] */
+const TOKEN_RE = /\[(person|topic|project|phase|task):([^\]]+)\]/g;
+
+/** Resolve bracket tokens in a body string against the DB at read time. */
+function refsFor(body: string): JournalRef[] {
+  const refs: JournalRef[] = [];
+  for (const m of body.matchAll(new RegExp(TOKEN_RE.source, "g"))) {
+    const kind = m[1] as JournalRef["kind"];
+    const rawName = m[2].trim();
+    const start = m.index!;
+    const end = start + m[0].length;
+    let entity: { id: string; slug: string; name: string } | undefined;
+    if (kind === "person") {
+      entity = people.bySlug(slugify(rawName)) ?? undefined;
+    } else if (kind === "topic") {
+      entity = topics.bySlug(slugify(rawName)) ?? undefined;
+    } else if (kind === "project") {
+      entity = projects.bySlug(slugify(rawName)) ?? undefined;
+    } else if (kind === "phase") {
+      // phase resolution without a project context: find by name across all phases
+      const ph = db
+        .prepare("SELECT * FROM phases WHERE LOWER(name) = LOWER(?) LIMIT 1")
+        .get(rawName) as Phase | undefined;
+      if (ph) entity = { id: ph.id, slug: slugify(ph.name), name: ph.name };
+    } else {
+      // task — find the most recent task with matching title
+      type TR = { id: string; title: string };
+      const t = db
+        .prepare("SELECT id, title FROM tasks WHERE LOWER(title) = LOWER(?) ORDER BY created_at DESC LIMIT 1")
+        .get(rawName) as TR | undefined;
+      if (t) entity = { id: t.id, slug: slugify(t.title), name: t.title };
+    }
+    if (entity) {
+      refs.push({ kind, id: entity.id, slug: entity.slug, name: entity.name, start, end });
+    }
+  }
+  return refs;
+}
+
 // ---- journal (write-only source of truth) ----
 
 export const journal = {
@@ -374,6 +540,7 @@ export const journal = {
       tags: json(r.tags),
       mentions: json(r.mentions),
       anchors: anchorsFor(r.id),
+      refs: refsFor(r.body),
     }));
   },
 
@@ -382,12 +549,14 @@ export const journal = {
       | (Omit<JournalEntry, "tags" | "mentions"> & { tags: string; mentions: string })
       | undefined;
     if (!r) return undefined;
-    return { ...r, tags: json(r.tags), mentions: json(r.mentions), anchors: anchorsFor(r.id) };
+    return { ...r, tags: json(r.tags), mentions: json(r.mentions), anchors: anchorsFor(r.id), refs: refsFor(r.body) };
   },
 
   /**
    * The one write path. Persist immutable prose, then materialise each anchored
    * span into a structured entity and fan out inbox notifications.
+   * Also parses inline [person:], [topic:], [project:], [phase:], [task:] tokens
+   * to emerge/link entities and feed inboxes.
    */
   append(input: NewJournalEntry, actorOverride?: string): JournalEntryView {
     return tx(() => {
@@ -411,6 +580,9 @@ export const journal = {
         materialiseAnchor(entry, a, author, assignedMentions);
       }
 
+      // Parse bracket tokens: emerge/link entities, fan to inboxes.
+      parseBracketTokens(entry, author, assignedMentions);
+
       // Anyone @mentioned but not already pulled into an anchor gets a plain
       // "mention" inbox item — humans and AIs alike.
       for (const m of mentions) {
@@ -420,7 +592,7 @@ export const journal = {
       }
 
       emit("journal.created", author, { id: entry.id, anchors: (input.anchors ?? []).length });
-      return { ...entry, anchors: anchorsFor(entry.id) };
+      return { ...entry, anchors: anchorsFor(entry.id), refs: refsFor(entry.body) };
     });
   },
 };
@@ -435,7 +607,10 @@ function materialiseAnchor(
   if (!text) return;
   const f: AnchorFields = a.fields ?? {};
   const spanMentions = parseMentions(text);
-  const assignees = (f.assignees ?? spanMentions).filter((x) => x !== author);
+  // Auto-assign to the entry author when no explicit assignees and no @mentions in the span.
+  const rawAssignees = f.assignees ?? (spanMentions.length > 0 ? spanMentions : [author]);
+  const assignees = rawAssignees.filter((x) => x !== author);
+  const assigneesForTask = rawAssignees.length > 0 ? rawAssignees : [author];
   const title = (f.title ?? text.split(/[.\n]/)[0]).slice(0, 120).trim();
 
   let refId: string;
@@ -448,7 +623,7 @@ function materialiseAnchor(
         status: (f.status as TaskStatus) ?? "todo",
         priority: f.priority,
         tags: f.tags,
-        assignees,
+        assignees: assigneesForTask,
         project: f.project ?? null,
         origin_entry_id: entry.id,
         anchor_text: text,
@@ -498,9 +673,93 @@ function materialiseAnchor(
   ).run(id("anc"), entry.id, a.start, a.end, text, a.kind, refId, now());
   links.create("journal", entry.id, a.kind, refId, "anchors", author);
 
-  for (const who of assignees) {
+  // For inbox delivery use the full assignee list (including author when auto-assigned).
+  const inboxRecipients = a.kind === "task" ? assigneesForTask : assignees;
+  for (const who of inboxRecipients) {
     assignedMentions.add(who);
     inbox.add(who, author, reason, a.kind, refId, entry.id, text);
+  }
+}
+
+/**
+ * Parse [person:], [topic:], [project:], [phase:], [task:] tokens from an entry body.
+ * Find-or-create each entity, create a links row, and fan to inboxes where relevant.
+ * Context tracking: if the entry mentions a [project:] and/or [phase:], any [task:]
+ * that emerges is related to that project/phase.
+ */
+function parseBracketTokens(
+  entry: JournalEntry,
+  author: string,
+  assignedMentions: Set<string>,
+): void {
+  // First pass: collect context (project + phase referenced in this entry)
+  let contextProjectId: string | null = null;
+  let contextPhaseId: string | null = null;
+
+  for (const m of entry.body.matchAll(new RegExp(TOKEN_RE.source, "g"))) {
+    const kind = m[1] as JournalRef["kind"];
+    const rawName = m[2].trim();
+    if (kind === "project") {
+      const p = projects.ensure(rawName);
+      contextProjectId = p.id;
+    } else if (kind === "phase" && contextProjectId) {
+      const ph = phases.ensure(contextProjectId, rawName);
+      contextPhaseId = ph.id;
+    }
+  }
+
+  // Second pass: process all tokens
+  for (const m of entry.body.matchAll(new RegExp(TOKEN_RE.source, "g"))) {
+    const kind = m[1] as JournalRef["kind"];
+    const rawName = m[2].trim();
+
+    if (kind === "person") {
+      // Resolve against ACTORS first (known actors), then ensure as a people row.
+      const slug = slugify(rawName);
+      const actorMatch = ACTORS.find((a) => a.name === slug || slugify(a.name) === slug);
+      const person = actorMatch
+        ? people.ensure(actorMatch.name.charAt(0).toUpperCase() + actorMatch.name.slice(1), actorMatch.kind)
+        : people.ensure(rawName);
+      links.create("journal", entry.id, "person", person.id, "mentions", author);
+      // Fan to inbox if this person is a known actor (same as @mention)
+      if (actorMatch) {
+        assignedMentions.add(actorMatch.name);
+        inbox.add(actorMatch.name, author, "mention", "journal", entry.id, entry.id, entry.body);
+      }
+
+    } else if (kind === "topic") {
+      const topic = topics.ensure(rawName);
+      links.create("journal", entry.id, "topic", topic.id, "tagged", author);
+
+    } else if (kind === "project") {
+      const proj = projects.ensure(rawName);
+      links.create("journal", entry.id, "project", proj.id, "about", author);
+
+    } else if (kind === "phase") {
+      const projId = contextProjectId;
+      if (projId) {
+        const ph = phases.ensure(projId, rawName);
+        links.create("journal", entry.id, "phase", ph.id, "about", author);
+      }
+
+    } else if (kind === "task") {
+      // Emerge a task anchored to this entry, auto-assigned to the author.
+      const t = tasks.create(
+        {
+          title: rawName,
+          body: "",
+          assignees: [author],
+          project: contextProjectId,
+          phase: contextPhaseId,
+          origin_entry_id: entry.id,
+          anchor_text: rawName,
+        },
+        author,
+      );
+      links.create("journal", entry.id, "task", t.id, "anchors", author);
+      // author is assigned; inbox.add silently skips self-notification (recipient===from)
+      inbox.add(author, author, "assignment", "task", t.id, entry.id, rawName);
+    }
   }
 }
 
@@ -566,7 +825,12 @@ export const links = {
 
 /** The whole knowledge graph: every linked entity as a node, every link as an
  * edge. Node titles are resolved from the entities themselves; an endpoint with
- * no resolvable title falls back to its id. */
+ * no resolvable title falls back to its id.
+ *
+ * Derived edges (computed at query time, not stored):
+ * - chain: per-author consecutive journal entry pairs (chronological within author)
+ * - project→task, project→phase, phase→task from column relationships
+ */
 export function graph(): GraphData {
   const rows = db
     .prepare("SELECT source_kind, source_id, target_kind, target_id, rel FROM links ORDER BY created_at")
@@ -579,17 +843,58 @@ export function graph(): GraphData {
   }[];
   const titleOf = new Map(embeddableItems().map((i) => [`${i.kind}:${i.id}`, i.title]));
   for (const n of notes.list()) titleOf.set(`note:${n.id}`, n.title);
+  for (const p of people.list()) titleOf.set(`person:${p.id}`, p.name);
+  for (const t of topics.list()) titleOf.set(`topic:${t.id}`, t.name);
+  for (const p of projects.list()) titleOf.set(`project:${p.id}`, p.name);
+  for (const ph of phases.list()) titleOf.set(`phase:${ph.id}`, ph.name);
 
   const nodes = new Map<string, GraphNode>();
   const addNode = (kind: EntityKind, refId: string) => {
     const key = `${kind}:${refId}`;
     if (!nodes.has(key)) nodes.set(key, { id: key, kind, title: titleOf.get(key) ?? refId });
   };
-  const edges = rows.map((r) => {
+  const edges: { source: string; target: string; rel: string }[] = rows.map((r) => {
     addNode(r.source_kind, r.source_id);
     addNode(r.target_kind, r.target_id);
     return { source: `${r.source_kind}:${r.source_id}`, target: `${r.target_kind}:${r.target_id}`, rel: r.rel };
   });
+
+  // Derived: per-author journal chain edges
+  const journalRows = db
+    .prepare("SELECT id, author FROM journal ORDER BY author, created_at ASC")
+    .all() as { id: string; author: string }[];
+  let prevAuthor: string | null = null;
+  let prevId: string | null = null;
+  for (const jr of journalRows) {
+    if (jr.author === prevAuthor && prevId) {
+      addNode("journal", prevId);
+      addNode("journal", jr.id);
+      edges.push({ source: `journal:${prevId}`, target: `journal:${jr.id}`, rel: "chain" });
+    } else if (jr.author !== prevAuthor) {
+      prevAuthor = jr.author;
+    }
+    prevId = jr.id;
+  }
+
+  // Derived: project→task and project→phase edges from column values
+  for (const t of tasks.list()) {
+    if (t.project) {
+      addNode("project", t.project);
+      addNode("task", t.id);
+      edges.push({ source: `project:${t.project}`, target: `task:${t.id}`, rel: "has_task" });
+    }
+    if (t.phase) {
+      addNode("phase", t.phase);
+      addNode("task", t.id);
+      edges.push({ source: `phase:${t.phase}`, target: `task:${t.id}`, rel: "has_task" });
+    }
+  }
+  for (const ph of phases.list()) {
+    addNode("project", ph.project);
+    addNode("phase", ph.id);
+    edges.push({ source: `project:${ph.project}`, target: `phase:${ph.id}`, rel: "has_phase" });
+  }
+
   return { nodes: [...nodes.values()], edges };
 }
 
@@ -625,6 +930,65 @@ function toMatchQuery(q: string): string {
     .map((term) => `${term.replace(/[^\p{L}\p{N}]/gu, "")}*`)
     .filter((t) => t.length > 1)
     .join(" ");
+}
+
+/** Typeahead autocomplete: matching people, open tasks, projects, topics, phases. */
+export function autocomplete(q: string, kinds?: string[]): AutocompleteItem[] {
+  const lower = q.toLowerCase();
+  const want = kinds ?? ["person", "task", "project", "topic", "phase"];
+  const results: AutocompleteItem[] = [];
+
+  if (want.includes("person")) {
+    for (const p of people.list()) {
+      if (p.name.toLowerCase().includes(lower)) {
+        results.push({ kind: "person", id: p.id, slug: p.slug, label: p.name });
+      }
+    }
+  }
+  if (want.includes("project")) {
+    for (const p of projects.list()) {
+      if (p.name.toLowerCase().includes(lower)) {
+        results.push({ kind: "project", id: p.id, slug: p.slug, label: p.name });
+      }
+    }
+  }
+  if (want.includes("topic")) {
+    for (const t of topics.list()) {
+      if (t.name.toLowerCase().includes(lower)) {
+        results.push({ kind: "topic", id: t.id, slug: t.slug, label: t.name });
+      }
+    }
+  }
+  if (want.includes("phase")) {
+    for (const ph of phases.list()) {
+      if (ph.name.toLowerCase().includes(lower)) {
+        results.push({ kind: "phase", id: ph.id, slug: slugify(ph.name), label: ph.name });
+      }
+    }
+  }
+  if (want.includes("task")) {
+    for (const t of tasks.list({ status: "todo" }).concat(tasks.list({ status: "doing" }))) {
+      if (t.title.toLowerCase().includes(lower)) {
+        results.push({ kind: "task", id: t.id, slug: slugify(t.title), label: t.title });
+      }
+    }
+  }
+
+  return results.slice(0, 8);
+}
+
+/** Ensure the 5 known actors exist as people rows. Safe to call multiple times. */
+export function seedActors(): void {
+  const FULL_NAMES: Record<string, string> = {
+    nate: "Nate",
+    maggie: "Maggie",
+    pia: "Pia",
+    apis: "Apis",
+    cera: "Cera",
+  };
+  for (const a of ACTORS) {
+    people.ensure(FULL_NAMES[a.name] ?? a.name, a.kind);
+  }
 }
 
 // ---- dashboard ----

@@ -10,10 +10,14 @@ import {
   inbox,
   journal,
   outbox,
+  people,
+  phases,
+  projects,
   search,
   semanticSearch,
   sources,
   tasks,
+  topics,
   workerStatus,
 } from "./store.ts";
 
@@ -65,7 +69,9 @@ export function buildMcpServer(): McpServer {
     {
       title: "Append a journal entry",
       description:
-        "Write an immutable prose entry. Optionally attach anchors: each is a {start,end} char span of `body` that materialises a task/decision/event anchored to that text. @mentions notify inboxes.",
+        "Write an immutable prose entry. Optionally attach anchors: each is a {start,end} char span of `body` that materialises a task/decision/event anchored to that text. @mentions notify inboxes. " +
+        "Inline bracket tokens also emerge entities: [person: Name], [topic: Name], [project: Name], [phase: Name], [task: Title]. " +
+        "A [task: Title] in the entry auto-assigns to the author. A [person: X] that matches a known actor also fans to their inbox.",
       inputSchema: {
         author: z.enum(ACTOR_NAMES as [string, ...string[]]),
         body: z.string().describe("the prose (Markdown supported); this is the source of truth"),
@@ -244,6 +250,34 @@ export function buildMcpServer(): McpServer {
     "worker_status",
     { title: "Worker heartbeat + last-run stats", inputSchema: {} },
     async () => ok(workerStatus()),
+  );
+
+  server.registerTool(
+    "people_list",
+    { title: "List people", description: "People and AI actors known to the hive.", inputSchema: {} },
+    async () => ok(people.list()),
+  );
+
+  server.registerTool(
+    "topics_list",
+    { title: "List topics", description: "Topics that have been tagged in journal entries.", inputSchema: {} },
+    async () => ok(topics.list()),
+  );
+
+  server.registerTool(
+    "projects_list",
+    { title: "List projects", description: "Projects with their tasks and phases.", inputSchema: {} },
+    async () => ok(projects.list()),
+  );
+
+  server.registerTool(
+    "phases_list",
+    {
+      title: "List phases",
+      description: "Phases within a project. Pass project_id to filter.",
+      inputSchema: { project_id: z.string().optional() },
+    },
+    async ({ project_id }) => ok(phases.list(project_id)),
   );
 
   return server;

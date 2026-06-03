@@ -57,8 +57,33 @@ export function migrate(): void {
     CREATE TABLE IF NOT EXISTS projects (
       id         TEXT PRIMARY KEY,
       name       TEXT NOT NULL UNIQUE,
+      slug       TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS people (
+      id         TEXT PRIMARY KEY,
+      name       TEXT NOT NULL,
+      slug       TEXT NOT NULL UNIQUE,
+      kind       TEXT NOT NULL DEFAULT 'human',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS topics (
+      id         TEXT PRIMARY KEY,
+      name       TEXT NOT NULL,
+      slug       TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS phases (
+      id         TEXT PRIMARY KEY,
+      project    TEXT NOT NULL,
+      name       TEXT NOT NULL,
+      position   INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS phases_project ON phases (project);
 
     CREATE TABLE IF NOT EXISTS tasks (
       id              TEXT PRIMARY KEY,
@@ -213,6 +238,27 @@ export function migrate(): void {
     .get();
   if (!hasOwner) {
     db.exec("ALTER TABLE sources ADD COLUMN owner TEXT");
+  }
+
+  const hasTaskPhase = db
+    .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name='phase'")
+    .get();
+  if (!hasTaskPhase) {
+    db.exec("ALTER TABLE tasks ADD COLUMN phase TEXT");
+  }
+
+  const hasTaskDue = db
+    .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name='due'")
+    .get();
+  if (!hasTaskDue) {
+    db.exec("ALTER TABLE tasks ADD COLUMN due TEXT");
+  }
+
+  const hasProjectSlug = db
+    .prepare("SELECT 1 FROM pragma_table_info('projects') WHERE name='slug'")
+    .get();
+  if (!hasProjectSlug) {
+    db.exec("ALTER TABLE projects ADD COLUMN slug TEXT NOT NULL DEFAULT ''");
   }
 }
 

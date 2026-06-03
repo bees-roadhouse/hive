@@ -5,6 +5,7 @@ import type { DecisionPatch, NewJournalEntry, NewSource, SourcePatch, TaskPatch 
 import { migrate } from "./db.ts";
 import { handleMcp } from "./mcp.ts";
 import {
+  autocomplete,
   dashboard,
   decisions,
   embeddingStats,
@@ -14,16 +15,21 @@ import {
   journal,
   links,
   outbox,
+  people,
+  phases,
   projects,
   search,
+  seedActors,
   semanticSearch,
   sources,
   tasks,
+  topics,
   wire,
   workerStatus,
 } from "./store.ts";
 
 migrate();
+seedActors();
 
 const app = new Hono();
 
@@ -99,7 +105,35 @@ app.post("/api/inbox/:recipient/read", (c) => c.json({ marked: inbox.markAllRead
 app.post("/api/inbox/item/:id/read", (c) => c.json({ marked: inbox.markRead(c.req.param("id")) }));
 
 // ---- misc ----
+app.get("/api/people", (c) => c.json(people.list()));
+app.get("/api/people/:id", (c) => {
+  const p = people.get(c.req.param("id"));
+  return p ? c.json(p) : c.json({ error: "not found" }, 404);
+});
+app.get("/api/topics", (c) => c.json(topics.list()));
+app.get("/api/topics/:id", (c) => {
+  const t = topics.get(c.req.param("id"));
+  return t ? c.json(t) : c.json({ error: "not found" }, 404);
+});
+app.get("/api/phases", (c) => {
+  const project = c.req.query("project");
+  return c.json(phases.list(project || undefined));
+});
+app.get("/api/phases/:id", (c) => {
+  const ph = phases.get(c.req.param("id"));
+  return ph ? c.json(ph) : c.json({ error: "not found" }, 404);
+});
 app.get("/api/projects", (c) => c.json(projects.list()));
+app.get("/api/projects/:id", (c) => {
+  const p = projects.withChildren(c.req.param("id"));
+  return p ? c.json(p) : c.json({ error: "not found" }, 404);
+});
+app.get("/api/autocomplete", (c) => {
+  const q = c.req.query("q") ?? "";
+  const kindsParam = c.req.query("kinds");
+  const kinds = kindsParam ? kindsParam.split(",").map((k) => k.trim()) : undefined;
+  return c.json(autocomplete(q, kinds));
+});
 app.get("/api/links/:id", (c) => c.json(links.forEntity(c.req.param("id"))));
 app.get("/api/search", async (c) => {
   const q = c.req.query("q") ?? "";

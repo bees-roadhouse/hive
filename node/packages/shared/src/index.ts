@@ -32,7 +32,7 @@ export type DecisionStatus = "proposed" | "accepted" | "rejected" | "superseded"
 /** The structured kinds that can be anchored into a journal entry. */
 export type AnchorKind = "task" | "decision" | "event";
 /** Everything addressable in search / inbox / links. */
-export type EntityKind = AnchorKind | "journal" | "note";
+export type EntityKind = AnchorKind | "journal" | "note" | "person" | "topic" | "project" | "phase";
 
 export const TASK_STATUSES: TaskStatus[] = ["todo", "doing", "blocked", "done"];
 export const PRIORITIES: Priority[] = ["low", "normal", "high", "urgent"];
@@ -79,6 +79,8 @@ export interface Task {
   tags: string[];
   assignees: string[];
   project: string | null;
+  phase: string | null;
+  due: string | null;
   origin_entry_id: string | null;
   anchor_text: string | null;
   created_at: string;
@@ -138,7 +140,51 @@ export interface InboxItem {
 export interface Project {
   id: string;
   name: string;
+  slug: string;
   created_at: string;
+}
+
+export interface Person {
+  id: string;
+  name: string;
+  slug: string;
+  kind: "human" | "ai";
+  created_at: string;
+}
+
+export interface Topic {
+  id: string;
+  name: string;
+  slug: string;
+  created_at: string;
+}
+
+export interface Phase {
+  id: string;
+  project: string;
+  name: string;
+  position: number;
+  created_at: string;
+}
+
+/** A resolved bracket token reference in a journal entry body. */
+export interface JournalRef {
+  kind: "person" | "topic" | "project" | "phase" | "task";
+  id: string;
+  slug: string;
+  name: string;
+  /** char offset of `[` in the body */
+  start: number;
+  /** char offset one past `]` in the body */
+  end: number;
+}
+
+/** Autocomplete candidate for the journal editor. */
+export interface AutocompleteItem {
+  kind: "person" | "topic" | "project" | "phase" | "task";
+  id: string;
+  slug: string;
+  label: string;
 }
 
 export interface Note {
@@ -281,6 +327,8 @@ export interface WorkerStatus {
 export type ResolvedAnchor = Anchor & { entity: Task | Decision | EventItem | null };
 export interface JournalEntryView extends JournalEntry {
   anchors: ResolvedAnchor[];
+  /** Resolved bracket-token references — renderer uses start/end to substitute display names. */
+  refs: JournalRef[];
 }
 
 export interface DashboardStats {
