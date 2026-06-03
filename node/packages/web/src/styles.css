@@ -92,18 +92,20 @@ textarea { width: 100%; resize: vertical; font-size: 0.95rem; line-height: 1.5; 
 .chip-event { border-left-color: var(--event); }
 
 /* ---- journal feed + anchored prose ---- */
-.feed { display: flex; flex-direction: column; gap: 0.75rem; }
-.entry { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 0.9rem 1rem; }
-.entry header { display: flex; gap: 0.5rem; align-items: baseline; border: none; padding: 0; }
+/* Each entry reads like its own page in a journal — generous padding, a calm
+   reading measure, real breathing room between entries. */
+.feed { display: flex; flex-direction: column; gap: 1.6rem; }
+.entry { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 1.7rem 2rem; }
+.entry header { display: flex; gap: 0.5rem; align-items: baseline; border: none; padding: 0; margin-bottom: 0.3rem; }
 .entry time { color: var(--dim); font-size: 0.78rem; }
-.prose { margin: 0.5rem 0 0; line-height: 1.7; font-size: 1rem; }
-.mention { color: var(--accent); font-weight: 600; }
-.anchor { cursor: pointer; border-radius: 4px; padding: 0.05em 0.15em; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
-.anchor sup { font-size: 0.62em; opacity: 0.8; margin-left: 0.1em; }
-.anchor-task { text-decoration-color: var(--task); background: rgba(111,179,255,0.10); }
-.anchor-decision { text-decoration-color: var(--decision); background: rgba(245,179,1,0.12); }
-.anchor-event { text-decoration-color: var(--event); background: rgba(192,139,255,0.12); }
-.anchor:hover { filter: brightness(1.3); }
+.prose { margin: 0.7rem 0 0; line-height: 1.85; font-size: 1.06rem; max-width: 70ch; }
+/* Linked things in prose (mentions, anchors, refs) are calm + uniform — a quiet
+   underline, not bold, no per-kind color. */
+.mention { color: inherit; font-weight: inherit; text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 2px; }
+.anchor { cursor: pointer; text-decoration: underline; text-decoration-color: var(--dim); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.anchor sup { font-size: 0.62em; opacity: 0.5; margin-left: 0.1em; }
+.anchor-task, .anchor-decision, .anchor-event { text-decoration-color: var(--dim); }
+.mention:hover, .anchor:hover { text-decoration-color: var(--honey); }
 
 /* ---- drawer ---- */
 .drawer-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: flex; justify-content: flex-end; z-index: 10; }
@@ -350,13 +352,14 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 /* ---- ref chips in rendered journal entries ---- */
 .ref {
   display: inline;
-  font-weight: 600;
-  border-radius: 4px;
-  padding: 0.05em 0.2em;
-  cursor: default;
-  font-size: 0.95em;
+  color: inherit;
+  font-weight: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: var(--line);
+  text-underline-offset: 2px;
 }
-.ref:hover { filter: brightness(1.2); }
+.ref:hover { text-decoration-color: var(--honey); }
 
 /* ---- entry fade-in animation ---- */
 .entry-fade {

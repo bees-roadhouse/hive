@@ -8,15 +8,6 @@ import { ANCHOR_GLYPH } from "./lib.tsx";
 // journal prose renders as a line break rather than being swallowed.
 marked.setOptions({ gfm: true, breaks: true });
 
-// Graph kind palette — mirrors Graph.tsx so ref chips match graph node colors.
-const REF_COLOR: Record<string, string> = {
-  person: "#ff8fab",
-  topic: "#6ee7d6",
-  project: "#ffd24a",
-  phase: "#ffb86b",
-  task: "#5ec8a0",
-};
-
 /** Markdown source → sanitized HTML string. */
 export function renderMarkdown(src: string): string {
   return DOMPurify.sanitize(marked.parse(src) as string);
@@ -62,7 +53,6 @@ export function JournalBody(props: {
       const token = refToken(r);
       wrapFirst(el, token, (span) => {
         span.className = `ref ref-${r.kind}`;
-        span.style.color = REF_COLOR[r.kind] ?? "var(--accent)";
         span.textContent = r.name;
         span.title = `${r.kind}: ${r.name}`;
       });
