@@ -1,6 +1,7 @@
 import { createEffect, createResource, onCleanup, onMount, For, type Component } from "solid-js";
 import ForceGraph from "force-graph";
 import { api } from "./api.ts";
+import { liveRev } from "./live.ts";
 
 // Kind → node color.
 const KIND_COLOR: Record<string, string> = {
@@ -22,7 +23,7 @@ const KIND_COLOR: Record<string, string> = {
  * focus it. Fed by /api/graph (journal entries + everything anchored from them).
  */
 export const Graph: Component = () => {
-  const [data] = createResource(() => api.graph());
+  const [data] = createResource(() => ({ _r: liveRev() }), () => api.graph());
   let host!: HTMLDivElement;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let fg: any;

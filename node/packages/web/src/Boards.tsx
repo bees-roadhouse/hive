@@ -14,6 +14,7 @@ import type {
 } from "@hive/shared";
 import { TASK_STATUSES } from "@hive/shared";
 import { api, getDoneRetentionHours, setDoneRetentionHours } from "./api.ts";
+import { liveRev } from "./live.ts";
 import { Icon } from "./icons.tsx";
 import { DECISION_GLYPH, relTime, TASK_GLYPH } from "./lib.tsx";
 import { Markdown } from "./markdown.tsx";
@@ -123,7 +124,7 @@ const RETENTION_OPTIONS: { label: string; hours: number }[] = [
 ];
 
 export const Tasks: Component = () => {
-  const [tasks, { refetch }] = createResource(() => api.tasks());
+  const [tasks, { refetch }] = createResource(() => ({ _r: liveRev() }), () => api.tasks());
   const [showDone, setShowDone] = createSignal(false);
   const [retentionHours, setRetentionHoursState] = createSignal(getDoneRetentionHours());
 
@@ -215,7 +216,7 @@ export const Tasks: Component = () => {
 // ---- Decisions ----
 
 export const Decisions: Component = () => {
-  const [decisions] = createResource(() => api.decisions());
+  const [decisions] = createResource(() => ({ _r: liveRev() }), () => api.decisions());
   return (
     <section>
       <For each={decisions()}>
@@ -255,7 +256,7 @@ export const Decisions: Component = () => {
 // ---- Events ----
 
 export const Events: Component = () => {
-  const [events] = createResource(() => api.events());
+  const [events] = createResource(() => ({ _r: liveRev() }), () => api.events());
   return (
     <section>
       <For each={events()}>
@@ -323,7 +324,7 @@ export const SearchPane: Component = () => {
 // ---- Wire ----
 
 export const Wire: Component = () => {
-  const [events] = createResource(() => api.wire());
+  const [events] = createResource(() => ({ _r: liveRev() }), () => api.wire());
   return (
     <section class="wire">
       <For each={events() as WireEvent[]}>
@@ -342,7 +343,7 @@ export const Wire: Component = () => {
 // ---- People view ----
 
 export const PeopleView: Component = () => {
-  const [people] = createResource(() => api.people());
+  const [people] = createResource(() => ({ _r: liveRev() }), () => api.people());
   return (
     <section>
       <p class="dim pad">People known to hive. Created automatically when referenced in journal entries, or added from Admin.</p>
@@ -365,7 +366,7 @@ export const PeopleView: Component = () => {
 // ---- Topics view ----
 
 export const TopicsView: Component = () => {
-  const [topics] = createResource(() => api.topics());
+  const [topics] = createResource(() => ({ _r: liveRev() }), () => api.topics());
   return (
     <section>
       <p class="dim pad">Topics extracted from <code>[topic:…]</code> references in journal entries.</p>
@@ -429,7 +430,7 @@ const ProjectCard: Component<{ p: Project }> = (props) => {
 };
 
 export const ProjectsView: Component = () => {
-  const [projects] = createResource(() => api.projects());
+  const [projects] = createResource(() => ({ _r: liveRev() }), () => api.projects());
   return (
     <section>
       <p class="dim pad">Projects with their phases and task counts. Projects are created automatically when a task references one.</p>

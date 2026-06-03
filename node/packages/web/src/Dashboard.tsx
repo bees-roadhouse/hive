@@ -1,11 +1,12 @@
 import { createResource, For, Show, type Component } from "solid-js";
 import { DECISION_STATUSES, TASK_STATUSES } from "@hive/shared";
 import { api } from "./api.ts";
+import { liveRev } from "./live.ts";
 import { DECISION_GLYPH, relTime, TASK_GLYPH } from "./lib.tsx";
 
 /** Cross-board view with simple drill-down bars. */
 export const Dashboard: Component = () => {
-  const [stats] = createResource(() => api.dashboard());
+  const [stats] = createResource(() => ({ _r: liveRev() }), () => api.dashboard());
 
   return (
     <Show when={stats()} fallback={<p class="dim pad">loading…</p>}>

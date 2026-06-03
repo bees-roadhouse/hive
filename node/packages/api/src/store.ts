@@ -43,6 +43,7 @@ import {
   DECISION_STATUSES,
 } from "@hive/shared";
 import { db, tx } from "./db.ts";
+import { publish } from "./bus.ts";
 import {
   contentHash,
   cosine,
@@ -90,6 +91,8 @@ export function emit(kind: string, actor: string, payload: unknown): WireEvent {
     JSON.stringify(ev.payload),
     ev.created_at,
   );
+  // Fan out to SSE subscribers after the DB write succeeds.
+  publish({ kind: ev.kind, actor: ev.actor, payload: ev.payload, at: ev.created_at });
   return ev;
 }
 

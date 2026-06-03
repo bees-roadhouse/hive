@@ -19,6 +19,7 @@ import type {
 } from "@hive/shared";
 import { PRIORITIES } from "@hive/shared";
 import { api, getActor } from "./api.ts";
+import { liveRev } from "./live.ts";
 import { ANCHOR_GLYPH, relTime } from "./lib.tsx";
 import { Icon } from "./icons.tsx";
 import { JournalBody, Markdown } from "./markdown.tsx";
@@ -114,6 +115,10 @@ export const Journal: Component = () => {
     setEntries([]);
     await loadMore();
   };
+
+  // Reload the feed when a remote event arrives. `on` with defer:true skips the
+  // initial run (the onMount already loads), so this only fires on actual bumps.
+  createEffect(on(liveRev, () => { void reload(); }, { defer: true }));
 
   const days = createMemo(() => {
     const out: { day: string; label: string; items: JournalEntryView[] }[] = [];

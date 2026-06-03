@@ -1,9 +1,11 @@
 import { createServer } from "node:http";
 import { getRequestListener } from "@hono/node-server";
 import { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
 import type { DecisionPatch, NewJournalEntry, NewSource, SourcePatch, TaskPatch, PersonPatch } from "@hive/shared";
 import { migrate } from "./db.ts";
 import { handleMcp } from "./mcp.ts";
+import { subscribe } from "./bus.ts";
 import {
   autocomplete,
   dashboard,
@@ -49,6 +51,42 @@ const actor = (c: { req: { header: (k: string) => string | undefined } }) =>
 app.get("/api/healthz", (c) =>
   c.json({ ok: true, service: "hive-node", mcp: "/mcp", ts: new Date().toISOString() }),
 );
+
+// ---- SSE live-push stream ----
+// Every mutation calls emit() → publish() → here. Clients reconnect automatically
+// via EventSource; we send a heartbeat comment every 25 s so proxies don't drop
+// idle connections.
+app.get("/api/stream", (c) => {
+  return streamSSE(c, async (stream) => {
+    // Initial SSE comment — confirms the connection is open without firing onmessage.
+    await stream.write(": connected\n\n");
+
+    const unsub = subscribe((ev) => {
+      // writeSSE is async but we fire-and-forget: if the write fails the stream is
+      // closing and the abort handler below will clean up.
+      void stream.writeSSE({ data: JSON.stringify(ev) });
+    });
+
+    // Heartbeat: a bare SSE comment every 25 s keeps the connection alive through
+    // proxies without firing an onmessage event in the browser.
+    const heartbeat = setInterval(() => {
+      void stream.write(": heartbeat\n\n");
+    }, 25_000);
+
+    // Hold the handler open until the client disconnects (request abort signal).
+    await new Promise<void>((resolve) => {
+      const signal = c.req.raw.signal;
+      if (signal.aborted) {
+        resolve();
+        return;
+      }
+      signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+
+    clearInterval(heartbeat);
+    unsub();
+  });
+});
 
 // ---- journal (the one write path) ----
 app.get("/api/journal", (c) =>

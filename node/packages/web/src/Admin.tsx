@@ -2,11 +2,12 @@ import { createResource, createSignal, For, Show, type Component } from "solid-j
 import type { Person } from "@hive/shared";
 import { api } from "./api.ts";
 import { relTime } from "./lib.tsx";
+import { liveRev } from "./live.ts";
 
 // ---- Writers management ----
 
 const WritersSection: Component = () => {
-  const [people, { refetch }] = createResource(() => api.people());
+  const [people, { refetch }] = createResource(() => ({ _r: liveRev() }), () => api.people());
 
   // Add-writer form state
   const [newName, setNewName] = createSignal("");
@@ -118,9 +119,9 @@ const WritersSection: Component = () => {
 /** Operational view: worker heartbeat + last cycle, embedding coverage,
  * outbound job queue, and writer management. */
 export const Admin: Component = () => {
-  const [worker, { refetch: rw }] = createResource(() => api.worker());
-  const [emb, { refetch: re }] = createResource(() => api.embeddings());
-  const [outbox, { refetch: ro }] = createResource(() => api.outbox());
+  const [worker, { refetch: rw }] = createResource(() => ({ _r: liveRev() }), () => api.worker());
+  const [emb, { refetch: re }] = createResource(() => ({ _r: liveRev() }), () => api.embeddings());
+  const [outbox, { refetch: ro }] = createResource(() => ({ _r: liveRev() }), () => api.outbox());
   const refresh = () => {
     rw();
     re();
