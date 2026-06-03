@@ -97,11 +97,25 @@ app.post("/api/inbox/item/:id/read", (c) => c.json({ marked: inbox.markRead(c.re
 // ---- misc ----
 app.get("/api/projects", (c) => c.json(projects.list()));
 app.get("/api/links/:id", (c) => c.json(links.forEntity(c.req.param("id"))));
-app.get("/api/search", (c) => {
+app.get("/api/search", async (c) => {
   const q = c.req.query("q") ?? "";
   const limit = Number(c.req.query("limit") ?? 25);
   // ?mode=semantic uses the local embedder; default is FTS keyword search.
-  return c.json(c.req.query("mode") === "semantic" ? semanticSearch(q, limit) : search(q, limit));
+  // Semantic flags: &hybrid=0 to disable the keyword blend, &rerank=1 for the
+  // cross-encoder pass, &threshold=<n> to drop weak vector matches.
+  if (c.req.query("mode") === "semantic") {
+    const flag = (name: string) => c.req.query(name) === "1" || c.req.query(name) === "true";
+    const thr = c.req.query("threshold");
+    return c.json(
+      await semanticSearch(q, {
+        limit,
+        hybrid: c.req.query("hybrid") !== "0" && c.req.query("hybrid") !== "false",
+        rerank: flag("rerank"),
+        threshold: thr ? Number(thr) : undefined,
+      }),
+    );
+  }
+  return c.json(search(q, limit));
 });
 app.get("/api/wire", (c) => c.json(wire(Number(c.req.query("limit") ?? 100))));
 app.get("/api/dashboard", (c) => c.json(dashboard()));

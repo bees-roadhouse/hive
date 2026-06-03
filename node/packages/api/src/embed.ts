@@ -1,13 +1,75 @@
-// Local, offline embedder for semantic search.
+// Local embedder + cross-encoder for semantic search, mirroring how
+// bees-roadhouse/bookstack-mcp does it (fastembed + BGE there; the Node-native
+// equivalent here is @huggingface/transformers running the same BGE ONNX
+// models from the HF hub).
 //
-// The rust hive used fastembed (bge-small, 384d). To stay runnable in an
-// ephemeral sandbox with no model download, the default provider here is a
-// deterministic hashed bag-of-ngrams embedder — meaningful enough to cluster
-// related prose, and a drop-in seam for a real transformer (set HIVE_EMBED=
-// transformers to load @huggingface/transformers later).
+// Two providers behind one seam, chosen by $HIVE_EMBED:
+//   hash         (default) — deterministic hashed bag-of-ngrams, 256d. No model
+//                 download, instant in CI/sandbox/offline. No reranker.
+//   transformers          — the real stack: Xenova/bge-large-en-v1.5 (1024d,
+//                 mean-pooled + L2-normalized) for embeddings and
+//                 Xenova/bge-reranker-base as the cross-encoder. Same models
+//                 bookstack-mcp uses. One-time model download (~heavy), so it
+//                 is opt-in: set HIVE_EMBED=transformers and let the worker
+//                 re-backfill — embeddings carry their model, so the next cycle
+//                 recomputes every row whose model no longer matches.
+//
+// embed()/embedQuery()/rerank() are async (the ONNX pipelines are). cosine()/
+// contentHash()/blob helpers stay sync. Embedding only happens on the worker's
+// backfill path and the read-side semanticSearch — never inside a better-sqlite3
+// write transaction — so the async boundary is clean.
 
-export const EMBED_DIM = 256;
-export const EMBED_MODEL = process.env.HIVE_EMBED_MODEL ?? "hash-ngram-v1";
+const PROVIDER = (process.env.HIVE_EMBED ?? "hash").toLowerCase();
+const USE_TRANSFORMERS = PROVIDER === "transformers";
+
+const EMBED_REPO = process.env.HIVE_EMBED_MODEL ?? "Xenova/bge-large-en-v1.5";
+const RERANK_REPO = process.env.HIVE_RERANK_MODEL ?? "Xenova/bge-reranker-base";
+
+export const EMBED_MODEL = USE_TRANSFORMERS ? EMBED_REPO : "hash-ngram-v1";
+// Nominal dimension for status display. The authoritative dim of a stored
+// vector is its own length (written to the `dim` column at upsert time).
+export const EMBED_DIM = USE_TRANSFORMERS ? 1024 : 256;
+
+// bge models are asymmetric: queries get an instruction prefix, passages don't.
+// This is the exact instruction bookstack-mcp's fastembed BGE applies internally.
+const BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: ";
+
+/** Whether a cross-encoder reranker is available for the active provider. */
+export const RERANK_AVAILABLE = USE_TRANSFORMERS;
+
+// ---- vector <-> blob (packed little-endian f32, matching bookstack-mcp) -----
+
+export function toBlob(embedding: number[]): Buffer {
+  const buf = Buffer.allocUnsafe(embedding.length * 4);
+  for (let i = 0; i < embedding.length; i++) buf.writeFloatLE(embedding[i], i * 4);
+  return buf;
+}
+
+export function fromBlob(blob: Buffer): number[] {
+  const out = new Array(blob.length >> 2);
+  for (let i = 0; i < out.length; i++) out[i] = blob.readFloatLE(i * 4);
+  return out;
+}
+
+/** Full cosine similarity — normalizes by both magnitudes (doesn't assume unit
+ * vectors), matching bookstack-mcp's `cosine_similarity`. */
+export function cosine(a: number[], b: number[]): number {
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  const denom = Math.sqrt(na) * Math.sqrt(nb);
+  return denom === 0 ? 0 : dot / denom;
+}
+
+// ---- hash provider ---------------------------------------------------------
+
+const HASH_DIM = 256;
 
 const STOP = new Set(
   "the a an and or of to in on for with is are was were be been being this that it as at by from we our you your they their i".split(
@@ -33,30 +95,102 @@ function hash(str: string): number {
   return h >>> 0;
 }
 
-/** Embed text into a unit-length EMBED_DIM vector. */
-export function embed(text: string): number[] {
-  const v = new Array(EMBED_DIM).fill(0);
+function embedHash(text: string): number[] {
+  const v = new Array(HASH_DIM).fill(0);
   const toks = tokens(text);
   const grams: string[] = [...toks];
   for (let i = 0; i < toks.length - 1; i++) grams.push(`${toks[i]}_${toks[i + 1]}`);
   for (const g of grams) {
     const h = hash(g);
-    const idx = h % EMBED_DIM;
+    const idx = h % HASH_DIM;
     const sign = (h >>> 31) & 1 ? -1 : 1;
-    v[idx] += sign; // raw count; magnitude grows with term frequency
+    v[idx] += sign;
   }
   let norm = Math.sqrt(v.reduce((s, x) => s + x * x, 0));
   if (norm === 0) norm = 1;
   return v.map((x) => x / norm);
 }
 
-export function cosine(a: number[], b: number[]): number {
-  let dot = 0;
-  for (let i = 0; i < a.length && i < b.length; i++) dot += a[i] * b[i];
-  return dot; // both are unit vectors
+// ---- transformers provider -------------------------------------------------
+
+type Extractor = (
+  text: string,
+  opts: { pooling: "mean"; normalize: boolean },
+) => Promise<{ data: Float32Array }>;
+let extractorPromise: Promise<Extractor> | null = null;
+
+function getExtractor(): Promise<Extractor> {
+  if (!extractorPromise) {
+    extractorPromise = import("@huggingface/transformers").then(({ pipeline }) =>
+      pipeline("feature-extraction", EMBED_REPO),
+    ) as Promise<Extractor>;
+  }
+  return extractorPromise;
 }
 
-/** Stable content hash so we only re-embed when text changes. */
+async function embedTransformers(text: string): Promise<number[]> {
+  const extractor = await getExtractor();
+  const out = await extractor(text, { pooling: "mean", normalize: true });
+  return Array.from(out.data);
+}
+
+// Cross-encoder: scores [query, doc] pairs jointly. Lazily loaded once.
+interface RerankBundle {
+  tokenizer: (
+    queries: string[],
+    opts: { text_pair: string[]; padding: boolean; truncation: boolean },
+  ) => Record<string, unknown>;
+  model: (inputs: Record<string, unknown>) => Promise<{ logits: { sigmoid(): { tolist(): number[][] } } }>;
+}
+let rerankPromise: Promise<RerankBundle> | null = null;
+
+function getReranker(): Promise<RerankBundle> {
+  if (!rerankPromise) {
+    rerankPromise = import("@huggingface/transformers").then(
+      async ({ AutoTokenizer, AutoModelForSequenceClassification }) => {
+        const [tokenizer, model] = await Promise.all([
+          AutoTokenizer.from_pretrained(RERANK_REPO),
+          AutoModelForSequenceClassification.from_pretrained(RERANK_REPO),
+        ]);
+        return {
+          tokenizer: (queries, opts) => tokenizer(queries, opts) as Record<string, unknown>,
+          model: (inputs) => model(inputs),
+        } as RerankBundle;
+      },
+    );
+  }
+  return rerankPromise;
+}
+
+// ---- public seam -----------------------------------------------------------
+
+/** Embed a passage/document into a unit-length vector for the active provider. */
+export async function embed(text: string): Promise<number[]> {
+  return USE_TRANSFORMERS ? embedTransformers(text) : embedHash(text);
+}
+
+/** Embed a search query. For bge this adds the retrieval instruction prefix;
+ * for the hash provider it is identical to embed(). */
+export async function embedQuery(text: string): Promise<number[]> {
+  return USE_TRANSFORMERS ? embedTransformers(`${BGE_QUERY_INSTRUCTION}${text}`) : embedHash(text);
+}
+
+/** Cross-encoder relevance scores for each doc against the query, in input
+ * order. Returns null when no reranker is available (hash provider). */
+export async function rerank(query: string, docs: string[]): Promise<number[] | null> {
+  if (!USE_TRANSFORMERS || docs.length === 0) return null;
+  const { tokenizer, model } = await getReranker();
+  const inputs = tokenizer(new Array(docs.length).fill(query), {
+    text_pair: docs,
+    padding: true,
+    truncation: true,
+  });
+  const { logits } = await model(inputs);
+  // bge-reranker emits one logit per pair; sigmoid → a 0..1 relevance score.
+  return logits.sigmoid().tolist().map((row) => row[0]);
+}
+
+/** Stable content hash so we only re-embed when the text changes. */
 export function contentHash(text: string): string {
   return hash(text).toString(16);
 }

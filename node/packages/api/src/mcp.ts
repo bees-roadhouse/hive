@@ -170,10 +170,18 @@ export function buildMcpServer(): McpServer {
     "semantic_search",
     {
       title: "Semantic search",
-      description: "Vector (embedding) search across journal/tasks/decisions/events.",
-      inputSchema: { q: z.string(), limit: z.number().int().optional() },
+      description:
+        "Hybrid semantic search across journal/tasks/decisions/events: vector + keyword blend, link-graph boost, optional cross-encoder rerank.",
+      inputSchema: {
+        q: z.string(),
+        limit: z.number().int().optional(),
+        hybrid: z.boolean().optional(),
+        rerank: z.boolean().optional(),
+        threshold: z.number().optional(),
+      },
     },
-    async ({ q, limit }) => ok(semanticSearch(q, limit ?? 10)),
+    async ({ q, limit, hybrid, rerank, threshold }) =>
+      ok(await semanticSearch(q, { limit: limit ?? 10, hybrid, rerank, threshold })),
   );
 
   // ---- worker configuration (sources) + status ----
