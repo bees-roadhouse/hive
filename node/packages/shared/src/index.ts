@@ -212,7 +212,7 @@ export interface EmbeddingStats {
 
 // ---- worker: sources, outbound queue, status ----
 
-export type SourceKind = "rss";
+export type SourceKind = "rss" | "scrape";
 export type Severity = "critical" | "high" | "medium" | "low" | "info";
 export const SEVERITIES: Severity[] = ["critical", "high", "medium", "low", "info"];
 
@@ -228,6 +228,8 @@ export interface Source {
   /** actor to ping in their inbox on new items, or null. */
   notify: string | null;
   enabled: boolean;
+  /** null = global (all actors see it); actor name = personal. */
+  owner: string | null;
   last_polled_at: string | null;
   last_status: string | null;
   created_at: string;
@@ -242,6 +244,7 @@ export interface NewSource {
   interval_secs?: number;
   notify?: string | null;
   enabled?: boolean;
+  owner?: string | null;
 }
 export type SourcePatch = Partial<Omit<Source, "id" | "created_at" | "last_polled_at" | "last_status">>;
 

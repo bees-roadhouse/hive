@@ -195,15 +195,18 @@ export function buildMcpServer(): McpServer {
     "sources_add",
     {
       title: "Add an ingest source",
-      description: "Register a feed (RSS) for the worker to poll into wire events.",
+      description:
+        "Register a feed (RSS) or page monitor (scrape) for the worker to poll into wire events. " +
+        "Set owner to an actor name for a personal source, or omit for global.",
       inputSchema: {
         name: z.string(),
         url: z.string().url(),
-        kind: z.enum(["rss"]).optional(),
+        kind: z.enum(["rss", "scrape"]).optional(),
         category: z.string().optional(),
         severity: z.enum(["critical", "high", "medium", "low", "info"]).optional(),
         interval_secs: z.number().int().min(30).optional(),
         notify: z.enum(ACTOR_NAMES as [string, ...string[]]).optional(),
+        owner: z.enum(ACTOR_NAMES as [string, ...string[]]).nullish(),
       },
     },
     async (args) => ok(sources.create(args as any, "mcp")),

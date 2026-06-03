@@ -11,6 +11,7 @@ import type {
   OutboxJob,
   SearchHit,
   Source,
+  SourceKind,
   SourcePatch,
   Task,
   TaskPatch,
@@ -61,8 +62,10 @@ export const api = {
   graph: () => req<GraphData>("/graph"),
   embeddings: () => req<EmbeddingStats>("/embeddings"),
 
-  sources: () => req<Source[]>("/sources"),
-  addSource: (s: NewSource) => req<Source>("/sources", { method: "POST", body: JSON.stringify(s) }),
+  sources: (owner?: string) =>
+    req<Source[]>(`/sources${owner ? `?owner=${encodeURIComponent(owner)}` : ""}`),
+  addSource: (s: NewSource & { scope?: "global" | "me" }) =>
+    req<Source>("/sources", { method: "POST", body: JSON.stringify(s) }),
   patchSource: (id: string, p: SourcePatch) =>
     req<Source>(`/sources/${id}`, { method: "PATCH", body: JSON.stringify(p) }),
   delSource: (id: string) => req<void>(`/sources/${id}`, { method: "DELETE" }),

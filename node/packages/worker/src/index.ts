@@ -8,6 +8,7 @@ import {
   embeddings,
   emit,
   ingest,
+  ingestScrape,
   outbox,
   setHeartbeat,
   setLastRun,
@@ -16,6 +17,7 @@ import {
 } from "@hive/api/store";
 import { db } from "@hive/api/db";
 import { parseFeed } from "./feed.ts";
+import { parsePage } from "./scrape.ts";
 
 const TICK_SECS = Number(process.env.HIVE_WORKER_TICK ?? 30);
 const once = process.argv.includes("--once");
@@ -31,9 +33,16 @@ async function pollSources(): Promise<{ polled: number; ingested: number }> {
       const res = await fetch(source.url, { signal: ctrl.signal });
       clearTimeout(t);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const items = parseFeed(await res.text());
-      ingested += ingest(source, items);
-      sources.markPolled(source.id, `ok · ${items.length} items`);
+      if (source.kind === "scrape") {
+        const items = parsePage(await res.text(), source.url);
+        const count = ingestScrape(source, items);
+        ingested += count;
+        sources.markPolled(source.id, `ok · ${count} new of ${items.length} items`);
+      } else {
+        const items = parseFeed(await res.text());
+        ingested += ingest(source, items);
+        sources.markPolled(source.id, `ok · ${items.length} items`);
+      }
     } catch (err) {
       sources.markPolled(source.id, `error · ${(err as Error).message}`);
     }

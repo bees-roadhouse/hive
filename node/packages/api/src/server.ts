@@ -126,11 +126,17 @@ app.get("/api/dashboard", (c) => c.json(dashboard()));
 app.get("/api/graph", (c) => c.json(graph()));
 
 // ---- worker config: sources (GUI + MCP configurable) ----
-app.get("/api/sources", (c) => c.json(sources.list()));
+app.get("/api/sources", (c) => {
+  const ownerParam = c.req.query("owner");
+  // ?owner=<actor> returns global + that actor's; omit for all.
+  return c.json(sources.list(ownerParam || undefined));
+});
 app.post("/api/sources", async (c) => {
-  const body = (await c.req.json()) as NewSource;
+  const body = (await c.req.json()) as NewSource & { scope?: "global" | "me" };
   if (!body?.name || !body?.url) return c.json({ error: "name and url required" }, 400);
-  return c.json(sources.create(body, actor(c)), 201);
+  // scope:"me" → owner = actor header; scope:"global" or absent → owner = null (global).
+  const owner = body.scope === "me" ? actor(c) : (body.owner ?? null);
+  return c.json(sources.create({ ...body, owner }, actor(c)), 201);
 });
 app.patch("/api/sources/:id", async (c) => {
   const patch = (await c.req.json()) as SourcePatch;
@@ -161,6 +167,22 @@ app.get("/api/_fixtures/sample.xml", (c) => {
     )
     .join("")}</channel></rss>`;
   return c.body(xml, 200, { "content-type": "application/rss+xml" });
+});
+
+// A locally-served sample HTML page so scrape ingestion is demoable without
+// depending on outbound network.
+app.get("/api/_fixtures/sample.html", (c) => {
+  const html = `<!DOCTYPE html><html><head><title>Bee scrape fixture</title></head><body>
+<h1>Bee's Roadhouse dev feed</h1>
+<h2>Latest picks</h2>
+<ul>
+  <li><a href="https://example.com/bee-scrape-1">Hono v4 ships — faster routing, smaller core</a></li>
+  <li><a href="https://example.com/bee-scrape-2">SolidJS fine-grained signals land in v2</a></li>
+  <li><a href="https://example.com/bee-scrape-3">better-sqlite3 adds WAL2 support</a></li>
+</ul>
+<nav><a href="/">home</a> <a href="/about">about</a></nav>
+</body></html>`;
+  return c.body(html, 200, { "content-type": "text/html" });
 });
 
 // Raw Node server so /mcp gets the un-touched request stream the Streamable
