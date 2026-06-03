@@ -89,7 +89,7 @@ async function cycle(): Promise<void> {
   setHeartbeat();
   const { polled, ingested } = await pollSources();
   const drained = await drainOutbox();
-  const embedded = embeddings.backfill();
+  const embedded = await embeddings.backfill();
   const maintenance = maintain();
   const stats = { at: new Date().toISOString(), polled, ingested, outbox: drained, embedded, maintenance };
   setLastRun(stats);

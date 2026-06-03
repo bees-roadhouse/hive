@@ -39,7 +39,17 @@ import {
   DECISION_STATUSES,
 } from "@hive/shared";
 import { db, tx } from "./db.ts";
-import { contentHash, cosine, embed, EMBED_DIM, EMBED_MODEL } from "./embed.ts";
+import {
+  contentHash,
+  cosine,
+  embed,
+  embedQuery,
+  EMBED_MODEL,
+  fromBlob,
+  rerank,
+  RERANK_AVAILABLE,
+  toBlob,
+} from "./embed.ts";
 
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${nanoid(12)}`;
@@ -824,48 +834,55 @@ export const outbox = {
 
 // ---- embeddings + semantic search ----
 
-/** Every text chunk worth embedding, with a change-detection hash. */
-export function embeddableItems(): { kind: string; id: string; title: string; text: string; hash: string }[] {
-  const out: { kind: string; id: string; title: string; text: string; hash: string }[] = [];
-  for (const e of journal.list(1000))
-    out.push({ kind: "journal", id: e.id, title: `${e.author}: ${e.body.slice(0, 40)}`, text: e.body, hash: contentHash(e.body) });
-  for (const t of tasks.list()) {
-    const text = `${t.title} ${t.body}`;
-    out.push({ kind: "task", id: t.id, title: t.title, text, hash: contentHash(text) });
-  }
-  for (const d of decisions.list()) {
-    const text = `${d.title} ${d.context} ${d.decision} ${d.consequences}`;
-    out.push({ kind: "decision", id: d.id, title: d.title, text, hash: contentHash(text) });
-  }
-  for (const ev of events.list()) {
-    const text = `${ev.title} ${ev.body}`;
-    out.push({ kind: "event", id: ev.id, title: ev.title, text, hash: contentHash(text) });
-  }
+/** Every item worth embedding. `text` is the clean body (for reranking +
+ * display); `embedText` carries a `[kind] title` context prefix the way
+ * bookstack-mcp prepends `[shelf > book > chapter > page]` before embedding. */
+export function embeddableItems(): {
+  kind: string;
+  id: string;
+  title: string;
+  text: string;
+  embedText: string;
+  hash: string;
+}[] {
+  const out: { kind: string; id: string; title: string; text: string; embedText: string; hash: string }[] = [];
+  const push = (kind: string, id: string, title: string, text: string) => {
+    const embedText = `[${kind}] ${title}\n\n${text}`;
+    out.push({ kind, id, title, text, embedText, hash: contentHash(embedText) });
+  };
+  for (const e of journal.list(1000)) push("journal", e.id, `${e.author}: ${e.body.slice(0, 40)}`, e.body);
+  for (const t of tasks.list()) push("task", t.id, t.title, `${t.title} ${t.body}`);
+  for (const d of decisions.list())
+    push("decision", d.id, d.title, `${d.title} ${d.context} ${d.decision} ${d.consequences}`);
+  for (const ev of events.list()) push("event", ev.id, ev.title, `${ev.title} ${ev.body}`);
   return out;
 }
 
 export const embeddings = {
   count: () => (db.prepare("SELECT count(*) n FROM embeddings").get() as { n: number }).n,
 
-  upsert(ref_kind: string, ref_id: string, text: string): boolean {
-    const hash = contentHash(text);
+  async upsert(ref_kind: string, ref_id: string, embedText: string): Promise<boolean> {
+    const hash = contentHash(embedText);
     const existing = db
-      .prepare("SELECT hash FROM embeddings WHERE ref_kind = ? AND ref_id = ?")
-      .get(ref_kind, ref_id) as { hash: string } | undefined;
-    if (existing?.hash === hash) return false; // unchanged
-    const vec = embed(text);
+      .prepare("SELECT hash, model FROM embeddings WHERE ref_kind = ? AND ref_id = ?")
+      .get(ref_kind, ref_id) as { hash: string; model: string } | undefined;
+    // Re-embed when the text changed OR the active model changed — so flipping
+    // $HIVE_EMBED makes the next backfill recompute even unchanged rows.
+    if (existing?.hash === hash && existing.model === EMBED_MODEL) return false;
+    const vec = await embed(embedText);
+    // Vector is stored as a packed little-endian f32 BLOB (see embed.toBlob).
     db.prepare(
       `INSERT INTO embeddings (ref_kind, ref_id, model, dim, vec, hash, created_at)
        VALUES (?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(ref_kind, ref_id) DO UPDATE SET model=excluded.model, dim=excluded.dim, vec=excluded.vec, hash=excluded.hash, created_at=excluded.created_at`,
-    ).run(ref_kind, ref_id, EMBED_MODEL, EMBED_DIM, JSON.stringify(vec), hash, now());
+    ).run(ref_kind, ref_id, EMBED_MODEL, vec.length, toBlob(vec), hash, now());
     return true;
   },
 
   /** Backfill any missing/stale embeddings; returns how many were (re)computed. */
-  backfill(): number {
+  async backfill(): Promise<number> {
     let n = 0;
-    for (const it of embeddableItems()) if (embeddings.upsert(it.kind, it.id, it.text)) n++;
+    for (const it of embeddableItems()) if (await embeddings.upsert(it.kind, it.id, it.embedText)) n++;
     return n;
   },
 };
@@ -898,27 +915,129 @@ export function embeddingStats(): EmbeddingStats {
   };
 }
 
-/** Rank stored embeddings by cosine similarity to the query. */
-export function semanticSearch(query: string, limit = 10): SearchHit[] {
+export interface SemanticOptions {
+  limit?: number;
+  /** Drop vector matches scoring below this cosine value (default 0). */
+  threshold?: number;
+  /** Blend FTS keyword ranks into the score (default true). */
+  hybrid?: boolean;
+  /** Re-order the top-N with the cross-encoder, when one is available. */
+  rerank?: boolean;
+}
+
+const refKey = (kind: string, id: string) => `${kind}:${id}`;
+function splitKey(k: string): [string, string] {
+  const ix = k.indexOf(":");
+  return [k.slice(0, ix), k.slice(ix + 1)];
+}
+
+/** Neighbors of an entity in the links graph (either direction) — the Markov
+ * blanket bookstack-mcp uses to boost results whose neighbors also surfaced. */
+function blanketNeighbors(kind: string, id: string): string[] {
+  const rows = db
+    .prepare(
+      `SELECT target_kind AS k, target_id AS i FROM links WHERE source_kind = ? AND source_id = ?
+       UNION
+       SELECT source_kind AS k, source_id AS i FROM links WHERE target_kind = ? AND target_id = ?`,
+    )
+    .all(kind, id, kind, id) as { k: string; i: string }[];
+  return rows.map((r) => refKey(r.k, r.i));
+}
+
+/**
+ * Semantic search, mirroring bookstack-mcp's hybrid pipeline: a brute-force
+ * cosine vector pass, an optional FTS keyword blend (0.7 vector / 0.2 keyword),
+ * a Markov-blanket boost from the links graph, and an optional cross-encoder
+ * rerank of the top-N. Falls back to top-k vector hits so a non-empty corpus
+ * never returns nothing.
+ */
+export async function semanticSearch(query: string, opts: SemanticOptions = {}): Promise<SearchHit[]> {
+  const limit = opts.limit ?? 10;
+  const threshold = opts.threshold ?? 0;
+  const hybrid = opts.hybrid ?? true;
+  const useRerank = (opts.rerank ?? false) && RERANK_AVAILABLE;
   if (!query.trim()) return [];
-  const q = embed(query);
-  const titleOf = new Map(embeddableItems().map((i) => [`${i.kind}:${i.id}`, i.title]));
-  const rows = db.prepare("SELECT ref_kind, ref_id, vec FROM embeddings").all() as {
-    ref_kind: string;
-    ref_id: string;
-    vec: string;
-  }[];
-  return rows
-    .map((r) => ({
-      kind: r.ref_kind as SearchHit["kind"],
-      id: r.ref_id,
-      title: titleOf.get(`${r.ref_kind}:${r.ref_id}`) ?? r.ref_id,
-      snippet: "",
-      score: Math.round(cosine(q, json<number[]>(r.vec)) * 1000) / 1000,
+
+  const items = embeddableItems();
+  const titleOf = new Map(items.map((i) => [refKey(i.kind, i.id), i.title]));
+  const textOf = new Map(items.map((i) => [refKey(i.kind, i.id), i.text]));
+
+  // 1. Vector pass — full cosine over model-matched blobs. The model+dim filter
+  // means a partial backfill (mixed models) never compares across dimensions.
+  const q = await embedQuery(query);
+  const rows = db
+    .prepare("SELECT ref_kind, ref_id, vec FROM embeddings WHERE model = ? AND dim = ?")
+    .all(EMBED_MODEL, q.length) as { ref_kind: string; ref_id: string; vec: Buffer }[];
+  const scoredAll = rows
+    .map((r) => ({ k: refKey(r.ref_kind, r.ref_id), score: cosine(q, fromBlob(r.vec)) }))
+    .sort((a, b) => b.score - a.score);
+  const passing = scoredAll.filter((h) => h.score >= threshold);
+  const rawHitKeys = new Set(passing.map((h) => h.k));
+  const vhits = passing.slice(0, Math.max(limit * 2, limit));
+
+  type Score = { vector: number; keyword: number; blanket: number };
+  const scores = new Map<string, Score>();
+  for (const h of vhits) scores.set(h.k, { vector: h.score, keyword: 0, blanket: 0 });
+
+  // 2. Keyword pass (FTS) — rank-based score, decaying from the top.
+  if (hybrid) {
+    const kw = search(query, limit * 2);
+    const total = kw.length || 1;
+    kw.forEach((r, i) => {
+      const kk = refKey(r.kind, r.id);
+      const s = scores.get(kk) ?? { vector: 0, keyword: 0, blanket: 0 };
+      s.keyword = 1 - i / total;
+      scores.set(kk, s);
+    });
+  }
+
+  // 3. Markov-blanket boost: neighbor in the final set (+0.05, cap 0.15),
+  // neighbor that had a vector hit but didn't make the cut (+0.02, cap 0.06).
+  const scoredKeys = new Set(scores.keys());
+  for (const [kk, s] of scores) {
+    const [k, id] = splitKey(kk);
+    let strong = 0;
+    let weak = 0;
+    for (const nk of blanketNeighbors(k, id)) {
+      if (scoredKeys.has(nk)) strong++;
+      else if (rawHitKeys.has(nk)) weak++;
+    }
+    if (strong || weak) s.blanket = Math.min(strong * 0.05, 0.15) + Math.min(weak * 0.02, 0.06);
+  }
+
+  // Drop keyword-only noise — a keyword hit with zero semantic relevance.
+  if (hybrid) for (const [kk, s] of [...scores]) if (s.vector === 0 && s.keyword > 0) scores.delete(kk);
+
+  // 4. Blended sort.
+  let ranked = [...scores.entries()]
+    .map(([k, s]) => ({
+      k,
+      score: s.keyword > 0 && s.vector > 0 ? s.vector * 0.7 + s.keyword * 0.2 + s.blanket : s.vector + s.blanket,
     }))
-    .filter((h) => h.score > 0.01)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
+
+  // 5. Cross-encoder rerank of the top-N (re-orders only; candidate set stays).
+  if (useRerank && ranked.length) {
+    const rr = await rerank(query, ranked.map((r) => textOf.get(r.k) ?? ""));
+    if (rr) ranked = ranked.map((r, i) => ({ k: r.k, score: rr[i] })).sort((a, b) => b.score - a.score);
+  }
+
+  // 6. Fallback — never return empty when vectors exist.
+  if (ranked.length === 0 && scoredAll.length) {
+    ranked = scoredAll.slice(0, limit).map((h) => ({ k: h.k, score: h.score }));
+  }
+
+  return ranked.map((r) => {
+    const [kind, id] = splitKey(r.k);
+    return {
+      kind: kind as SearchHit["kind"],
+      id,
+      title: titleOf.get(r.k) ?? id,
+      snippet: "",
+      score: Math.round(r.score * 1000) / 1000,
+    };
+  });
 }
 
 // ---- worker status ----

@@ -8,8 +8,8 @@ knowledge-graph links, and a wire event log).
 fresh container.
 
 > This replaced an earlier Rust workspace (Postgres + pgvector + a 9-phase auth
-> stack). That tradeoff means: no auth, and semantic search uses a local
-> embedder rather than a hosted model — see the worker section.
+> stack). That tradeoff means: no auth, and semantic search runs a local
+> embedder rather than a hosted model — see [Semantic search](#semantic-search).
 
 ## Stack
 
@@ -50,10 +50,35 @@ pnpm worker:once   # one cycle then exit (CI / demo)
 
 It polls every enabled **source** (RSS) into `feed.item` wire events (optionally
 pinging an inbox), drains the **outbox** (webhooks, with retry/backoff), refreshes
-**embeddings** for semantic search, and runs **maintenance** (WAL checkpoint, FTS
-optimize, prune, vacuum). Sources are configured in the **Settings** tab or via
-MCP. Embeddings use a local offline embedder by default (`hash-ngram-v1`); the
-`embed.ts` seam is where a real transformer drops in.
+**embeddings** for [semantic search](#semantic-search), and runs **maintenance**
+(WAL checkpoint, FTS optimize, prune, vacuum). Sources are configured in the
+**Settings** tab or via MCP. Embeddings carry the model they were made with, so
+flipping the embedder makes the next worker cycle re-backfill automatically.
+
+## Semantic search
+
+Modeled on [`bees-roadhouse/bookstack-mcp`](https://github.com/bees-roadhouse/bookstack-mcp)'s
+pipeline. `semanticSearch` (the `semantic_search` MCP tool and `/api/search?mode=semantic`)
+runs a hybrid rank:
+
+1. **Vector** — brute-force full-cosine over the corpus. Vectors are stored as
+   packed little-endian f32 BLOBs; the scan is sub-10ms at this scale.
+2. **Keyword blend** (`&hybrid=1`, default) — FTS5 keyword rank folded in
+   (`0.7·vector + 0.2·keyword`).
+3. **Markov-blanket boost** — entities whose link-graph neighbors also surfaced
+   get a small bump.
+4. **Cross-encoder rerank** (`&rerank=1`, opt-in) — re-orders the top-N.
+
+Two embedders behind the `embed.ts` seam, chosen by `HIVE_EMBED`:
+
+| `HIVE_EMBED`   | Model                          | Dim  | Notes |
+| -------------- | ------------------------------ | ---- | ----- |
+| `hash` (default) | `hash-ngram-v1`              | 256  | Deterministic, no download — instant in CI/sandbox/offline. No reranker. |
+| `transformers` | `Xenova/bge-large-en-v1.5` + `Xenova/bge-reranker-base` | 1024 | The real stack (same BGE models bookstack-mcp uses), via [@huggingface/transformers](https://github.com/huggingface/transformers.js) on onnxruntime. One-time model download. |
+
+Set `HIVE_EMBED=transformers` on the api **and** worker, then let the worker
+re-backfill. Override the repos with `HIVE_EMBED_MODEL` / `HIVE_RERANK_MODEL`
+(e.g. `Xenova/bge-small-en-v1.5` for a lighter 384d model).
 
 ## Quick start
 
@@ -130,3 +155,6 @@ fresh web session comes up ready to `pnpm dev`. Re-running is safe.
 | `HIVE_DB`      | `node/data/hive.db`     | api        |
 | `HIVE_API_URL` | `http://localhost:8787` | cli, web proxy |
 | `HIVE_ACTOR`   | `cli`                   | cli        |
+| `HIVE_EMBED`   | `hash`                  | api, worker — `transformers` for the real BGE stack |
+| `HIVE_EMBED_MODEL` | `Xenova/bge-large-en-v1.5` | api, worker (transformers mode) |
+| `HIVE_RERANK_MODEL` | `Xenova/bge-reranker-base` | api, worker (transformers mode) |

@@ -20,6 +20,15 @@ db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 
 export function migrate(): void {
+  // Storage-format migration: embeddings.vec moved from JSON-text to packed
+  // little-endian f32 BLOB (matching bookstack-mcp). Drop a stale TEXT-format
+  // table so the worker re-backfills it in the new format. Runs once — after
+  // recreation the column type is BLOB and this is a no-op.
+  const vecCol = db
+    .prepare("SELECT type FROM pragma_table_info('embeddings') WHERE name = 'vec'")
+    .get() as { type: string } | undefined;
+  if (vecCol && vecCol.type.toUpperCase() !== "BLOB") db.exec("DROP TABLE embeddings");
+
   db.exec(`
     -- The journal is the source of truth: append-only, write-once prose.
     CREATE TABLE IF NOT EXISTS journal (
@@ -182,7 +191,7 @@ export function migrate(): void {
       ref_id     TEXT NOT NULL,
       model      TEXT NOT NULL,
       dim        INTEGER NOT NULL,
-      vec        TEXT NOT NULL,
+      vec        BLOB NOT NULL,
       hash       TEXT NOT NULL,
       created_at TEXT NOT NULL,
       PRIMARY KEY (ref_kind, ref_id)
