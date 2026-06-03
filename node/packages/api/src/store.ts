@@ -6,7 +6,11 @@ import {
   type Decision,
   type DecisionPatch,
   type DecisionStatus,
+  type EmbeddingStats,
+  type EntityKind,
   type EventItem,
+  type GraphData,
+  type GraphNode,
   type InboxItem,
   type InboxReason,
   type JournalEntry,
@@ -550,6 +554,35 @@ export const links = {
       .all(refId, refId) as Link[],
 };
 
+/** The whole knowledge graph: every linked entity as a node, every link as an
+ * edge. Node titles are resolved from the entities themselves; an endpoint with
+ * no resolvable title falls back to its id. */
+export function graph(): GraphData {
+  const rows = db
+    .prepare("SELECT source_kind, source_id, target_kind, target_id, rel FROM links ORDER BY created_at")
+    .all() as {
+    source_kind: EntityKind;
+    source_id: string;
+    target_kind: EntityKind;
+    target_id: string;
+    rel: string;
+  }[];
+  const titleOf = new Map(embeddableItems().map((i) => [`${i.kind}:${i.id}`, i.title]));
+  for (const n of notes.list()) titleOf.set(`note:${n.id}`, n.title);
+
+  const nodes = new Map<string, GraphNode>();
+  const addNode = (kind: EntityKind, refId: string) => {
+    const key = `${kind}:${refId}`;
+    if (!nodes.has(key)) nodes.set(key, { id: key, kind, title: titleOf.get(key) ?? refId });
+  };
+  const edges = rows.map((r) => {
+    addNode(r.source_kind, r.source_id);
+    addNode(r.target_kind, r.target_id);
+    return { source: `${r.source_kind}:${r.source_id}`, target: `${r.target_kind}:${r.target_id}`, rel: r.rel };
+  });
+  return { nodes: [...nodes.values()], edges };
+}
+
 // ---- search ----
 
 export function search(query: string, limit = 25): SearchHit[] {
@@ -836,6 +869,34 @@ export const embeddings = {
     return n;
   },
 };
+
+/** Admin view of the embedding corpus: coverage + per-kind/per-model breakdown. */
+export function embeddingStats(): EmbeddingStats {
+  const items = embeddableItems();
+  const stored = new Map(
+    (
+      db.prepare("SELECT ref_kind, ref_id, hash FROM embeddings").all() as {
+        ref_kind: string;
+        ref_id: string;
+        hash: string;
+      }[]
+    ).map((r) => [`${r.ref_kind}:${r.ref_id}`, r.hash]),
+  );
+  let pending = 0;
+  for (const it of items) if (stored.get(`${it.kind}:${it.id}`) !== it.hash) pending++;
+  return {
+    total: embeddings.count(),
+    model: EMBED_MODEL,
+    embeddable: items.length,
+    pending,
+    byKind: db
+      .prepare("SELECT ref_kind AS kind, count(*) AS count FROM embeddings GROUP BY ref_kind ORDER BY count DESC")
+      .all() as { kind: string; count: number }[],
+    byModel: db
+      .prepare("SELECT model, dim, count(*) AS count FROM embeddings GROUP BY model, dim ORDER BY count DESC")
+      .all() as { model: string; dim: number; count: number }[],
+  };
+}
 
 /** Rank stored embeddings by cosine similarity to the query. */
 export function semanticSearch(query: string, limit = 10): SearchHit[] {

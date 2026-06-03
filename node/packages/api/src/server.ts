@@ -7,7 +7,9 @@ import { handleMcp } from "./mcp.ts";
 import {
   dashboard,
   decisions,
+  embeddingStats,
   events,
+  graph,
   inbox,
   journal,
   links,
@@ -105,6 +107,7 @@ app.get("/api/search", (c) => {
 });
 app.get("/api/wire", (c) => c.json(wire(Number(c.req.query("limit") ?? 100))));
 app.get("/api/dashboard", (c) => c.json(dashboard()));
+app.get("/api/graph", (c) => c.json(graph()));
 
 // ---- worker config: sources (GUI + MCP configurable) ----
 app.get("/api/sources", (c) => c.json(sources.list()));
@@ -122,9 +125,10 @@ app.delete("/api/sources/:id", (c) =>
   sources.remove(c.req.param("id"), actor(c)) ? c.body(null, 204) : c.json({ error: "not found" }, 404),
 );
 
-// ---- worker status + outbox ----
+// ---- worker status + outbox + embeddings (admin) ----
 app.get("/api/worker", (c) => c.json(workerStatus()));
 app.get("/api/outbox", (c) => c.json(outbox.list(Number(c.req.query("limit") ?? 50))));
+app.get("/api/embeddings", (c) => c.json(embeddingStats()));
 
 // A locally-served sample RSS feed so feed ingestion is real (and demoable)
 // without depending on outbound network in the sandbox.
