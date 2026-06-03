@@ -191,6 +191,9 @@ app.get("/api/search", async (c) => {
   // ?mode=semantic uses the local embedder; default is FTS keyword search.
   // Semantic flags: &hybrid=0 to disable the keyword blend, &rerank=1 for the
   // cross-encoder pass, &threshold=<n> to drop weak vector matches.
+  // Results are scoped to the acting user's visible entries (permission-honoring,
+  // like bookstack-mcp). ?viewer= overrides the x-hive-actor header.
+  const viewer = c.req.query("viewer") ?? actor(c);
   if (c.req.query("mode") === "semantic") {
     const flag = (name: string) => c.req.query(name) === "1" || c.req.query(name) === "true";
     const thr = c.req.query("threshold");
@@ -200,10 +203,11 @@ app.get("/api/search", async (c) => {
         hybrid: c.req.query("hybrid") !== "0" && c.req.query("hybrid") !== "false",
         rerank: flag("rerank"),
         threshold: thr ? Number(thr) : undefined,
+        viewer,
       }),
     );
   }
-  return c.json(search(q, limit));
+  return c.json(search(q, limit, viewer));
 });
 app.get("/api/wire", (c) => c.json(wire(Number(c.req.query("limit") ?? 100))));
 app.get("/api/dashboard", (c) => c.json(dashboard()));

@@ -1121,27 +1121,89 @@ export function graph(): GraphData {
 
 // ---- search ----
 
-export function search(query: string, limit = 25): SearchHit[] {
+/** Journal entry ids visible to a viewer — the permission boundary every read
+ * (feed, search, entity reads) filters through. Mirrors visibleJournal's rule:
+ * own entries + owned/related/mentioned AIs + shared entries + journal shares. */
+export function visibleEntryIds(viewer: string): Set<string> {
+  const col = (rows: unknown[], key: string) => (rows as Record<string, string>[]).map((r) => r[key]);
+  const ownedAi = col(db.prepare("SELECT slug FROM people WHERE kind='ai' AND owner=?").all(viewer), "slug");
+  const linkedAi = col(
+    db
+      .prepare(
+        `SELECT DISTINCT j.author author FROM journal j
+           JOIN links l ON l.source_kind='journal' AND l.source_id=j.id
+          WHERE l.target_kind='person' AND l.target_id=?
+            AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')`,
+      )
+      .all(viewer),
+    "author",
+  );
+  const mentionedAi = col(
+    db
+      .prepare(
+        `SELECT DISTINCT j.author author FROM journal j
+          WHERE j.mentions LIKE ? AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')`,
+      )
+      .all(`%"${viewer}"%`),
+    "author",
+  );
+  const journalShared = col(db.prepare("SELECT ref FROM shares WHERE scope='journal' AND viewer=?").all(viewer), "ref");
+  const authors = new Set<string>([viewer, ...ownedAi, ...linkedAi, ...mentionedAi, ...journalShared]);
+
+  const ids = new Set<string>([
+    ...col(db.prepare("SELECT ref FROM shares WHERE scope='entry' AND viewer=?").all(viewer), "ref"),
+    ...col(db.prepare("SELECT id FROM journal WHERE mentions LIKE ?").all(`%"${viewer}"%`), "id"),
+  ]);
+  if (authors.size) {
+    const ph = [...authors].map(() => "?").join(",");
+    for (const r of db.prepare(`SELECT id FROM journal WHERE author IN (${ph})`).all(...authors) as { id: string }[]) {
+      ids.add(r.id);
+    }
+  }
+  return ids;
+}
+
+const ORIGIN_TABLE: Record<string, string> = { task: "tasks", decision: "decisions", event: "events" };
+
+/** Drop search hits a viewer can't see: a journal entry they can read, or an
+ * entity that emerged from one. (bookstack-mcp does the equivalent ACL filter.) */
+function scopeHits(hits: SearchHit[], viewer: string): SearchHit[] {
+  const visible = visibleEntryIds(viewer);
+  return hits.filter((h) => {
+    if (h.kind === "journal") return visible.has(h.id);
+    const table = ORIGIN_TABLE[h.kind];
+    if (!table) return false;
+    const r = db.prepare(`SELECT origin_entry_id FROM ${table} WHERE id = ?`).get(h.id) as
+      | { origin_entry_id: string | null }
+      | undefined;
+    return r?.origin_entry_id ? visible.has(r.origin_entry_id) : false;
+  });
+}
+
+export function search(query: string, limit = 25, viewer?: string): SearchHit[] {
   if (!query.trim()) return [];
+  // Over-fetch when scoping so permission filtering doesn't starve the result.
+  const fetch = viewer ? limit * 5 : limit;
   const rows = db
     .prepare(
       `SELECT kind, ref_id, title, snippet(search, 3, '[', ']', '…', 12) AS snip, bm25(search) AS rank
        FROM search WHERE search MATCH ? ORDER BY rank LIMIT ?`,
     )
-    .all(toMatchQuery(query), limit) as {
+    .all(toMatchQuery(query), fetch) as {
     kind: SearchHit["kind"];
     ref_id: string;
     title: string;
     snip: string;
     rank: number;
   }[];
-  return rows.map((r) => ({
+  const hits = rows.map((r) => ({
     kind: r.kind,
     id: r.ref_id,
     title: r.title,
     snippet: r.snip,
     score: Math.round((1 / (1 + Math.abs(r.rank))) * 1000) / 1000,
   }));
+  return (viewer ? scopeHits(hits, viewer) : hits).slice(0, limit);
 }
 
 function toMatchQuery(q: string): string {
@@ -1592,6 +1654,8 @@ export interface SemanticOptions {
   hybrid?: boolean;
   /** Re-order the top-N with the cross-encoder, when one is available. */
   rerank?: boolean;
+  /** Scope results to entries this viewer may see (own + owned/shared/mentioned). */
+  viewer?: string;
 }
 
 const refKey = (kind: string, id: string) => `${kind}:${id}`;
@@ -1697,7 +1761,7 @@ export async function semanticSearch(query: string, opts: SemanticOptions = {}):
     ranked = scoredAll.slice(0, limit).map((h) => ({ k: h.k, score: h.score }));
   }
 
-  return ranked.map((r) => {
+  const hits = ranked.map((r) => {
     const [kind, id] = splitKey(r.k);
     return {
       kind: kind as SearchHit["kind"],
@@ -1707,6 +1771,7 @@ export async function semanticSearch(query: string, opts: SemanticOptions = {}):
       score: Math.round(r.score * 1000) / 1000,
     };
   });
+  return opts.viewer ? scopeHits(hits, opts.viewer) : hits;
 }
 
 // ---- worker status ----
