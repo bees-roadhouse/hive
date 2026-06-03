@@ -45,7 +45,9 @@ app.get("/api/healthz", (c) =>
 );
 
 // ---- journal (the one write path) ----
-app.get("/api/journal", (c) => c.json(journal.list(Number(c.req.query("limit") ?? 50))));
+app.get("/api/journal", (c) =>
+  c.json(journal.list(Number(c.req.query("limit") ?? 50), Number(c.req.query("offset") ?? 0))),
+);
 app.post("/api/journal", async (c) => {
   const body = (await c.req.json()) as NewJournalEntry;
   if (!body?.body?.trim()) return c.json({ error: "body required" }, 400);

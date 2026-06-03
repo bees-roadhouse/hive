@@ -234,6 +234,23 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 .graph-svg .node.sel text { fill: var(--ink); font-weight: 600; }
 .graph-svg .node.faded { opacity: 0.28; }
 
+/* ---- line-icon system ---- */
+.icon { display: inline-block; vertical-align: -0.18em; flex: none; }
+.sidebar nav .nav-icon { display: inline-flex; align-items: center; color: inherit; }
+
+/* ---- journal: one comb cell (day page) per day, infinite scroll ---- */
+.day { margin-bottom: 1.4rem; }
+.day-head {
+  display: flex; align-items: center; gap: 0.55rem;
+  position: sticky; top: 0; z-index: 2;
+  padding: 0.7rem 0 0.55rem;
+  background: linear-gradient(var(--bg) 78%, transparent);
+}
+.day-head h3 { margin: 0; font-size: 1.02rem; letter-spacing: 0.01em; }
+.day-head .comb { color: var(--honey); }
+.day-head .dim.sm { margin-left: auto; font-variant-numeric: tabular-nums; }
+.sentinel { display: flex; justify-content: center; align-items: center; padding: 1.3rem 0; min-height: 2.2rem; }
+
 @media (max-width: 760px) {
   .board, .kpis { grid-template-columns: 1fr 1fr; }
   .dash-grid { grid-template-columns: 1fr; }

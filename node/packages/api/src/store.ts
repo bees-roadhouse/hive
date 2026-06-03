@@ -355,10 +355,10 @@ const anchorsFor = (entryId: string): ResolvedAnchor[] =>
 // ---- journal (write-only source of truth) ----
 
 export const journal = {
-  list(limit = 100): JournalEntryView[] {
+  list(limit = 100, offset = 0): JournalEntryView[] {
     const rows = db
-      .prepare("SELECT * FROM journal ORDER BY created_at DESC LIMIT ?")
-      .all(limit) as (Omit<JournalEntry, "tags" | "mentions"> & { tags: string; mentions: string })[];
+      .prepare("SELECT * FROM journal ORDER BY created_at DESC LIMIT ? OFFSET ?")
+      .all(limit, offset) as (Omit<JournalEntry, "tags" | "mentions"> & { tags: string; mentions: string })[];
     return rows.map((r) => ({
       ...r,
       tags: json(r.tags),

@@ -33,7 +33,8 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  journal: (limit = 50) => req<JournalEntryView[]>(`/journal?limit=${limit}`),
+  journal: (limit = 50, offset = 0) =>
+    req<JournalEntryView[]>(`/journal?limit=${limit}&offset=${offset}`),
   append: (e: NewJournalEntry) =>
     req<JournalEntryView>("/journal", { method: "POST", body: JSON.stringify(e) }),
 
