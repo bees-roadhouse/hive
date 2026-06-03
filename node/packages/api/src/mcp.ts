@@ -68,7 +68,7 @@ export function buildMcpServer(): McpServer {
         "Write an immutable prose entry. Optionally attach anchors: each is a {start,end} char span of `body` that materialises a task/decision/event anchored to that text. @mentions notify inboxes.",
       inputSchema: {
         author: z.enum(ACTOR_NAMES as [string, ...string[]]),
-        body: z.string().describe("the prose; this is the source of truth"),
+        body: z.string().describe("the prose (Markdown supported); this is the source of truth"),
         tags: z.array(z.string()).optional(),
         anchors: z.array(anchorSchema).optional(),
       },

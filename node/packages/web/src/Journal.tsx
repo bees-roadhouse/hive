@@ -2,8 +2,9 @@ import { createMemo, createSignal, For, onCleanup, onMount, Show, type Component
 import type { AnchorKind, JournalEntryView, NewAnchor, Priority, ResolvedAnchor } from "@hive/shared";
 import { PRIORITIES } from "@hive/shared";
 import { api, getActor } from "./api.ts";
-import { ANCHOR_GLYPH, Prose, relTime } from "./lib.tsx";
+import { ANCHOR_GLYPH, relTime } from "./lib.tsx";
 import { Icon } from "./icons.tsx";
+import { JournalBody, Markdown } from "./markdown.tsx";
 import { EntityCard } from "./Boards.tsx";
 
 interface Pending {
@@ -29,6 +30,7 @@ function dayLabel(iso: string): string {
 
 export const Journal: Component = () => {
   const [body, setBody] = createSignal("");
+  const [preview, setPreview] = createSignal(false);
   const [pending, setPending] = createSignal<Pending[]>([]);
   const [sel, setSel] = createSignal<{ start: number; end: number }>({ start: 0, end: 0 });
   const [open, setOpen] = createSignal<ResolvedAnchor | null>(null);
@@ -90,6 +92,33 @@ export const Journal: Component = () => {
   const trackSel = () => setSel({ start: ta.selectionStart, end: ta.selectionEnd });
   const selectedText = () => body().slice(sel().start, sel().end).trim();
 
+  // Markdown toolbar — for writers who don't know the syntax. Wrap/prefix the
+  // current selection, then restore focus + selection so anchoring still works.
+  const surround = (pre: string, post = pre) => {
+    const s = ta.selectionStart;
+    const e = ta.selectionEnd;
+    const v = body();
+    const chosen = v.slice(s, e) || "text";
+    setBody(v.slice(0, s) + pre + chosen + post + v.slice(e));
+    queueMicrotask(() => {
+      ta.focus();
+      ta.selectionStart = s + pre.length;
+      ta.selectionEnd = s + pre.length + chosen.length;
+      trackSel();
+    });
+  };
+  const prefixLine = (prefix: string) => {
+    const s = ta.selectionStart;
+    const v = body();
+    const lineStart = v.lastIndexOf("\n", s - 1) + 1;
+    setBody(v.slice(0, lineStart) + prefix + v.slice(lineStart));
+    queueMicrotask(() => {
+      ta.focus();
+      ta.selectionStart = ta.selectionEnd = s + prefix.length;
+      trackSel();
+    });
+  };
+
   const mark = (kind: AnchorKind) => {
     const text = body().slice(sel().start, sel().end).trim();
     if (!text) return;
@@ -126,20 +155,50 @@ export const Journal: Component = () => {
   return (
     <section class="journal">
       <div class="composer">
-        <div class="composer-hint">
-          Write what happened. Select any phrase, then tag it — it becomes a task, decision, or
-          event anchored to that text. <span class="mention">@mention</span> to notify someone.
+        <div class="composer-top">
+          <div class="composer-hint">
+            Write what happened in <strong>markdown</strong>. Select any phrase, then tag it — it
+            becomes a task, decision, or event anchored to that text.{" "}
+            <span class="mention">@mention</span> to notify someone.
+          </div>
+          <div class="seg">
+            <button classList={{ active: !preview() }} onClick={() => setPreview(false)}>
+              write
+            </button>
+            <button classList={{ active: preview() }} onClick={() => setPreview(true)}>
+              preview
+            </button>
+          </div>
         </div>
-        <textarea
-          ref={ta}
-          rows={4}
-          placeholder="e.g. Synced with @pia — we'll ship the Solid UI this week. Decided to stay on SQLite."
-          value={body()}
-          onInput={(e) => setBody(e.currentTarget.value)}
-          onSelect={trackSel}
-          onMouseUp={trackSel}
-          onKeyUp={trackSel}
-        />
+        <Show
+          when={!preview()}
+          fallback={
+            <div class="composer-preview">
+              <Markdown src={body().trim() || "*nothing to preview yet*"} />
+            </div>
+          }
+        >
+          <div class="md-toolbar">
+            <button title="bold" onClick={() => surround("**")}><b>B</b></button>
+            <button title="italic" onClick={() => surround("_")}><i>I</i></button>
+            <button title="inline code" onClick={() => surround("`")}>{"</>"}</button>
+            <button title="heading" onClick={() => prefixLine("## ")}>H</button>
+            <button title="bullet" onClick={() => prefixLine("- ")}>•</button>
+            <button title="checkbox task" onClick={() => prefixLine("- [ ] ")}>☑</button>
+            <button title="quote" onClick={() => prefixLine("> ")}>❝</button>
+            <button title="link" onClick={() => surround("[", "](https://)")}>🔗</button>
+          </div>
+          <textarea
+            ref={ta}
+            rows={4}
+            placeholder="e.g. Synced with @pia — we'll ship the **Solid UI** this week. Decided to stay on `SQLite`."
+            value={body()}
+            onInput={(e) => setBody(e.currentTarget.value)}
+            onSelect={trackSel}
+            onMouseUp={trackSel}
+            onKeyUp={trackSel}
+          />
+        </Show>
         <div class="composer-bar">
           <div class="mark-group">
             <span class="dim">
@@ -205,7 +264,7 @@ export const Journal: Component = () => {
                         </span>
                       </Show>
                     </header>
-                    <Prose body={e.body} anchors={e.anchors} onAnchor={setOpen} />
+                    <JournalBody body={e.body} anchors={e.anchors} onAnchor={setOpen} />
                   </article>
                 )}
               </For>
