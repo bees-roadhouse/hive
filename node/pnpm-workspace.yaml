@@ -5,6 +5,18 @@ packages:
 allowBuilds:
   better-sqlite3: true
   esbuild: true
+  # Native deps of the optional transformers embedder (HIVE_EMBED=transformers):
+  # onnxruntime backend, sharp (its prebuilt image binary), protobuf codegen.
+  onnxruntime-node: true
+  sharp: true
+  protobufjs: true
+
+# transformers.js (the optional HIVE_EMBED=transformers embedder) imports
+# `onnxruntime-common` directly, but it's a transitive dep of onnxruntime-node.
+# pnpm's strict node_modules won't resolve it unless the onnxruntime packages are
+# hoisted to a publicly-visible location.
+publicHoistPattern:
+  - "*onnxruntime*"
 
 # Don't re-run an install check before every `pnpm <script>` — it's noisy in a
 # workspace and trips the registry release-age policy.
