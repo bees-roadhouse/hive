@@ -1,14 +1,17 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // SQLite is the whole datastore — zero infra, spins up instantly in a fresh
 // container. FTS5 (bundled in better-sqlite3) gives unified search across the
 // journal and every structured entity that emerges from it.
 
-const DB_PATH = resolve(
-  process.env.HIVE_DB ?? new URL("../../../data/hive.db", import.meta.url).pathname,
-);
+// fileURLToPath (not URL.pathname) so Windows drive paths resolve correctly —
+// `.pathname` yields "/C:/…" which resolve() then turns into "C:\C:\…".
+const DB_PATH = process.env.HIVE_DB
+  ? resolve(process.env.HIVE_DB)
+  : fileURLToPath(new URL("../../../data/hive.db", import.meta.url));
 
 mkdirSync(dirname(DB_PATH), { recursive: true });
 
