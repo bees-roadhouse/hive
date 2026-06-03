@@ -144,6 +144,14 @@ export const Journal: Component = () => {
   // Rich mode reads/writes it via TipTap; source mode reads/writes it directly.
   const [markdownBody, setMarkdownBody] = createSignal("");
 
+  // tiptap-markdown escapes `[`/`]` (markdown link syntax), turning our entity
+  // tokens into `\[person: …\]`. Restore them so the parser + feed recognise them.
+  const cleanTokens = (md: string) =>
+    md.replace(
+      /\\\[(person|topic|project|phase|task):\s*([^\]\\]+)\\\]/gi,
+      (_m, k: string, l: string) => `[${k}: ${l.trim()}]`,
+    );
+
   // ---- pending anchors ----
   const [pending, setPending] = createSignal<Pending[]>([]);
 
@@ -291,7 +299,7 @@ export const Journal: Component = () => {
       onUpdate({ editor: ed }) {
         // Keep markdownBody in sync so submit always has fresh source.
         const md = (ed.storage.markdown as { getMarkdown(): string }).getMarkdown();
-        setMarkdownBody(md);
+        setMarkdownBody(cleanTokens(md));
 
         // Drive autocomplete on content change (same as textarea's onInput).
         const { from } = ed.state.selection;
@@ -338,7 +346,7 @@ export const Journal: Component = () => {
     // Flush editor markdown to signal before swapping mode.
     if (editor) {
       const md = (editor.storage.markdown as { getMarkdown(): string }).getMarkdown();
-      setMarkdownBody(md);
+      setMarkdownBody(cleanTokens(md));
     }
     setEditorMode("source");
     queueMicrotask(() => { if (sourceTA) sourceTA.focus(); });
@@ -505,9 +513,11 @@ export const Journal: Component = () => {
 
   // ---- submit ----
   const post = async () => {
-    const md = editorMode() === "rich"
-      ? (editor?.storage.markdown as { getMarkdown(): string } | undefined)?.getMarkdown() ?? markdownBody()
-      : markdownBody();
+    const md = cleanTokens(
+      editorMode() === "rich"
+        ? (editor?.storage.markdown as { getMarkdown(): string } | undefined)?.getMarkdown() ?? markdownBody()
+        : markdownBody(),
+    );
     if (!md.trim()) return;
 
     // Recompute anchor offsets from the serialised markdown at submit time.
