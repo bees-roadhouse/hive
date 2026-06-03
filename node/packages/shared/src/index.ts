@@ -14,6 +14,49 @@ export interface ActorInfo {
   kind: ActorKind;
 }
 
+// ---- people (the writers; kind human|ai) ----
+
+export interface Person {
+  id: string;
+  slug: string;
+  name: string;
+  kind: ActorKind;
+  /** For AI writers: the slug of their human owner. null for humans. */
+  owner: string | null;
+  created_at: string;
+}
+
+export type PersonPatch = Partial<Pick<Person, "name" | "kind" | "owner">>;
+
+// ---- shares ----
+
+export type ShareScope = "entry" | "journal";
+
+export interface Share {
+  id: string;
+  /** 'entry' → ref is a journal entry id; 'journal' → ref is an author slug. */
+  scope: ShareScope;
+  ref: string;
+  /** Person slug the share is granted to. */
+  viewer: string;
+  created_at: string;
+}
+
+export interface NewShare {
+  scope: ShareScope;
+  ref: string;
+  viewer: string;
+}
+
+// ---- journal writers (for filter UI) ----
+
+export interface JournalWriter {
+  slug: string;
+  name: string;
+  kind: ActorKind;
+  owner: string | null;
+}
+
 /** The known cast. Mentions resolve against these to drive inboxes. */
 export const ACTORS: ActorInfo[] = [
   { name: "nate", kind: "human" },
@@ -375,7 +418,6 @@ export interface NewJournalEntry {
 
 export type TaskPatch = Partial<Pick<Task, "status" | "priority" | "assignees" | "title" | "body" | "tags">>;
 export type DecisionPatch = Partial<Pick<Decision, "status" | "title" | "context" | "decision" | "consequences" | "tags" | "assignees">>;
-export type PersonPatch = Partial<Pick<Person, "name" | "kind">>;
 
 /** Pull @mentions of known actors out of prose. */
 export function parseMentions(text: string): string[] {

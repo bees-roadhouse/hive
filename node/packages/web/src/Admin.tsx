@@ -8,6 +8,11 @@ import { liveRev } from "./live.ts";
 
 const WritersSection: Component = () => {
   const [people, { refetch }] = createResource(() => ({ _r: liveRev() }), () => api.people());
+  const humans = () => (people() ?? []).filter((p) => p.kind === "human");
+  const setOwner = async (p: Person, owner: string) => {
+    await api.patchPerson(p.slug, { owner: owner || null });
+    refetch();
+  };
 
   // Add-writer form state
   const [newName, setNewName] = createSignal("");
@@ -20,7 +25,7 @@ const WritersSection: Component = () => {
   const [editKind, setEditKind] = createSignal<"human" | "ai">("human");
 
   const startEdit = (p: Person) => {
-    setEditId(p.id);
+    setEditId(p.slug);
     setEditName(p.name);
     setEditKind(p.kind);
   };
@@ -78,7 +83,7 @@ const WritersSection: Component = () => {
           {(p) => (
             <div class="source-row">
               <Show
-                when={editId() === p.id}
+                when={editId() === p.slug}
                 fallback={
                   <>
                     <span class="source-main">
@@ -88,6 +93,19 @@ const WritersSection: Component = () => {
                       </span>
                       <span class="dim sm">{p.slug}</span>
                     </span>
+                    <Show when={p.kind === "ai"}>
+                      <label class="writer-owner-label dim sm">
+                        owner&nbsp;
+                        <select
+                          class="writer-owner-select"
+                          value={p.owner ?? ""}
+                          onChange={(e) => setOwner(p, e.currentTarget.value)}
+                        >
+                          <option value="">none</option>
+                          <For each={humans()}>{(h) => <option value={h.slug}>{h.name}</option>}</For>
+                        </select>
+                      </label>
+                    </Show>
                     <button class="ghost" onClick={() => startEdit(p)}>edit</button>
                   </>
                 }

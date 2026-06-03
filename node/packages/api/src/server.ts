@@ -2,7 +2,15 @@ import { createServer } from "node:http";
 import { getRequestListener } from "@hono/node-server";
 import { Hono } from "hono";
 import type { ServerResponse } from "node:http";
-import type { DecisionPatch, NewJournalEntry, NewSource, SourcePatch, TaskPatch, PersonPatch } from "@hive/shared";
+import type {
+  DecisionPatch,
+  NewJournalEntry,
+  NewShare,
+  NewSource,
+  PersonPatch,
+  SourcePatch,
+  TaskPatch,
+} from "@hive/shared";
 import { migrate } from "./db.ts";
 import { handleMcp } from "./mcp.ts";
 import { subscribe } from "./bus.ts";
@@ -15,6 +23,7 @@ import {
   graph,
   inbox,
   journal,
+  journalWriters,
   links,
   outbox,
   people,
@@ -23,9 +32,11 @@ import {
   search,
   seedActors,
   semanticSearch,
+  shares,
   sources,
   tasks,
   topics,
+  visibleJournal,
   wire,
   workerStatus,
 } from "./store.ts";
@@ -53,9 +64,22 @@ app.get("/api/healthz", (c) =>
 );
 
 // ---- journal (the one write path) ----
-app.get("/api/journal", (c) =>
-  c.json(journal.list(Number(c.req.query("limit") ?? 50), Number(c.req.query("offset") ?? 0))),
-);
+app.get("/api/journal/writers", (c) => {
+  const viewer = c.req.query("viewer");
+  if (!viewer) return c.json({ error: "viewer required" }, 400);
+  return c.json(journalWriters(viewer));
+});
+app.get("/api/journal", (c) => {
+  const limit = Number(c.req.query("limit") ?? 50);
+  const offset = Number(c.req.query("offset") ?? 0);
+  const viewer = c.req.query("viewer");
+  if (viewer) {
+    const writersParam = c.req.query("writers");
+    const writers = writersParam ? writersParam.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
+    return c.json(visibleJournal({ viewer, writers, limit, offset }));
+  }
+  return c.json(journal.list(limit, offset));
+});
 app.post("/api/journal", async (c) => {
   const body = (await c.req.json()) as NewJournalEntry;
   if (!body?.body?.trim()) return c.json({ error: "body required" }, 400);
@@ -106,22 +130,36 @@ app.get("/api/inbox/:recipient", (c) => {
 app.post("/api/inbox/:recipient/read", (c) => c.json({ marked: inbox.markAllRead(c.req.param("recipient")) }));
 app.post("/api/inbox/item/:id/read", (c) => c.json({ marked: inbox.markRead(c.req.param("id")) }));
 
-// ---- misc ----
+// ---- people (writers: humans + AIs with ownership) ----
 app.get("/api/people", (c) => c.json(people.list()));
+app.get("/api/people/:slug", (c) => {
+  const p = people.get(c.req.param("slug"));
+  return p ? c.json(p) : c.json({ error: "not found" }, 404);
+});
+app.patch("/api/people/:slug", async (c) => {
+  const patch = (await c.req.json()) as PersonPatch;
+  const p = people.update(c.req.param("slug"), patch, actor(c));
+  return p ? c.json(p) : c.json({ error: "not found" }, 404);
+});
 app.post("/api/people", async (c) => {
   const body = (await c.req.json()) as { name: string; kind?: "human" | "ai" };
   if (!body?.name?.trim()) return c.json({ error: "name required" }, 400);
   return c.json(people.create(body, actor(c)), 201);
 });
-app.get("/api/people/:id", (c) => {
-  const p = people.get(c.req.param("id"));
-  return p ? c.json(p) : c.json({ error: "not found" }, 404);
+
+// ---- shares ----
+app.post("/api/shares", async (c) => {
+  const body = (await c.req.json()) as NewShare;
+  if (!body?.scope || !body?.ref || !body?.viewer) return c.json({ error: "scope, ref, viewer required" }, 400);
+  return c.json(shares.create(body), 201);
 });
-app.patch("/api/people/:id", async (c) => {
-  const patch = (await c.req.json()) as PersonPatch;
-  const p = people.update(c.req.param("id"), patch, actor(c));
-  return p ? c.json(p) : c.json({ error: "not found" }, 404);
+app.get("/api/shares", (c) => {
+  const viewer = c.req.query("viewer");
+  if (!viewer) return c.json({ error: "viewer required" }, 400);
+  return c.json(shares.forViewer(viewer));
 });
+
+// ---- misc ----
 app.get("/api/topics", (c) => c.json(topics.list()));
 app.get("/api/topics/:id", (c) => {
   const t = topics.get(c.req.param("id"));

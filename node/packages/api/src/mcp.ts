@@ -15,6 +15,7 @@ import {
   projects,
   search,
   semanticSearch,
+  shares,
   sources,
   tasks,
   topics,
@@ -254,7 +255,7 @@ export function buildMcpServer(): McpServer {
 
   server.registerTool(
     "people_list",
-    { title: "List people", description: "People and AI actors known to the hive.", inputSchema: {} },
+    { title: "List writers", description: "All known writers (humans + AIs) with their ownership.", inputSchema: {} },
     async () => ok(people.list()),
   );
 
@@ -278,6 +279,24 @@ export function buildMcpServer(): McpServer {
       inputSchema: { project_id: z.string().optional() },
     },
     async ({ project_id }) => ok(phases.list(project_id)),
+  );
+
+  // ---- shares ----
+  server.registerTool(
+    "share_entry",
+    {
+      title: "Share a journal entry or author's journal",
+      description:
+        "Grant a viewer visibility into a specific entry (scope='entry', ref=entry_id) " +
+        "or an author's entire journal stream (scope='journal', ref=author_slug). " +
+        "Idempotent — safe to call multiple times.",
+      inputSchema: {
+        scope: z.enum(["entry", "journal"]).describe("'entry' for a single entry; 'journal' for all entries by an author"),
+        ref: z.string().describe("journal entry id (scope=entry) or author slug (scope=journal)"),
+        viewer: z.enum(ACTOR_NAMES as [string, ...string[]]).describe("the actor who gains visibility"),
+      },
+    },
+    async ({ scope, ref, viewer }) => ok(shares.create({ scope, ref, viewer })),
   );
 
   return server;

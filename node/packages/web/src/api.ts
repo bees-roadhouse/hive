@@ -7,7 +7,9 @@ import type {
   GraphData,
   InboxItem,
   JournalEntryView,
+  JournalWriter,
   NewJournalEntry,
+  NewShare,
   NewSource,
   OutboxJob,
   Person,
@@ -15,6 +17,7 @@ import type {
   Phase,
   Project,
   SearchHit,
+  Share,
   Source,
   SourceKind,
   SourcePatch,
@@ -55,6 +58,13 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   journal: (limit = 50, offset = 0) =>
     req<JournalEntryView[]>(`/journal?limit=${limit}&offset=${offset}`),
+  journalScoped: (viewer: string, writers?: string[], limit = 50, offset = 0) => {
+    const p = new URLSearchParams({ viewer, limit: String(limit), offset: String(offset) });
+    if (writers && writers.length > 0) p.set("writers", writers.join(","));
+    return req<JournalEntryView[]>(`/journal?${p}`);
+  },
+  journalWriters: (viewer: string) =>
+    req<JournalWriter[]>(`/journal/writers?viewer=${encodeURIComponent(viewer)}`),
   append: (e: NewJournalEntry) =>
     req<JournalEntryView>("/journal", { method: "POST", body: JSON.stringify(e) }),
 
@@ -99,11 +109,16 @@ export const api = {
   people: () => req<Person[]>("/people"),
   addPerson: (p: { name: string; kind?: "human" | "ai" }) =>
     req<Person>("/people", { method: "POST", body: JSON.stringify(p) }),
-  patchPerson: (id: string, p: PersonPatch) =>
-    req<Person>(`/people/${id}`, { method: "PATCH", body: JSON.stringify(p) }),
+  patchPerson: (slug: string, patch: PersonPatch) =>
+    req<Person>(`/people/${slug}`, { method: "PATCH", body: JSON.stringify(patch) }),
 
   topics: () => req<Topic[]>("/topics"),
   projects: () => req<Project[]>("/projects"),
   projectById: (id: string) =>
     req<Project & { tasks: Task[]; phases: Phase[] }>(`/projects/${id}`),
+
+  createShare: (share: NewShare) =>
+    req<Share>("/shares", { method: "POST", body: JSON.stringify(share) }),
+  shares: (viewer: string) =>
+    req<Share[]>(`/shares?viewer=${encodeURIComponent(viewer)}`),
 };

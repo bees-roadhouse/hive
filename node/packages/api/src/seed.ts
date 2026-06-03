@@ -2,7 +2,7 @@
 // spans of the prose anchored into tasks / decisions / events. Offsets are
 // computed from the text with a small helper so the entries stay readable.
 import { migrate } from "./db.ts";
-import { journal, outbox, seedActors, sources } from "./store.ts";
+import { journal, outbox, people, seedActors, sources } from "./store.ts";
 import type { AnchorKind, AnchorFields } from "@hive/shared";
 
 migrate();
@@ -151,4 +151,4 @@ outbox.enqueue("log", { note: "hello from the seed — worker will drain this" }
   write("nate", body, [], ["roadhouse"]);
 }
 
-console.log("🌱 seeded hive: journal + anchors, inboxes, a sample RSS source, a scrape source, an outbox job, and bracket-token entries.");
+console.log("🌱 seeded hive: people, journal + anchors, inboxes, a sample RSS source, a scrape source, an outbox job, and bracket-token entries.");
