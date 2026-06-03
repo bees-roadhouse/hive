@@ -1,6 +1,57 @@
-import { createResource, For, Show, type Component } from "solid-js";
+import { createResource, createSignal, For, Show, type Component } from "solid-js";
+import type { Person } from "@hive/shared";
 import { api } from "./api.ts";
 import { relTime } from "./lib.tsx";
+
+/** Writers section: lists all people and lets the owner of an AI be changed. */
+const WritersSection: Component = () => {
+  const [persons, { refetch }] = createResource(() => api.people());
+  const humans = () => (persons() ?? []).filter((p) => p.kind === "human");
+
+  const setOwner = async (person: Person, owner: string) => {
+    await api.patchPerson(person.slug, { owner: owner || null });
+    refetch();
+  };
+
+  return (
+    <div class="writers-section">
+      <h3 class="sec">Writers</h3>
+      <Show when={persons()} fallback={<p class="dim sm">loading…</p>}>
+        {(ps) => (
+          <div class="writers-list">
+            <For each={ps()}>
+              {(p) => (
+                <div class="writer-row">
+                  <span class={`badge kind-${p.kind}`}>{p.kind}</span>
+                  <code class="writer-slug">{p.slug}</code>
+                  <span class="writer-name">{p.name}</span>
+                  <Show
+                    when={p.kind === "ai"}
+                    fallback={<span class="dim sm writer-owner-placeholder">—</span>}
+                  >
+                    <label class="writer-owner-label dim sm">
+                      owner&nbsp;
+                      <select
+                        class="writer-owner-select"
+                        value={p.owner ?? ""}
+                        onChange={(e) => setOwner(p, e.currentTarget.value)}
+                      >
+                        <option value="">none</option>
+                        <For each={humans()}>
+                          {(h) => <option value={h.slug}>{h.name}</option>}
+                        </For>
+                      </select>
+                    </label>
+                  </Show>
+                </div>
+              )}
+            </For>
+          </div>
+        )}
+      </Show>
+    </div>
+  );
+};
 
 /** Operational view: worker heartbeat + last cycle, embedding coverage, and the
  * outbound job queue. Read-only — the worker drives the writes. */
@@ -19,6 +70,8 @@ export const Admin: Component = () => {
 
   return (
     <section class="admin">
+      <WritersSection />
+
       <div class="admin-head">
         <h3 class="sec">Worker</h3>
         <button class="ghost" onClick={refresh}>↻ refresh</button>

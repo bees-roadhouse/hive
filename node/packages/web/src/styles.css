@@ -286,3 +286,16 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
   .dash-grid { grid-template-columns: 1fr; }
   .emb-grid { grid-template-columns: 1fr; }
 }
+
+/* ---- writers section (Admin panel) ---- */
+.writers-section { margin-bottom: 1.5rem; }
+.writers-list { display: flex; flex-direction: column; gap: 0.35rem; }
+.writer-row { display: flex; align-items: center; gap: 0.6rem; padding: 0.3rem 0; border-bottom: 1px solid var(--line); }
+.writer-row:last-child { border-bottom: none; }
+.writer-slug { min-width: 4rem; }
+.writer-name { flex: 1; }
+.writer-owner-label { display: flex; align-items: center; gap: 0.3rem; }
+.writer-owner-select { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; color: var(--ink); padding: 0.15rem 0.4rem; font-size: 0.8rem; }
+.writer-owner-placeholder { min-width: 8rem; }
+.kind-human { background: #2a6e3a; color: #d4f0da; }
+.kind-ai { background: #2a4a7a; color: #c0d8f8; }

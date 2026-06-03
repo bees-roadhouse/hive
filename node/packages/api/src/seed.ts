@@ -2,10 +2,21 @@
 // spans of the prose anchored into tasks / decisions / events. Offsets are
 // computed from the text with a small helper so the entries stay readable.
 import { migrate } from "./db.ts";
-import { journal, outbox, sources } from "./store.ts";
+import { journal, outbox, people, sources } from "./store.ts";
 import type { AnchorKind, AnchorFields } from "@hive/shared";
 
 migrate();
+
+// Seed the people table: the five known writers. AI writers have owner='nate'
+// so Nate's default view shows all AI activity.
+function seedActors() {
+  people.upsert("nate", "Nate Smith", "human", null);
+  people.upsert("maggie", "Maggie Bierly", "human", null);
+  people.upsert("pia", "Pia (Apiara)", "ai", "nate");
+  people.upsert("apis", "Apis", "ai", "nate");
+  people.upsert("cera", "Cera", "ai", "nate");
+}
+seedActors();
 
 const BASE = process.env.HIVE_API_URL ?? "http://localhost:8787";
 
@@ -135,4 +146,4 @@ sources.create(
 );
 outbox.enqueue("log", { note: "hello from the seed — worker will drain this" }, undefined, "cera");
 
-console.log("🌱 seeded hive: journal + anchors, inboxes, a sample RSS source, a scrape source, and an outbox job.");
+console.log("🌱 seeded hive: people, journal + anchors, inboxes, a sample RSS source, a scrape source, and an outbox job.");

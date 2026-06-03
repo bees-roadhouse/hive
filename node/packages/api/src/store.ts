@@ -15,17 +15,22 @@ import {
   type InboxReason,
   type JournalEntry,
   type JournalEntryView,
+  type JournalWriter,
   type Link,
   type NewAnchor,
   type NewJournalEntry,
+  type NewShare,
   type NewSource,
   type Note,
   type OutboxJob,
   type OutboxStatus,
+  type Person,
+  type PersonPatch,
   type Project,
   type ResolvedAnchor,
   type SearchHit,
   type Severity,
+  type Share,
   type Source,
   type SourcePatch,
   type Task,
@@ -165,6 +170,246 @@ export const projects = {
     );
   },
 };
+
+// ---- people (the writers) ----
+
+export const people = {
+  list(): Person[] {
+    return db.prepare("SELECT * FROM people ORDER BY kind, slug").all() as Person[];
+  },
+
+  get(slug: string): Person | undefined {
+    return db.prepare("SELECT * FROM people WHERE slug = ?").get(slug) as Person | undefined;
+  },
+
+  upsert(slug: string, name: string, kind: Person["kind"], owner: string | null = null): Person {
+    const existing = people.get(slug);
+    if (existing) return existing;
+    const p: Person = { id: id("per"), slug, name, kind, owner, created_at: now() };
+    db.prepare(
+      "INSERT INTO people (id, slug, name, kind, owner, created_at) VALUES (@id, @slug, @name, @kind, @owner, @created_at)",
+    ).run(p);
+    return p;
+  },
+
+  update(slug: string, patch: PersonPatch, actor = "system"): Person | undefined {
+    const cur = people.get(slug);
+    if (!cur) return undefined;
+    const next: Person = { ...cur, ...patch };
+    db.prepare("UPDATE people SET name=@name, owner=@owner WHERE slug=@slug").run({
+      name: next.name,
+      owner: next.owner,
+      slug: next.slug,
+    });
+    emit("people.updated", actor, { slug: next.slug, owner: next.owner });
+    return next;
+  },
+};
+
+// ---- shares ----
+
+export const shares = {
+  create(input: NewShare): Share {
+    // Idempotent — ignore if the same (scope, ref, viewer) triple already exists.
+    const existing = db
+      .prepare("SELECT * FROM shares WHERE scope=? AND ref=? AND viewer=?")
+      .get(input.scope, input.ref, input.viewer) as Share | undefined;
+    if (existing) return existing;
+    const s: Share = { id: id("shr"), scope: input.scope, ref: input.ref, viewer: input.viewer, created_at: now() };
+    db.prepare(
+      "INSERT INTO shares (id, scope, ref, viewer, created_at) VALUES (@id, @scope, @ref, @viewer, @created_at)",
+    ).run(s);
+    emit("share.created", "system", { scope: s.scope, ref: s.ref, viewer: s.viewer });
+    return s;
+  },
+
+  forViewer(viewer: string): Share[] {
+    return db.prepare("SELECT * FROM shares WHERE viewer=? ORDER BY created_at DESC").all(viewer) as Share[];
+  },
+};
+
+// ---- visible journal (scoped to a viewer) ----
+
+export function visibleJournal(opts: {
+  viewer: string;
+  writers?: string[];
+  limit?: number;
+  offset?: number;
+}): JournalEntryView[] {
+  const { viewer, writers, limit = 50, offset = 0 } = opts;
+
+  // 1. Authors whose entries the viewer can see by ownership / relationship.
+  //    a) The viewer themselves.
+  //    b) AI people whose owner = viewer.
+  //    c) AI people who have ≥1 entry referencing viewer (links target_kind='person'
+  //       OR mentions contains viewer).
+  const ownedAiSlugs = (
+    db.prepare("SELECT slug FROM people WHERE kind='ai' AND owner=?").all(viewer) as { slug: string }[]
+  ).map((r) => r.slug);
+
+  // AI authors that referenced viewer via links (target_kind='person', target_id=viewer).
+  const linkedAiSlugs = (
+    db
+      .prepare(
+        `SELECT DISTINCT j.author FROM journal j
+         JOIN links l ON l.source_kind='journal' AND l.source_id=j.id
+         WHERE l.target_kind='person' AND l.target_id=?
+           AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')`,
+      )
+      .all(viewer) as { author: string }[]
+  ).map((r) => r.author);
+
+  // AI authors that @mentioned viewer in any entry.
+  const mentionedAiSlugs = (
+    db
+      .prepare(
+        `SELECT DISTINCT j.author FROM journal j
+         WHERE j.mentions LIKE ?
+           AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')`,
+      )
+      .all(`%"${viewer}"%`) as { author: string }[]
+  ).map((r) => r.author);
+
+  const visibleAuthors = new Set<string>([
+    viewer,
+    ...ownedAiSlugs,
+    ...linkedAiSlugs,
+    ...mentionedAiSlugs,
+  ]);
+
+  // 2. Entry-level shares (scope='entry') for this viewer.
+  const sharedEntryIds = (
+    db
+      .prepare("SELECT ref FROM shares WHERE scope='entry' AND viewer=?")
+      .all(viewer) as { ref: string }[]
+  ).map((r) => r.ref);
+
+  // 3. Journal-level shares (scope='journal') give visibility into entire author streams.
+  const journalSharedAuthors = (
+    db
+      .prepare("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
+      .all(viewer) as { ref: string }[]
+  ).map((r) => r.ref);
+  for (const a of journalSharedAuthors) visibleAuthors.add(a);
+
+  // 4. Entries where viewer is @mentioned.
+  const mentionedEntryIds = (
+    db
+      .prepare("SELECT id FROM journal WHERE mentions LIKE ?")
+      .all(`%"${viewer}"%`) as { id: string }[]
+  ).map((r) => r.id);
+
+  // Union the visible entry id set (from shares + mentions).
+  const extraIds = new Set([...sharedEntryIds, ...mentionedEntryIds]);
+
+  // 5. Optional writers filter: intersect with requested authors.
+  const authorSet = writers && writers.length > 0
+    ? new Set([...visibleAuthors].filter((a) => writers.includes(a)))
+    : visibleAuthors;
+
+  // 6. Build and run the query. SQLite doesn't support arrays natively, so we
+  //    use IN with placeholders assembled from the sets.
+  const authorList = [...authorSet];
+  const extraList = [...extraIds].filter((eid) => {
+    // For entries in extraIds, still apply the writers filter if present.
+    if (!writers || writers.length === 0) return true;
+    // We'll need to check author at query time — handled via subquery below.
+    return true;
+  });
+
+  const authorPlaceholders = authorList.length > 0 ? authorList.map(() => "?").join(",") : "'__never__'";
+  const extraPlaceholders = extraList.length > 0 ? extraList.map(() => "?").join(",") : "'__never__'";
+
+  // writers filter on the extra-id path: if writers specified, only include
+  // extra entries whose author is in the writers filter.
+  const writersFilter = writers && writers.length > 0
+    ? `AND j.author IN (${writers.map(() => "?").join(",")})`
+    : "";
+
+  const sql = `
+    SELECT j.* FROM journal j
+    WHERE (
+      j.author IN (${authorPlaceholders})
+      OR (j.id IN (${extraPlaceholders}) ${writersFilter})
+    )
+    ORDER BY j.created_at DESC
+    LIMIT ? OFFSET ?
+  `;
+
+  const params: unknown[] = [
+    ...authorList,
+    ...extraList,
+    ...(writers && writers.length > 0 ? writers : []),
+    limit,
+    offset,
+  ];
+
+  const rows = db.prepare(sql).all(...params) as (Omit<JournalEntry, "tags" | "mentions"> & {
+    tags: string;
+    mentions: string;
+  })[];
+
+  return rows.map((r) => ({
+    ...r,
+    tags: json(r.tags),
+    mentions: json(r.mentions),
+    anchors: anchorsFor(r.id),
+  }));
+}
+
+/** Writers visible to a viewer: themselves + their AIs + related AIs. */
+export function journalWriters(viewer: string): JournalWriter[] {
+  // Reuse the same author discovery logic as visibleJournal.
+  const ownedAiSlugs = (
+    db.prepare("SELECT slug FROM people WHERE kind='ai' AND owner=?").all(viewer) as { slug: string }[]
+  ).map((r) => r.slug);
+
+  const linkedAiSlugs = (
+    db
+      .prepare(
+        `SELECT DISTINCT j.author FROM journal j
+         JOIN links l ON l.source_kind='journal' AND l.source_id=j.id
+         WHERE l.target_kind='person' AND l.target_id=?
+           AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')`,
+      )
+      .all(viewer) as { author: string }[]
+  ).map((r) => r.author);
+
+  const mentionedAiSlugs = (
+    db
+      .prepare(
+        `SELECT DISTINCT j.author FROM journal j
+         WHERE j.mentions LIKE ?
+           AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')`,
+      )
+      .all(`%"${viewer}"%`) as { author: string }[]
+  ).map((r) => r.author);
+
+  const journalSharedAuthors = (
+    db
+      .prepare("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
+      .all(viewer) as { ref: string }[]
+  ).map((r) => r.ref);
+
+  const slugSet = new Set<string>([
+    viewer,
+    ...ownedAiSlugs,
+    ...linkedAiSlugs,
+    ...mentionedAiSlugs,
+    ...journalSharedAuthors,
+  ]);
+
+  const result: JournalWriter[] = [];
+  for (const slug of slugSet) {
+    const p = people.get(slug);
+    if (p) result.push({ slug: p.slug, name: p.name, kind: p.kind, owner: p.owner });
+    else {
+      // Viewer may not be in people table yet — return a minimal record.
+      result.push({ slug, name: slug, kind: "human", owner: null });
+    }
+  }
+  return result.sort((a, b) => a.slug.localeCompare(b.slug));
+}
 
 // ---- structured entities (created internally from journal anchors) ----
 
@@ -416,6 +661,14 @@ export const journal = {
       for (const m of mentions) {
         if (!assignedMentions.has(m)) {
           inbox.add(m, author, "mention", "journal", entry.id, entry.id, input.body);
+        }
+      }
+
+      // Auto-share: every @mentioned actor gets an entry-level share so the
+      // entry is visible in their scoped journal view.
+      for (const m of mentions) {
+        if (m !== author) {
+          shares.create({ scope: "entry", ref: entry.id, viewer: m });
         }
       }
 
