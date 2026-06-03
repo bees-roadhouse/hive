@@ -1,10 +1,21 @@
 import { createServer } from "node:http";
 import { getRequestListener } from "@hono/node-server";
 import { Hono } from "hono";
-import type { DecisionPatch, NewJournalEntry, NewSource, SourcePatch, TaskPatch } from "@hive/shared";
+import type { ServerResponse } from "node:http";
+import type {
+  DecisionPatch,
+  NewJournalEntry,
+  NewShare,
+  NewSource,
+  PersonPatch,
+  SourcePatch,
+  TaskPatch,
+} from "@hive/shared";
 import { migrate } from "./db.ts";
 import { handleMcp } from "./mcp.ts";
+import { subscribe } from "./bus.ts";
 import {
+  autocomplete,
   dashboard,
   decisions,
   embeddingStats,
@@ -12,18 +23,26 @@ import {
   graph,
   inbox,
   journal,
+  journalWriters,
   links,
   outbox,
+  people,
+  phases,
   projects,
   search,
+  seedActors,
   semanticSearch,
+  shares,
   sources,
   tasks,
+  topics,
+  visibleJournal,
   wire,
   workerStatus,
 } from "./store.ts";
 
 migrate();
+seedActors();
 
 const app = new Hono();
 
@@ -45,9 +64,22 @@ app.get("/api/healthz", (c) =>
 );
 
 // ---- journal (the one write path) ----
-app.get("/api/journal", (c) =>
-  c.json(journal.list(Number(c.req.query("limit") ?? 50), Number(c.req.query("offset") ?? 0))),
-);
+app.get("/api/journal/writers", (c) => {
+  const viewer = c.req.query("viewer");
+  if (!viewer) return c.json({ error: "viewer required" }, 400);
+  return c.json(journalWriters(viewer));
+});
+app.get("/api/journal", (c) => {
+  const limit = Number(c.req.query("limit") ?? 50);
+  const offset = Number(c.req.query("offset") ?? 0);
+  const viewer = c.req.query("viewer");
+  if (viewer) {
+    const writersParam = c.req.query("writers");
+    const writers = writersParam ? writersParam.split(",").map((s) => s.trim()).filter(Boolean) : undefined;
+    return c.json(visibleJournal({ viewer, writers, limit, offset }));
+  }
+  return c.json(journal.list(limit, offset));
+});
 app.post("/api/journal", async (c) => {
   const body = (await c.req.json()) as NewJournalEntry;
   if (!body?.body?.trim()) return c.json({ error: "body required" }, 400);
@@ -98,8 +130,60 @@ app.get("/api/inbox/:recipient", (c) => {
 app.post("/api/inbox/:recipient/read", (c) => c.json({ marked: inbox.markAllRead(c.req.param("recipient")) }));
 app.post("/api/inbox/item/:id/read", (c) => c.json({ marked: inbox.markRead(c.req.param("id")) }));
 
+// ---- people (writers: humans + AIs with ownership) ----
+app.get("/api/people", (c) => c.json(people.list()));
+app.get("/api/people/:slug", (c) => {
+  const p = people.get(c.req.param("slug"));
+  return p ? c.json(p) : c.json({ error: "not found" }, 404);
+});
+app.patch("/api/people/:slug", async (c) => {
+  const patch = (await c.req.json()) as PersonPatch;
+  const p = people.update(c.req.param("slug"), patch, actor(c));
+  return p ? c.json(p) : c.json({ error: "not found" }, 404);
+});
+app.post("/api/people", async (c) => {
+  const body = (await c.req.json()) as { name: string; kind?: "human" | "ai" };
+  if (!body?.name?.trim()) return c.json({ error: "name required" }, 400);
+  return c.json(people.create(body, actor(c)), 201);
+});
+
+// ---- shares ----
+app.post("/api/shares", async (c) => {
+  const body = (await c.req.json()) as NewShare;
+  if (!body?.scope || !body?.ref || !body?.viewer) return c.json({ error: "scope, ref, viewer required" }, 400);
+  return c.json(shares.create(body), 201);
+});
+app.get("/api/shares", (c) => {
+  const viewer = c.req.query("viewer");
+  if (!viewer) return c.json({ error: "viewer required" }, 400);
+  return c.json(shares.forViewer(viewer));
+});
+
 // ---- misc ----
+app.get("/api/topics", (c) => c.json(topics.list()));
+app.get("/api/topics/:id", (c) => {
+  const t = topics.get(c.req.param("id"));
+  return t ? c.json(t) : c.json({ error: "not found" }, 404);
+});
+app.get("/api/phases", (c) => {
+  const project = c.req.query("project");
+  return c.json(phases.list(project || undefined));
+});
+app.get("/api/phases/:id", (c) => {
+  const ph = phases.get(c.req.param("id"));
+  return ph ? c.json(ph) : c.json({ error: "not found" }, 404);
+});
 app.get("/api/projects", (c) => c.json(projects.list()));
+app.get("/api/projects/:id", (c) => {
+  const p = projects.withChildren(c.req.param("id"));
+  return p ? c.json(p) : c.json({ error: "not found" }, 404);
+});
+app.get("/api/autocomplete", (c) => {
+  const q = c.req.query("q") ?? "";
+  const kindsParam = c.req.query("kinds");
+  const kinds = kindsParam ? kindsParam.split(",").map((k) => k.trim()) : undefined;
+  return c.json(autocomplete(q, kinds));
+});
 app.get("/api/links/:id", (c) => c.json(links.forEntity(c.req.param("id"))));
 app.get("/api/search", async (c) => {
   const q = c.req.query("q") ?? "";
@@ -107,6 +191,9 @@ app.get("/api/search", async (c) => {
   // ?mode=semantic uses the local embedder; default is FTS keyword search.
   // Semantic flags: &hybrid=0 to disable the keyword blend, &rerank=1 for the
   // cross-encoder pass, &threshold=<n> to drop weak vector matches.
+  // Results are scoped to the acting user's visible entries (permission-honoring,
+  // like bookstack-mcp). ?viewer= overrides the x-hive-actor header.
+  const viewer = c.req.query("viewer") ?? actor(c);
   if (c.req.query("mode") === "semantic") {
     const flag = (name: string) => c.req.query(name) === "1" || c.req.query(name) === "true";
     const thr = c.req.query("threshold");
@@ -116,10 +203,11 @@ app.get("/api/search", async (c) => {
         hybrid: c.req.query("hybrid") !== "0" && c.req.query("hybrid") !== "false",
         rerank: flag("rerank"),
         threshold: thr ? Number(thr) : undefined,
+        viewer,
       }),
     );
   }
-  return c.json(search(q, limit));
+  return c.json(search(q, limit, viewer));
 });
 app.get("/api/wire", (c) => c.json(wire(Number(c.req.query("limit") ?? 100))));
 app.get("/api/dashboard", (c) => c.json(dashboard()));
@@ -185,6 +273,28 @@ app.get("/api/_fixtures/sample.html", (c) => {
   return c.body(html, 200, { "content-type": "text/html" });
 });
 
+// ---- SSE live-push stream ----
+// Every mutation calls emit() → publish() → here. Served from the raw Node http
+// server (not Hono) so `res.write` flushes each frame to the socket immediately —
+// streamSSE through node-server buffers mid-stream writes. Clients reconnect
+// automatically via EventSource; a heartbeat comment every 25 s keeps idle
+// connections alive through proxies.
+function handleStream(res: ServerResponse): void {
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache",
+    connection: "keep-alive",
+    "access-control-allow-origin": "*",
+  });
+  res.write(": connected\n\n");
+  const unsub = subscribe((ev) => res.write(`data: ${JSON.stringify(ev)}\n\n`));
+  const heartbeat = setInterval(() => res.write(": heartbeat\n\n"), 25_000);
+  res.on("close", () => {
+    clearInterval(heartbeat);
+    unsub();
+  });
+}
+
 // Raw Node server so /mcp gets the un-touched request stream the Streamable
 // HTTP transport needs; everything else is delegated to Hono.
 const honoListener = getRequestListener(app.fetch);
@@ -197,6 +307,10 @@ createServer((req, res) => {
       console.error("mcp error", err);
       if (!res.headersSent) res.writeHead(500).end();
     });
+    return;
+  }
+  if (path === "/api/stream") {
+    handleStream(res);
     return;
   }
   honoListener(req, res);

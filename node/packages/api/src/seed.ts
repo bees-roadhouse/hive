@@ -2,10 +2,11 @@
 // spans of the prose anchored into tasks / decisions / events. Offsets are
 // computed from the text with a small helper so the entries stay readable.
 import { migrate } from "./db.ts";
-import { journal, outbox, sources } from "./store.ts";
+import { journal, outbox, people, seedActors, sources } from "./store.ts";
 import type { AnchorKind, AnchorFields } from "@hive/shared";
 
 migrate();
+seedActors();
 
 const BASE = process.env.HIVE_API_URL ?? "http://localhost:8787";
 
@@ -135,4 +136,19 @@ sources.create(
 );
 outbox.enqueue("log", { note: "hello from the seed — worker will drain this" }, undefined, "cera");
 
-console.log("🌱 seeded hive: journal + anchors, inboxes, a sample RSS source, a scrape source, and an outbox job.");
+// Bracket-token demo entries — exercise the new inline emergence model.
+{
+  const body =
+    "Synced with [person: Maggie] on [project: Roadhouse Site] — [task: ship the editor]. " +
+    "The new [topic: entity-model] work lands this sprint.";
+  write("nate", body, [], ["planning"]);
+}
+
+{
+  const body =
+    "Kicking off [project: Roadhouse Site] with a [phase: Discovery] phase. " +
+    "[person: Pia] owns the initial scoping — [task: scope the discovery phase].";
+  write("nate", body, [], ["roadhouse"]);
+}
+
+console.log("🌱 seeded hive: people, journal + anchors, inboxes, a sample RSS source, a scrape source, an outbox job, and bracket-token entries.");

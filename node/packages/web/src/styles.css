@@ -92,18 +92,19 @@ textarea { width: 100%; resize: vertical; font-size: 0.95rem; line-height: 1.5; 
 .chip-event { border-left-color: var(--event); }
 
 /* ---- journal feed + anchored prose ---- */
-.feed { display: flex; flex-direction: column; gap: 0.75rem; }
-.entry { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 0.9rem 1rem; }
-.entry header { display: flex; gap: 0.5rem; align-items: baseline; border: none; padding: 0; }
+/* Each entry reads like its own page in a journal — generous padding, a calm
+   reading measure, real breathing room between entries. */
+.feed { display: flex; flex-direction: column; gap: 1.6rem; }
+.entry { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 1.7rem 2rem; }
+.entry header { display: flex; gap: 0.5rem; align-items: baseline; border: none; padding: 0; margin-bottom: 0.3rem; }
 .entry time { color: var(--dim); font-size: 0.78rem; }
-.prose { margin: 0.5rem 0 0; line-height: 1.7; font-size: 1rem; }
-.mention { color: var(--accent); font-weight: 600; }
-.anchor { cursor: pointer; border-radius: 4px; padding: 0.05em 0.15em; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 3px; }
-.anchor sup { font-size: 0.62em; opacity: 0.8; margin-left: 0.1em; }
-.anchor-task { text-decoration-color: var(--task); background: rgba(111,179,255,0.10); }
-.anchor-decision { text-decoration-color: var(--decision); background: rgba(245,179,1,0.12); }
-.anchor-event { text-decoration-color: var(--event); background: rgba(192,139,255,0.12); }
-.anchor:hover { filter: brightness(1.3); }
+.prose { margin: 0.7rem 0 0; line-height: 1.85; font-size: 1.06rem; max-width: 70ch; }
+/* Linked things in prose (mentions, anchors, refs) are distinguished by weight,
+   not color or underline — calm and uniform. */
+.mention { color: inherit; font-weight: 600; }
+.anchor { cursor: pointer; font-weight: 600; }
+.anchor sup { font-size: 0.62em; opacity: 0.5; margin-left: 0.1em; font-weight: 400; }
+.mention:hover, .anchor:hover, .ref:hover { color: var(--honey); }
 
 /* ---- drawer ---- */
 .drawer-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: flex; justify-content: flex-end; z-index: 10; }
@@ -123,11 +124,24 @@ blockquote.origin { font-size: 0.82rem; }
 .pri-urgent { color: #ff7a59; } .pri-high { color: var(--accent); }
 
 /* ---- tasks board ---- */
+.tasks-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+.tasks-controls { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; padding: 0.5rem 0; }
+.show-done-toggle { display: flex; align-items: center; gap: 0.3rem; font-size: 0.82rem; color: var(--dim); cursor: pointer; }
+.show-done-toggle input { margin: 0; }
 .board { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.75rem; }
 .col h3 { text-transform: capitalize; color: var(--dim); font-size: 0.85rem; margin: 0 0 0.5rem; }
 .card { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--task); border-radius: 8px; padding: 0.6rem; margin-bottom: 0.5rem; cursor: pointer; }
 .card:hover { border-color: var(--accent); }
 .card-title { margin-top: 0.2rem; }
+.card-meta-row { display: flex; align-items: center; justify-content: space-between; gap: 0.3rem; flex-wrap: wrap; }
+/* Due-date badges on task cards */
+.due-badge { font-size: 0.68rem; border-radius: 999px; padding: 0.05rem 0.4rem; background: var(--line); color: var(--dim); }
+.due-badge.overdue { background: rgba(255,90,60,0.18); color: #ff7a59; font-weight: 600; }
+
+/* ---- field wrapper for markdown decision prose ---- */
+.field { margin: 0.5rem 0; line-height: 1.5; }
+.field strong { display: block; font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--dim); margin-bottom: 0.15rem; }
+.field .md { margin: 0; }
 
 /* ---- decisions / events ---- */
 .decision { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1rem; margin-bottom: 0.9rem; }
@@ -226,6 +240,8 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 .legend .lg { display: inline-flex; align-items: center; gap: 0.3rem; }
 .legend .lg i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
 .graph-svg { width: 100%; height: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; margin: 0.4rem 0; }
+.graph-canvas { height: 72vh; min-height: 440px; background: var(--bg); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; margin: 0.4rem 0; }
+.graph-canvas canvas { display: block; }
 .graph-svg .edge { stroke: var(--line); stroke-width: 1.2; }
 .graph-svg .edge.faded { stroke-opacity: 0.18; }
 .graph-svg .node { cursor: pointer; }
@@ -239,16 +255,25 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 .sidebar nav .nav-icon { display: inline-flex; align-items: center; color: inherit; }
 
 /* ---- journal: one comb cell (day page) per day, infinite scroll ---- */
-.day { margin-bottom: 1.4rem; }
+/* A day is ONE page in the journal — its entries flow down the same sheet,
+   separated by a thin rule, not as individual boxes. */
+.day {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 1.9rem 2.2rem;
+  margin-bottom: 1.6rem;
+}
 .day-head {
   display: flex; align-items: center; gap: 0.55rem;
-  position: sticky; top: 0; z-index: 2;
-  padding: 0.7rem 0 0.55rem;
-  background: linear-gradient(var(--bg) 78%, transparent);
+  padding-bottom: 0.85rem; margin-bottom: 1.3rem;
+  border-bottom: 1px solid var(--line);
 }
-.day-head h3 { margin: 0; font-size: 1.02rem; letter-spacing: 0.01em; }
+.day-head h3 { margin: 0; font-size: 1.12rem; letter-spacing: 0.01em; }
 .day-head .comb { color: var(--honey); }
 .day-head .dim.sm { margin-left: auto; font-variant-numeric: tabular-nums; }
+.day .entry { background: none; border: none; border-radius: 0; padding: 0; }
+.day .entry + .entry { margin-top: 1.6rem; padding-top: 1.6rem; border-top: 1px solid var(--line); }
 .sentinel { display: flex; justify-content: center; align-items: center; padding: 1.3rem 0; min-height: 2.2rem; }
 
 /* ---- markdown content ---- */
@@ -281,8 +306,458 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 .md-toolbar { display: flex; gap: 0.25rem; margin-bottom: 0.4rem; flex-wrap: wrap; }
 .md-toolbar button { padding: 0.25rem 0.55rem; font-size: 0.85rem; line-height: 1; min-width: 1.9rem; }
 
+/* Inline trigger-scheme hints in the composer hint text. */
+.trigger-hint { font-size: 0.82em; padding: 0.05em 0.3em; border-radius: 4px; }
+
+/* Full-width auto-grow textarea for the generous editor feel. */
+.composer-editor-wrap { position: relative; }
+.composer-ta {
+  width: 100%;
+  min-height: 7rem;
+  max-height: 60vh;
+  resize: none;
+  overflow-y: auto;
+  font-size: 1rem;
+  line-height: 1.65;
+  padding: 0.75rem 0.9rem;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--panel2);
+  transition: border-color 0.15s;
+}
+.composer-ta:focus { outline: none; border-color: var(--honey); }
+
+/* ---- autocomplete dropdown ---- */
+.ac-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 20;
+  margin: 0;
+  padding: 0.25rem 0;
+  list-style: none;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.45);
+  max-height: 280px;
+  overflow-y: auto;
+}
+.ac-item {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.45rem 0.85rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+.ac-item:hover, .ac-item-active { background: var(--panel2); }
+.ac-kind-glyph { font-size: 0.95em; width: 1.2rem; text-align: center; color: var(--dim); }
+.ac-label { flex: 1; }
+.ac-kind { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; }
+
+/* ---- ref chips in rendered journal entries ---- */
+.ref {
+  display: inline;
+  color: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+/* ---- entry fade-in animation ---- */
+.entry-fade {
+  opacity: 0;
+  transform: translateY(10px);
+  transition: opacity 0.35s ease, transform 0.35s ease;
+}
+.entry-visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+@media (prefers-reduced-motion: reduce) {
+  .entry-fade { opacity: 1; transform: none; transition: none; }
+}
+
 @media (max-width: 760px) {
   .board, .kpis { grid-template-columns: 1fr 1fr; }
   .dash-grid { grid-template-columns: 1fr; }
   .emb-grid { grid-template-columns: 1fr; }
 }
+
+/* ---- entity browser (people / topics / projects) ---- */
+.entity-row {
+  display: flex; align-items: center; gap: 0.55rem;
+  padding: 0.55rem 0.7rem; border-bottom: 1px solid var(--line);
+  font-size: 0.92rem;
+}
+.entity-row:last-child { border-bottom: none; }
+.entity-icon { color: var(--dim); display: inline-flex; align-items: center; }
+.entity-name { flex: 1; font-weight: 500; }
+.entity-slug { font-size: 0.72rem; opacity: 0.6; }
+
+/* kind badges coloured by type */
+.kind-badge-human { background: rgba(111,179,255,0.14); color: #7cb8ff; }
+.kind-badge-ai    { background: rgba(192,139,255,0.14); color: #c77dff; }
+
+/* ---- project cards ---- */
+.project-card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 0.9rem 1rem; margin-bottom: 0.9rem;
+}
+.project-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.55rem; }
+.project-name { margin: 0; font-size: 1rem; flex: 1; }
+.project-slug { font-size: 0.72rem; }
+.phases { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.5rem; }
+.phase-chip {
+  display: inline-flex; align-items: center; gap: 0.3rem;
+  background: rgba(255,184,107,0.12); color: #ffb86b;
+  border-radius: 999px; padding: 0.15rem 0.6rem; font-size: 0.75rem;
+}
+.project-tasks { margin-top: 0.2rem; }
+
+/* ---- dashboard (rich: calendar, charts, agent feed) ---- */
+
+/* Layout rows */
+.dash-cal-row { display: grid; grid-template-columns: 1fr 280px; gap: 0.75rem; margin-bottom: 0.75rem; }
+.dash-charts-row { display: grid; grid-template-columns: 1.2fr 1fr 1fr; gap: 0.75rem; margin-bottom: 0.75rem; }
+
+/* Calendar panel */
+.dash-cal-panel { min-width: 0; }
+.cal-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.6rem; }
+.cal-header h3 { margin: 0; font-size: 0.95rem; }
+
+.cal-grid {
+  display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px;
+}
+.cal-weekday {
+  text-align: center; font-size: 0.68rem; color: var(--dim);
+  padding: 0.15rem 0 0.3rem; text-transform: uppercase; letter-spacing: 0.04em;
+}
+.cal-cell {
+  min-height: 3.4rem; padding: 0.2rem 0.25rem;
+  background: var(--panel2); border-radius: 5px; border: 1px solid transparent;
+  font-size: 0.78rem; display: flex; flex-direction: column; gap: 2px;
+}
+.cal-empty { background: transparent; border-color: transparent; }
+.cal-today { border-color: var(--honey) !important; background: rgba(245,179,1,0.08); }
+.cal-num { font-size: 0.72rem; color: var(--dim); line-height: 1; }
+.cal-today .cal-num { color: var(--honey); font-weight: 700; }
+
+.cal-chips { display: flex; flex-direction: column; gap: 2px; }
+.cal-task-chip {
+  display: block; font-size: 0.6rem; border-radius: 3px; padding: 0.05rem 0.28rem;
+  background: rgba(255,210,74,0.12); color: var(--accent);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  line-height: 1.4;
+}
+.cal-chip-overdue { background: rgba(255,90,60,0.16); color: #ff7a59; }
+.cal-chip-today { background: rgba(245,179,1,0.22); color: var(--honey); font-weight: 600; }
+.cal-chip-more { background: rgba(169,155,120,0.14); color: var(--dim); }
+
+/* Calendar legend */
+.cal-legend { display: flex; gap: 0.75rem; margin-top: 0.5rem; flex-wrap: wrap; }
+.cal-leg { display: flex; align-items: center; gap: 0.3rem; font-size: 0.72rem; color: var(--dim); }
+.cal-swatch { display: inline-block; width: 0.65rem; height: 0.65rem; border-radius: 2px; }
+.cal-swatch-overdue { background: #ff7a59; }
+.cal-swatch-today { background: var(--honey); }
+.cal-swatch-normal { background: var(--accent); opacity: 0.5; }
+
+/* Upcoming tasks panel */
+.dash-upcoming-panel { overflow: hidden; }
+.upcoming-tasks { display: flex; flex-direction: column; gap: 0.5rem; }
+.upcoming-section { display: flex; flex-direction: column; gap: 0.3rem; }
+.upcoming-group-label {
+  font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--dim); padding: 0.1rem 0 0.25rem;
+}
+.overdue-label { color: #ff7a59; }
+.upcoming-row { display: flex; align-items: center; justify-content: space-between; gap: 0.4rem; }
+.upcoming-row .cal-task-chip { flex: 1; min-width: 0; font-size: 0.75rem; padding: 0.15rem 0.4rem; }
+
+/* Sparkline chart */
+.spark-axis { display: flex; justify-content: space-between; margin-top: 0.25rem; }
+.dash-chart-sub { margin: 0.25rem 0 0; }
+
+/* Horizontal bar chart (author / callout) */
+.dash-hbar-row { display: flex; align-items: center; gap: 0.5rem; margin: 0.3rem 0; font-size: 0.82rem; }
+.dash-hbar-label { width: 5.5rem; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-transform: capitalize; }
+.dash-hbar-track { flex: 1; height: 9px; background: var(--panel2); border-radius: 5px; overflow: hidden; }
+.dash-hbar-fill { height: 100%; border-radius: 5px; transition: width 0.4s ease; }
+.dash-hbar-val { width: 2rem; text-align: right; color: var(--dim); font-size: 0.78rem; }
+
+/* Agent live feed */
+.agent-feed-title { display: flex; align-items: center; gap: 0.5rem; margin: 0 0 0.6rem; font-size: 0.95rem; }
+.live-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: #57d977; box-shadow: 0 0 6px #57d977;
+  animation: pulse-dot 2s ease-in-out infinite;
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; box-shadow: 0 0 6px #57d977; }
+  50% { opacity: 0.6; box-shadow: 0 0 12px #57d977; }
+}
+.agent-feed { display: flex; flex-direction: column; gap: 0.2rem; max-height: 260px; overflow-y: auto; }
+.agent-row {
+  display: flex; align-items: center; gap: 0.55rem; padding: 0.3rem 0;
+  border-bottom: 1px solid var(--line); font-size: 0.83rem;
+}
+.agent-actor {
+  border-radius: 5px; padding: 0.07rem 0.38rem;
+  font-size: 0.72rem; font-weight: 600; text-transform: capitalize;
+  white-space: nowrap;
+}
+.agent-kind { font-size: 0.8rem; flex: 1; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-time { color: var(--dim); font-size: 0.72rem; white-space: nowrap; }
+
+/* Responsive breakpoints for dashboard */
+@media (max-width: 900px) {
+  .dash-cal-row { grid-template-columns: 1fr; }
+  .dash-charts-row { grid-template-columns: 1fr 1fr; }
+  .dash-charts-row .panel:last-child { grid-column: 1 / -1; }
+}
+@media (max-width: 600px) {
+  .dash-charts-row { grid-template-columns: 1fr; }
+  .cal-cell { min-height: 2.4rem; }
+}
+/* ---- journal overlay editor ---- */
+
+/* Header row above the feed: "new entry" button aligned right */
+.journal-header {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  margin-bottom: 1.1rem;
+}
+.journal-new-btn {
+  font-size: 0.88rem;
+  padding: 0.4rem 0.9rem;
+}
+
+/* Floating action button — bottom-right corner of the viewport */
+.journal-fab {
+  position: fixed;
+  bottom: 1.75rem;
+  right: 1.75rem;
+  width: 3rem;
+  height: 3rem;
+  border-radius: 50%;
+  background: var(--honey);
+  color: #1a1407;
+  border: none;
+  font-size: 1.3rem;
+  display: grid;
+  place-items: center;
+  box-shadow: 0 4px 18px rgba(0,0,0,0.45);
+  z-index: 30;
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+.journal-fab:hover:not(:disabled) {
+  transform: scale(1.08);
+  box-shadow: 0 6px 24px rgba(0,0,0,0.55);
+  border-color: transparent;
+}
+
+/* Full-screen dimmed backdrop */
+.overlay-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.62);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 40;
+  animation: overlay-fade-in 0.18s ease both;
+}
+@keyframes overlay-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .overlay-backdrop { animation: none; }
+}
+
+/* Full-page writing panel */
+.overlay-panel {
+  width: min(1100px, 96vw);
+  min-height: 80vh;
+  max-height: 95vh;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 1.25rem 1.4rem 1.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  box-shadow: 0 16px 56px rgba(0, 0, 0, 0.6);
+  animation: overlay-slide-in 0.2s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes overlay-slide-in {
+  from { opacity: 0; transform: scale(0.97) translateY(6px); }
+  to   { opacity: 1; transform: scale(1)    translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .overlay-panel { animation: none; }
+}
+
+/* Panel header: title + write/preview seg + close button */
+.overlay-head {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.overlay-title {
+  font-weight: 600;
+  font-size: 1rem;
+  flex: 1;
+  text-transform: lowercase;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+}
+
+/* Hint text inside overlay */
+.overlay-hint {
+  font-size: 0.83rem;
+  margin-bottom: 0;
+}
+
+/* Preview pane inside overlay (taller than the inline composer's) */
+.overlay-preview {
+  min-height: 10rem;
+}
+
+/* The overlay textarea — a full page to write on; auto-grows beyond this. */
+.overlay-ta {
+  min-height: 58vh;
+  max-height: none;
+}
+.overlay-panel .composer-editor-wrap { flex: 1; }
+
+/* Subtle close animation when the overlay unmounts (Solid removes instantly,
+   so we handle the "open → closed" transition via the open animation alone;
+   the backdrop click is fast enough that no exit animation is needed.) */
+
+/* ---- wysiwyg editor ---- */
+
+/* Mode toggle in overlay header */
+.wysiwyg-mode-seg { font-size: 0.83rem; }
+.wysiwyg-mode-seg button { padding: 0.35rem 0.7rem; font-size: 0.82rem; }
+
+/* Container that holds the ProseMirror div — scrollable, same sizing as .overlay-ta */
+.wysiwyg-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+/* The div that TipTap attaches to — it wraps the .ProseMirror element */
+.wysiwyg-host {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ProseMirror content-editable area — styled to match the rest of the app */
+.ProseMirror {
+  flex: 1;
+  min-height: 58vh;
+  max-height: none;
+  width: 100%;
+  outline: none;
+  font-size: 1rem;
+  line-height: 1.65;
+  padding: 0.75rem 0.9rem;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--panel2);
+  color: var(--ink);
+  transition: border-color 0.15s;
+  font-family: inherit;
+  /* Overflow to allow long entries */
+  overflow-y: auto;
+  cursor: text;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ProseMirror:focus {
+  border-color: var(--honey);
+}
+
+/* Placeholder when empty */
+.ProseMirror p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  color: var(--dim);
+  pointer-events: none;
+  float: left;
+  height: 0;
+}
+
+/* Prose typography — mirrors .md class so the WYSIWYG matches the feed */
+.ProseMirror > p { margin: 0 0 0.6rem; }
+.ProseMirror > p:last-child { margin-bottom: 0; }
+.ProseMirror h1, .ProseMirror h2, .ProseMirror h3, .ProseMirror h4 {
+  margin: 0.85rem 0 0.4rem; line-height: 1.25;
+}
+.ProseMirror h1 { font-size: 1.3rem; }
+.ProseMirror h2 { font-size: 1.15rem; }
+.ProseMirror h3 { font-size: 1.02rem; }
+.ProseMirror ul, .ProseMirror ol { margin: 0.3rem 0 0.6rem; padding-left: 1.3rem; }
+.ProseMirror li { margin: 0.15rem 0; }
+/* Checkbox task lists */
+.ProseMirror li[data-type="taskItem"] { list-style: none; margin-left: -0.8rem; display: flex; gap: 0.45rem; align-items: baseline; }
+.ProseMirror li[data-type="taskItem"] > label { flex: none; }
+.ProseMirror li[data-type="taskItem"] > label input[type="checkbox"] { accent-color: var(--honey); margin: 0; }
+.ProseMirror li[data-type="taskItem"] > div { flex: 1; }
+/* Inline code */
+.ProseMirror code {
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 0.05rem 0.35rem;
+  font-size: 0.88em;
+}
+/* Code block */
+.ProseMirror pre {
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.7rem 0.9rem;
+  overflow-x: auto;
+  margin: 0.5rem 0;
+}
+.ProseMirror pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.9em;
+}
+/* Links */
+.ProseMirror a { color: var(--accent); text-decoration: underline; }
+.ProseMirror a:hover { filter: brightness(1.25); }
+/* Blockquote */
+.ProseMirror blockquote {
+  margin: 0.5rem 0;
+  padding: 0.1rem 0 0.1rem 0.8rem;
+  border-left: 3px solid var(--line);
+  color: var(--dim);
+}
+/* Horizontal rule */
+.ProseMirror hr { border: none; border-top: 1px solid var(--line); margin: 0.9rem 0; }
+/* Selection highlight — honey-tinted */
+.ProseMirror ::selection { background: rgba(245, 179, 1, 0.28); }
+
+/* Ensure the editor-wrap inside the overlay takes remaining height */
+.overlay-panel .wysiwyg-wrap { flex: 1; }
+/* ---- writers section (Admin panel) ---- */
+.writers-section { margin-bottom: 1.5rem; }
+.writers-list { display: flex; flex-direction: column; gap: 0.35rem; }
+.writer-row { display: flex; align-items: center; gap: 0.6rem; padding: 0.3rem 0; border-bottom: 1px solid var(--line); }
+.writer-row:last-child { border-bottom: none; }
+.writer-slug { min-width: 4rem; }
+.writer-name { flex: 1; }
+.writer-owner-label { display: flex; align-items: center; gap: 0.3rem; }
+.writer-owner-select { background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; color: var(--ink); padding: 0.15rem 0.4rem; font-size: 0.8rem; }
+.writer-owner-placeholder { min-width: 8rem; }
+.kind-human { background: #2a6e3a; color: #d4f0da; }
+.kind-ai { background: #2a4a7a; color: #c0d8f8; }

@@ -2,6 +2,7 @@ import { nanoid } from "nanoid";
 import {
   type Anchor,
   type AnchorFields,
+  type AutocompleteItem,
   type DashboardStats,
   type Decision,
   type DecisionPatch,
@@ -15,22 +16,29 @@ import {
   type InboxReason,
   type JournalEntry,
   type JournalEntryView,
+  type JournalRef,
+  type JournalWriter,
   type Link,
   type NewAnchor,
   type NewJournalEntry,
+  type NewShare,
   type NewSource,
-  type Note,
   type OutboxJob,
   type OutboxStatus,
+  type Person,
+  type Phase,
+  type PersonPatch,
   type Project,
   type ResolvedAnchor,
   type SearchHit,
   type Severity,
+  type Share,
   type Source,
   type SourcePatch,
   type Task,
   type TaskPatch,
   type TaskStatus,
+  type Topic,
   type WireEvent,
   type WorkerStatus,
   ACTORS,
@@ -39,6 +47,7 @@ import {
   DECISION_STATUSES,
 } from "@hive/shared";
 import { db, tx } from "./db.ts";
+import { publish } from "./bus.ts";
 import {
   contentHash,
   cosine,
@@ -55,6 +64,13 @@ const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${nanoid(12)}`;
 const json = <T>(s: string): T => JSON.parse(s) as T;
 const snip = (s: string, n = 140) => (s.length > n ? `${s.slice(0, n)}…` : s);
+
+/** lowercase, spaces→'-', strip non [a-z0-9-] */
+const slugify = (s: string) =>
+  s
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^a-z0-9-]/g, "");
 
 // ---- search index helpers ----
 
@@ -79,6 +95,8 @@ export function emit(kind: string, actor: string, payload: unknown): WireEvent {
     JSON.stringify(ev.payload),
     ev.created_at,
   );
+  // Fan out to SSE subscribers after the DB write succeeds.
+  publish({ kind: ev.kind, actor: ev.actor, payload: ev.payload, at: ev.created_at });
   return ev;
 }
 
@@ -156,15 +174,361 @@ export const inbox = {
 
 export const projects = {
   list: (): Project[] => db.prepare("SELECT * FROM projects ORDER BY name").all() as Project[],
-  ensure(name: string): void {
-    if (db.prepare("SELECT 1 FROM projects WHERE name = ?").get(name)) return;
-    db.prepare("INSERT INTO projects (id, name, created_at) VALUES (?, ?, ?)").run(
-      id("proj"),
-      name,
-      now(),
+
+  get(projectId: string): Project | undefined {
+    return db.prepare("SELECT * FROM projects WHERE id = ?").get(projectId) as Project | undefined;
+  },
+
+  bySlug(slug: string): Project | undefined {
+    return db.prepare("SELECT * FROM projects WHERE slug = ?").get(slug) as Project | undefined;
+  },
+
+  ensure(name: string): Project {
+    const slug = slugify(name);
+    const existing = db.prepare("SELECT * FROM projects WHERE slug = ?").get(slug) as Project | undefined;
+    if (existing) return existing;
+    const p: Project = { id: id("proj"), name, slug, created_at: now() };
+    db.prepare("INSERT INTO projects (id, name, slug, created_at) VALUES (?, ?, ?, ?)").run(
+      p.id, p.name, p.slug, p.created_at,
     );
+    return p;
+  },
+
+  withChildren(projectId: string): Project & { tasks: Task[]; phases: Phase[] } | undefined {
+    const p = projects.get(projectId);
+    if (!p) return undefined;
+    return {
+      ...p,
+      tasks: tasks.list({ project: projectId }),
+      phases: phases.list(projectId),
+    };
   },
 };
+
+// ---- people ----
+
+export const people = {
+  list: (): Person[] => db.prepare("SELECT * FROM people ORDER BY kind, slug").all() as Person[],
+
+  get(idOrSlug: string): Person | undefined {
+    return db.prepare("SELECT * FROM people WHERE slug = ? OR id = ?").get(idOrSlug, idOrSlug) as Person | undefined;
+  },
+
+  bySlug(slug: string): Person | undefined {
+    return db.prepare("SELECT * FROM people WHERE slug = ?").get(slug) as Person | undefined;
+  },
+
+  ensure(name: string, kind: "human" | "ai" = "human"): Person {
+    const slug = slugify(name);
+    const existing = people.bySlug(slug);
+    if (existing) return existing;
+    const p: Person = { id: id("per"), name, slug, kind, owner: null, created_at: now() };
+    db.prepare(
+      "INSERT INTO people (id, name, slug, kind, owner, created_at) VALUES (@id, @name, @slug, @kind, @owner, @created_at)",
+    ).run(p);
+    return p;
+  },
+
+  upsert(slug: string, name: string, kind: Person["kind"], owner: string | null = null): Person {
+    const existing = people.bySlug(slug);
+    if (existing) return existing;
+    const p: Person = { id: id("per"), slug, name, kind, owner, created_at: now() };
+    db.prepare(
+      "INSERT INTO people (id, slug, name, kind, owner, created_at) VALUES (@id, @slug, @name, @kind, @owner, @created_at)",
+    ).run(p);
+    return p;
+  },
+
+  create(input: { name: string; kind?: "human" | "ai" }, actor = "system"): Person {
+    const p = people.ensure(input.name, input.kind ?? "human");
+    emit("person.created", actor, { id: p.id, name: p.name, kind: p.kind });
+    return p;
+  },
+
+  update(idOrSlug: string, patch: PersonPatch, actor = "system"): Person | undefined {
+    const cur = people.get(idOrSlug);
+    if (!cur) return undefined;
+    const name = patch.name ?? cur.name;
+    const kind = patch.kind ?? cur.kind;
+    const owner = patch.owner !== undefined ? patch.owner : cur.owner;
+    const slug = patch.name ? slugify(name) : cur.slug;
+    db.prepare("UPDATE people SET name = ?, slug = ?, kind = ?, owner = ? WHERE id = ?").run(name, slug, kind, owner, cur.id);
+    const next: Person = { ...cur, name, slug, kind, owner };
+    emit("person.updated", actor, { id: cur.id, name, kind });
+    return next;
+  },
+};
+
+// ---- topics ----
+
+export const topics = {
+  list: (): Topic[] => db.prepare("SELECT * FROM topics ORDER BY name").all() as Topic[],
+
+  get(topicId: string): Topic | undefined {
+    return db.prepare("SELECT * FROM topics WHERE id = ?").get(topicId) as Topic | undefined;
+  },
+
+  bySlug(slug: string): Topic | undefined {
+    return db.prepare("SELECT * FROM topics WHERE slug = ?").get(slug) as Topic | undefined;
+  },
+
+  ensure(name: string): Topic {
+    const slug = slugify(name);
+    const existing = db.prepare("SELECT * FROM topics WHERE slug = ?").get(slug) as Topic | undefined;
+    if (existing) return existing;
+    const t: Topic = { id: id("top"), name, slug, created_at: now() };
+    db.prepare("INSERT INTO topics (id, name, slug, created_at) VALUES (?, ?, ?, ?)").run(
+      t.id, t.name, t.slug, t.created_at,
+    );
+    return t;
+  },
+};
+
+// ---- phases ----
+
+export const phases = {
+  list(projectId?: string): Phase[] {
+    if (projectId) {
+      return db
+        .prepare("SELECT * FROM phases WHERE project = ? ORDER BY position, created_at")
+        .all(projectId) as Phase[];
+    }
+    return db.prepare("SELECT * FROM phases ORDER BY project, position, created_at").all() as Phase[];
+  },
+
+  get(phaseId: string): Phase | undefined {
+    return db.prepare("SELECT * FROM phases WHERE id = ?").get(phaseId) as Phase | undefined;
+  },
+
+  bySlug(slug: string, projectId: string): Phase | undefined {
+    return db
+      .prepare("SELECT * FROM phases WHERE project = ? AND name = ? COLLATE NOCASE")
+      .get(projectId, slug.replace(/-/g, " ")) as Phase | undefined ??
+      db.prepare("SELECT * FROM phases WHERE project = ? AND LOWER(REPLACE(name,' ','-')) = ?")
+        .get(projectId, slug) as Phase | undefined;
+  },
+
+  ensure(projectId: string, name: string): Phase {
+    const existing = db
+      .prepare("SELECT * FROM phases WHERE project = ? AND LOWER(name) = LOWER(?)")
+      .get(projectId, name) as Phase | undefined;
+    if (existing) return existing;
+    const pos = (
+      db.prepare("SELECT COALESCE(MAX(position)+1, 0) AS n FROM phases WHERE project = ?").get(projectId) as { n: number }
+    ).n;
+    const ph: Phase = { id: id("ph"), project: projectId, name, position: pos, created_at: now() };
+    db.prepare("INSERT INTO phases (id, project, name, position, created_at) VALUES (?, ?, ?, ?, ?)").run(
+      ph.id, ph.project, ph.name, ph.position, ph.created_at,
+    );
+    return ph;
+  },
+};
+
+// ---- shares ----
+
+export const shares = {
+  create(input: NewShare): Share {
+    // Idempotent — ignore if the same (scope, ref, viewer) triple already exists.
+    const existing = db
+      .prepare("SELECT * FROM shares WHERE scope=? AND ref=? AND viewer=?")
+      .get(input.scope, input.ref, input.viewer) as Share | undefined;
+    if (existing) return existing;
+    const s: Share = { id: id("shr"), scope: input.scope, ref: input.ref, viewer: input.viewer, created_at: now() };
+    db.prepare(
+      "INSERT INTO shares (id, scope, ref, viewer, created_at) VALUES (@id, @scope, @ref, @viewer, @created_at)",
+    ).run(s);
+    emit("share.created", "system", { scope: s.scope, ref: s.ref, viewer: s.viewer });
+    return s;
+  },
+
+  forViewer(viewer: string): Share[] {
+    return db.prepare("SELECT * FROM shares WHERE viewer=? ORDER BY created_at DESC").all(viewer) as Share[];
+  },
+};
+
+// ---- visible journal (scoped to a viewer) ----
+
+export function visibleJournal(opts: {
+  viewer: string;
+  writers?: string[];
+  limit?: number;
+  offset?: number;
+}): JournalEntryView[] {
+  const { viewer, writers, limit = 50, offset = 0 } = opts;
+
+  // 1. Authors whose entries the viewer can see by ownership / relationship.
+  //    a) The viewer themselves.
+  //    b) AI people whose owner = viewer.
+  //    c) AI people who have ≥1 entry referencing viewer (links target_kind='person'
+  //       OR mentions contains viewer).
+  const ownedAiSlugs = (
+    db.prepare("SELECT slug FROM people WHERE kind='ai' AND owner=?").all(viewer) as { slug: string }[]
+  ).map((r) => r.slug);
+
+  // AI authors that referenced viewer via links (target_kind='person', target_id=viewer).
+  const linkedAiSlugs = (
+    db
+      .prepare(
+        `SELECT DISTINCT j.author FROM journal j
+         JOIN links l ON l.source_kind='journal' AND l.source_id=j.id
+         WHERE l.target_kind='person' AND l.target_id=?
+           AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')`,
+      )
+      .all(viewer) as { author: string }[]
+  ).map((r) => r.author);
+
+  // AI authors that @mentioned viewer in any entry.
+  const mentionedAiSlugs = (
+    db
+      .prepare(
+        `SELECT DISTINCT j.author FROM journal j
+         WHERE j.mentions LIKE ?
+           AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')`,
+      )
+      .all(`%"${viewer}"%`) as { author: string }[]
+  ).map((r) => r.author);
+
+  const visibleAuthors = new Set<string>([
+    viewer,
+    ...ownedAiSlugs,
+    ...linkedAiSlugs,
+    ...mentionedAiSlugs,
+  ]);
+
+  // 2. Entry-level shares (scope='entry') for this viewer.
+  const sharedEntryIds = (
+    db
+      .prepare("SELECT ref FROM shares WHERE scope='entry' AND viewer=?")
+      .all(viewer) as { ref: string }[]
+  ).map((r) => r.ref);
+
+  // 3. Journal-level shares (scope='journal') give visibility into entire author streams.
+  const journalSharedAuthors = (
+    db
+      .prepare("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
+      .all(viewer) as { ref: string }[]
+  ).map((r) => r.ref);
+  for (const a of journalSharedAuthors) visibleAuthors.add(a);
+
+  // 4. Entries where viewer is @mentioned.
+  const mentionedEntryIds = (
+    db
+      .prepare("SELECT id FROM journal WHERE mentions LIKE ?")
+      .all(`%"${viewer}"%`) as { id: string }[]
+  ).map((r) => r.id);
+
+  // Union the visible entry id set (from shares + mentions).
+  const extraIds = new Set([...sharedEntryIds, ...mentionedEntryIds]);
+
+  // 5. Optional writers filter: intersect with requested authors.
+  const authorSet = writers && writers.length > 0
+    ? new Set([...visibleAuthors].filter((a) => writers.includes(a)))
+    : visibleAuthors;
+
+  // 6. Build and run the query. SQLite doesn't support arrays natively, so we
+  //    use IN with placeholders assembled from the sets.
+  const authorList = [...authorSet];
+  const extraList = [...extraIds].filter((eid) => {
+    // For entries in extraIds, still apply the writers filter if present.
+    if (!writers || writers.length === 0) return true;
+    // We'll need to check author at query time — handled via subquery below.
+    return true;
+  });
+
+  const authorPlaceholders = authorList.length > 0 ? authorList.map(() => "?").join(",") : "'__never__'";
+  const extraPlaceholders = extraList.length > 0 ? extraList.map(() => "?").join(",") : "'__never__'";
+
+  // writers filter on the extra-id path: if writers specified, only include
+  // extra entries whose author is in the writers filter.
+  const writersFilter = writers && writers.length > 0
+    ? `AND j.author IN (${writers.map(() => "?").join(",")})`
+    : "";
+
+  const sql = `
+    SELECT j.* FROM journal j
+    WHERE (
+      j.author IN (${authorPlaceholders})
+      OR (j.id IN (${extraPlaceholders}) ${writersFilter})
+    )
+    ORDER BY j.created_at DESC
+    LIMIT ? OFFSET ?
+  `;
+
+  const params: unknown[] = [
+    ...authorList,
+    ...extraList,
+    ...(writers && writers.length > 0 ? writers : []),
+    limit,
+    offset,
+  ];
+
+  const rows = db.prepare(sql).all(...params) as (Omit<JournalEntry, "tags" | "mentions"> & {
+    tags: string;
+    mentions: string;
+  })[];
+
+  return rows.map((r) => ({
+    ...r,
+    tags: json(r.tags),
+    mentions: json(r.mentions),
+    anchors: anchorsFor(r.id),
+    refs: refsFor(r.id),
+  }));
+}
+
+/** Writers visible to a viewer: themselves + their AIs + related AIs. */
+export function journalWriters(viewer: string): JournalWriter[] {
+  // Reuse the same author discovery logic as visibleJournal.
+  const ownedAiSlugs = (
+    db.prepare("SELECT slug FROM people WHERE kind='ai' AND owner=?").all(viewer) as { slug: string }[]
+  ).map((r) => r.slug);
+
+  const linkedAiSlugs = (
+    db
+      .prepare(
+        `SELECT DISTINCT j.author FROM journal j
+         JOIN links l ON l.source_kind='journal' AND l.source_id=j.id
+         WHERE l.target_kind='person' AND l.target_id=?
+           AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')`,
+      )
+      .all(viewer) as { author: string }[]
+  ).map((r) => r.author);
+
+  const mentionedAiSlugs = (
+    db
+      .prepare(
+        `SELECT DISTINCT j.author FROM journal j
+         WHERE j.mentions LIKE ?
+           AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')`,
+      )
+      .all(`%"${viewer}"%`) as { author: string }[]
+  ).map((r) => r.author);
+
+  const journalSharedAuthors = (
+    db
+      .prepare("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
+      .all(viewer) as { ref: string }[]
+  ).map((r) => r.ref);
+
+  const slugSet = new Set<string>([
+    viewer,
+    ...ownedAiSlugs,
+    ...linkedAiSlugs,
+    ...mentionedAiSlugs,
+    ...journalSharedAuthors,
+  ]);
+
+  const result: JournalWriter[] = [];
+  for (const slug of slugSet) {
+    const p = people.get(slug);
+    if (p) result.push({ slug: p.slug, name: p.name, kind: p.kind, owner: p.owner });
+    else {
+      // Viewer may not be in people table yet — return a minimal record.
+      result.push({ slug, name: slug, kind: "human", owner: null });
+    }
+  }
+  return result.sort((a, b) => a.slug.localeCompare(b.slug));
+}
 
 // ---- structured entities (created internally from journal anchors) ----
 
@@ -172,7 +536,7 @@ type TaskRow = Omit<Task, "tags" | "assignees"> & { tags: string; assignees: str
 const toTask = (r: TaskRow): Task => ({ ...r, tags: json(r.tags), assignees: json(r.assignees) });
 
 export const tasks = {
-  list(filter: { status?: string; assignee?: string; project?: string } = {}): Task[] {
+  list(filter: { status?: string; assignee?: string; project?: string; phase?: string } = {}): Task[] {
     const rows = db
       .prepare(
         "SELECT * FROM tasks ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC",
@@ -182,6 +546,7 @@ export const tasks = {
       .map(toTask)
       .filter((t) => !filter.status || t.status === filter.status)
       .filter((t) => !filter.project || t.project === filter.project)
+      .filter((t) => !filter.phase || t.phase === filter.phase)
       .filter((t) => !filter.assignee || t.assignees.includes(filter.assignee));
   },
 
@@ -191,7 +556,8 @@ export const tasks = {
   },
 
   create(input: Partial<Task> & { title: string }, actor = "system"): Task {
-    if (input.project) projects.ensure(input.project);
+    // Only ensure-by-name when the project value is not already a known project id.
+    if (input.project && !projects.get(input.project)) projects.ensure(input.project);
     const t: Task = {
       id: id("task"),
       title: input.title,
@@ -201,14 +567,16 @@ export const tasks = {
       tags: input.tags ?? [],
       assignees: input.assignees ?? [],
       project: input.project ?? null,
+      phase: input.phase ?? null,
+      due: input.due ?? null,
       origin_entry_id: input.origin_entry_id ?? null,
       anchor_text: input.anchor_text ?? null,
       created_at: now(),
       updated_at: now(),
     };
     db.prepare(
-      `INSERT INTO tasks (id, project, title, body, status, priority, tags, assignees, origin_entry_id, anchor_text, created_at, updated_at)
-       VALUES (@id, @project, @title, @body, @status, @priority, @tags, @assignees, @origin_entry_id, @anchor_text, @created_at, @updated_at)`,
+      `INSERT INTO tasks (id, project, phase, due, title, body, status, priority, tags, assignees, origin_entry_id, anchor_text, created_at, updated_at)
+       VALUES (@id, @project, @phase, @due, @title, @body, @status, @priority, @tags, @assignees, @origin_entry_id, @anchor_text, @created_at, @updated_at)`,
     ).run({ ...t, tags: JSON.stringify(t.tags), assignees: JSON.stringify(t.assignees) });
     indexEntity("task", t.id, t.title, t.body, t.tags);
     emit("task.created", actor, { id: t.id, title: t.title });
@@ -250,7 +618,7 @@ export const decisions = {
   },
 
   create(input: Partial<Decision> & { title: string; decision: string }, actor = "system"): Decision {
-    if (input.project) projects.ensure(input.project);
+    if (input.project && !projects.get(input.project)) projects.ensure(input.project);
     const d: Decision = {
       id: id("dec"),
       title: input.title,
@@ -362,6 +730,45 @@ const anchorsFor = (entryId: string): ResolvedAnchor[] =>
     entryId,
   ) as Anchor[]).map((a) => ({ ...a, entity: entityById(a.kind, a.ref_id) }));
 
+/** Regex to find bracket tokens like [person: Maggie Bierly] */
+const TOKEN_RE = /\[(person|topic|project|phase|task):([^\]]+)\]/g;
+
+/** Resolve bracket tokens in a body string against the DB at read time. */
+function refsFor(body: string): JournalRef[] {
+  const refs: JournalRef[] = [];
+  for (const m of body.matchAll(new RegExp(TOKEN_RE.source, "g"))) {
+    const kind = m[1] as JournalRef["kind"];
+    const rawName = m[2].trim();
+    const start = m.index!;
+    const end = start + m[0].length;
+    let entity: { id: string; slug: string; name: string } | undefined;
+    if (kind === "person") {
+      entity = people.bySlug(slugify(rawName)) ?? undefined;
+    } else if (kind === "topic") {
+      entity = topics.bySlug(slugify(rawName)) ?? undefined;
+    } else if (kind === "project") {
+      entity = projects.bySlug(slugify(rawName)) ?? undefined;
+    } else if (kind === "phase") {
+      // phase resolution without a project context: find by name across all phases
+      const ph = db
+        .prepare("SELECT * FROM phases WHERE LOWER(name) = LOWER(?) LIMIT 1")
+        .get(rawName) as Phase | undefined;
+      if (ph) entity = { id: ph.id, slug: slugify(ph.name), name: ph.name };
+    } else {
+      // task — find the most recent task with matching title
+      type TR = { id: string; title: string };
+      const t = db
+        .prepare("SELECT id, title FROM tasks WHERE LOWER(title) = LOWER(?) ORDER BY created_at DESC LIMIT 1")
+        .get(rawName) as TR | undefined;
+      if (t) entity = { id: t.id, slug: slugify(t.title), name: t.title };
+    }
+    if (entity) {
+      refs.push({ kind, id: entity.id, slug: entity.slug, name: entity.name, start, end });
+    }
+  }
+  return refs;
+}
+
 // ---- journal (write-only source of truth) ----
 
 export const journal = {
@@ -374,6 +781,7 @@ export const journal = {
       tags: json(r.tags),
       mentions: json(r.mentions),
       anchors: anchorsFor(r.id),
+      refs: refsFor(r.body),
     }));
   },
 
@@ -382,12 +790,14 @@ export const journal = {
       | (Omit<JournalEntry, "tags" | "mentions"> & { tags: string; mentions: string })
       | undefined;
     if (!r) return undefined;
-    return { ...r, tags: json(r.tags), mentions: json(r.mentions), anchors: anchorsFor(r.id) };
+    return { ...r, tags: json(r.tags), mentions: json(r.mentions), anchors: anchorsFor(r.id), refs: refsFor(r.body) };
   },
 
   /**
    * The one write path. Persist immutable prose, then materialise each anchored
    * span into a structured entity and fan out inbox notifications.
+   * Also parses inline [person:], [topic:], [project:], [phase:], [task:] tokens
+   * to emerge/link entities and feed inboxes.
    */
   append(input: NewJournalEntry, actorOverride?: string): JournalEntryView {
     return tx(() => {
@@ -411,6 +821,9 @@ export const journal = {
         materialiseAnchor(entry, a, author, assignedMentions);
       }
 
+      // Parse bracket tokens: emerge/link entities, fan to inboxes.
+      parseBracketTokens(entry, author, assignedMentions);
+
       // Anyone @mentioned but not already pulled into an anchor gets a plain
       // "mention" inbox item — humans and AIs alike.
       for (const m of mentions) {
@@ -419,8 +832,16 @@ export const journal = {
         }
       }
 
+      // Auto-share: every @mentioned actor gets an entry-level share so the
+      // entry is visible in their scoped journal view.
+      for (const m of mentions) {
+        if (m !== author) {
+          shares.create({ scope: "entry", ref: entry.id, viewer: m });
+        }
+      }
+
       emit("journal.created", author, { id: entry.id, anchors: (input.anchors ?? []).length });
-      return { ...entry, anchors: anchorsFor(entry.id) };
+      return { ...entry, anchors: anchorsFor(entry.id), refs: refsFor(entry.body) };
     });
   },
 };
@@ -435,7 +856,10 @@ function materialiseAnchor(
   if (!text) return;
   const f: AnchorFields = a.fields ?? {};
   const spanMentions = parseMentions(text);
-  const assignees = (f.assignees ?? spanMentions).filter((x) => x !== author);
+  // Auto-assign to the entry author when no explicit assignees and no @mentions in the span.
+  const rawAssignees = f.assignees ?? (spanMentions.length > 0 ? spanMentions : [author]);
+  const assignees = rawAssignees.filter((x) => x !== author);
+  const assigneesForTask = rawAssignees.length > 0 ? rawAssignees : [author];
   const title = (f.title ?? text.split(/[.\n]/)[0]).slice(0, 120).trim();
 
   let refId: string;
@@ -448,7 +872,7 @@ function materialiseAnchor(
         status: (f.status as TaskStatus) ?? "todo",
         priority: f.priority,
         tags: f.tags,
-        assignees,
+        assignees: assigneesForTask,
         project: f.project ?? null,
         origin_entry_id: entry.id,
         anchor_text: text,
@@ -498,38 +922,95 @@ function materialiseAnchor(
   ).run(id("anc"), entry.id, a.start, a.end, text, a.kind, refId, now());
   links.create("journal", entry.id, a.kind, refId, "anchors", author);
 
-  for (const who of assignees) {
+  // For inbox delivery use the full assignee list (including author when auto-assigned).
+  const inboxRecipients = a.kind === "task" ? assigneesForTask : assignees;
+  for (const who of inboxRecipients) {
     assignedMentions.add(who);
     inbox.add(who, author, reason, a.kind, refId, entry.id, text);
   }
 }
 
-// ---- notes (kept for compat; no longer the prose surface) ----
+/**
+ * Parse [person:], [topic:], [project:], [phase:], [task:] tokens from an entry body.
+ * Find-or-create each entity, create a links row, and fan to inboxes where relevant.
+ * Context tracking: if the entry mentions a [project:] and/or [phase:], any [task:]
+ * that emerges is related to that project/phase.
+ */
+function parseBracketTokens(
+  entry: JournalEntry,
+  author: string,
+  assignedMentions: Set<string>,
+): void {
+  // First pass: collect context (project + phase referenced in this entry)
+  let contextProjectId: string | null = null;
+  let contextPhaseId: string | null = null;
 
-type NoteRow = Omit<Note, "tags"> & { tags: string };
-export const notes = {
-  list: (): Note[] =>
-    (db.prepare("SELECT * FROM notes ORDER BY updated_at DESC").all() as NoteRow[]).map((r) => ({
-      ...r,
-      tags: json(r.tags),
-    })),
-  create(input: { title: string; body?: string; tags?: string[] }, actor = "system"): Note {
-    const n: Note = {
-      id: id("note"),
-      title: input.title,
-      body: input.body ?? "",
-      tags: input.tags ?? [],
-      created_at: now(),
-      updated_at: now(),
-    };
-    db.prepare(
-      "INSERT INTO notes (id, title, body, tags, created_at, updated_at) VALUES (@id, @title, @body, @tags, @created_at, @updated_at)",
-    ).run({ ...n, tags: JSON.stringify(n.tags) });
-    indexEntity("note", n.id, n.title, n.body, n.tags);
-    emit("note.created", actor, { id: n.id });
-    return n;
-  },
-};
+  for (const m of entry.body.matchAll(new RegExp(TOKEN_RE.source, "g"))) {
+    const kind = m[1] as JournalRef["kind"];
+    const rawName = m[2].trim();
+    if (kind === "project") {
+      const p = projects.ensure(rawName);
+      contextProjectId = p.id;
+    } else if (kind === "phase" && contextProjectId) {
+      const ph = phases.ensure(contextProjectId, rawName);
+      contextPhaseId = ph.id;
+    }
+  }
+
+  // Second pass: process all tokens
+  for (const m of entry.body.matchAll(new RegExp(TOKEN_RE.source, "g"))) {
+    const kind = m[1] as JournalRef["kind"];
+    const rawName = m[2].trim();
+
+    if (kind === "person") {
+      // Resolve against ACTORS first (known actors), then ensure as a people row.
+      const slug = slugify(rawName);
+      const actorMatch = ACTORS.find((a) => a.name === slug || slugify(a.name) === slug);
+      const person = actorMatch
+        ? people.ensure(actorMatch.name.charAt(0).toUpperCase() + actorMatch.name.slice(1), actorMatch.kind)
+        : people.ensure(rawName);
+      links.create("journal", entry.id, "person", person.id, "mentions", author);
+      // Fan to inbox if this person is a known actor (same as @mention)
+      if (actorMatch) {
+        assignedMentions.add(actorMatch.name);
+        inbox.add(actorMatch.name, author, "mention", "journal", entry.id, entry.id, entry.body);
+      }
+
+    } else if (kind === "topic") {
+      const topic = topics.ensure(rawName);
+      links.create("journal", entry.id, "topic", topic.id, "tagged", author);
+
+    } else if (kind === "project") {
+      const proj = projects.ensure(rawName);
+      links.create("journal", entry.id, "project", proj.id, "about", author);
+
+    } else if (kind === "phase") {
+      const projId = contextProjectId;
+      if (projId) {
+        const ph = phases.ensure(projId, rawName);
+        links.create("journal", entry.id, "phase", ph.id, "about", author);
+      }
+
+    } else if (kind === "task") {
+      // Emerge a task anchored to this entry, auto-assigned to the author.
+      const t = tasks.create(
+        {
+          title: rawName,
+          body: "",
+          assignees: [author],
+          project: contextProjectId,
+          phase: contextPhaseId,
+          origin_entry_id: entry.id,
+          anchor_text: rawName,
+        },
+        author,
+      );
+      links.create("journal", entry.id, "task", t.id, "anchors", author);
+      // author is assigned; inbox.add silently skips self-notification (recipient===from)
+      inbox.add(author, author, "assignment", "task", t.id, entry.id, rawName);
+    }
+  }
+}
 
 // ---- links (knowledge graph) ----
 
@@ -566,7 +1047,12 @@ export const links = {
 
 /** The whole knowledge graph: every linked entity as a node, every link as an
  * edge. Node titles are resolved from the entities themselves; an endpoint with
- * no resolvable title falls back to its id. */
+ * no resolvable title falls back to its id.
+ *
+ * Derived edges (computed at query time, not stored):
+ * - chain: per-author consecutive journal entry pairs (chronological within author)
+ * - project→task, project→phase, phase→task from column relationships
+ */
 export function graph(): GraphData {
   const rows = db
     .prepare("SELECT source_kind, source_id, target_kind, target_id, rel FROM links ORDER BY created_at")
@@ -578,44 +1064,146 @@ export function graph(): GraphData {
     rel: string;
   }[];
   const titleOf = new Map(embeddableItems().map((i) => [`${i.kind}:${i.id}`, i.title]));
-  for (const n of notes.list()) titleOf.set(`note:${n.id}`, n.title);
+  for (const p of people.list()) titleOf.set(`person:${p.id}`, p.name);
+  for (const t of topics.list()) titleOf.set(`topic:${t.id}`, t.name);
+  for (const p of projects.list()) titleOf.set(`project:${p.id}`, p.name);
+  for (const ph of phases.list()) titleOf.set(`phase:${ph.id}`, ph.name);
 
   const nodes = new Map<string, GraphNode>();
   const addNode = (kind: EntityKind, refId: string) => {
     const key = `${kind}:${refId}`;
     if (!nodes.has(key)) nodes.set(key, { id: key, kind, title: titleOf.get(key) ?? refId });
   };
-  const edges = rows.map((r) => {
+  const edges: { source: string; target: string; rel: string }[] = rows.map((r) => {
     addNode(r.source_kind, r.source_id);
     addNode(r.target_kind, r.target_id);
     return { source: `${r.source_kind}:${r.source_id}`, target: `${r.target_kind}:${r.target_id}`, rel: r.rel };
   });
+
+  // Derived: per-author journal chain edges
+  const journalRows = db
+    .prepare("SELECT id, author FROM journal ORDER BY author, created_at ASC")
+    .all() as { id: string; author: string }[];
+  let prevAuthor: string | null = null;
+  let prevId: string | null = null;
+  for (const jr of journalRows) {
+    if (jr.author === prevAuthor && prevId) {
+      addNode("journal", prevId);
+      addNode("journal", jr.id);
+      edges.push({ source: `journal:${prevId}`, target: `journal:${jr.id}`, rel: "chain" });
+    } else if (jr.author !== prevAuthor) {
+      prevAuthor = jr.author;
+    }
+    prevId = jr.id;
+  }
+
+  // Derived: project→task and project→phase edges from column values
+  for (const t of tasks.list()) {
+    if (t.project) {
+      addNode("project", t.project);
+      addNode("task", t.id);
+      edges.push({ source: `project:${t.project}`, target: `task:${t.id}`, rel: "has_task" });
+    }
+    if (t.phase) {
+      addNode("phase", t.phase);
+      addNode("task", t.id);
+      edges.push({ source: `phase:${t.phase}`, target: `task:${t.id}`, rel: "has_task" });
+    }
+  }
+  for (const ph of phases.list()) {
+    addNode("project", ph.project);
+    addNode("phase", ph.id);
+    edges.push({ source: `project:${ph.project}`, target: `phase:${ph.id}`, rel: "has_phase" });
+  }
+
   return { nodes: [...nodes.values()], edges };
 }
 
 // ---- search ----
 
-export function search(query: string, limit = 25): SearchHit[] {
+/** Journal entry ids visible to a viewer — the permission boundary every read
+ * (feed, search, entity reads) filters through. Mirrors visibleJournal's rule:
+ * own entries + owned/related/mentioned AIs + shared entries + journal shares. */
+export function visibleEntryIds(viewer: string): Set<string> {
+  const col = (rows: unknown[], key: string) => (rows as Record<string, string>[]).map((r) => r[key]);
+  const ownedAi = col(db.prepare("SELECT slug FROM people WHERE kind='ai' AND owner=?").all(viewer), "slug");
+  const linkedAi = col(
+    db
+      .prepare(
+        `SELECT DISTINCT j.author author FROM journal j
+           JOIN links l ON l.source_kind='journal' AND l.source_id=j.id
+          WHERE l.target_kind='person' AND l.target_id=?
+            AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')`,
+      )
+      .all(viewer),
+    "author",
+  );
+  const mentionedAi = col(
+    db
+      .prepare(
+        `SELECT DISTINCT j.author author FROM journal j
+          WHERE j.mentions LIKE ? AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')`,
+      )
+      .all(`%"${viewer}"%`),
+    "author",
+  );
+  const journalShared = col(db.prepare("SELECT ref FROM shares WHERE scope='journal' AND viewer=?").all(viewer), "ref");
+  const authors = new Set<string>([viewer, ...ownedAi, ...linkedAi, ...mentionedAi, ...journalShared]);
+
+  const ids = new Set<string>([
+    ...col(db.prepare("SELECT ref FROM shares WHERE scope='entry' AND viewer=?").all(viewer), "ref"),
+    ...col(db.prepare("SELECT id FROM journal WHERE mentions LIKE ?").all(`%"${viewer}"%`), "id"),
+  ]);
+  if (authors.size) {
+    const ph = [...authors].map(() => "?").join(",");
+    for (const r of db.prepare(`SELECT id FROM journal WHERE author IN (${ph})`).all(...authors) as { id: string }[]) {
+      ids.add(r.id);
+    }
+  }
+  return ids;
+}
+
+const ORIGIN_TABLE: Record<string, string> = { task: "tasks", decision: "decisions", event: "events" };
+
+/** Drop search hits a viewer can't see: a journal entry they can read, or an
+ * entity that emerged from one. (bookstack-mcp does the equivalent ACL filter.) */
+function scopeHits(hits: SearchHit[], viewer: string): SearchHit[] {
+  const visible = visibleEntryIds(viewer);
+  return hits.filter((h) => {
+    if (h.kind === "journal") return visible.has(h.id);
+    const table = ORIGIN_TABLE[h.kind];
+    if (!table) return false;
+    const r = db.prepare(`SELECT origin_entry_id FROM ${table} WHERE id = ?`).get(h.id) as
+      | { origin_entry_id: string | null }
+      | undefined;
+    return r?.origin_entry_id ? visible.has(r.origin_entry_id) : false;
+  });
+}
+
+export function search(query: string, limit = 25, viewer?: string): SearchHit[] {
   if (!query.trim()) return [];
+  // Over-fetch when scoping so permission filtering doesn't starve the result.
+  const fetch = viewer ? limit * 5 : limit;
   const rows = db
     .prepare(
       `SELECT kind, ref_id, title, snippet(search, 3, '[', ']', '…', 12) AS snip, bm25(search) AS rank
        FROM search WHERE search MATCH ? ORDER BY rank LIMIT ?`,
     )
-    .all(toMatchQuery(query), limit) as {
+    .all(toMatchQuery(query), fetch) as {
     kind: SearchHit["kind"];
     ref_id: string;
     title: string;
     snip: string;
     rank: number;
   }[];
-  return rows.map((r) => ({
+  const hits = rows.map((r) => ({
     kind: r.kind,
     id: r.ref_id,
     title: r.title,
     snippet: r.snip,
     score: Math.round((1 / (1 + Math.abs(r.rank))) * 1000) / 1000,
   }));
+  return (viewer ? scopeHits(hits, viewer) : hits).slice(0, limit);
 }
 
 function toMatchQuery(q: string): string {
@@ -625,6 +1213,66 @@ function toMatchQuery(q: string): string {
     .map((term) => `${term.replace(/[^\p{L}\p{N}]/gu, "")}*`)
     .filter((t) => t.length > 1)
     .join(" ");
+}
+
+/** Typeahead autocomplete: matching people, open tasks, projects, topics, phases. */
+export function autocomplete(q: string, kinds?: string[]): AutocompleteItem[] {
+  const lower = q.toLowerCase();
+  const want = kinds ?? ["person", "task", "project", "topic", "phase"];
+  const results: AutocompleteItem[] = [];
+
+  if (want.includes("person")) {
+    for (const p of people.list()) {
+      if (p.name.toLowerCase().includes(lower)) {
+        results.push({ kind: "person", id: p.id, slug: p.slug, label: p.name });
+      }
+    }
+  }
+  if (want.includes("project")) {
+    for (const p of projects.list()) {
+      if (p.name.toLowerCase().includes(lower)) {
+        results.push({ kind: "project", id: p.id, slug: p.slug, label: p.name });
+      }
+    }
+  }
+  if (want.includes("topic")) {
+    for (const t of topics.list()) {
+      if (t.name.toLowerCase().includes(lower)) {
+        results.push({ kind: "topic", id: t.id, slug: t.slug, label: t.name });
+      }
+    }
+  }
+  if (want.includes("phase")) {
+    for (const ph of phases.list()) {
+      if (ph.name.toLowerCase().includes(lower)) {
+        results.push({ kind: "phase", id: ph.id, slug: slugify(ph.name), label: ph.name });
+      }
+    }
+  }
+  if (want.includes("task")) {
+    for (const t of tasks.list({ status: "todo" }).concat(tasks.list({ status: "doing" }))) {
+      if (t.title.toLowerCase().includes(lower)) {
+        results.push({ kind: "task", id: t.id, slug: slugify(t.title), label: t.title });
+      }
+    }
+  }
+
+  return results.slice(0, 8);
+}
+
+/** Ensure the 5 known actors exist as people rows. Safe to call multiple times. */
+export function seedActors(): void {
+  const FULL_NAMES: Record<string, string> = {
+    nate: "Nate Smith",
+    maggie: "Maggie Bierly",
+    pia: "Pia (Apiara)",
+    apis: "Apis",
+    cera: "Cera",
+  };
+  for (const a of ACTORS) {
+    // AIs default to nate's ownership so his journal view surfaces their activity.
+    people.upsert(a.name, FULL_NAMES[a.name] ?? a.name, a.kind, a.kind === "ai" ? "nate" : null);
+  }
 }
 
 // ---- dashboard ----
@@ -651,6 +1299,50 @@ export function dashboard(): DashboardStats {
     total: count('SELECT count(*) n FROM inbox WHERE recipient=?', a.name),
   }));
 
+  // Open tasks with a due date (for calendar overlay).
+  type TaskDueRow = { id: string; title: string; due: string; status: string; assignees: string };
+  const tasksWithDue = (
+    db.prepare(
+      "SELECT id, title, due, status, assignees FROM tasks WHERE due IS NOT NULL AND status != 'done' ORDER BY due ASC",
+    ).all() as TaskDueRow[]
+  ).map((r) => ({
+    id: r.id,
+    title: r.title,
+    due: r.due,
+    status: r.status as TaskStatus,
+    assignees: json<string[]>(r.assignees),
+  }));
+
+  // Entry counts per day for last 30 days (SQLite substr gives YYYY-MM-DD).
+  const entriesByDay = db
+    .prepare(
+      `SELECT substr(created_at, 1, 10) AS day, count(*) AS count
+       FROM journal
+       WHERE created_at >= datetime('now', '-30 days')
+       GROUP BY day ORDER BY day ASC`,
+    )
+    .all() as { day: string; count: number }[];
+
+  // Entry counts per author (total — for the author bar chart).
+  const entriesByAuthor = db
+    .prepare("SELECT author, count(*) AS count FROM journal GROUP BY author ORDER BY count DESC")
+    .all() as { author: string; count: number }[];
+
+  // Callouts: how often each person is referenced via links (target_kind='person').
+  type CalloutRow = { target_id: string; count: number };
+  const calloutRows = db
+    .prepare(
+      `SELECT target_id, count(*) AS count FROM links WHERE target_kind = 'person'
+       GROUP BY target_id ORDER BY count DESC`,
+    )
+    .all() as CalloutRow[];
+  const calloutsByPerson = calloutRows
+    .map((r) => {
+      const p = people.get(r.target_id);
+      return p ? { name: p.name, slug: p.slug, count: r.count } : null;
+    })
+    .filter((x): x is { name: string; slug: string; count: number } => x !== null);
+
   return {
     entries: count("SELECT count(*) n FROM journal"),
     events: count("SELECT count(*) n FROM events"),
@@ -659,6 +1351,10 @@ export function dashboard(): DashboardStats {
     inbox: inboxStats,
     byAuthor,
     recent: wire(12),
+    tasksWithDue,
+    entriesByDay,
+    entriesByAuthor,
+    calloutsByPerson,
   };
 }
 
@@ -958,6 +1654,8 @@ export interface SemanticOptions {
   hybrid?: boolean;
   /** Re-order the top-N with the cross-encoder, when one is available. */
   rerank?: boolean;
+  /** Scope results to entries this viewer may see (own + owned/shared/mentioned). */
+  viewer?: string;
 }
 
 const refKey = (kind: string, id: string) => `${kind}:${id}`;
@@ -1063,7 +1761,7 @@ export async function semanticSearch(query: string, opts: SemanticOptions = {}):
     ranked = scoredAll.slice(0, limit).map((h) => ({ k: h.k, score: h.score }));
   }
 
-  return ranked.map((r) => {
+  const hits = ranked.map((r) => {
     const [kind, id] = splitKey(r.k);
     return {
       kind: kind as SearchHit["kind"],
@@ -1073,6 +1771,7 @@ export async function semanticSearch(query: string, opts: SemanticOptions = {}):
       score: Math.round(r.score * 1000) / 1000,
     };
   });
+  return opts.viewer ? scopeHits(hits, opts.viewer) : hits;
 }
 
 // ---- worker status ----

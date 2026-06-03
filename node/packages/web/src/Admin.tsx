@@ -1,13 +1,145 @@
-import { createResource, For, Show, type Component } from "solid-js";
+import { createResource, createSignal, For, Show, type Component } from "solid-js";
+import type { Person } from "@hive/shared";
 import { api } from "./api.ts";
 import { relTime } from "./lib.tsx";
+import { liveRev } from "./live.ts";
 
-/** Operational view: worker heartbeat + last cycle, embedding coverage, and the
- * outbound job queue. Read-only — the worker drives the writes. */
+// ---- Writers management ----
+
+const WritersSection: Component = () => {
+  const [people, { refetch }] = createResource(() => ({ _r: liveRev() }), () => api.people());
+  const humans = () => (people() ?? []).filter((p) => p.kind === "human");
+  const setOwner = async (p: Person, owner: string) => {
+    await api.patchPerson(p.slug, { owner: owner || null });
+    refetch();
+  };
+
+  // Add-writer form state
+  const [newName, setNewName] = createSignal("");
+  const [newKind, setNewKind] = createSignal<"human" | "ai">("human");
+  const [adding, setAdding] = createSignal(false);
+
+  // Inline-edit state: tracks which person is being edited and their draft values
+  const [editId, setEditId] = createSignal<string | null>(null);
+  const [editName, setEditName] = createSignal("");
+  const [editKind, setEditKind] = createSignal<"human" | "ai">("human");
+
+  const startEdit = (p: Person) => {
+    setEditId(p.slug);
+    setEditName(p.name);
+    setEditKind(p.kind);
+  };
+
+  const cancelEdit = () => setEditId(null);
+
+  const saveEdit = async () => {
+    const id = editId();
+    if (!id) return;
+    await api.patchPerson(id, { name: editName().trim() || undefined, kind: editKind() });
+    setEditId(null);
+    refetch();
+  };
+
+  const addWriter = async () => {
+    const name = newName().trim();
+    if (!name) return;
+    setAdding(true);
+    try {
+      await api.addPerson({ name, kind: newKind() });
+      setNewName("");
+      setNewKind("human");
+      refetch();
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  return (
+    <>
+      <h3 class="sec">Writers</h3>
+      <p class="dim sm pad">Actors who can write journal entries and receive inbox items. Seeded from ACTORS; add more here.</p>
+
+      {/* Add-writer form */}
+      <div class="source-form">
+        <input
+          class="grow"
+          placeholder="Name…"
+          value={newName()}
+          onInput={(e) => setNewName(e.currentTarget.value)}
+          onKeyDown={(e) => e.key === "Enter" && addWriter()}
+        />
+        <select value={newKind()} onChange={(e) => setNewKind(e.currentTarget.value as "human" | "ai")}>
+          <option value="human">human</option>
+          <option value="ai">ai</option>
+        </select>
+        <button class="primary" onClick={addWriter} disabled={adding() || !newName().trim()}>
+          + add
+        </button>
+      </div>
+
+      {/* Writers list */}
+      <Show when={people()} fallback={<p class="dim sm">loading…</p>}>
+        <For each={people()} fallback={<p class="dim sm">no writers yet.</p>}>
+          {(p) => (
+            <div class="source-row">
+              <Show
+                when={editId() === p.slug}
+                fallback={
+                  <>
+                    <span class="source-main">
+                      <span class="source-name">
+                        <strong>{p.name}</strong>
+                        <span class={`badge kind-badge-${p.kind}`}>{p.kind}</span>
+                      </span>
+                      <span class="dim sm">{p.slug}</span>
+                    </span>
+                    <Show when={p.kind === "ai"}>
+                      <label class="writer-owner-label dim sm">
+                        owner&nbsp;
+                        <select
+                          class="writer-owner-select"
+                          value={p.owner ?? ""}
+                          onChange={(e) => setOwner(p, e.currentTarget.value)}
+                        >
+                          <option value="">none</option>
+                          <For each={humans()}>{(h) => <option value={h.slug}>{h.name}</option>}</For>
+                        </select>
+                      </label>
+                    </Show>
+                    <button class="ghost" onClick={() => startEdit(p)}>edit</button>
+                  </>
+                }
+              >
+                {/* Inline edit row */}
+                <input
+                  value={editName()}
+                  onInput={(e) => setEditName(e.currentTarget.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") saveEdit(); if (e.key === "Escape") cancelEdit(); }}
+                  style={{ flex: "1" }}
+                />
+                <select value={editKind()} onChange={(e) => setEditKind(e.currentTarget.value as "human" | "ai")}>
+                  <option value="human">human</option>
+                  <option value="ai">ai</option>
+                </select>
+                <button class="primary" onClick={saveEdit}>save</button>
+                <button class="ghost" onClick={cancelEdit}>cancel</button>
+              </Show>
+            </div>
+          )}
+        </For>
+      </Show>
+    </>
+  );
+};
+
+// ---- Admin shell ----
+
+/** Operational view: worker heartbeat + last cycle, embedding coverage,
+ * outbound job queue, and writer management. */
 export const Admin: Component = () => {
-  const [worker, { refetch: rw }] = createResource(() => api.worker());
-  const [emb, { refetch: re }] = createResource(() => api.embeddings());
-  const [outbox, { refetch: ro }] = createResource(() => api.outbox());
+  const [worker, { refetch: rw }] = createResource(() => ({ _r: liveRev() }), () => api.worker());
+  const [emb, { refetch: re }] = createResource(() => ({ _r: liveRev() }), () => api.embeddings());
+  const [outbox, { refetch: ro }] = createResource(() => ({ _r: liveRev() }), () => api.outbox());
   const refresh = () => {
     rw();
     re();
@@ -19,6 +151,8 @@ export const Admin: Component = () => {
 
   return (
     <section class="admin">
+      <WritersSection />
+
       <div class="admin-head">
         <h3 class="sec">Worker</h3>
         <button class="ghost" onClick={refresh}>↻ refresh</button>

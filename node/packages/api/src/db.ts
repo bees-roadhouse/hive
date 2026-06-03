@@ -57,8 +57,33 @@ export function migrate(): void {
     CREATE TABLE IF NOT EXISTS projects (
       id         TEXT PRIMARY KEY,
       name       TEXT NOT NULL UNIQUE,
+      slug       TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS people (
+      id         TEXT PRIMARY KEY,
+      name       TEXT NOT NULL,
+      slug       TEXT NOT NULL UNIQUE,
+      kind       TEXT NOT NULL DEFAULT 'human',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS topics (
+      id         TEXT PRIMARY KEY,
+      name       TEXT NOT NULL,
+      slug       TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS phases (
+      id         TEXT PRIMARY KEY,
+      project    TEXT NOT NULL,
+      name       TEXT NOT NULL,
+      position   INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS phases_project ON phases (project);
 
     CREATE TABLE IF NOT EXISTS tasks (
       id              TEXT PRIMARY KEY,
@@ -118,15 +143,6 @@ export function migrate(): void {
       read_at    TEXT
     );
     CREATE INDEX IF NOT EXISTS inbox_recipient ON inbox (recipient, read_at);
-
-    CREATE TABLE IF NOT EXISTS notes (
-      id         TEXT PRIMARY KEY,
-      title      TEXT NOT NULL,
-      body       TEXT NOT NULL DEFAULT '',
-      tags       TEXT NOT NULL DEFAULT '[]',
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
 
     CREATE TABLE IF NOT EXISTS links (
       id          TEXT PRIMARY KEY,
@@ -204,6 +220,30 @@ export function migrate(): void {
       heartbeat  TEXT,
       last_run   TEXT
     );
+
+    -- Writers: every human and AI that can author journal entries.
+    -- kind='ai' rows carry owner (a human slug) for visibility scoping.
+    CREATE TABLE IF NOT EXISTS people (
+      id         TEXT PRIMARY KEY,
+      slug       TEXT NOT NULL UNIQUE,
+      name       TEXT NOT NULL,
+      kind       TEXT NOT NULL DEFAULT 'human',
+      owner      TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    -- Shares: explicit visibility grants.
+    -- scope='entry' → ref is a journal entry id (shared with viewer).
+    -- scope='journal' → ref is an author slug (viewer sees all entries by that author).
+    CREATE TABLE IF NOT EXISTS shares (
+      id         TEXT PRIMARY KEY,
+      scope      TEXT NOT NULL,
+      ref        TEXT NOT NULL,
+      viewer     TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS shares_viewer ON shares (viewer, scope);
+    CREATE UNIQUE INDEX IF NOT EXISTS shares_uniq ON shares (scope, ref, viewer);
   `);
 
   // Idempotent column additions for DBs created before owner was introduced.
@@ -213,6 +253,35 @@ export function migrate(): void {
     .get();
   if (!hasOwner) {
     db.exec("ALTER TABLE sources ADD COLUMN owner TEXT");
+  }
+
+  const hasTaskPhase = db
+    .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name='phase'")
+    .get();
+  if (!hasTaskPhase) {
+    db.exec("ALTER TABLE tasks ADD COLUMN phase TEXT");
+  }
+
+  const hasTaskDue = db
+    .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name='due'")
+    .get();
+  if (!hasTaskDue) {
+    db.exec("ALTER TABLE tasks ADD COLUMN due TEXT");
+  }
+
+  const hasProjectSlug = db
+    .prepare("SELECT 1 FROM pragma_table_info('projects') WHERE name='slug'")
+    .get();
+  if (!hasProjectSlug) {
+    db.exec("ALTER TABLE projects ADD COLUMN slug TEXT NOT NULL DEFAULT ''");
+  }
+
+  // people.owner — guard for DBs bootstrapped before this column was added.
+  const hasPeopleOwner = db
+    .prepare("SELECT 1 FROM pragma_table_info('people') WHERE name='owner'")
+    .get();
+  if (!hasPeopleOwner) {
+    db.exec("ALTER TABLE people ADD COLUMN owner TEXT");
   }
 }
 

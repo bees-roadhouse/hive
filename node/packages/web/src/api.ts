@@ -1,4 +1,5 @@
 import type {
+  AutocompleteItem,
   DashboardStats,
   Decision,
   EmbeddingStats,
@@ -6,15 +7,23 @@ import type {
   GraphData,
   InboxItem,
   JournalEntryView,
+  JournalWriter,
   NewJournalEntry,
+  NewShare,
   NewSource,
   OutboxJob,
+  Person,
+  PersonPatch,
+  Phase,
+  Project,
   SearchHit,
+  Share,
   Source,
   SourceKind,
   SourcePatch,
   Task,
   TaskPatch,
+  Topic,
   WireEvent,
   WorkerStatus,
 } from "@hive/shared";
@@ -23,6 +32,19 @@ import type {
 const ACTOR_KEY = "hive.actor";
 export const getActor = () => localStorage.getItem(ACTOR_KEY) ?? "nate";
 export const setActor = (a: string) => localStorage.setItem(ACTOR_KEY, a);
+
+// Done-retention: how long (in hours) a DONE task stays visible before it's
+// hidden by default. The Tasks board respects this unless "show done" is toggled.
+const DONE_RETENTION_KEY = "hive.doneRetentionHours";
+const DONE_RETENTION_DEFAULT = 24;
+export const getDoneRetentionHours = (): number => {
+  const raw = localStorage.getItem(DONE_RETENTION_KEY);
+  const n = raw !== null ? Number(raw) : NaN;
+  // Sentinel: Infinity means "always show" (never hide by age).
+  return Number.isFinite(n) && n >= 0 ? n : DONE_RETENTION_DEFAULT;
+};
+export const setDoneRetentionHours = (hours: number): void =>
+  localStorage.setItem(DONE_RETENTION_KEY, String(hours));
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/api${path}`, {
@@ -36,6 +58,13 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   journal: (limit = 50, offset = 0) =>
     req<JournalEntryView[]>(`/journal?limit=${limit}&offset=${offset}`),
+  journalScoped: (viewer: string, writers?: string[], limit = 50, offset = 0) => {
+    const p = new URLSearchParams({ viewer, limit: String(limit), offset: String(offset) });
+    if (writers && writers.length > 0) p.set("writers", writers.join(","));
+    return req<JournalEntryView[]>(`/journal?${p}`);
+  },
+  journalWriters: (viewer: string) =>
+    req<JournalWriter[]>(`/journal/writers?viewer=${encodeURIComponent(viewer)}`),
   append: (e: NewJournalEntry) =>
     req<JournalEntryView>("/journal", { method: "POST", body: JSON.stringify(e) }),
 
@@ -71,4 +100,25 @@ export const api = {
   delSource: (id: string) => req<void>(`/sources/${id}`, { method: "DELETE" }),
   worker: () => req<WorkerStatus>("/worker"),
   outbox: () => req<OutboxJob[]>("/outbox"),
+
+  autocomplete: (q: string, kinds: string[]) =>
+    req<AutocompleteItem[]>(
+      `/autocomplete?q=${encodeURIComponent(q)}&kinds=${kinds.join(",")}`,
+    ),
+
+  people: () => req<Person[]>("/people"),
+  addPerson: (p: { name: string; kind?: "human" | "ai" }) =>
+    req<Person>("/people", { method: "POST", body: JSON.stringify(p) }),
+  patchPerson: (slug: string, patch: PersonPatch) =>
+    req<Person>(`/people/${slug}`, { method: "PATCH", body: JSON.stringify(patch) }),
+
+  topics: () => req<Topic[]>("/topics"),
+  projects: () => req<Project[]>("/projects"),
+  projectById: (id: string) =>
+    req<Project & { tasks: Task[]; phases: Phase[] }>(`/projects/${id}`),
+
+  createShare: (share: NewShare) =>
+    req<Share>("/shares", { method: "POST", body: JSON.stringify(share) }),
+  shares: (viewer: string) =>
+    req<Share[]>(`/shares?viewer=${encodeURIComponent(viewer)}`),
 };

@@ -1,7 +1,7 @@
 import { createEffect, type JSX } from "solid-js";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
-import type { ResolvedAnchor } from "@hive/shared";
+import type { JournalRef, ResolvedAnchor } from "@hive/shared";
 import { ANCHOR_GLYPH } from "./lib.tsx";
 
 // GFM (task-list checkboxes, tables) + soft line breaks so a single newline in
@@ -21,21 +21,44 @@ export function Markdown(props: { src: string; class?: string }): JSX.Element {
 const MENTION = /@[a-z][a-z0-9_-]*/gi;
 
 /**
- * Render a journal entry as markdown, then overlay clickable anchor highlights
- * and @mention chips. Anchors are matched by their text (markdown rendering
- * moots the raw char offsets); an anchor whose text is split across markdown
- * formatting simply isn't highlighted inline — it's still reachable from the
- * boards and the drawer.
+ * Reconstruct the raw bracket token for a JournalRef so we can find it as a
+ * literal string in the rendered text. Shape: `[kind: name]`.
+ */
+function refToken(r: JournalRef): string {
+  return `[${r.kind}: ${r.name}]`;
+}
+
+/**
+ * Render a journal entry as markdown, then overlay:
+ *   1. Ref chips — bracket tokens (`[person: Maggie Bierly]`) → clean colored chips.
+ *   2. Anchor highlights — span-based anchored text → clickable underlined spans.
+ *   3. @mention chips.
+ *
+ * Refs are matched by their literal token string (most robust; the token survives
+ * markdown rendering as plain text). Anchors are matched by their text. Refs are
+ * applied first so they don't get double-wrapped by the anchor pass.
  */
 export function JournalBody(props: {
   body: string;
   anchors: ResolvedAnchor[];
+  refs?: JournalRef[];
   onAnchor?: (a: ResolvedAnchor) => void;
 }): JSX.Element {
   let el!: HTMLDivElement;
   createEffect(() => {
     el.innerHTML = renderMarkdown(props.body);
-    // Longest first so a short anchor can't pre-empt a longer overlapping one.
+
+    // 1. Replace ref bracket tokens with colored chips.
+    for (const r of props.refs ?? []) {
+      const token = refToken(r);
+      wrapFirst(el, token, (span) => {
+        span.className = `ref ref-${r.kind}`;
+        span.textContent = r.name;
+        span.title = `${r.kind}: ${r.name}`;
+      });
+    }
+
+    // 2. Longest-first so a short anchor can't pre-empt a longer overlapping one.
     for (const a of [...props.anchors].sort((x, y) => y.text.length - x.text.length)) {
       wrapFirst(el, a.text, (span) => {
         span.className = `anchor anchor-${a.kind}`;
@@ -46,19 +69,23 @@ export function JournalBody(props: {
         span.appendChild(sup);
       });
     }
+
+    // 3. @mention chips.
     chipMentions(el);
   });
   return <div ref={el} class="md prose" />;
 }
 
-/** Wrap the first plain occurrence of `needle` in a <span>, then `decorate` it.
- * Skips text already inside an anchor/mention/code so passes don't nest. */
+/**
+ * Wrap the first plain occurrence of `needle` in a <span>, then `decorate` it.
+ * Skips text already inside an anchor/ref/mention/code so passes don't nest.
+ */
 function wrapFirst(root: HTMLElement, needle: string, decorate: (span: HTMLSpanElement) => void): void {
   if (!needle) return;
   const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
   let node = walker.nextNode() as Text | null;
   while (node) {
-    if (!node.parentElement?.closest(".anchor, .mention, code, pre")) {
+    if (!node.parentElement?.closest(".anchor, .ref, .mention, code, pre")) {
       const i = node.nodeValue!.indexOf(needle);
       if (i !== -1) {
         const match = node.splitText(i);
@@ -80,7 +107,7 @@ function chipMentions(root: HTMLElement): void {
   const targets: Text[] = [];
   let node = walker.nextNode() as Text | null;
   while (node) {
-    if (!node.parentElement?.closest(".anchor, .mention, code, pre")) {
+    if (!node.parentElement?.closest(".anchor, .ref, .mention, code, pre")) {
       MENTION.lastIndex = 0;
       if (MENTION.test(node.nodeValue!)) targets.push(node);
     }

@@ -2,13 +2,14 @@ import { createResource, createSignal, For, Show, type Component } from "solid-j
 import { ACTOR_NAMES, SEVERITIES, type Severity, type SourceKind } from "@hive/shared";
 import { api, getActor } from "./api.ts";
 import { relTime } from "./lib.tsx";
+import { liveRev } from "./live.ts";
 
 /** Worker configuration: ingest sources (GUI ⇄ MCP), status, outbound queue. */
 export const Settings: Component = () => {
   const actor = getActor();
-  const [sources, { refetch }] = createResource(() => api.sources(actor));
-  const [status, { refetch: refetchStatus }] = createResource(() => api.worker());
-  const [outbox] = createResource(() => api.outbox());
+  const [sources, { refetch }] = createResource(() => ({ _r: liveRev() }), () => api.sources(actor));
+  const [status, { refetch: refetchStatus }] = createResource(() => ({ _r: liveRev() }), () => api.worker());
+  const [outbox] = createResource(() => ({ _r: liveRev() }), () => api.outbox());
   const [form, setForm] = createSignal({
     name: "",
     url: "",

@@ -1,6 +1,7 @@
 import { createResource, createSignal, For, Show, type Component } from "solid-js";
 import { ACTORS } from "@hive/shared";
 import { api, getActor } from "./api.ts";
+import { liveRev } from "./live.ts";
 import { Mentions, relTime } from "./lib.tsx";
 
 const REASON_GLYPH: Record<string, string> = {
@@ -15,7 +16,7 @@ export const Inbox: Component = () => {
   const [who, setWho] = createSignal(getActor());
   const [unreadOnly, setUnreadOnly] = createSignal(true);
   const [items, { refetch }] = createResource(
-    () => ({ who: who(), unread: unreadOnly() }),
+    () => ({ who: who(), unread: unreadOnly(), _r: liveRev() }),
     (k) => api.inbox(k.who, k.unread),
   );
 

@@ -14,6 +14,49 @@ export interface ActorInfo {
   kind: ActorKind;
 }
 
+// ---- people (the writers; kind human|ai) ----
+
+export interface Person {
+  id: string;
+  slug: string;
+  name: string;
+  kind: ActorKind;
+  /** For AI writers: the slug of their human owner. null for humans. */
+  owner: string | null;
+  created_at: string;
+}
+
+export type PersonPatch = Partial<Pick<Person, "name" | "kind" | "owner">>;
+
+// ---- shares ----
+
+export type ShareScope = "entry" | "journal";
+
+export interface Share {
+  id: string;
+  /** 'entry' → ref is a journal entry id; 'journal' → ref is an author slug. */
+  scope: ShareScope;
+  ref: string;
+  /** Person slug the share is granted to. */
+  viewer: string;
+  created_at: string;
+}
+
+export interface NewShare {
+  scope: ShareScope;
+  ref: string;
+  viewer: string;
+}
+
+// ---- journal writers (for filter UI) ----
+
+export interface JournalWriter {
+  slug: string;
+  name: string;
+  kind: ActorKind;
+  owner: string | null;
+}
+
 /** The known cast. Mentions resolve against these to drive inboxes. */
 export const ACTORS: ActorInfo[] = [
   { name: "nate", kind: "human" },
@@ -32,7 +75,7 @@ export type DecisionStatus = "proposed" | "accepted" | "rejected" | "superseded"
 /** The structured kinds that can be anchored into a journal entry. */
 export type AnchorKind = "task" | "decision" | "event";
 /** Everything addressable in search / inbox / links. */
-export type EntityKind = AnchorKind | "journal" | "note";
+export type EntityKind = AnchorKind | "journal" | "person" | "topic" | "project" | "phase";
 
 export const TASK_STATUSES: TaskStatus[] = ["todo", "doing", "blocked", "done"];
 export const PRIORITIES: Priority[] = ["low", "normal", "high", "urgent"];
@@ -79,6 +122,8 @@ export interface Task {
   tags: string[];
   assignees: string[];
   project: string | null;
+  phase: string | null;
+  due: string | null;
   origin_entry_id: string | null;
   anchor_text: string | null;
   created_at: string;
@@ -138,16 +183,51 @@ export interface InboxItem {
 export interface Project {
   id: string;
   name: string;
+  slug: string;
   created_at: string;
 }
 
-export interface Note {
+export interface Person {
   id: string;
-  title: string;
-  body: string;
-  tags: string[];
+  name: string;
+  slug: string;
+  kind: "human" | "ai";
   created_at: string;
-  updated_at: string;
+}
+
+export interface Topic {
+  id: string;
+  name: string;
+  slug: string;
+  created_at: string;
+}
+
+export interface Phase {
+  id: string;
+  project: string;
+  name: string;
+  position: number;
+  created_at: string;
+}
+
+/** A resolved bracket token reference in a journal entry body. */
+export interface JournalRef {
+  kind: "person" | "topic" | "project" | "phase" | "task";
+  id: string;
+  slug: string;
+  name: string;
+  /** char offset of `[` in the body */
+  start: number;
+  /** char offset one past `]` in the body */
+  end: number;
+}
+
+/** Autocomplete candidate for the journal editor. */
+export interface AutocompleteItem {
+  kind: "person" | "topic" | "project" | "phase" | "task";
+  id: string;
+  slug: string;
+  label: string;
 }
 
 export interface Link {
@@ -281,6 +361,8 @@ export interface WorkerStatus {
 export type ResolvedAnchor = Anchor & { entity: Task | Decision | EventItem | null };
 export interface JournalEntryView extends JournalEntry {
   anchors: ResolvedAnchor[];
+  /** Resolved bracket-token references — renderer uses start/end to substitute display names. */
+  refs: JournalRef[];
 }
 
 export interface DashboardStats {
@@ -291,6 +373,14 @@ export interface DashboardStats {
   inbox: { recipient: string; kind: ActorKind; unread: number; total: number }[];
   byAuthor: { author: string; entries: number }[];
   recent: WireEvent[];
+  /** Open tasks (status != done) that have a due date — for the calendar overlay. */
+  tasksWithDue: { id: string; title: string; due: string; status: TaskStatus; assignees: string[] }[];
+  /** Journal entry counts per day for the last ~30 days. */
+  entriesByDay: { day: string; count: number }[];
+  /** Journal entry counts per author (same data as byAuthor but in count form). */
+  entriesByAuthor: { author: string; count: number }[];
+  /** How often each person is referenced via links (target_kind='person'), most to least. */
+  calloutsByPerson: { name: string; slug: string; count: number }[];
 }
 
 // ---- write payloads ----
