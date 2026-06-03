@@ -3,13 +3,13 @@
 *.swp
 .DS_Store
 
-# Node / Solid app (node/)
+# Node / Solid app
 node_modules/
 **/node_modules/
-node/packages/*/dist/
-node/data/*.db
-node/data/*.db-shm
-node/data/*.db-wal
+packages/*/dist/
+data/*.db
+data/*.db-shm
+data/*.db-wal
 *.tsbuildinfo
 
 # agent worktrees (managed by the Agent tool)

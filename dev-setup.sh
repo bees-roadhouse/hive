@@ -5,7 +5,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-echo "🐝 hive(node) setup — installing deps…"
+echo "🐝 hive setup — installing deps…"
 corepack enable >/dev/null 2>&1 || true
 # CI=true: non-interactive. minimumReleaseAge=0: this sandbox's registry policy
 # can flag very-recently-published transitives; we don't gate on release age.
@@ -20,5 +20,5 @@ else
 fi
 
 echo "✅ ready."
-echo "   API + web:  cd node && pnpm dev        (api :8787 + web :5173, MCP at /mcp)"
+echo "   API + web:  pnpm dev        (api :8787 + web :5173, MCP at /mcp)"
 echo "   worker:     pnpm --filter @hive/worker start   (or: once)"
