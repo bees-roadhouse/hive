@@ -1,4 +1,5 @@
 import type {
+  AutocompleteItem,
   DashboardStats,
   Decision,
   EmbeddingStats,
@@ -71,4 +72,9 @@ export const api = {
   delSource: (id: string) => req<void>(`/sources/${id}`, { method: "DELETE" }),
   worker: () => req<WorkerStatus>("/worker"),
   outbox: () => req<OutboxJob[]>("/outbox"),
+
+  autocomplete: (q: string, kinds: string[]) =>
+    req<AutocompleteItem[]>(
+      `/autocomplete?q=${encodeURIComponent(q)}&kinds=${kinds.join(",")}`,
+    ),
 };

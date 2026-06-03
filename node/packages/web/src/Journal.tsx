@@ -1,5 +1,22 @@
-import { createMemo, createSignal, For, onCleanup, onMount, Show, type Component } from "solid-js";
-import type { AnchorKind, JournalEntryView, NewAnchor, Priority, ResolvedAnchor } from "@hive/shared";
+import {
+  createEffect,
+  createMemo,
+  createSignal,
+  For,
+  on,
+  onCleanup,
+  onMount,
+  Show,
+  type Component,
+} from "solid-js";
+import type {
+  AnchorKind,
+  AutocompleteItem,
+  JournalEntryView,
+  NewAnchor,
+  Priority,
+  ResolvedAnchor,
+} from "@hive/shared";
 import { PRIORITIES } from "@hive/shared";
 import { api, getActor } from "./api.ts";
 import { ANCHOR_GLYPH, relTime } from "./lib.tsx";
@@ -16,6 +33,29 @@ interface Pending {
 
 const PAGE = 20;
 
+// Autocomplete trigger scheme:
+//   @  → person
+//   #  → topic
+//   +  → project
+//   !  → task (open)
+//   [  → all kinds (person, topic, project, phase, task)
+const TRIGGERS: Record<string, string[]> = {
+  "@": ["person"],
+  "#": ["topic"],
+  "+": ["project"],
+  "!": ["task"],
+  "[": ["person", "topic", "project", "phase", "task"],
+};
+
+// Kind glyph for the autocomplete dropdown.
+const KIND_GLYPH: Record<string, string> = {
+  person: "👤",
+  topic: "#",
+  project: "◈",
+  phase: "◷",
+  task: "◻",
+};
+
 /** "Today" / "Yesterday" / "Tuesday, June 2, 2026" for a day header. */
 function dayLabel(iso: string): string {
   const d = new Date(iso);
@@ -25,7 +65,18 @@ function dayLabel(iso: string): string {
   yesterday.setDate(today.getDate() - 1);
   if (key(d) === key(today)) return "Today";
   if (key(d) === key(yesterday)) return "Yesterday";
-  return d.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+  return d.toLocaleDateString(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+  });
+}
+
+// Auto-grow a textarea to its content height (capped by CSS max-height).
+function autoGrow(el: HTMLTextAreaElement) {
+  el.style.height = "auto";
+  el.style.height = `${el.scrollHeight}px`;
 }
 
 export const Journal: Component = () => {
@@ -35,9 +86,14 @@ export const Journal: Component = () => {
   const [sel, setSel] = createSignal<{ start: number; end: number }>({ start: 0, end: 0 });
   const [open, setOpen] = createSignal<ResolvedAnchor | null>(null);
 
-  // The feed is an infinite scroll: entries accumulate page by page, oldest
-  // loaded on demand as a sentinel at the bottom scrolls into view, then group
-  // into one "page" (comb cell) per calendar day.
+  // Autocomplete state.
+  const [acItems, setAcItems] = createSignal<AutocompleteItem[]>([]);
+  const [acTrigger, setAcTrigger] = createSignal<string | null>(null);
+  const [acQuery, setAcQuery] = createSignal("");
+  const [acActive, setAcActive] = createSignal(0);
+  let acTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // Infinite scroll feed state.
   const [entries, setEntries] = createSignal<JournalEntryView[]>([]);
   const [loading, setLoading] = createSignal(false);
   const [done, setDone] = createSignal(false);
@@ -76,24 +132,68 @@ export const Journal: Component = () => {
   });
 
   let sentinel!: HTMLDivElement;
+  let feedEl!: HTMLDivElement;
+
   onMount(() => {
     void loadMore();
-    const obs = new IntersectionObserver(
+
+    // Infinite scroll sentinel.
+    const scrollObs = new IntersectionObserver(
       (ents) => {
         if (ents.some((x) => x.isIntersecting)) void loadMore();
       },
       { rootMargin: "300px" },
     );
-    obs.observe(sentinel);
-    onCleanup(() => obs.disconnect());
+    scrollObs.observe(sentinel);
+
+    // Fade-in for entry cards as they enter the viewport.
+    // Respect prefers-reduced-motion — if set, skip the animation entirely.
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    let fadeObs: IntersectionObserver | undefined;
+    if (!reduced) {
+      fadeObs = new IntersectionObserver(
+        (ents) => {
+          for (const ent of ents) {
+            if (ent.isIntersecting) {
+              (ent.target as HTMLElement).classList.add("entry-visible");
+              fadeObs!.unobserve(ent.target);
+            }
+          }
+        },
+        { threshold: 0.05 },
+      );
+      // Observe existing entries and any that arrive later.
+      const observeEntries = () => {
+        if (!fadeObs) return;
+        feedEl?.querySelectorAll(".entry:not(.entry-visible)").forEach((el) => {
+          fadeObs!.observe(el);
+        });
+      };
+      observeEntries();
+      // Re-observe after each feed update.
+      const mo = new MutationObserver(observeEntries);
+      mo.observe(feedEl, { childList: true, subtree: true });
+      onCleanup(() => mo.disconnect());
+    }
+
+    onCleanup(() => {
+      scrollObs.disconnect();
+      fadeObs?.disconnect();
+    });
   });
 
   let ta!: HTMLTextAreaElement;
   const trackSel = () => setSel({ start: ta.selectionStart, end: ta.selectionEnd });
   const selectedText = () => body().slice(sel().start, sel().end).trim();
 
-  // Markdown toolbar — for writers who don't know the syntax. Wrap/prefix the
-  // current selection, then restore focus + selection so anchoring still works.
+  // Auto-grow the textarea whenever body changes.
+  createEffect(
+    on(body, () => {
+      if (ta) autoGrow(ta);
+    }),
+  );
+
+  // Markdown toolbar helpers.
   const surround = (pre: string, post = pre) => {
     const s = ta.selectionStart;
     const e = ta.selectionEnd;
@@ -129,9 +229,98 @@ export const Journal: Component = () => {
   };
   const removePending = (i: number) => setPending(pending().filter((_, j) => j !== i));
 
+  // Autocomplete: scan backward from caret for a trigger char + query text.
+  const findTriggerContext = (
+    text: string,
+    caret: number,
+  ): { trigger: string; query: string; triggerPos: number } | null => {
+    // Scan back up to 64 chars (long enough for any realistic name).
+    const limit = Math.max(0, caret - 64);
+    for (let i = caret - 1; i >= limit; i--) {
+      const ch = text[i];
+      if (ch in TRIGGERS) {
+        // Make sure the char just before the trigger isn't a word char (no mid-word trigger).
+        const before = i === 0 ? "" : text[i - 1];
+        if (before && /\w/.test(before)) continue;
+        return { trigger: ch, query: text.slice(i + 1, caret), triggerPos: i };
+      }
+      // Stop if we hit whitespace (no trigger on a multi-word gap without a trigger).
+      if (/\s/.test(ch) && ch !== " ") break;
+    }
+    return null;
+  };
+
+  const dismissAc = () => {
+    setAcItems([]);
+    setAcTrigger(null);
+    setAcQuery("");
+    setAcActive(0);
+    clearTimeout(acTimer);
+  };
+
+  const onBodyInput = (e: InputEvent & { currentTarget: HTMLTextAreaElement }) => {
+    const val = e.currentTarget.value;
+    setBody(val);
+    trackSel();
+    const caret = e.currentTarget.selectionStart;
+    const ctx = findTriggerContext(val, caret);
+    if (!ctx) { dismissAc(); return; }
+    setAcTrigger(ctx.trigger);
+    setAcQuery(ctx.query);
+    setAcActive(0);
+    clearTimeout(acTimer);
+    acTimer = setTimeout(async () => {
+      try {
+        const kinds = TRIGGERS[ctx.trigger] ?? ["person"];
+        const items = await api.autocomplete(ctx.query, kinds);
+        setAcItems(items);
+        setAcActive(0);
+      } catch {
+        setAcItems([]);
+      }
+    }, 120);
+  };
+
+  const selectAcItem = (item: AutocompleteItem) => {
+    const val = body();
+    const caret = ta.selectionStart;
+    const ctx = findTriggerContext(val, caret);
+    if (!ctx) { dismissAc(); return; }
+    // Build the bracket token to insert.
+    const token = `[${item.kind}: ${item.label}]`;
+    const before = val.slice(0, ctx.triggerPos);
+    const after = val.slice(caret);
+    const next = `${before}${token}${after}`;
+    setBody(next);
+    dismissAc();
+    // Place caret right after the inserted token.
+    queueMicrotask(() => {
+      ta.focus();
+      const pos = before.length + token.length;
+      ta.selectionStart = ta.selectionEnd = pos;
+      trackSel();
+    });
+  };
+
+  const onKeyDown = (e: KeyboardEvent) => {
+    if (!acItems().length) return;
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setAcActive((i) => Math.min(i + 1, acItems().length - 1));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setAcActive((i) => Math.max(i - 1, 0));
+    } else if (e.key === "Enter" || e.key === "Tab") {
+      e.preventDefault();
+      const item = acItems()[acActive()];
+      if (item) selectAcItem(item);
+    } else if (e.key === "Escape") {
+      dismissAc();
+    }
+  };
+
   const post = async () => {
     if (!body().trim()) return;
-    // Recompute offsets from text at submit time so edits never desync anchors.
     let cursor = 0;
     const anchors: NewAnchor[] = [];
     for (const p of pending()) {
@@ -149,6 +338,7 @@ export const Journal: Component = () => {
     await api.append({ author: getActor(), body: body(), anchors });
     setBody("");
     setPending([]);
+    dismissAc();
     await reload();
   };
 
@@ -157,9 +347,13 @@ export const Journal: Component = () => {
       <div class="composer">
         <div class="composer-top">
           <div class="composer-hint">
-            Write what happened in <strong>markdown</strong>. Select any phrase, then tag it — it
-            becomes a task, decision, or event anchored to that text.{" "}
-            <span class="mention">@mention</span> to notify someone.
+            Write in <strong>markdown</strong>. Use{" "}
+            <code class="trigger-hint">@name</code> for people,{" "}
+            <code class="trigger-hint">#topic</code>,{" "}
+            <code class="trigger-hint">+project</code>,{" "}
+            <code class="trigger-hint">!task</code>, or{" "}
+            <code class="trigger-hint">[kind: …]</code> for any entity.
+            Select text to tag it as a task, decision, or event.
           </div>
           <div class="seg">
             <button classList={{ active: !preview() }} onClick={() => setPreview(false)}>
@@ -188,21 +382,44 @@ export const Journal: Component = () => {
             <button title="quote" onClick={() => prefixLine("> ")}>❝</button>
             <button title="link" onClick={() => surround("[", "](https://)")}>🔗</button>
           </div>
-          <textarea
-            ref={ta}
-            rows={4}
-            placeholder="e.g. Synced with @pia — we'll ship the **Solid UI** this week. Decided to stay on `SQLite`."
-            value={body()}
-            onInput={(e) => setBody(e.currentTarget.value)}
-            onSelect={trackSel}
-            onMouseUp={trackSel}
-            onKeyUp={trackSel}
-          />
+          <div class="composer-editor-wrap">
+            <textarea
+              ref={ta}
+              class="composer-ta"
+              placeholder="e.g. Synced with @pia — shipping the **Solid UI** this week. Staying on `SQLite`."
+              value={body()}
+              onInput={onBodyInput}
+              onSelect={trackSel}
+              onMouseUp={trackSel}
+              onKeyUp={trackSel}
+              onKeyDown={onKeyDown}
+            />
+            <Show when={acItems().length > 0}>
+              <ul class="ac-dropdown" role="listbox">
+                <For each={acItems()}>
+                  {(item, i) => (
+                    <li
+                      class="ac-item"
+                      classList={{ "ac-item-active": i() === acActive() }}
+                      role="option"
+                      aria-selected={i() === acActive()}
+                      onMouseDown={(e) => { e.preventDefault(); selectAcItem(item); }}
+                      onMouseEnter={() => setAcActive(i())}
+                    >
+                      <span class="ac-kind-glyph">{KIND_GLYPH[item.kind] ?? "·"}</span>
+                      <span class="ac-label">{item.label}</span>
+                      <span class="ac-kind dim">{item.kind}</span>
+                    </li>
+                  )}
+                </For>
+              </ul>
+            </Show>
+          </div>
         </Show>
         <div class="composer-bar">
           <div class="mark-group">
             <span class="dim">
-              {selectedText() ? `tag “${selectedText().slice(0, 28)}…” as` : "select text to tag"}
+              {selectedText() ? `tag "${selectedText().slice(0, 28)}…" as` : "select text to tag"}
             </span>
             <For each={["task", "decision", "event"] as AnchorKind[]}>
               {(k) => (
@@ -227,7 +444,11 @@ export const Journal: Component = () => {
                   <Show when={p.kind === "task"}>
                     <select onChange={(e) => (p.priority = e.currentTarget.value as Priority)}>
                       <For each={PRIORITIES}>
-                        {(pr) => <option value={pr} selected={pr === "normal"}>{pr}</option>}
+                        {(pr) => (
+                          <option value={pr} selected={pr === "normal"}>
+                            {pr}
+                          </option>
+                        )}
                       </For>
                     </select>
                   </Show>
@@ -241,7 +462,7 @@ export const Journal: Component = () => {
         </Show>
       </div>
 
-      <div class="feed">
+      <div ref={feedEl} class="feed">
         <For each={days()}>
           {(d) => (
             <section class="day">
@@ -254,7 +475,7 @@ export const Journal: Component = () => {
               </header>
               <For each={d.items}>
                 {(e) => (
-                  <article class="entry">
+                  <article class="entry entry-fade">
                     <header>
                       <span class="actor-chip">{e.author}</span>
                       <time>{relTime(e.created_at)}</time>
@@ -264,7 +485,7 @@ export const Journal: Component = () => {
                         </span>
                       </Show>
                     </header>
-                    <JournalBody body={e.body} anchors={e.anchors} onAnchor={setOpen} />
+                    <JournalBody body={e.body} anchors={e.anchors} refs={e.refs} onAnchor={setOpen} />
                   </article>
                 )}
               </For>
@@ -300,7 +521,7 @@ export const Journal: Component = () => {
                   ✕
                 </button>
               </div>
-              <blockquote>“{a().text}”</blockquote>
+              <blockquote>"{a().text}"</blockquote>
               <EntityCard kind={a().kind} entity={a().entity} />
             </div>
           </div>
