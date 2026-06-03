@@ -513,3 +513,118 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
   .dash-charts-row { grid-template-columns: 1fr; }
   .cal-cell { min-height: 2.4rem; }
 }
+/* ---- journal overlay editor ---- */
+
+/* Header row above the feed: "new entry" button aligned right */
+.journal-header {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  margin-bottom: 1.1rem;
+}
+.journal-new-btn {
+  font-size: 0.88rem;
+  padding: 0.4rem 0.9rem;
+}
+
+/* Floating action button — bottom-right corner of the viewport */
+.journal-fab {
+  position: fixed;
+  bottom: 1.75rem;
+  right: 1.75rem;
+  width: 3rem;
+  height: 3rem;
+  border-radius: 50%;
+  background: var(--honey);
+  color: #1a1407;
+  border: none;
+  font-size: 1.3rem;
+  display: grid;
+  place-items: center;
+  box-shadow: 0 4px 18px rgba(0,0,0,0.45);
+  z-index: 30;
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+.journal-fab:hover:not(:disabled) {
+  transform: scale(1.08);
+  box-shadow: 0 6px 24px rgba(0,0,0,0.55);
+  border-color: transparent;
+}
+
+/* Full-screen dimmed backdrop */
+.overlay-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.62);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 40;
+  animation: overlay-fade-in 0.18s ease both;
+}
+@keyframes overlay-fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .overlay-backdrop { animation: none; }
+}
+
+/* Centered writing panel */
+.overlay-panel {
+  width: min(720px, 92vw);
+  max-height: 90vh;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 1.25rem 1.4rem 1.4rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  box-shadow: 0 16px 56px rgba(0, 0, 0, 0.6);
+  animation: overlay-slide-in 0.2s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes overlay-slide-in {
+  from { opacity: 0; transform: scale(0.97) translateY(6px); }
+  to   { opacity: 1; transform: scale(1)    translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .overlay-panel { animation: none; }
+}
+
+/* Panel header: title + write/preview seg + close button */
+.overlay-head {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+.overlay-title {
+  font-weight: 600;
+  font-size: 1rem;
+  flex: 1;
+  text-transform: lowercase;
+  letter-spacing: 0.01em;
+  color: var(--ink);
+}
+
+/* Hint text inside overlay */
+.overlay-hint {
+  font-size: 0.83rem;
+  margin-bottom: 0;
+}
+
+/* Preview pane inside overlay (taller than the inline composer's) */
+.overlay-preview {
+  min-height: 10rem;
+}
+
+/* The overlay textarea — generous, auto-grows, not inline-rows-limited */
+.overlay-ta {
+  min-height: 10rem;
+  max-height: 55vh;
+}
+
+/* Subtle close animation when the overlay unmounts (Solid removes instantly,
+   so we handle the "open → closed" transition via the open animation alone;
+   the backdrop click is fast enough that no exit animation is needed.) */
