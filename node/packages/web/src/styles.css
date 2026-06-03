@@ -99,13 +99,12 @@ textarea { width: 100%; resize: vertical; font-size: 0.95rem; line-height: 1.5; 
 .entry header { display: flex; gap: 0.5rem; align-items: baseline; border: none; padding: 0; margin-bottom: 0.3rem; }
 .entry time { color: var(--dim); font-size: 0.78rem; }
 .prose { margin: 0.7rem 0 0; line-height: 1.85; font-size: 1.06rem; max-width: 70ch; }
-/* Linked things in prose (mentions, anchors, refs) are calm + uniform — a quiet
-   underline, not bold, no per-kind color. */
-.mention { color: inherit; font-weight: inherit; text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 2px; }
-.anchor { cursor: pointer; text-decoration: underline; text-decoration-color: var(--dim); text-decoration-thickness: 1px; text-underline-offset: 3px; }
-.anchor sup { font-size: 0.62em; opacity: 0.5; margin-left: 0.1em; }
-.anchor-task, .anchor-decision, .anchor-event { text-decoration-color: var(--dim); }
-.mention:hover, .anchor:hover { text-decoration-color: var(--honey); }
+/* Linked things in prose (mentions, anchors, refs) are distinguished by weight,
+   not color or underline — calm and uniform. */
+.mention { color: inherit; font-weight: 600; }
+.anchor { cursor: pointer; font-weight: 600; }
+.anchor sup { font-size: 0.62em; opacity: 0.5; margin-left: 0.1em; font-weight: 400; }
+.mention:hover, .anchor:hover, .ref:hover { color: var(--honey); }
 
 /* ---- drawer ---- */
 .drawer-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: flex; justify-content: flex-end; z-index: 10; }
@@ -256,16 +255,25 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 .sidebar nav .nav-icon { display: inline-flex; align-items: center; color: inherit; }
 
 /* ---- journal: one comb cell (day page) per day, infinite scroll ---- */
-.day { margin-bottom: 1.4rem; }
+/* A day is ONE page in the journal — its entries flow down the same sheet,
+   separated by a thin rule, not as individual boxes. */
+.day {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 1.9rem 2.2rem;
+  margin-bottom: 1.6rem;
+}
 .day-head {
   display: flex; align-items: center; gap: 0.55rem;
-  position: sticky; top: 0; z-index: 2;
-  padding: 0.7rem 0 0.55rem;
-  background: linear-gradient(var(--bg) 78%, transparent);
+  padding-bottom: 0.85rem; margin-bottom: 1.3rem;
+  border-bottom: 1px solid var(--line);
 }
-.day-head h3 { margin: 0; font-size: 1.02rem; letter-spacing: 0.01em; }
+.day-head h3 { margin: 0; font-size: 1.12rem; letter-spacing: 0.01em; }
 .day-head .comb { color: var(--honey); }
 .day-head .dim.sm { margin-left: auto; font-variant-numeric: tabular-nums; }
+.day .entry { background: none; border: none; border-radius: 0; padding: 0; }
+.day .entry + .entry { margin-top: 1.6rem; padding-top: 1.6rem; border-top: 1px solid var(--line); }
 .sentinel { display: flex; justify-content: center; align-items: center; padding: 1.3rem 0; min-height: 2.2rem; }
 
 /* ---- markdown content ---- */
@@ -353,13 +361,9 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 .ref {
   display: inline;
   color: inherit;
-  font-weight: inherit;
+  font-weight: 600;
   cursor: pointer;
-  text-decoration: underline;
-  text-decoration-color: var(--line);
-  text-underline-offset: 2px;
 }
-.ref:hover { text-decoration-color: var(--honey); }
 
 /* ---- entry fade-in animation ---- */
 .entry-fade {
@@ -573,10 +577,11 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
   .overlay-backdrop { animation: none; }
 }
 
-/* Centered writing panel */
+/* Full-page writing panel */
 .overlay-panel {
-  width: min(720px, 92vw);
-  max-height: 90vh;
+  width: min(1100px, 96vw);
+  min-height: 80vh;
+  max-height: 95vh;
   overflow-y: auto;
   background: var(--panel);
   border: 1px solid var(--line);
@@ -622,11 +627,12 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
   min-height: 10rem;
 }
 
-/* The overlay textarea — generous, auto-grows, not inline-rows-limited */
+/* The overlay textarea — a full page to write on; auto-grows beyond this. */
 .overlay-ta {
-  min-height: 10rem;
-  max-height: 55vh;
+  min-height: 58vh;
+  max-height: none;
 }
+.overlay-panel .composer-editor-wrap { flex: 1; }
 
 /* Subtle close animation when the overlay unmounts (Solid removes instantly,
    so we handle the "open → closed" transition via the open animation alone;
