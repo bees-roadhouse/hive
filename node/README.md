@@ -1,15 +1,15 @@
-# hive (node) — a fun Node.js + Solid.js rewrite
+# hive (node) — Node.js + Solid.js
 
-A playful reimplementation of [`hive`](../README.md) — the shared state every
-Bee's Roadhouse / DTC AI config reads and writes (tasks, journal, notes,
-**decisions**, knowledge-graph links, and a wire event log).
+The [`hive`](../README.md) app — the shared state every Bee's Roadhouse / DTC AI
+config reads and writes (journal, tasks, **decisions**, events, notes,
+knowledge-graph links, and a wire event log).
 
-This is the *fun, not-that-serious* sibling of the production Rust workspace. It
-trades Postgres + pgvector and the 9-phase auth stack for **zero-infra SQLite**
-so it spins up instantly in a fresh container.
+**Zero-infra**: a single-file SQLite database, so it spins up instantly in a
+fresh container.
 
-> Not a drop-in replacement for the Rust `hive`. Same domain, much smaller scope:
-> no semantic/vector search, no auth, single-file DB.
+> This replaced an earlier Rust workspace (Postgres + pgvector + a 9-phase auth
+> stack). That tradeoff means: no auth, and semantic search uses a local
+> embedder rather than a hosted model — see the worker section.
 
 ## Stack
 

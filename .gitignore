@@ -1,24 +1,9 @@
-/target
-**/*.rs.bk
-Cargo.lock.bak
 .vscode/
 .idea/
 *.swp
 .DS_Store
 
-# Local sqlite scratch (the real DB lives at ~/.hive/hive.db, not in-repo)
-*.db
-*.db-shm
-*.db-wal
-
-# Leptos build artifacts
-/site
-/dist
-
-# Local model cache for hive-embed
-/models
-
-# Node / Solid rewrite (node/)
+# Node / Solid app (node/)
 node_modules/
 **/node_modules/
 node/packages/*/dist/

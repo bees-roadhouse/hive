@@ -7,5 +7,10 @@ allowBuilds:
   esbuild: true
 
 # Don't re-run an install check before every `pnpm <script>` — it's noisy in a
-# workspace and (in this sandbox) trips the registry release-age policy.
+# workspace and trips the registry release-age policy.
 verifyDepsBeforeRun: false
+
+# Don't gate installs on how recently a (transitive) version was published.
+# Vite pulls a fresh `node-releases`/browserslist data package on most releases,
+# and a frozen-lockfile CI install shouldn't fail just because it's <24h old.
+minimumReleaseAge: 0
