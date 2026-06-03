@@ -330,6 +330,14 @@ export interface DashboardStats {
   inbox: { recipient: string; kind: ActorKind; unread: number; total: number }[];
   byAuthor: { author: string; entries: number }[];
   recent: WireEvent[];
+  /** Open tasks (status != done) that have a due date — for the calendar overlay. */
+  tasksWithDue: { id: string; title: string; due: string; status: TaskStatus; assignees: string[] }[];
+  /** Journal entry counts per day for the last ~30 days. */
+  entriesByDay: { day: string; count: number }[];
+  /** Journal entry counts per author (same data as byAuthor but in count form). */
+  entriesByAuthor: { author: string; count: number }[];
+  /** How often each person is referenced via links (target_kind='person'), most to least. */
+  calloutsByPerson: { name: string; slug: string; count: number }[];
 }
 
 // ---- write payloads ----

@@ -1007,6 +1007,50 @@ export function dashboard(): DashboardStats {
     total: count('SELECT count(*) n FROM inbox WHERE recipient=?', a.name),
   }));
 
+  // Open tasks with a due date (for calendar overlay).
+  type TaskDueRow = { id: string; title: string; due: string; status: string; assignees: string };
+  const tasksWithDue = (
+    db.prepare(
+      "SELECT id, title, due, status, assignees FROM tasks WHERE due IS NOT NULL AND status != 'done' ORDER BY due ASC",
+    ).all() as TaskDueRow[]
+  ).map((r) => ({
+    id: r.id,
+    title: r.title,
+    due: r.due,
+    status: r.status as TaskStatus,
+    assignees: json<string[]>(r.assignees),
+  }));
+
+  // Entry counts per day for last 30 days (SQLite substr gives YYYY-MM-DD).
+  const entriesByDay = db
+    .prepare(
+      `SELECT substr(created_at, 1, 10) AS day, count(*) AS count
+       FROM journal
+       WHERE created_at >= datetime('now', '-30 days')
+       GROUP BY day ORDER BY day ASC`,
+    )
+    .all() as { day: string; count: number }[];
+
+  // Entry counts per author (total — for the author bar chart).
+  const entriesByAuthor = db
+    .prepare("SELECT author, count(*) AS count FROM journal GROUP BY author ORDER BY count DESC")
+    .all() as { author: string; count: number }[];
+
+  // Callouts: how often each person is referenced via links (target_kind='person').
+  type CalloutRow = { target_id: string; count: number };
+  const calloutRows = db
+    .prepare(
+      `SELECT target_id, count(*) AS count FROM links WHERE target_kind = 'person'
+       GROUP BY target_id ORDER BY count DESC`,
+    )
+    .all() as CalloutRow[];
+  const calloutsByPerson = calloutRows
+    .map((r) => {
+      const p = people.get(r.target_id);
+      return p ? { name: p.name, slug: p.slug, count: r.count } : null;
+    })
+    .filter((x): x is { name: string; slug: string; count: number } => x !== null);
+
   return {
     entries: count("SELECT count(*) n FROM journal"),
     events: count("SELECT count(*) n FROM events"),
@@ -1015,6 +1059,10 @@ export function dashboard(): DashboardStats {
     inbox: inboxStats,
     byAuthor,
     recent: wire(12),
+    tasksWithDue,
+    entriesByDay,
+    entriesByAuthor,
+    calloutsByPerson,
   };
 }
 
