@@ -226,6 +226,8 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 .legend .lg { display: inline-flex; align-items: center; gap: 0.3rem; }
 .legend .lg i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
 .graph-svg { width: 100%; height: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; margin: 0.4rem 0; }
+.graph-canvas { height: 72vh; min-height: 440px; background: var(--bg); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; margin: 0.4rem 0; }
+.graph-canvas canvas { display: block; }
 .graph-svg .edge { stroke: var(--line); stroke-width: 1.2; }
 .graph-svg .edge.faded { stroke-opacity: 0.18; }
 .graph-svg .node { cursor: pointer; }

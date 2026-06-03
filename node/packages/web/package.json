@@ -11,6 +11,7 @@
   "dependencies": {
     "@hive/shared": "workspace:*",
     "dompurify": "^3.4.7",
+    "force-graph": "^1.51.4",
     "marked": "^18.0.4",
     "solid-js": "^1.9.5"
   },
