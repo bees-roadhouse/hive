@@ -1,14 +1,22 @@
 import { createResource, createSignal, For, Show, type Component } from "solid-js";
-import { ACTOR_NAMES, SEVERITIES, type Severity } from "@hive/shared";
-import { api } from "./api.ts";
+import { ACTOR_NAMES, SEVERITIES, type Severity, type SourceKind } from "@hive/shared";
+import { api, getActor } from "./api.ts";
 import { relTime } from "./lib.tsx";
 
 /** Worker configuration: ingest sources (GUI ⇄ MCP), status, outbound queue. */
 export const Settings: Component = () => {
-  const [sources, { refetch }] = createResource(() => api.sources());
+  const actor = getActor();
+  const [sources, { refetch }] = createResource(() => api.sources(actor));
   const [status, { refetch: refetchStatus }] = createResource(() => api.worker());
   const [outbox] = createResource(() => api.outbox());
-  const [form, setForm] = createSignal({ name: "", url: "", severity: "info" as Severity, notify: "" });
+  const [form, setForm] = createSignal({
+    name: "",
+    url: "",
+    kind: "rss" as SourceKind,
+    severity: "info" as Severity,
+    notify: "",
+    scope: "global" as "global" | "me",
+  });
 
   const refreshAll = () => {
     refetch();
@@ -19,8 +27,15 @@ export const Settings: Component = () => {
     e.preventDefault();
     const f = form();
     if (!f.name.trim() || !f.url.trim()) return;
-    await api.addSource({ name: f.name, url: f.url, severity: f.severity, notify: f.notify || null });
-    setForm({ name: "", url: "", severity: "info", notify: "" });
+    await api.addSource({
+      name: f.name,
+      url: f.url,
+      kind: f.kind,
+      severity: f.severity,
+      notify: f.notify || null,
+      scope: f.scope,
+    });
+    setForm({ name: "", url: "", kind: "rss", severity: "info", notify: "", scope: "global" });
     refreshAll();
   };
   const toggle = async (id: string, enabled: boolean) => {
@@ -66,13 +81,21 @@ export const Settings: Component = () => {
 
       <form class="source-form" onSubmit={add}>
         <input placeholder="name" value={form().name} onInput={(e) => setForm({ ...form(), name: e.currentTarget.value })} />
-        <input class="grow" placeholder="https://…/feed.xml" value={form().url} onInput={(e) => setForm({ ...form(), url: e.currentTarget.value })} />
+        <input class="grow" placeholder="https://…" value={form().url} onInput={(e) => setForm({ ...form(), url: e.currentTarget.value })} />
+        <select value={form().kind} onChange={(e) => setForm({ ...form(), kind: e.currentTarget.value as SourceKind })}>
+          <option value="rss">rss</option>
+          <option value="scrape">scrape</option>
+        </select>
         <select value={form().severity} onChange={(e) => setForm({ ...form(), severity: e.currentTarget.value as Severity })}>
           <For each={SEVERITIES}>{(s) => <option value={s}>{s}</option>}</For>
         </select>
         <select value={form().notify} onChange={(e) => setForm({ ...form(), notify: e.currentTarget.value })}>
           <option value="">no notify</option>
           <For each={ACTOR_NAMES}>{(a) => <option value={a}>notify @{a}</option>}</For>
+        </select>
+        <select value={form().scope} onChange={(e) => setForm({ ...form(), scope: e.currentTarget.value as "global" | "me" })}>
+          <option value="global">global</option>
+          <option value="me">personal</option>
         </select>
         <button class="primary" type="submit">add source</button>
       </form>
@@ -85,7 +108,10 @@ export const Settings: Component = () => {
             </label>
             <div class="source-main">
               <div class="source-name">
-                {s.name} <span class="badge">{s.severity}</span>
+                {s.name}
+                <span class="badge">{s.kind}</span>
+                <span class="badge">{s.severity}</span>
+                <span class="badge dim">{s.owner ? `@${s.owner}` : "global"}</span>
                 <Show when={s.notify}><span class="actor-chip sm">@{s.notify}</span></Show>
               </div>
               <div class="dim sm">{s.url}</div>

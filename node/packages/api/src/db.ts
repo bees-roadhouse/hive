@@ -157,6 +157,7 @@ export function migrate(): void {
       interval_secs INTEGER NOT NULL DEFAULT 900,
       notify        TEXT,
       enabled       INTEGER NOT NULL DEFAULT 1,
+      owner         TEXT,
       last_polled_at TEXT,
       last_status   TEXT,
       created_at    TEXT NOT NULL
@@ -195,6 +196,15 @@ export function migrate(): void {
       last_run   TEXT
     );
   `);
+
+  // Idempotent column additions for DBs created before owner was introduced.
+  // Must run after the CREATE TABLE block so the table exists on fresh DBs.
+  const hasOwner = db
+    .prepare("SELECT 1 FROM pragma_table_info('sources') WHERE name='owner'")
+    .get();
+  if (!hasOwner) {
+    db.exec("ALTER TABLE sources ADD COLUMN owner TEXT");
+  }
 }
 
 /** Wrap a unit of work in a transaction. */

@@ -106,7 +106,7 @@ function write(author: string, body: string, spans: ReturnType<typeof at>[], tag
 }
 
 // Worker config: a sample RSS source (served locally by the API) the worker
-// polls into wire events, plus a demo outbound job.
+// polls into wire events, a scrape source, plus a demo outbound job.
 sources.create(
   {
     name: "Bee feed (sample)",
@@ -116,9 +116,23 @@ sources.create(
     severity: "low",
     interval_secs: 300,
     notify: "apis",
+    owner: null,
+  },
+  "cera",
+);
+sources.create(
+  {
+    name: "Bee page (sample scrape)",
+    url: `${BASE}/api/_fixtures/sample.html`,
+    kind: "scrape",
+    category: "deps",
+    severity: "low",
+    interval_secs: 300,
+    notify: "pia",
+    owner: null,
   },
   "cera",
 );
 outbox.enqueue("log", { note: "hello from the seed — worker will drain this" }, undefined, "cera");
 
-console.log("🌱 seeded hive: journal + anchors, inboxes, a sample feed source, and an outbox job.");
+console.log("🌱 seeded hive: journal + anchors, inboxes, a sample RSS source, a scrape source, and an outbox job.");

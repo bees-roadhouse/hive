@@ -627,8 +627,15 @@ type SourceRow = Omit<Source, "enabled"> & { enabled: number };
 const toSource = (r: SourceRow): Source => ({ ...r, enabled: !!r.enabled });
 
 export const sources = {
-  list: (): Source[] =>
-    (db.prepare("SELECT * FROM sources ORDER BY created_at").all() as SourceRow[]).map(toSource),
+  /**
+   * List sources. If `owner` is provided, returns global (owner=null) + that actor's.
+   * Omit to get all sources (worker uses this path).
+   */
+  list(owner?: string): Source[] {
+    const all = (db.prepare("SELECT * FROM sources ORDER BY created_at").all() as SourceRow[]).map(toSource);
+    if (owner === undefined) return all;
+    return all.filter((s) => s.owner === null || s.owner === owner);
+  },
 
   get(sourceId: string): Source | undefined {
     const r = db.prepare("SELECT * FROM sources WHERE id = ?").get(sourceId) as SourceRow | undefined;
@@ -646,13 +653,14 @@ export const sources = {
       interval_secs: input.interval_secs ?? 900,
       notify: input.notify ?? null,
       enabled: input.enabled ?? true,
+      owner: input.owner ?? null,
       last_polled_at: null,
       last_status: null,
       created_at: now(),
     };
     db.prepare(
-      `INSERT INTO sources (id, name, url, kind, category, severity, interval_secs, notify, enabled, last_polled_at, last_status, created_at)
-       VALUES (@id, @name, @url, @kind, @category, @severity, @interval_secs, @notify, @enabled, @last_polled_at, @last_status, @created_at)`,
+      `INSERT INTO sources (id, name, url, kind, category, severity, interval_secs, notify, enabled, owner, last_polled_at, last_status, created_at)
+       VALUES (@id, @name, @url, @kind, @category, @severity, @interval_secs, @notify, @enabled, @owner, @last_polled_at, @last_status, @created_at)`,
     ).run({ ...s, enabled: s.enabled ? 1 : 0 });
     emit("source.added", actor, { id: s.id, name: s.name, url: s.url });
     return s;
@@ -664,7 +672,7 @@ export const sources = {
     const next: Source = { ...cur, ...patch, id: cur.id };
     db.prepare(
       `UPDATE sources SET name=@name, url=@url, kind=@kind, category=@category, severity=@severity,
-       interval_secs=@interval_secs, notify=@notify, enabled=@enabled WHERE id=@id`,
+       interval_secs=@interval_secs, notify=@notify, enabled=@enabled, owner=@owner WHERE id=@id`,
     ).run({ ...next, enabled: next.enabled ? 1 : 0 });
     emit("source.updated", actor, { id: next.id });
     return next;
@@ -710,6 +718,33 @@ export function ingest(
       title: it.title,
       url: it.url ?? null,
       body: it.body ?? "",
+      source: source.name,
+      category: source.category,
+      severity: source.severity,
+    });
+    if (source.notify) {
+      inbox.add(source.notify, source.name, "mention", "journal", source.id, null, `${source.name}: ${it.title}`);
+    }
+    added++;
+  }
+  return added;
+}
+
+/** Ingest scraped page items into wire events (deduped by guid = resolved URL). */
+export function ingestScrape(
+  source: Source,
+  items: { guid: string; title: string; url: string }[],
+): number {
+  let added = 0;
+  for (const it of items) {
+    const dupe = db
+      .prepare("SELECT 1 FROM wire WHERE kind = 'scrape.item' AND payload LIKE ? LIMIT 1")
+      .get(`%${JSON.stringify(it.guid).slice(1, -1)}%`);
+    if (dupe) continue;
+    emit("scrape.item", source.name, {
+      guid: it.guid,
+      title: it.title,
+      url: it.url,
       source: source.name,
       category: source.category,
       severity: source.severity,
