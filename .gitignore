@@ -11,3 +11,6 @@ node/data/*.db
 node/data/*.db-shm
 node/data/*.db-wal
 *.tsbuildinfo
+
+# agent worktrees (managed by the Agent tool)
+.claude/worktrees/

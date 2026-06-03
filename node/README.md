@@ -114,6 +114,33 @@ pnpm hive search sqlite
 Tasks, notes, journal, and decisions are all indexed into one SQLite **FTS5**
 table for unified `/api/search`.
 
+## Storage model — SQLite, not a document DB
+
+The datastore is SQLite, and it stays SQLite. "JSON database vs SQLite" is a
+false choice: SQLite *is* a first-class JSON store (JSON1). When we add **custom
+entities** and **custom fields**, the shape is a `data JSON` column on a generic
+`entities(kind, data, origin_entry_id, anchor_text, …)` table that the
+journal-anchor flow emits into — exactly like `tasks`/`decisions`/`events` do
+today. Custom fields you actually filter or sort on get a **generated column**
+(`json_extract(data,'$.field')`) plus an index; everything else just lives in
+the JSON.
+
+Why not a separate document DB (Mongo/LowDB): it would cost us FTS5, atomic
+transactions, the embeddings table, and the single-file zero-infra story — and
+buy nothing at this scale. The corpus is thousands of rows; the brute-force
+cosine scan for semantic search is sub-10ms. For a local single-node app,
+in-process SQLite beats a networked document store on every axis that matters.
+
+## Admin + knowledge graph
+
+The **admin** tab (and the `/api/worker`, `/api/embeddings`, `/api/outbox`
+routes) surfaces the worker heartbeat + last cycle, embedding coverage
+(per-kind / per-model, with a pending count), and the outbound job queue. The
+**graph** tab renders the `links` knowledge graph (`/api/graph`) as a
+force-directed node-link diagram — every journal entry and the tasks/decisions/
+events anchored from it, plus `supersedes` edges — click a node to focus its
+neighborhood.
+
 ## Cloud dev env (GitHub / Claude Code on the web)
 
 `/.claude/settings.json` registers a **SessionStart** hook that runs

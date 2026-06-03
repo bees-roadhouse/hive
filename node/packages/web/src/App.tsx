@@ -5,18 +5,23 @@ import { Journal } from "./Journal.tsx";
 import { Inbox } from "./Inbox.tsx";
 import { Dashboard } from "./Dashboard.tsx";
 import { Settings } from "./Settings.tsx";
+import { Admin } from "./Admin.tsx";
+import { Graph } from "./Graph.tsx";
+import { Icon } from "./icons.tsx";
 import { Decisions, Events, SearchPane, Tasks, Wire } from "./Boards.tsx";
 
 const TABS = [
-  { id: "journal", icon: "📓" },
-  { id: "inbox", icon: "📥" },
-  { id: "dashboard", icon: "📊" },
-  { id: "tasks", icon: "◻" },
-  { id: "decisions", icon: "◆" },
-  { id: "events", icon: "◷" },
-  { id: "search", icon: "⌕" },
-  { id: "wire", icon: "⚡" },
-  { id: "settings", icon: "⚙" },
+  { id: "journal" },
+  { id: "inbox" },
+  { id: "dashboard" },
+  { id: "tasks" },
+  { id: "decisions" },
+  { id: "events" },
+  { id: "graph" },
+  { id: "search" },
+  { id: "wire" },
+  { id: "admin" },
+  { id: "settings" },
 ] as const;
 type Tab = (typeof TABS)[number]["id"];
 
@@ -44,7 +49,7 @@ export const App: Component = () => {
           <For each={TABS}>
             {(t) => (
               <button classList={{ active: tab() === t.id }} onClick={() => setTab(t.id)}>
-                <span class="nav-icon">{t.icon}</span>
+                <span class="nav-icon"><Icon name={t.id} /></span>
                 <span class="nav-label">{t.id}</span>
                 <Show when={t.id === "inbox" && (unread() ?? 0) > 0}>
                   <span class="nav-badge">{unread()}</span>
@@ -81,8 +86,10 @@ export const App: Component = () => {
         <Show when={tab() === "tasks"}><Tasks /></Show>
         <Show when={tab() === "decisions"}><Decisions /></Show>
         <Show when={tab() === "events"}><Events /></Show>
+        <Show when={tab() === "graph"}><Graph /></Show>
         <Show when={tab() === "search"}><SearchPane /></Show>
         <Show when={tab() === "wire"}><Wire /></Show>
+        <Show when={tab() === "admin"}><Admin /></Show>
         <Show when={tab() === "settings"}><Settings /></Show>
       </main>
     </div>

@@ -176,6 +176,40 @@ export interface SearchHit {
   score: number;
 }
 
+// ---- knowledge graph ----
+
+/** A node in the knowledge graph; `id` is the `kind:ref_id` composite key. */
+export interface GraphNode {
+  id: string;
+  kind: EntityKind;
+  title: string;
+}
+
+/** A directed edge; `source`/`target` are `kind:ref_id` keys into the nodes. */
+export interface GraphEdge {
+  source: string;
+  target: string;
+  rel: string;
+}
+
+export interface GraphData {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
+
+// ---- embeddings admin ----
+
+export interface EmbeddingStats {
+  total: number;
+  model: string;
+  /** How many items are currently embeddable (the backfill target). */
+  embeddable: number;
+  /** Embeddable items whose stored embedding is missing or stale. */
+  pending: number;
+  byKind: { kind: string; count: number }[];
+  byModel: { model: string; dim: number; count: number }[];
+}
+
 // ---- worker: sources, outbound queue, status ----
 
 export type SourceKind = "rss";

@@ -1,8 +1,10 @@
-import { createResource, createSignal, For, Show, type Component } from "solid-js";
-import type { AnchorKind, NewAnchor, Priority, ResolvedAnchor } from "@hive/shared";
+import { createMemo, createSignal, For, onCleanup, onMount, Show, type Component } from "solid-js";
+import type { AnchorKind, JournalEntryView, NewAnchor, Priority, ResolvedAnchor } from "@hive/shared";
 import { PRIORITIES } from "@hive/shared";
 import { api, getActor } from "./api.ts";
-import { ANCHOR_GLYPH, Prose, relTime } from "./lib.tsx";
+import { ANCHOR_GLYPH, relTime } from "./lib.tsx";
+import { Icon } from "./icons.tsx";
+import { JournalBody, Markdown } from "./markdown.tsx";
 import { EntityCard } from "./Boards.tsx";
 
 interface Pending {
@@ -12,16 +14,110 @@ interface Pending {
   priority: Priority;
 }
 
+const PAGE = 20;
+
+/** "Today" / "Yesterday" / "Tuesday, June 2, 2026" for a day header. */
+function dayLabel(iso: string): string {
+  const d = new Date(iso);
+  const key = (x: Date) => `${x.getFullYear()}-${x.getMonth()}-${x.getDate()}`;
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  if (key(d) === key(today)) return "Today";
+  if (key(d) === key(yesterday)) return "Yesterday";
+  return d.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric", year: "numeric" });
+}
+
 export const Journal: Component = () => {
-  const [entries, { refetch }] = createResource(() => api.journal());
   const [body, setBody] = createSignal("");
+  const [preview, setPreview] = createSignal(false);
   const [pending, setPending] = createSignal<Pending[]>([]);
   const [sel, setSel] = createSignal<{ start: number; end: number }>({ start: 0, end: 0 });
   const [open, setOpen] = createSignal<ResolvedAnchor | null>(null);
 
+  // The feed is an infinite scroll: entries accumulate page by page, oldest
+  // loaded on demand as a sentinel at the bottom scrolls into view, then group
+  // into one "page" (comb cell) per calendar day.
+  const [entries, setEntries] = createSignal<JournalEntryView[]>([]);
+  const [loading, setLoading] = createSignal(false);
+  const [done, setDone] = createSignal(false);
+
+  const loadMore = async () => {
+    if (loading() || done()) return;
+    setLoading(true);
+    try {
+      const batch = await api.journal(PAGE, entries().length);
+      setEntries([...entries(), ...batch]);
+      if (batch.length < PAGE) setDone(true);
+    } finally {
+      setLoading(false);
+    }
+  };
+  const reload = async () => {
+    setDone(false);
+    setEntries([]);
+    await loadMore();
+  };
+
+  const days = createMemo(() => {
+    const out: { day: string; label: string; items: JournalEntryView[] }[] = [];
+    const idx = new Map<string, number>();
+    for (const e of entries()) {
+      const day = e.created_at.slice(0, 10);
+      let i = idx.get(day);
+      if (i === undefined) {
+        i = out.length;
+        idx.set(day, i);
+        out.push({ day, label: dayLabel(e.created_at), items: [] });
+      }
+      out[i].items.push(e);
+    }
+    return out;
+  });
+
+  let sentinel!: HTMLDivElement;
+  onMount(() => {
+    void loadMore();
+    const obs = new IntersectionObserver(
+      (ents) => {
+        if (ents.some((x) => x.isIntersecting)) void loadMore();
+      },
+      { rootMargin: "300px" },
+    );
+    obs.observe(sentinel);
+    onCleanup(() => obs.disconnect());
+  });
+
   let ta!: HTMLTextAreaElement;
   const trackSel = () => setSel({ start: ta.selectionStart, end: ta.selectionEnd });
   const selectedText = () => body().slice(sel().start, sel().end).trim();
+
+  // Markdown toolbar — for writers who don't know the syntax. Wrap/prefix the
+  // current selection, then restore focus + selection so anchoring still works.
+  const surround = (pre: string, post = pre) => {
+    const s = ta.selectionStart;
+    const e = ta.selectionEnd;
+    const v = body();
+    const chosen = v.slice(s, e) || "text";
+    setBody(v.slice(0, s) + pre + chosen + post + v.slice(e));
+    queueMicrotask(() => {
+      ta.focus();
+      ta.selectionStart = s + pre.length;
+      ta.selectionEnd = s + pre.length + chosen.length;
+      trackSel();
+    });
+  };
+  const prefixLine = (prefix: string) => {
+    const s = ta.selectionStart;
+    const v = body();
+    const lineStart = v.lastIndexOf("\n", s - 1) + 1;
+    setBody(v.slice(0, lineStart) + prefix + v.slice(lineStart));
+    queueMicrotask(() => {
+      ta.focus();
+      ta.selectionStart = ta.selectionEnd = s + prefix.length;
+      trackSel();
+    });
+  };
 
   const mark = (kind: AnchorKind) => {
     const text = body().slice(sel().start, sel().end).trim();
@@ -53,26 +149,56 @@ export const Journal: Component = () => {
     await api.append({ author: getActor(), body: body(), anchors });
     setBody("");
     setPending([]);
-    refetch();
+    await reload();
   };
 
   return (
     <section class="journal">
       <div class="composer">
-        <div class="composer-hint">
-          Write what happened. Select any phrase, then tag it — it becomes a task, decision, or
-          event anchored to that text. <span class="mention">@mention</span> to notify someone.
+        <div class="composer-top">
+          <div class="composer-hint">
+            Write what happened in <strong>markdown</strong>. Select any phrase, then tag it — it
+            becomes a task, decision, or event anchored to that text.{" "}
+            <span class="mention">@mention</span> to notify someone.
+          </div>
+          <div class="seg">
+            <button classList={{ active: !preview() }} onClick={() => setPreview(false)}>
+              write
+            </button>
+            <button classList={{ active: preview() }} onClick={() => setPreview(true)}>
+              preview
+            </button>
+          </div>
         </div>
-        <textarea
-          ref={ta}
-          rows={4}
-          placeholder="e.g. Synced with @pia — we'll ship the Solid UI this week. Decided to stay on SQLite."
-          value={body()}
-          onInput={(e) => setBody(e.currentTarget.value)}
-          onSelect={trackSel}
-          onMouseUp={trackSel}
-          onKeyUp={trackSel}
-        />
+        <Show
+          when={!preview()}
+          fallback={
+            <div class="composer-preview">
+              <Markdown src={body().trim() || "*nothing to preview yet*"} />
+            </div>
+          }
+        >
+          <div class="md-toolbar">
+            <button title="bold" onClick={() => surround("**")}><b>B</b></button>
+            <button title="italic" onClick={() => surround("_")}><i>I</i></button>
+            <button title="inline code" onClick={() => surround("`")}>{"</>"}</button>
+            <button title="heading" onClick={() => prefixLine("## ")}>H</button>
+            <button title="bullet" onClick={() => prefixLine("- ")}>•</button>
+            <button title="checkbox task" onClick={() => prefixLine("- [ ] ")}>☑</button>
+            <button title="quote" onClick={() => prefixLine("> ")}>❝</button>
+            <button title="link" onClick={() => surround("[", "](https://)")}>🔗</button>
+          </div>
+          <textarea
+            ref={ta}
+            rows={4}
+            placeholder="e.g. Synced with @pia — we'll ship the **Solid UI** this week. Decided to stay on `SQLite`."
+            value={body()}
+            onInput={(e) => setBody(e.currentTarget.value)}
+            onSelect={trackSel}
+            onMouseUp={trackSel}
+            onKeyUp={trackSel}
+          />
+        </Show>
         <div class="composer-bar">
           <div class="mark-group">
             <span class="dim">
@@ -116,22 +242,52 @@ export const Journal: Component = () => {
       </div>
 
       <div class="feed">
-        <For each={entries()}>
-          {(e) => (
-            <article class="entry">
-              <header>
-                <span class="actor-chip">{e.author}</span>
-                <time>{relTime(e.created_at)}</time>
-                <Show when={e.anchors.length}>
-                  <span class="dim">
-                    · {e.anchors.length} anchor{e.anchors.length > 1 ? "s" : ""}
-                  </span>
-                </Show>
+        <For each={days()}>
+          {(d) => (
+            <section class="day">
+              <header class="day-head">
+                <Icon name="hex" class="comb" />
+                <h3>{d.label}</h3>
+                <span class="dim sm">
+                  {d.items.length} {d.items.length > 1 ? "entries" : "entry"}
+                </span>
               </header>
-              <Prose body={e.body} anchors={e.anchors} onAnchor={setOpen} />
-            </article>
+              <For each={d.items}>
+                {(e) => (
+                  <article class="entry">
+                    <header>
+                      <span class="actor-chip">{e.author}</span>
+                      <time>{relTime(e.created_at)}</time>
+                      <Show when={e.anchors.length}>
+                        <span class="dim">
+                          · {e.anchors.length} anchor{e.anchors.length > 1 ? "s" : ""}
+                        </span>
+                      </Show>
+                    </header>
+                    <JournalBody body={e.body} anchors={e.anchors} onAnchor={setOpen} />
+                  </article>
+                )}
+              </For>
+            </section>
           )}
         </For>
+
+        <div ref={sentinel} class="sentinel">
+          <Show when={loading()}>
+            <span class="dim sm">gathering…</span>
+          </Show>
+          <Show when={!loading() && !done() && entries().length > 0}>
+            <button class="ghost" onClick={() => void loadMore()}>
+              load earlier
+            </button>
+          </Show>
+          <Show when={done() && entries().length > 0}>
+            <span class="dim sm">— the first cell —</span>
+          </Show>
+          <Show when={done() && entries().length === 0}>
+            <span class="dim sm">no entries yet. write the first one above.</span>
+          </Show>
+        </div>
       </div>
 
       <Show when={open()}>

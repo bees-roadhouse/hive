@@ -1,7 +1,9 @@
 import type {
   DashboardStats,
   Decision,
+  EmbeddingStats,
   EventItem,
+  GraphData,
   InboxItem,
   JournalEntryView,
   NewJournalEntry,
@@ -31,7 +33,8 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
-  journal: (limit = 50) => req<JournalEntryView[]>(`/journal?limit=${limit}`),
+  journal: (limit = 50, offset = 0) =>
+    req<JournalEntryView[]>(`/journal?limit=${limit}&offset=${offset}`),
   append: (e: NewJournalEntry) =>
     req<JournalEntryView>("/journal", { method: "POST", body: JSON.stringify(e) }),
 
@@ -55,6 +58,8 @@ export const api = {
     req<SearchHit[]>(`/search?q=${encodeURIComponent(query)}&mode=${mode}`),
   wire: () => req<WireEvent[]>("/wire"),
   dashboard: () => req<DashboardStats>("/dashboard"),
+  graph: () => req<GraphData>("/graph"),
+  embeddings: () => req<EmbeddingStats>("/embeddings"),
 
   sources: () => req<Source[]>("/sources"),
   addSource: (s: NewSource) => req<Source>("/sources", { method: "POST", body: JSON.stringify(s) }),
