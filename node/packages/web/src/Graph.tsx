@@ -2,8 +2,7 @@ import { createEffect, createResource, onCleanup, onMount, For, type Component }
 import ForceGraph from "force-graph";
 import { api } from "./api.ts";
 
-// Kind → node color. Includes the entity kinds that emerge from the journal
-// today plus the ones coming next (person/topic/project).
+// Kind → node color.
 const KIND_COLOR: Record<string, string> = {
   journal: "#7c9cff",
   task: "#5ec8a0",
@@ -13,6 +12,7 @@ const KIND_COLOR: Record<string, string> = {
   person: "#ff8fab",
   topic: "#6ee7d6",
   project: "#ffd24a",
+  phase: "#ffb86b",
 };
 
 /**
@@ -31,8 +31,9 @@ export const Graph: Component = () => {
     fg = new ForceGraph(host)
       .backgroundColor("#14110c")
       .nodeRelSize(5)
-      .linkColor(() => "rgba(169,155,120,0.22)")
-      .linkWidth(1)
+      // Chain edges (per-author journal timeline) are subtle/dashed; entity links are warmer.
+      .linkColor((l: { rel?: string }) => l.rel === "chain" ? "rgba(124,156,255,0.18)" : "rgba(169,155,120,0.22)")
+      .linkWidth((l: { rel?: string }) => l.rel === "chain" ? 0.8 : 1.2)
       .linkDirectionalParticles(0)
       .nodeLabel((n: { kind: string; title: string }) => `${n.kind} · ${n.title}`)
       .nodeCanvasObject(

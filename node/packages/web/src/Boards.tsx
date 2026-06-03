@@ -3,13 +3,18 @@ import type {
   AnchorKind,
   Decision,
   EventItem,
+  Phase,
+  Person,
+  Project,
   SearchHit,
   Task,
   TaskStatus,
+  Topic,
   WireEvent,
 } from "@hive/shared";
 import { TASK_STATUSES } from "@hive/shared";
 import { api } from "./api.ts";
+import { Icon } from "./icons.tsx";
 import { DECISION_GLYPH, relTime, TASK_GLYPH } from "./lib.tsx";
 
 /** Renders whichever structured entity an anchor points at. */
@@ -229,6 +234,109 @@ export const Wire: Component = () => {
           </div>
         )}
       </For>
+    </section>
+  );
+};
+
+// ---- People view ----
+
+export const PeopleView: Component = () => {
+  const [people] = createResource(() => api.people());
+  return (
+    <section>
+      <p class="dim pad">People known to hive. Created automatically when referenced in journal entries, or added from Admin.</p>
+      <Show when={people()} fallback={<p class="dim sm">loading…</p>}>
+        <For each={people() as Person[]} fallback={<p class="dim sm">no people yet — reference someone in a journal entry.</p>}>
+          {(p) => (
+            <div class="entity-row">
+              <span class="entity-icon"><Icon name="person" size={16} /></span>
+              <span class="entity-name">{p.name}</span>
+              <span class={`badge kind-badge-${p.kind}`}>{p.kind}</span>
+              <span class="dim sm entity-slug">{p.slug}</span>
+            </div>
+          )}
+        </For>
+      </Show>
+    </section>
+  );
+};
+
+// ---- Topics view ----
+
+export const TopicsView: Component = () => {
+  const [topics] = createResource(() => api.topics());
+  return (
+    <section>
+      <p class="dim pad">Topics extracted from <code>[topic:…]</code> references in journal entries.</p>
+      <Show when={topics()} fallback={<p class="dim sm">loading…</p>}>
+        <For each={topics() as Topic[]} fallback={<p class="dim sm">no topics yet — reference a topic in a journal entry.</p>}>
+          {(t) => (
+            <div class="entity-row">
+              <span class="entity-icon"><Icon name="topic" size={16} /></span>
+              <span class="entity-name">{t.name}</span>
+              <span class="dim sm entity-slug">{t.slug}</span>
+            </div>
+          )}
+        </For>
+      </Show>
+    </section>
+  );
+};
+
+// ---- Projects view ----
+
+const ProjectCard: Component<{ p: Project }> = (props) => {
+  const [detail] = createResource(() => api.projectById(props.p.id));
+  return (
+    <article class="project-card">
+      <header class="project-header">
+        <span class="entity-icon"><Icon name="project" size={16} /></span>
+        <h3 class="project-name">{props.p.name}</h3>
+        <span class="dim sm project-slug">{props.p.slug}</span>
+      </header>
+
+      <Show when={detail()}>
+        {(d) => (
+          <>
+            {/* Phases */}
+            <Show when={d().phases.length > 0}>
+              <div class="phases">
+                <For each={d().phases}>
+                  {(ph: Phase) => (
+                    <span class="phase-chip">
+                      <Icon name="phase" size={13} />
+                      {ph.name}
+                    </span>
+                  )}
+                </For>
+              </div>
+            </Show>
+
+            {/* Task summary */}
+            <Show when={d().tasks.length > 0}>
+              <div class="project-tasks dim sm">
+                {d().tasks.filter((t: Task) => t.status !== "done").length} open ·{" "}
+                {d().tasks.filter((t: Task) => t.status === "done").length} done
+                <span class="dim"> ({d().tasks.length} total)</span>
+              </div>
+            </Show>
+          </>
+        )}
+      </Show>
+    </article>
+  );
+};
+
+export const ProjectsView: Component = () => {
+  const [projects] = createResource(() => api.projects());
+  return (
+    <section>
+      <p class="dim pad">Projects with their phases and task counts. Projects are created automatically when a task references one.</p>
+      <Show when={projects()} fallback={<p class="dim sm">loading…</p>}>
+        <For each={projects() as Project[]} fallback={<p class="dim sm">no projects yet — assign a task a project in a journal entry.</p>}>
+          {(p) => <ProjectCard p={p} />}
+        </For>
+      </Show>
     </section>
   );
 };

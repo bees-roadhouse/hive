@@ -83,6 +83,32 @@ function paths(name: string): JSX.Element {
       );
     case "hex": // honeycomb cell — the day-page marker
       return <path d="M12 2.5l8.2 4.75v9.5L12 21.5l-8.2-4.75v-9.5z" />;
+    case "person": // user outline — head + shoulders
+      return (
+        <>
+          <circle cx="12" cy="8" r="3.5" />
+          <path d="M4.5 21c0-4.1 3.4-7.5 7.5-7.5s7.5 3.4 7.5 7.5" />
+        </>
+      );
+    case "topic": // hash / tag
+      return (
+        <>
+          <path d="M4 9h16M4 15h16M9 4l-2 16M17 4l-2 16" />
+        </>
+      );
+    case "project": // folder / layers
+      return (
+        <>
+          <path d="M3 7h7l2 2.5H21v10.5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z" />
+        </>
+      );
+    case "phase": // milestone / flag
+      return (
+        <>
+          <path d="M6 4v16" />
+          <path d="M6 4h11l-3 4 3 4H6" />
+        </>
+      );
     default:
       return <circle cx="12" cy="12" r="9" />;
   }

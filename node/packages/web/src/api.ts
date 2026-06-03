@@ -10,12 +10,17 @@ import type {
   NewJournalEntry,
   NewSource,
   OutboxJob,
+  Person,
+  PersonPatch,
+  Phase,
+  Project,
   SearchHit,
   Source,
   SourceKind,
   SourcePatch,
   Task,
   TaskPatch,
+  Topic,
   WireEvent,
   WorkerStatus,
 } from "@hive/shared";
@@ -77,4 +82,15 @@ export const api = {
     req<AutocompleteItem[]>(
       `/autocomplete?q=${encodeURIComponent(q)}&kinds=${kinds.join(",")}`,
     ),
+
+  people: () => req<Person[]>("/people"),
+  addPerson: (p: { name: string; kind?: "human" | "ai" }) =>
+    req<Person>("/people", { method: "POST", body: JSON.stringify(p) }),
+  patchPerson: (id: string, p: PersonPatch) =>
+    req<Person>(`/people/${id}`, { method: "PATCH", body: JSON.stringify(p) }),
+
+  topics: () => req<Topic[]>("/topics"),
+  projects: () => req<Project[]>("/projects"),
+  projectById: (id: string) =>
+    req<Project & { tasks: Task[]; phases: Phase[] }>(`/projects/${id}`),
 };

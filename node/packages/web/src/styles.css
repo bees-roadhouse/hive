@@ -364,3 +364,34 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
   .dash-grid { grid-template-columns: 1fr; }
   .emb-grid { grid-template-columns: 1fr; }
 }
+
+/* ---- entity browser (people / topics / projects) ---- */
+.entity-row {
+  display: flex; align-items: center; gap: 0.55rem;
+  padding: 0.55rem 0.7rem; border-bottom: 1px solid var(--line);
+  font-size: 0.92rem;
+}
+.entity-row:last-child { border-bottom: none; }
+.entity-icon { color: var(--dim); display: inline-flex; align-items: center; }
+.entity-name { flex: 1; font-weight: 500; }
+.entity-slug { font-size: 0.72rem; opacity: 0.6; }
+
+/* kind badges coloured by type */
+.kind-badge-human { background: rgba(111,179,255,0.14); color: #7cb8ff; }
+.kind-badge-ai    { background: rgba(192,139,255,0.14); color: #c77dff; }
+
+/* ---- project cards ---- */
+.project-card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 0.9rem 1rem; margin-bottom: 0.9rem;
+}
+.project-header { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.55rem; }
+.project-name { margin: 0; font-size: 1rem; flex: 1; }
+.project-slug { font-size: 0.72rem; }
+.phases { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.5rem; }
+.phase-chip {
+  display: inline-flex; align-items: center; gap: 0.3rem;
+  background: rgba(255,184,107,0.12); color: #ffb86b;
+  border-radius: 999px; padding: 0.15rem 0.6rem; font-size: 0.75rem;
+}
+.project-tasks { margin-top: 0.2rem; }

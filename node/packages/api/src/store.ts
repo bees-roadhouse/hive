@@ -222,6 +222,24 @@ export const people = {
     );
     return p;
   },
+
+  create(input: { name: string; kind?: "human" | "ai" }, actor = "system"): Person {
+    const p = people.ensure(input.name, input.kind ?? "human");
+    emit("person.created", actor, { id: p.id, name: p.name, kind: p.kind });
+    return p;
+  },
+
+  update(personId: string, patch: { name?: string; kind?: "human" | "ai" }, actor = "system"): Person | undefined {
+    const cur = people.get(personId);
+    if (!cur) return undefined;
+    const name = patch.name ?? cur.name;
+    const kind = patch.kind ?? cur.kind;
+    const slug = patch.name ? slugify(name) : cur.slug;
+    db.prepare("UPDATE people SET name = ?, slug = ?, kind = ? WHERE id = ?").run(name, slug, kind, personId);
+    const next: Person = { ...cur, name, slug, kind };
+    emit("person.updated", actor, { id: personId, name, kind });
+    return next;
+  },
 };
 
 // ---- topics ----

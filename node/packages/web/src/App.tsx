@@ -8,7 +8,7 @@ import { Settings } from "./Settings.tsx";
 import { Admin } from "./Admin.tsx";
 import { Graph } from "./Graph.tsx";
 import { Icon } from "./icons.tsx";
-import { Decisions, Events, SearchPane, Tasks, Wire } from "./Boards.tsx";
+import { Decisions, Events, PeopleView, ProjectsView, SearchPane, Tasks, TopicsView, Wire } from "./Boards.tsx";
 
 const TABS = [
   { id: "journal" },
@@ -17,6 +17,9 @@ const TABS = [
   { id: "tasks" },
   { id: "decisions" },
   { id: "events" },
+  { id: "people" },
+  { id: "topics" },
+  { id: "projects" },
   { id: "graph" },
   { id: "search" },
   { id: "wire" },
@@ -86,6 +89,9 @@ export const App: Component = () => {
         <Show when={tab() === "tasks"}><Tasks /></Show>
         <Show when={tab() === "decisions"}><Decisions /></Show>
         <Show when={tab() === "events"}><Events /></Show>
+        <Show when={tab() === "people"}><PeopleView /></Show>
+        <Show when={tab() === "topics"}><TopicsView /></Show>
+        <Show when={tab() === "projects"}><ProjectsView /></Show>
         <Show when={tab() === "graph"}><Graph /></Show>
         <Show when={tab() === "search"}><SearchPane /></Show>
         <Show when={tab() === "wire"}><Wire /></Show>

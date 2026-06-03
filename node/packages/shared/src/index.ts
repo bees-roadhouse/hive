@@ -376,6 +376,7 @@ export interface NewJournalEntry {
 
 export type TaskPatch = Partial<Pick<Task, "status" | "priority" | "assignees" | "title" | "body" | "tags">>;
 export type DecisionPatch = Partial<Pick<Decision, "status" | "title" | "context" | "decision" | "consequences" | "tags" | "assignees">>;
+export type PersonPatch = Partial<Pick<Person, "name" | "kind">>;
 
 /** Pull @mentions of known actors out of prose. */
 export function parseMentions(text: string): string[] {

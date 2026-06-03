@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { getRequestListener } from "@hono/node-server";
 import { Hono } from "hono";
-import type { DecisionPatch, NewJournalEntry, NewSource, SourcePatch, TaskPatch } from "@hive/shared";
+import type { DecisionPatch, NewJournalEntry, NewSource, SourcePatch, TaskPatch, PersonPatch } from "@hive/shared";
 import { migrate } from "./db.ts";
 import { handleMcp } from "./mcp.ts";
 import {
@@ -106,8 +106,18 @@ app.post("/api/inbox/item/:id/read", (c) => c.json({ marked: inbox.markRead(c.re
 
 // ---- misc ----
 app.get("/api/people", (c) => c.json(people.list()));
+app.post("/api/people", async (c) => {
+  const body = (await c.req.json()) as { name: string; kind?: "human" | "ai" };
+  if (!body?.name?.trim()) return c.json({ error: "name required" }, 400);
+  return c.json(people.create(body, actor(c)), 201);
+});
 app.get("/api/people/:id", (c) => {
   const p = people.get(c.req.param("id"));
+  return p ? c.json(p) : c.json({ error: "not found" }, 404);
+});
+app.patch("/api/people/:id", async (c) => {
+  const patch = (await c.req.json()) as PersonPatch;
+  const p = people.update(c.req.param("id"), patch, actor(c));
   return p ? c.json(p) : c.json({ error: "not found" }, 404);
 });
 app.get("/api/topics", (c) => c.json(topics.list()));
