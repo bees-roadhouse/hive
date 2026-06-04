@@ -1,0 +1,11 @@
+# Force a clean install inside the image; never ship host artifacts.
+**/node_modules
+**/dist
+**/.cache
+.git
+.github
+**/.claude
+data
+*.log
+.env
+.env.*
