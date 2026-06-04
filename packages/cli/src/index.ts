@@ -6,13 +6,23 @@ import type { Decision, EventItem, InboxItem, JournalEntryView, SearchHit, Task 
 
 const BASE = process.env.HIVE_API_URL ?? "http://localhost:8787";
 const ACTOR = process.env.HIVE_ACTOR ?? "cli";
+// v0.1.1+: hive-api requires auth. Programmatic clients present a Bearer API
+// token (mint one in the UI: Admin → API tokens). The actor is the token's.
+const TOKEN = process.env.HIVE_API_TOKEN;
 const dim = (s: string) => `\x1b[2m${s}\x1b[0m`;
 
 async function api(path: string, init?: RequestInit) {
   const res = await fetch(`${BASE}/api${path}`, {
     ...init,
-    headers: { "content-type": "application/json", "x-hive-actor": ACTOR, ...init?.headers },
+    headers: {
+      "content-type": "application/json",
+      "x-hive-actor": ACTOR,
+      ...(TOKEN ? { authorization: `Bearer ${TOKEN}` } : {}),
+      ...init?.headers,
+    },
   });
+  if (res.status === 401)
+    throw new Error("401 unauthorized — set HIVE_API_TOKEN to a hive API token (Admin → API tokens in the UI).");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}: ${await res.text()}`);
   return res.status === 204 ? null : res.json();
 }

@@ -20,8 +20,13 @@ function bump() {
   }, 300);
 }
 
-// A single shared EventSource for the whole app. EventSource auto-reconnects on
-// drop, so reconnect logic is handled by the browser for free.
-const es = new EventSource("/api/stream");
-es.onmessage = () => bump();
-// SSE comment lines (heartbeat) do not fire onmessage, so they don't cause spurious bumps.
+// A single shared EventSource for the whole app, opened only once the user is
+// authenticated (the stream requires a session — connecting on the login screen
+// would just 401-retry). EventSource auto-reconnects on drop, so the browser
+// handles reconnect for free. SSE comment lines (heartbeat) don't fire onmessage.
+let es: EventSource | null = null;
+export function connectLive(): void {
+  if (es) return;
+  es = new EventSource("/api/stream");
+  es.onmessage = () => bump();
+}

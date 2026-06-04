@@ -1,20 +1,28 @@
 import { createServer } from "node:http";
 import { getRequestListener } from "@hono/node-server";
 import { Hono } from "hono";
-import type { ServerResponse } from "node:http";
+import { deleteCookie, getCookie, setCookie } from "hono/cookie";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import type {
   DecisionPatch,
   NewJournalEntry,
   NewShare,
   NewSource,
+  OnboardingPayload,
   PersonPatch,
   SourcePatch,
   TaskPatch,
+  UserRole,
 } from "@hive/shared";
 import { migrate } from "./db.ts";
 import { handleMcp } from "./mcp.ts";
 import { subscribe } from "./bus.ts";
+import { SESSION_COOKIE, SESSION_TTL_MS } from "./auth.ts";
 import {
+  onboarding,
+  sessions,
+  tokens,
+  users,
   autocomplete,
   dashboard,
   decisions,
@@ -44,24 +52,152 @@ import {
 migrate();
 seedActors();
 
-const app = new Hono();
+type Principal = "session" | "token";
+type Env = { Variables: { actor?: string; principal?: Principal; role?: UserRole } };
+const app = new Hono<Env>();
 
-// CORS + actor shim. The real hive does EdDSA/JWT (9 phases); this fun port
-// reads who's acting from a header so the journal/inbox/wire stay honest.
+// CORS. Credentials must flow (the session is an HttpOnly cookie), so we reflect
+// the request Origin rather than using "*" (the two are mutually exclusive).
 app.use("*", async (c, next) => {
-  c.header("access-control-allow-origin", "*");
-  c.header("access-control-allow-headers", "content-type, x-hive-actor");
+  const origin = c.req.header("origin");
+  if (origin) {
+    c.header("access-control-allow-origin", origin);
+    c.header("vary", "Origin");
+    c.header("access-control-allow-credentials", "true");
+  }
+  c.header("access-control-allow-headers", "content-type, authorization, x-hive-actor");
   c.header("access-control-allow-methods", "GET,POST,PATCH,DELETE,OPTIONS");
   if (c.req.method === "OPTIONS") return c.body(null, 204);
   await next();
 });
 
-const actor = (c: { req: { header: (k: string) => string | undefined } }) =>
-  c.req.header("x-hive-actor") ?? "anon";
+// Auth. v0.1.1 ends the trust-the-header model: identity comes from a session
+// cookie (browser) or a Bearer API token (CLI / MCP / AI agents). The
+// x-hive-actor header is no longer honored for identity.
+const PUBLIC_PATHS = new Set([
+  "/api/healthz",
+  "/api/onboarding/status",
+  "/api/onboarding",
+  "/api/auth/login",
+  "/api/auth/me",
+]);
+
+app.use("*", async (c, next) => {
+  // Resolve the principal if any credentials are present.
+  const auth = c.req.header("authorization");
+  const bearer = auth?.startsWith("Bearer ") ? auth.slice(7).trim() : undefined;
+  if (bearer) {
+    const a = tokens.resolve(bearer);
+    if (a) {
+      c.set("actor", a);
+      c.set("principal", "token");
+    }
+  }
+  if (!c.get("actor")) {
+    const cookie = getCookie(c, SESSION_COOKIE);
+    if (cookie) {
+      const u = sessions.resolve(cookie);
+      if (u) {
+        c.set("actor", u.actor);
+        c.set("principal", "session");
+        c.set("role", u.role);
+      }
+    }
+  }
+
+  if (PUBLIC_PATHS.has(c.req.path)) return next();
+  // Before setup, everything non-public is locked until onboarding runs.
+  if (onboarding.required()) return c.json({ error: "onboarding_required" }, 403);
+  if (!c.get("actor")) return c.json({ error: "unauthenticated" }, 401);
+  return next();
+});
+
+const actor = (c: { get: (k: "actor") => string | undefined }) => c.get("actor") ?? "anon";
+const requireAdmin = (c: { get: (k: "role") => UserRole | undefined }) => c.get("role") === "admin";
 
 app.get("/api/healthz", (c) =>
   c.json({ ok: true, service: "hive-node", mcp: "/mcp", ts: new Date().toISOString() }),
 );
+
+// ---- onboarding (first-run) + auth ----
+app.get("/api/onboarding/status", (c) => c.json(onboarding.status()));
+
+app.post("/api/onboarding", async (c) => {
+  if (!onboarding.required()) return c.json({ error: "already_completed" }, 409);
+  const body = (await c.req.json()) as OnboardingPayload;
+  const { instanceName, adminName, adminEmail, password } = body ?? {};
+  if (!instanceName?.trim() || !adminName?.trim() || !adminEmail?.trim() || !password?.trim())
+    return c.json({ error: "instanceName, adminName, adminEmail, password required" }, 400);
+  if (password.length < 8) return c.json({ error: "password must be at least 8 characters" }, 400);
+  const { user, session } = onboarding.complete({ instanceName, adminName, adminEmail, password });
+  setCookie(c, SESSION_COOKIE, session, {
+    httpOnly: true,
+    sameSite: "Lax",
+    path: "/",
+    maxAge: SESSION_TTL_MS / 1000,
+  });
+  return c.json({ user }, 201);
+});
+
+app.post("/api/auth/login", async (c) => {
+  const { email, password } = (await c.req.json()) as { email?: string; password?: string };
+  if (!email || !password) return c.json({ error: "email and password required" }, 400);
+  const u = users.authenticate(email, password);
+  if (!u) return c.json({ error: "invalid credentials" }, 401);
+  const session = sessions.create(u.id);
+  setCookie(c, SESSION_COOKIE, session, {
+    httpOnly: true,
+    sameSite: "Lax",
+    path: "/",
+    maxAge: SESSION_TTL_MS / 1000,
+  });
+  return c.json({ user: users.safe(u) });
+});
+
+app.post("/api/auth/logout", (c) => {
+  const cookie = getCookie(c, SESSION_COOKIE);
+  if (cookie) sessions.destroy(cookie);
+  deleteCookie(c, SESSION_COOKIE, { path: "/" });
+  return c.json({ ok: true });
+});
+
+app.get("/api/auth/me", (c) => {
+  const a = c.get("actor");
+  const u = a ? users.list().find((x) => x.actor === a) : undefined;
+  return c.json({ user: u ?? null, principal: c.get("principal") ?? null });
+});
+
+// ---- users (admin) ----
+app.get("/api/users", (c) => (requireAdmin(c) ? c.json(users.list()) : c.json({ error: "forbidden" }, 403)));
+app.post("/api/users", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "forbidden" }, 403);
+  const body = (await c.req.json()) as {
+    name: string;
+    email: string;
+    password: string;
+    role?: UserRole;
+    kind?: "human" | "ai";
+  };
+  if (!body?.name?.trim() || !body?.email?.trim() || !body?.password?.trim())
+    return c.json({ error: "name, email, password required" }, 400);
+  if (body.password.length < 8) return c.json({ error: "password must be at least 8 characters" }, 400);
+  return c.json(users.create(body, actor(c)), 201);
+});
+
+// ---- API tokens (admin) ----
+app.get("/api/tokens", (c) => (requireAdmin(c) ? c.json(tokens.list()) : c.json({ error: "forbidden" }, 403)));
+app.post("/api/tokens", async (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "forbidden" }, 403);
+  const body = (await c.req.json()) as { actor: string; label: string };
+  if (!body?.actor?.trim() || !body?.label?.trim()) return c.json({ error: "actor and label required" }, 400);
+  // The plaintext token is returned ONCE here and never again.
+  const { token, record } = tokens.create(body, actor(c));
+  return c.json({ token, record }, 201);
+});
+app.delete("/api/tokens/:id", (c) => {
+  if (!requireAdmin(c)) return c.json({ error: "forbidden" }, 403);
+  return tokens.remove(c.req.param("id")) ? c.body(null, 204) : c.json({ error: "not found" }, 404);
+});
 
 // ---- journal (the one write path) ----
 app.get("/api/journal/writers", (c) => {
@@ -83,7 +219,8 @@ app.get("/api/journal", (c) => {
 app.post("/api/journal", async (c) => {
   const body = (await c.req.json()) as NewJournalEntry;
   if (!body?.body?.trim()) return c.json({ error: "body required" }, 400);
-  return c.json(journal.append({ ...body, author: body.author ?? actor(c) }, actor(c)), 201);
+  // Author is the authenticated identity — a client can't write as someone else.
+  return c.json(journal.append({ ...body, author: actor(c) }, actor(c)), 201);
 });
 app.get("/api/journal/:id", (c) => {
   const e = journal.get(c.req.param("id"));
@@ -279,6 +416,23 @@ app.get("/api/_fixtures/sample.html", (c) => {
 // streamSSE through node-server buffers mid-stream writes. Clients reconnect
 // automatically via EventSource; a heartbeat comment every 25 s keeps idle
 // connections alive through proxies.
+// Resolve identity for the raw-server endpoints (/mcp, /api/stream), which
+// bypass Hono. Bearer token → actor; else session cookie → actor.
+function rawActor(req: IncomingMessage): { actor: string; principal: Principal } | undefined {
+  const auth = req.headers["authorization"];
+  if (auth?.startsWith("Bearer ")) {
+    const a = tokens.resolve(auth.slice(7).trim());
+    if (a) return { actor: a, principal: "token" };
+  }
+  const raw = req.headers["cookie"] ?? "";
+  const m = raw.split(";").map((s) => s.trim()).find((s) => s.startsWith(`${SESSION_COOKIE}=`));
+  if (m) {
+    const u = sessions.resolve(decodeURIComponent(m.slice(SESSION_COOKIE.length + 1)));
+    if (u) return { actor: u.actor, principal: "session" };
+  }
+  return undefined;
+}
+
 function handleStream(res: ServerResponse): void {
   res.writeHead(200, {
     "content-type": "text/event-stream",
@@ -303,6 +457,19 @@ const port = Number(process.env.PORT ?? 8787);
 createServer((req, res) => {
   const path = (req.url ?? "").split("?")[0];
   if (path === "/mcp") {
+    // MCP is the programmatic surface — require a valid Bearer token (OPTIONS
+    // preflight passes through so handleMcp can answer CORS).
+    if (req.method !== "OPTIONS" && (onboarding.required() || !rawActor(req))) {
+      res.writeHead(401, { "content-type": "application/json", "access-control-allow-origin": "*" });
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          error: { code: -32001, message: "Unauthorized — provide a Bearer API token." },
+          id: null,
+        }),
+      );
+      return;
+    }
     handleMcp(req, res).catch((err) => {
       console.error("mcp error", err);
       if (!res.headersSent) res.writeHead(500).end();
@@ -310,6 +477,11 @@ createServer((req, res) => {
     return;
   }
   if (path === "/api/stream") {
+    if (onboarding.required() || !rawActor(req)) {
+      res.writeHead(401, { "content-type": "application/json", "access-control-allow-origin": "*" });
+      res.end(JSON.stringify({ error: "unauthenticated" }));
+      return;
+    }
     handleStream(res);
     return;
   }

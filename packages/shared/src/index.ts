@@ -68,6 +68,67 @@ export const ACTORS: ActorInfo[] = [
 export const ACTOR_NAMES = ACTORS.map((a) => a.name);
 export const isAi = (name: string) => ACTORS.find((a) => a.name === name)?.kind === "ai";
 
+// ---- auth, users, onboarding (v0.1.1) ----
+
+/** The app version that introduced auth + onboarding. The DB records the
+ *  version that initialized it; databases created before this never show the
+ *  onboarding wizard. */
+export const APP_VERSION = "0.1.1";
+
+export type UserRole = "admin" | "member";
+
+/** A login account. `actor` is the person slug this user writes as — so the
+ *  authenticated identity, not a spoofable header, drives the journal/inbox. */
+export interface User {
+  id: string;
+  actor: string;
+  email: string;
+  name: string;
+  role: UserRole;
+  created_at: string;
+  last_login_at: string | null;
+}
+
+/** A user without the password hash — the only shape that crosses the wire. */
+export interface SafeUser {
+  id: string;
+  actor: string;
+  email: string;
+  name: string;
+  role: UserRole;
+}
+
+/** A bearer token for programmatic clients (CLI, MCP, AI agents). The plaintext
+ *  is shown once at creation; only its hash is stored. */
+export interface ApiToken {
+  id: string;
+  actor: string;
+  label: string;
+  created_at: string;
+  last_used_at: string | null;
+  created_by: string;
+}
+
+/** Public first-run state — the SPA reads this before anything else. */
+export interface OnboardingStatus {
+  completed: boolean;
+  instanceName: string | null;
+  version: string;
+}
+
+export interface OnboardingPayload {
+  instanceName: string;
+  adminName: string;
+  adminEmail: string;
+  password: string;
+}
+
+/** Who the caller is, resolved from a session cookie or bearer token. */
+export interface AuthMe {
+  user: SafeUser | null;
+  principal: "session" | "token" | null;
+}
+
 export type TaskStatus = "todo" | "doing" | "blocked" | "done";
 export type Priority = "low" | "normal" | "high" | "urgent";
 export type DecisionStatus = "proposed" | "accepted" | "rejected" | "superseded";

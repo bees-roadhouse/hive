@@ -26,12 +26,23 @@ import type {
   Topic,
   WireEvent,
   WorkerStatus,
+  ApiToken,
+  AuthMe,
+  OnboardingPayload,
+  OnboardingStatus,
+  SafeUser,
+  UserRole,
 } from "@hive/shared";
 
 // Vite proxies /api → hive-api in dev (see vite.config.ts).
-const ACTOR_KEY = "hive.actor";
-export const getActor = () => localStorage.getItem(ACTOR_KEY) ?? "nate";
-export const setActor = (a: string) => localStorage.setItem(ACTOR_KEY, a);
+// Identity is the authenticated user (v0.1.1) — set once auth resolves, read by
+// the journal/inbox views. No more spoofable localStorage actor.
+let currentUser: SafeUser | null = null;
+export const setCurrentUser = (u: SafeUser | null) => {
+  currentUser = u;
+};
+export const getCurrentUser = () => currentUser;
+export const getActor = () => currentUser?.actor ?? "nate";
 
 // Done-retention: how long (in hours) a DONE task stays visible before it's
 // hidden by default. The Tasks board respects this unless "show done" is toggled.
@@ -49,7 +60,8 @@ export const setDoneRetentionHours = (hours: number): void =>
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`/api${path}`, {
     ...init,
-    headers: { "content-type": "application/json", "x-hive-actor": getActor(), ...init?.headers },
+    credentials: "include", // send the session cookie
+    headers: { "content-type": "application/json", ...init?.headers },
   });
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
   return (res.status === 204 ? undefined : await res.json()) as T;
@@ -121,4 +133,22 @@ export const api = {
     req<Share>("/shares", { method: "POST", body: JSON.stringify(share) }),
   shares: (viewer: string) =>
     req<Share[]>(`/shares?viewer=${encodeURIComponent(viewer)}`),
+
+  // ---- auth + onboarding (v0.1.1) ----
+  onboardingStatus: () => req<OnboardingStatus>("/onboarding/status"),
+  onboard: (p: OnboardingPayload) =>
+    req<{ user: SafeUser }>("/onboarding", { method: "POST", body: JSON.stringify(p) }),
+  login: (email: string, password: string) =>
+    req<{ user: SafeUser }>("/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }),
+  logout: () => req<{ ok: boolean }>("/auth/logout", { method: "POST" }),
+  me: () => req<AuthMe>("/auth/me"),
+
+  // admin: users + API tokens
+  users: () => req<SafeUser[]>("/users"),
+  addUser: (u: { name: string; email: string; password: string; role?: UserRole; kind?: "human" | "ai" }) =>
+    req<SafeUser>("/users", { method: "POST", body: JSON.stringify(u) }),
+  apiTokens: () => req<ApiToken[]>("/tokens"),
+  createToken: (actor: string, label: string) =>
+    req<{ token: string; record: ApiToken }>("/tokens", { method: "POST", body: JSON.stringify({ actor, label }) }),
+  deleteToken: (id: string) => req<void>(`/tokens/${id}`, { method: "DELETE" }),
 };
