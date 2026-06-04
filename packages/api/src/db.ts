@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { APP_VERSION } from "@hive/shared";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +21,13 @@ db.pragma("journal_mode = WAL");
 db.pragma("foreign_keys = ON");
 
 export function migrate(): void {
+  // Was this a brand-new database? `journal` is the oldest core table, so its
+  // absence before this migrate run means a genuinely fresh install (→ run
+  // onboarding). A DB that predates v0.1.1 already has it (→ skip onboarding).
+  const fresh = !db
+    .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal'")
+    .get();
+
   // Storage-format migration: embeddings.vec moved from JSON-text to packed
   // little-endian f32 BLOB (matching bookstack-mcp). Drop a stale TEXT-format
   // table so the worker re-backfills it in the new format. Runs once — after
@@ -244,6 +252,49 @@ export function migrate(): void {
     );
     CREATE INDEX IF NOT EXISTS shares_viewer ON shares (viewer, scope);
     CREATE UNIQUE INDEX IF NOT EXISTS shares_uniq ON shares (scope, ref, viewer);
+
+    -- Key/value instance config (v0.1.1). Holds app.version, onboarding.completed,
+    -- instance.name, and anything else that's per-deployment rather than content.
+    CREATE TABLE IF NOT EXISTS config (
+      key        TEXT PRIMARY KEY,
+      value      TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    -- Login accounts. actor is the people.slug this user authenticates as.
+    CREATE TABLE IF NOT EXISTS users (
+      id            TEXT PRIMARY KEY,
+      actor         TEXT NOT NULL UNIQUE,
+      email         TEXT NOT NULL UNIQUE,
+      name          TEXT NOT NULL,
+      role          TEXT NOT NULL DEFAULT 'member',
+      password_hash TEXT NOT NULL,
+      created_at    TEXT NOT NULL,
+      last_login_at TEXT
+    );
+
+    -- Browser sessions (cookie auth). token_hash = sha256(plaintext cookie value).
+    CREATE TABLE IF NOT EXISTS sessions (
+      id         TEXT PRIMARY KEY,
+      token_hash TEXT NOT NULL UNIQUE,
+      user_id    TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      last_seen  TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS sessions_user ON sessions (user_id);
+
+    -- Bearer tokens for programmatic clients (CLI, MCP, AI agents).
+    -- token_hash = sha256(plaintext). The plaintext is returned once at creation.
+    CREATE TABLE IF NOT EXISTS api_tokens (
+      id           TEXT PRIMARY KEY,
+      token_hash   TEXT NOT NULL UNIQUE,
+      actor        TEXT NOT NULL,
+      label        TEXT NOT NULL,
+      created_by   TEXT NOT NULL,
+      created_at   TEXT NOT NULL,
+      last_used_at TEXT
+    );
   `);
 
   // Idempotent column additions for DBs created before owner was introduced.
@@ -282,6 +333,24 @@ export function migrate(): void {
     .get();
   if (!hasPeopleOwner) {
     db.exec("ALTER TABLE people ADD COLUMN owner TEXT");
+  }
+
+  // ---- v0.1.1 onboarding gate ----
+  // The first time this schema initializes a DB, stamp the app version and
+  // decide whether onboarding is required. A fresh DB needs the wizard; a DB
+  // that predates v0.1.1 (already had `journal`) is treated as already set up,
+  // so existing deployments never get bounced through onboarding.
+  const cfg = (key: string): string | undefined =>
+    (db.prepare("SELECT value FROM config WHERE key = ?").get(key) as { value: string } | undefined)?.value;
+  const setCfg = (key: string, value: string): void => {
+    db.prepare(
+      "INSERT INTO config (key, value, updated_at) VALUES (?, ?, ?) " +
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+    ).run(key, value, new Date().toISOString());
+  };
+  if (!cfg("app.version")) {
+    setCfg("app.version", APP_VERSION);
+    setCfg("onboarding.completed", fresh ? "false" : "true");
   }
 }
 

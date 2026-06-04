@@ -41,13 +41,29 @@ import {
   type Topic,
   type WireEvent,
   type WorkerStatus,
+  type ApiToken,
+  type OnboardingStatus,
+  type SafeUser,
+  type User,
+  type UserRole,
   ACTORS,
+  APP_VERSION,
+  isAi,
   parseMentions,
   TASK_STATUSES,
   DECISION_STATUSES,
 } from "@hive/shared";
 import { db, tx } from "./db.ts";
 import { publish } from "./bus.ts";
+import {
+  API_TOKEN_PREFIX,
+  generateToken,
+  hashPassword,
+  SESSION_PREFIX,
+  SESSION_TTL_MS,
+  tokenHash,
+  verifyPassword,
+} from "./auth.ts";
 import {
   contentHash,
   cosine,
@@ -256,6 +272,189 @@ export const people = {
     const next: Person = { ...cur, name, slug, kind, owner };
     emit("person.updated", actor, { id: cur.id, name, kind });
     return next;
+  },
+};
+
+// ---- config (per-instance key/value, v0.1.1) ----
+
+export const config = {
+  get(key: string): string | undefined {
+    return (db.prepare("SELECT value FROM config WHERE key = ?").get(key) as { value: string } | undefined)?.value;
+  },
+  set(key: string, value: string): void {
+    db.prepare(
+      "INSERT INTO config (key, value, updated_at) VALUES (?, ?, ?) " +
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+    ).run(key, value, now());
+  },
+  bool(key: string): boolean {
+    return config.get(key) === "true";
+  },
+};
+
+// ---- users (login accounts) ----
+// A user authenticates with email + password and writes as their `actor`
+// (a people.slug) — so the authenticated identity, not a spoofable header,
+// drives the journal/inbox.
+
+type UserRow = User & { password_hash: string };
+
+const safeUser = (u: User): SafeUser => ({
+  id: u.id,
+  actor: u.actor,
+  email: u.email,
+  name: u.name,
+  role: u.role,
+});
+
+export const users = {
+  count: (): number => (db.prepare("SELECT COUNT(*) AS n FROM users").get() as { n: number }).n,
+  list: (): SafeUser[] =>
+    db.prepare("SELECT id, actor, email, name, role FROM users ORDER BY created_at").all() as SafeUser[],
+  safe: safeUser,
+  byEmail: (email: string): UserRow | undefined =>
+    db.prepare("SELECT * FROM users WHERE email = ?").get(email.trim().toLowerCase()) as UserRow | undefined,
+  byId: (uid: string): UserRow | undefined =>
+    db.prepare("SELECT * FROM users WHERE id = ?").get(uid) as UserRow | undefined,
+
+  create(
+    input: { name: string; email: string; password: string; role?: UserRole; actor?: string; kind?: "human" | "ai" },
+    by = "system",
+  ): SafeUser {
+    // Tie the account to a person row (the actor it writes as).
+    const person = people.ensure(input.actor ?? input.name, input.kind ?? "human");
+    const u: User = {
+      id: id("usr"),
+      actor: person.slug,
+      email: input.email.trim().toLowerCase(),
+      name: input.name,
+      role: input.role ?? "member",
+      created_at: now(),
+      last_login_at: null,
+    };
+    db.prepare(
+      "INSERT INTO users (id, actor, email, name, role, password_hash, created_at, last_login_at) " +
+        "VALUES (@id, @actor, @email, @name, @role, @password_hash, @created_at, @last_login_at)",
+    ).run({ ...u, password_hash: hashPassword(input.password) });
+    emit("user.created", by, { id: u.id, actor: u.actor, role: u.role });
+    return safeUser(u);
+  },
+
+  /** Verify credentials; on success stamp last_login_at and return the row. */
+  authenticate(email: string, password: string): UserRow | undefined {
+    const u = users.byEmail(email);
+    if (!u || !verifyPassword(password, u.password_hash)) return undefined;
+    db.prepare("UPDATE users SET last_login_at = ? WHERE id = ?").run(now(), u.id);
+    return u;
+  },
+};
+
+// ---- sessions (browser cookie auth) ----
+
+export const sessions = {
+  create(userId: string): string {
+    const token = generateToken(SESSION_PREFIX);
+    const ts = now();
+    db.prepare(
+      "INSERT INTO sessions (id, token_hash, user_id, created_at, expires_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
+    ).run(id("ses"), tokenHash(token), userId, ts, new Date(Date.now() + SESSION_TTL_MS).toISOString(), ts);
+    return token;
+  },
+  /** Resolve a session cookie to its user, or undefined if missing/expired. */
+  resolve(token: string): UserRow | undefined {
+    const row = db.prepare("SELECT id, user_id, expires_at FROM sessions WHERE token_hash = ?").get(tokenHash(token)) as
+      | { id: string; user_id: string; expires_at: string }
+      | undefined;
+    if (!row) return undefined;
+    if (new Date(row.expires_at).getTime() < Date.now()) {
+      db.prepare("DELETE FROM sessions WHERE id = ?").run(row.id);
+      return undefined;
+    }
+    db.prepare("UPDATE sessions SET last_seen = ? WHERE id = ?").run(now(), row.id);
+    return users.byId(row.user_id);
+  },
+  destroy(token: string): void {
+    db.prepare("DELETE FROM sessions WHERE token_hash = ?").run(tokenHash(token));
+  },
+};
+
+// ---- API tokens (programmatic clients: CLI, MCP, AI agents) ----
+
+export const tokens = {
+  list: (): ApiToken[] =>
+    db
+      .prepare("SELECT id, actor, label, created_by, created_at, last_used_at FROM api_tokens ORDER BY created_at DESC")
+      .all() as ApiToken[],
+
+  create(input: { actor: string; label: string }, by = "system"): { token: string; record: ApiToken } {
+    const person = people.ensure(input.actor, isAi(input.actor) ? "ai" : "human");
+    const token = generateToken(API_TOKEN_PREFIX);
+    const record: ApiToken = {
+      id: id("tok"),
+      actor: person.slug,
+      label: input.label,
+      created_by: by,
+      created_at: now(),
+      last_used_at: null,
+    };
+    db.prepare(
+      "INSERT INTO api_tokens (id, token_hash, actor, label, created_by, created_at, last_used_at) " +
+        "VALUES (@id, @token_hash, @actor, @label, @created_by, @created_at, @last_used_at)",
+    ).run({ ...record, token_hash: tokenHash(token) });
+    emit("token.created", by, { id: record.id, actor: record.actor, label: record.label });
+    return { token, record };
+  },
+
+  /** Resolve a bearer token to its actor (and stamp last_used), or undefined. */
+  resolve(token: string): string | undefined {
+    const row = db.prepare("SELECT id, actor FROM api_tokens WHERE token_hash = ?").get(tokenHash(token)) as
+      | { id: string; actor: string }
+      | undefined;
+    if (!row) return undefined;
+    db.prepare("UPDATE api_tokens SET last_used_at = ? WHERE id = ?").run(now(), row.id);
+    return row.actor;
+  },
+
+  remove: (tokenId: string): boolean => db.prepare("DELETE FROM api_tokens WHERE id = ?").run(tokenId).changes > 0,
+};
+
+// ---- onboarding (first-run setup, v0.1.1) ----
+
+export const onboarding = {
+  /** Setup is required for a fresh install (flag false) OR any instance with no
+   *  login account yet — the latter keeps a pre-0.1.1 DB (auth is new, so it
+   *  has zero users) from bricking itself behind a login it can't satisfy. */
+  required: (): boolean => !config.bool("onboarding.completed") || users.count() === 0,
+
+  status: (): OnboardingStatus => ({
+    completed: !onboarding.required(),
+    instanceName: config.get("instance.name") ?? null,
+    version: config.get("app.version") ?? APP_VERSION,
+  }),
+
+  /** Create the first admin + name the instance, then mark setup complete and
+   *  return a session so the wizard logs the admin straight in. */
+  complete(input: { instanceName: string; adminName: string; adminEmail: string; password: string }): {
+    user: SafeUser;
+    session: string;
+  } {
+    const admin = users.create(
+      {
+        name: input.adminName,
+        email: input.adminEmail,
+        password: input.password,
+        role: "admin",
+        actor: input.adminName,
+        kind: "human",
+      },
+      "onboarding",
+    );
+    config.set("instance.name", input.instanceName);
+    config.set("app.version", APP_VERSION);
+    config.set("onboarding.completed", "true");
+    const session = sessions.create(admin.id);
+    emit("onboarding.completed", admin.actor, { instance: input.instanceName });
+    return { user: admin, session };
   },
 };
 
