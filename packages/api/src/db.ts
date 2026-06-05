@@ -335,6 +335,14 @@ export function migrate(): void {
     db.exec("ALTER TABLE people ADD COLUMN owner TEXT");
   }
 
+  // api_tokens.expires_at — tokens predating expiry support keep NULL (= non-expiring).
+  const hasTokenExpiry = db
+    .prepare("SELECT 1 FROM pragma_table_info('api_tokens') WHERE name='expires_at'")
+    .get();
+  if (!hasTokenExpiry) {
+    db.exec("ALTER TABLE api_tokens ADD COLUMN expires_at TEXT");
+  }
+
   // ---- v0.1.1 onboarding gate ----
   // The first time this schema initializes a DB, stamp the app version and
   // decide whether onboarding is required. A fresh DB needs the wizard; a DB
