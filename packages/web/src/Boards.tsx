@@ -219,7 +219,7 @@ export const Decisions: Component = () => {
   const [decisions] = createResource(() => ({ _r: liveRev() }), () => api.decisions());
   return (
     <section>
-      <For each={decisions()}>
+      <For each={decisions()} fallback={<p class="dim sm pad">no decisions yet — a decision emerges when you anchor one in a journal entry.</p>}>
         {(d) => (
           <article class={`decision status-${d.status}`}>
             <header>
@@ -259,7 +259,7 @@ export const Events: Component = () => {
   const [events] = createResource(() => ({ _r: liveRev() }), () => api.events());
   return (
     <section>
-      <For each={events()}>
+      <For each={events()} fallback={<p class="dim sm pad">no events yet — an event emerges when you anchor one in a journal entry.</p>}>
         {(e) => (
           <article class="entry">
             <h3>◷ {e.title}</h3>
@@ -327,7 +327,7 @@ export const Wire: Component = () => {
   const [events] = createResource(() => ({ _r: liveRev() }), () => api.wire());
   return (
     <section class="wire">
-      <For each={events() as WireEvent[]}>
+      <For each={events() as WireEvent[]} fallback={<p class="dim sm pad">no activity yet — the wire shows live events as you and the agents work.</p>}>
         {(e) => (
           <div class="wire-row">
             <time>{relTime(e.created_at)}</time>
