@@ -42,7 +42,6 @@ import {
   phases,
   projects,
   search,
-  seedActors,
   semanticSearch,
   shares,
   sources,
@@ -54,7 +53,8 @@ import {
 } from "./store.ts";
 
 migrate();
-seedActors();
+// No actor seeding: the instance holds only who you onboard, import, or create.
+// (seedActors stays exported for the demo `pnpm seed`.)
 
 type Principal = "session" | "token";
 type Env = { Variables: { actor?: string; principal?: Principal; role?: UserRole } };
@@ -533,8 +533,14 @@ app.get("/api/people/:slug", (c) => {
   return p ? c.json(p) : c.json({ error: "not found" }, 404);
 });
 app.patch("/api/people/:slug", async (c) => {
+  const slug = c.req.param("slug");
+  const target = people.get(slug);
+  if (!target) return c.json({ error: "not found" }, 404);
+  // Editable by an admin, the AI's owner, or the identity itself.
+  const me = c.get("actor");
+  if (!requireAdmin(c) && target.owner !== me && target.slug !== me) return c.json({ error: "forbidden" }, 403);
   const patch = (await c.req.json()) as PersonPatch;
-  const p = people.update(c.req.param("slug"), patch, actor(c));
+  const p = people.update(slug, patch, actor(c));
   return p ? c.json(p) : c.json({ error: "not found" }, 404);
 });
 app.post("/api/people", async (c) => {

@@ -1,7 +1,7 @@
 {
   "name": "@hive/api",
   "private": true,
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "exports": {
     "./store": "./src/store.ts",
@@ -13,7 +13,8 @@
     "start": "node --experimental-strip-types src/server.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json",
-    "seed": "node --experimental-strip-types src/seed.ts"
+    "seed": "node --experimental-strip-types src/seed.ts",
+    "import": "node --experimental-strip-types src/import.ts"
   },
   "dependencies": {
     "@hive/shared": "workspace:*",

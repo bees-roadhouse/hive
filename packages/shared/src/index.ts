@@ -23,10 +23,14 @@ export interface Person {
   kind: ActorKind;
   /** For AI writers: the slug of their human owner. null for humans. */
   owner: string | null;
+  /** Freeform identity profile — who they are / what they do. */
+  bio: string | null;
+  /** Short role/title, e.g. "VP of Technology". */
+  role: string | null;
   created_at: string;
 }
 
-export type PersonPatch = Partial<Pick<Person, "name" | "kind" | "owner">>;
+export type PersonPatch = Partial<Pick<Person, "name" | "kind" | "owner" | "bio" | "role">>;
 
 // ---- shares ----
 
@@ -73,7 +77,7 @@ export const isAi = (name: string) => ACTORS.find((a) => a.name === name)?.kind 
 /** The app version that introduced auth + onboarding. The DB records the
  *  version that initialized it; databases created before this never show the
  *  onboarding wizard. */
-export const APP_VERSION = "0.1.2";
+export const APP_VERSION = "0.1.3";
 
 export type UserRole = "admin" | "member";
 
