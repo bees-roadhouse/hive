@@ -101,6 +101,17 @@ export function buildMcpServer(actor: string): McpServer {
   );
 
   server.registerTool(
+    "profile_update",
+    {
+      title: "Update your profile",
+      description:
+        "Keep your own identity profile current — set your bio and/or role. Writes to your authenticated identity (you can't edit anyone else's).",
+      inputSchema: { bio: z.string().optional(), role: z.string().optional() },
+    },
+    async ({ bio, role }) => ok(people.update(actor, { bio, role }, actor) ?? { error: "no profile for your identity" }),
+  );
+
+  server.registerTool(
     "tasks_list",
     {
       title: "List tasks",

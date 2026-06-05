@@ -247,9 +247,9 @@ export const people = {
     const slug = slugify(name);
     const existing = people.bySlug(slug);
     if (existing) return existing;
-    const p: Person = { id: id("per"), name, slug, kind, owner: null, created_at: now() };
+    const p: Person = { id: id("per"), name, slug, kind, owner: null, bio: null, role: null, created_at: now() };
     db.prepare(
-      "INSERT INTO people (id, name, slug, kind, owner, created_at) VALUES (@id, @name, @slug, @kind, @owner, @created_at)",
+      "INSERT INTO people (id, name, slug, kind, owner, bio, role, created_at) VALUES (@id, @name, @slug, @kind, @owner, @bio, @role, @created_at)",
     ).run(p);
     return p;
   },
@@ -257,9 +257,9 @@ export const people = {
   upsert(slug: string, name: string, kind: Person["kind"], owner: string | null = null): Person {
     const existing = people.bySlug(slug);
     if (existing) return existing;
-    const p: Person = { id: id("per"), slug, name, kind, owner, created_at: now() };
+    const p: Person = { id: id("per"), slug, name, kind, owner, bio: null, role: null, created_at: now() };
     db.prepare(
-      "INSERT INTO people (id, slug, name, kind, owner, created_at) VALUES (@id, @slug, @name, @kind, @owner, @created_at)",
+      "INSERT INTO people (id, slug, name, kind, owner, bio, role, created_at) VALUES (@id, @slug, @name, @kind, @owner, @bio, @role, @created_at)",
     ).run(p);
     return p;
   },
@@ -276,9 +276,13 @@ export const people = {
     const name = patch.name ?? cur.name;
     const kind = patch.kind ?? cur.kind;
     const owner = patch.owner !== undefined ? patch.owner : cur.owner;
+    const bio = patch.bio !== undefined ? patch.bio : cur.bio;
+    const role = patch.role !== undefined ? patch.role : cur.role;
     const slug = patch.name ? slugify(name) : cur.slug;
-    db.prepare("UPDATE people SET name = ?, slug = ?, kind = ?, owner = ? WHERE id = ?").run(name, slug, kind, owner, cur.id);
-    const next: Person = { ...cur, name, slug, kind, owner };
+    db.prepare("UPDATE people SET name = ?, slug = ?, kind = ?, owner = ?, bio = ?, role = ? WHERE id = ?").run(
+      name, slug, kind, owner, bio, role, cur.id,
+    );
+    const next: Person = { ...cur, name, slug, kind, owner, bio, role };
     emit("person.updated", actor, { id: cur.id, name, kind });
     return next;
   },

@@ -237,6 +237,8 @@ export function migrate(): void {
       name       TEXT NOT NULL,
       kind       TEXT NOT NULL DEFAULT 'human',
       owner      TEXT,
+      bio        TEXT,
+      role       TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -359,6 +361,12 @@ export function migrate(): void {
     .get();
   if (!hasPeopleOwner) {
     db.exec("ALTER TABLE people ADD COLUMN owner TEXT");
+  }
+
+  // Identity profile (bio + role), editable in the UI and self-updatable via MCP.
+  for (const col of ["bio", "role"]) {
+    const has = db.prepare("SELECT 1 FROM pragma_table_info('people') WHERE name=?").get(col);
+    if (!has) db.exec(`ALTER TABLE people ADD COLUMN ${col} TEXT`);
   }
 
   // v0.1.2: OAuth tokens share the api_tokens table so tokens.resolve keeps
