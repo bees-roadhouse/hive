@@ -10,6 +10,7 @@ import { Account } from "./Account.tsx";
 import { Graph } from "./Graph.tsx";
 import { Onboarding } from "./Onboarding.tsx";
 import { Login } from "./Login.tsx";
+import { OAuthConsent } from "./OAuthConsent.tsx";
 import { Icon } from "./icons.tsx";
 import { Decisions, Events, PeopleView, ProjectsView, SearchPane, Tasks, TopicsView, Wire } from "./Boards.tsx";
 
@@ -140,7 +141,12 @@ export const App: Component = () => {
           when={boot()?.signedIn}
           fallback={<Login instanceName={boot()?.status.instanceName ?? null} onLogin={reload} />}
         >
-          <Workspace instanceName={boot()?.status.instanceName ?? null} onLogout={onLogout} />
+          <Show
+            when={window.location.pathname === "/consent"}
+            fallback={<Workspace instanceName={boot()?.status.instanceName ?? null} onLogout={onLogout} />}
+          >
+            <OAuthConsent />
+          </Show>
         </Show>
       </Show>
     </Suspense>

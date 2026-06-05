@@ -73,7 +73,7 @@ export const isAi = (name: string) => ACTORS.find((a) => a.name === name)?.kind 
 /** The app version that introduced auth + onboarding. The DB records the
  *  version that initialized it; databases created before this never show the
  *  onboarding wizard. */
-export const APP_VERSION = "0.1.1";
+export const APP_VERSION = "0.1.2";
 
 export type UserRole = "admin" | "member";
 
@@ -99,7 +99,9 @@ export interface SafeUser {
 }
 
 /** A bearer token for programmatic clients (CLI, MCP, AI agents). The plaintext
- *  is shown once at creation; only its hash is stored. */
+ *  is shown once at creation; only its hash is stored. `kind='oauth'` tokens were
+ *  minted via the OAuth consent flow and carry a client + expiry; `kind='pat'`
+ *  (or null) are admin-minted personal tokens with no expiry. */
 export interface ApiToken {
   id: string;
   actor: string;
@@ -107,6 +109,39 @@ export interface ApiToken {
   created_at: string;
   last_used_at: string | null;
   created_by: string;
+  kind: "pat" | "oauth" | null;
+  client_id: string | null;
+  granted_by: string | null;
+  expires_at: string | null;
+  scope: string | null;
+}
+
+/** A dynamically-registered OAuth client (RFC 7591). */
+export interface OAuthClient {
+  client_id: string;
+  client_name: string;
+  redirect_uris: string[];
+  grant_types: string[];
+  created_at: string;
+}
+
+/** An AI identity a signed-in human owns and may grant via the consent flow. */
+export interface AiIdentity {
+  slug: string;
+  name: string;
+}
+
+/** Payload the consent screen reads to render the grant UI. */
+export interface OAuthConsentContext {
+  client_name: string;
+  identities: AiIdentity[];
+  csrf: string;
+}
+
+/** Public auth capabilities the SPA reads before login. */
+export interface AuthConfig {
+  oidc: boolean;
+  instanceName: string | null;
 }
 
 /** Public first-run state — the SPA reads this before anything else. */

@@ -849,3 +849,8 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 }
 .token-reveal code { font-size: 0.9rem; }
 button.danger { background: #5a2a2a; color: #f0d0d0; border: none; border-radius: 6px; padding: 0.25rem 0.6rem; cursor: pointer; }
+
+/* ---- OAuth consent actions ---- */
+.consent-actions { display: flex; gap: 0.6rem; margin-top: 0.5rem; }
+.consent-actions button { flex: 1; }
+.consent-actions button[type="button"]:last-child { background: #2a6e3a; color: #d4f0da; border: none; border-radius: 8px; padding: 0.6rem; font-weight: 600; cursor: pointer; }

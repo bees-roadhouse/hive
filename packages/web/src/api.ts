@@ -27,7 +27,9 @@ import type {
   WireEvent,
   WorkerStatus,
   ApiToken,
+  AuthConfig,
   AuthMe,
+  OAuthConsentContext,
   OnboardingPayload,
   OnboardingStatus,
   SafeUser,
@@ -142,6 +144,34 @@ export const api = {
     req<{ user: SafeUser }>("/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }),
   logout: () => req<{ ok: boolean }>("/auth/logout", { method: "POST" }),
   me: () => req<AuthMe>("/auth/me"),
+  authConfig: () => req<AuthConfig>("/auth/config"),
+
+  // OAuth consent (AI identity grant). These hit /oauth/* (not under /api).
+  oauthContext: (clientId: string) =>
+    fetch(`/oauth/authorize/context?client_id=${encodeURIComponent(clientId)}`, { credentials: "include" }).then(
+      async (r) => {
+        if (!r.ok) throw new Error(String(r.status));
+        return (await r.json()) as OAuthConsentContext;
+      },
+    ),
+  oauthGrant: (body: {
+    client_id: string;
+    redirect_uri: string;
+    code_challenge: string;
+    state: string;
+    scope: string;
+    ai_actor: string;
+    csrf: string;
+  }) =>
+    fetch("/oauth/authorize/grant", {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }).then(async (r) => {
+      if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+      return (await r.json()) as { redirect: string };
+    }),
 
   // admin: users + API tokens
   users: () => req<SafeUser[]>("/users"),
