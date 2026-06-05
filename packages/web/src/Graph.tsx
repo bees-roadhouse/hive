@@ -109,8 +109,9 @@ export const Graph: Component = () => {
       </div>
       <div ref={host} class="graph-canvas" />
       <div class="dim sm">
-        {data() ? `${data()!.nodes.length} nodes · ${data()!.edges.length} edges · ` : ""}
-        drag to pull · scroll to zoom · click a node to focus
+        {data() && data()!.nodes.length === 0
+          ? "no graph yet — journal entries and the things they link to appear here."
+          : `${data() ? `${data()!.nodes.length} nodes · ${data()!.edges.length} edges · ` : ""}drag to pull · scroll to zoom · click a node to focus`}
       </div>
     </section>
   );
