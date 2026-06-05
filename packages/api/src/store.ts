@@ -52,6 +52,10 @@ import {
   parseMentions,
   TASK_STATUSES,
   DECISION_STATUSES,
+  API_TOKEN_MAX_EXPIRY_DAYS,
+  API_TOKEN_DEFAULT_EXPIRY_DAYS,
+  type LegacyImport,
+  type ImportResult,
 } from "@hive/shared";
 import { db, tx } from "./db.ts";
 import { publish } from "./bus.ts";
@@ -383,40 +387,143 @@ export const sessions = {
 export const tokens = {
   list: (): ApiToken[] =>
     db
-      .prepare("SELECT id, actor, label, created_by, created_at, last_used_at FROM api_tokens ORDER BY created_at DESC")
+      .prepare(
+        "SELECT id, actor, label, created_by, created_at, last_used_at, expires_at FROM api_tokens ORDER BY created_at DESC",
+      )
       .all() as ApiToken[],
 
-  create(input: { actor: string; label: string }, by = "system"): { token: string; record: ApiToken } {
+  /**
+   * Mint a bearer token. `expiresInDays` is clamped to [1, API_TOKEN_MAX_EXPIRY_DAYS];
+   * omitted → API_TOKEN_DEFAULT_EXPIRY_DAYS. The plaintext is returned once and never stored.
+   */
+  create(
+    input: { actor: string; label: string; expiresInDays?: number | null },
+    by = "system",
+  ): { token: string; record: ApiToken } {
     const person = people.ensure(input.actor, isAi(input.actor) ? "ai" : "human");
     const token = generateToken(API_TOKEN_PREFIX);
+    const requested = input.expiresInDays ?? API_TOKEN_DEFAULT_EXPIRY_DAYS;
+    const days = Math.min(API_TOKEN_MAX_EXPIRY_DAYS, Math.max(1, Math.floor(requested)));
+    const createdAt = now();
     const record: ApiToken = {
       id: id("tok"),
       actor: person.slug,
       label: input.label,
       created_by: by,
-      created_at: now(),
+      created_at: createdAt,
       last_used_at: null,
+      expires_at: new Date(Date.parse(createdAt) + days * 86_400_000).toISOString(),
     };
     db.prepare(
-      "INSERT INTO api_tokens (id, token_hash, actor, label, created_by, created_at, last_used_at) " +
-        "VALUES (@id, @token_hash, @actor, @label, @created_by, @created_at, @last_used_at)",
+      "INSERT INTO api_tokens (id, token_hash, actor, label, created_by, created_at, last_used_at, expires_at) " +
+        "VALUES (@id, @token_hash, @actor, @label, @created_by, @created_at, @last_used_at, @expires_at)",
     ).run({ ...record, token_hash: tokenHash(token) });
-    emit("token.created", by, { id: record.id, actor: record.actor, label: record.label });
+    emit("token.created", by, { id: record.id, actor: record.actor, label: record.label, expires_at: record.expires_at });
     return { token, record };
   },
 
-  /** Resolve a bearer token to its actor (and stamp last_used), or undefined. */
+  /** Resolve a bearer token to its actor (and stamp last_used), or undefined if missing/expired. */
   resolve(token: string): string | undefined {
-    const row = db.prepare("SELECT id, actor FROM api_tokens WHERE token_hash = ?").get(tokenHash(token)) as
-      | { id: string; actor: string }
+    const row = db.prepare("SELECT id, actor, expires_at FROM api_tokens WHERE token_hash = ?").get(tokenHash(token)) as
+      | { id: string; actor: string; expires_at: string | null }
       | undefined;
     if (!row) return undefined;
+    // expires_at NULL = legacy non-expiring token. Past expiry → reject (and reap it).
+    if (row.expires_at && Date.parse(row.expires_at) < Date.now()) {
+      db.prepare("DELETE FROM api_tokens WHERE id = ?").run(row.id);
+      return undefined;
+    }
     db.prepare("UPDATE api_tokens SET last_used_at = ? WHERE id = ?").run(now(), row.id);
     return row.actor;
   },
 
   remove: (tokenId: string): boolean => db.prepare("DELETE FROM api_tokens WHERE id = ?").run(tokenId).changes > 0,
 };
+
+// ---- Bulk historical import (legacy hive.db → this instance) ----
+
+/**
+ * Idempotent bulk import. Rows keep their original ids + timestamps; an id that
+ * already exists is left untouched (INSERT OR IGNORE) and counted as skipped — so
+ * re-running is safe. Unlike journal.append this does NOT fan out inbox/anchor/share
+ * side effects (inappropriate for backfilling history); it only persists + indexes.
+ */
+export function importLegacy(payload: LegacyImport): ImportResult {
+  const count = () => ({ inserted: 0, skipped: 0 });
+  const res: ImportResult = { journal: count(), projects: count(), tasks: count(), links: count() };
+
+  return tx(() => {
+    for (const p of payload.projects ?? []) {
+      const r = db
+        .prepare("INSERT OR IGNORE INTO projects (id, name, slug, created_at) VALUES (@id, @name, @slug, @created_at)")
+        .run(p);
+      r.changes ? res.projects.inserted++ : res.projects.skipped++;
+    }
+
+    for (const e of payload.journal ?? []) {
+      people.ensure(e.author, isAi(e.author) ? "ai" : "human");
+      const r = db
+        .prepare(
+          "INSERT OR IGNORE INTO journal (id, author, body, tags, mentions, created_at) " +
+            "VALUES (@id, @author, @body, @tags, @mentions, @created_at)",
+        )
+        .run({
+          id: e.id,
+          author: e.author,
+          body: e.body,
+          tags: JSON.stringify(e.tags ?? []),
+          mentions: JSON.stringify(parseMentions(e.body)),
+          created_at: e.created_at,
+        });
+      if (r.changes) {
+        indexEntity("journal", e.id, `${e.author}: ${snip(e.body, 50)}`, e.body, e.tags ?? []);
+        res.journal.inserted++;
+      } else {
+        res.journal.skipped++;
+      }
+    }
+
+    for (const t of payload.tasks ?? []) {
+      const status = TASK_STATUSES.includes(t.status as TaskStatus) ? t.status : "todo";
+      const r = db
+        .prepare(
+          "INSERT OR IGNORE INTO tasks (id, project, title, body, status, priority, tags, assignees, due, created_at, updated_at) " +
+            "VALUES (@id, @project, @title, @body, @status, @priority, @tags, @assignees, @due, @created_at, @updated_at)",
+        )
+        .run({
+          id: t.id,
+          project: t.project,
+          title: t.title,
+          body: t.body ?? "",
+          status,
+          priority: t.priority || "normal",
+          tags: JSON.stringify(t.tags ?? []),
+          assignees: JSON.stringify(t.assignees ?? []),
+          due: t.due,
+          created_at: t.created_at,
+          updated_at: t.updated_at,
+        });
+      if (r.changes) {
+        indexEntity("task", t.id, t.title, t.body ?? "", t.tags ?? []);
+        res.tasks.inserted++;
+      } else {
+        res.tasks.skipped++;
+      }
+    }
+
+    for (const l of payload.links ?? []) {
+      const r = db
+        .prepare(
+          "INSERT OR IGNORE INTO links (id, source_kind, source_id, target_kind, target_id, rel, created_at) " +
+            "VALUES (@id, @source_kind, @source_id, @target_kind, @target_id, @rel, @created_at)",
+        )
+        .run(l);
+      r.changes ? res.links.inserted++ : res.links.skipped++;
+    }
+
+    return res;
+  });
+}
 
 // ---- onboarding (first-run setup, v0.1.1) ----
 

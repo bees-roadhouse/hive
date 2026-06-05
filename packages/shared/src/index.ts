@@ -107,6 +107,49 @@ export interface ApiToken {
   created_at: string;
   last_used_at: string | null;
   created_by: string;
+  /** ISO expiry; null = legacy non-expiring token. Resolution rejects expired tokens. */
+  expires_at: string | null;
+}
+
+/** API-token expiry policy. New tokens get DEFAULT days unless specified; never more than MAX. */
+export const API_TOKEN_MAX_EXPIRY_DAYS = 365;
+export const API_TOKEN_DEFAULT_EXPIRY_DAYS = 90;
+
+/** Bulk historical import (legacy hive.db → this instance). Rows carry their original
+ *  ids + timestamps; the importer is idempotent (existing ids are skipped). */
+export interface LegacyImport {
+  journal?: { id: string; author: string; body: string; tags: string[]; created_at: string }[];
+  projects?: { id: string; name: string; slug: string; created_at: string }[];
+  tasks?: {
+    id: string;
+    project: string | null;
+    title: string;
+    body: string;
+    status: string;
+    priority: string;
+    tags: string[];
+    assignees: string[];
+    due: string | null;
+    created_at: string;
+    updated_at: string;
+  }[];
+  links?: {
+    id: string;
+    source_kind: string;
+    source_id: string;
+    target_kind: string;
+    target_id: string;
+    rel: string;
+    created_at: string;
+  }[];
+}
+
+export type ImportCounts = { inserted: number; skipped: number };
+export interface ImportResult {
+  journal: ImportCounts;
+  projects: ImportCounts;
+  tasks: ImportCounts;
+  links: ImportCounts;
 }
 
 /** Public first-run state — the SPA reads this before anything else. */

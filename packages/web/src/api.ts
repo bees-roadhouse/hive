@@ -5,6 +5,7 @@ import type {
   EmbeddingStats,
   EventItem,
   GraphData,
+  ImportResult,
   InboxItem,
   JournalEntryView,
   JournalWriter,
@@ -148,7 +149,20 @@ export const api = {
   addUser: (u: { name: string; email: string; password: string; role?: UserRole; kind?: "human" | "ai" }) =>
     req<SafeUser>("/users", { method: "POST", body: JSON.stringify(u) }),
   apiTokens: () => req<ApiToken[]>("/tokens"),
-  createToken: (actor: string, label: string) =>
-    req<{ token: string; record: ApiToken }>("/tokens", { method: "POST", body: JSON.stringify({ actor, label }) }),
+  createToken: (actor: string, label: string, expiresInDays?: number) =>
+    req<{ token: string; record: ApiToken }>("/tokens", {
+      method: "POST",
+      body: JSON.stringify({ actor, label, expiresInDays }),
+    }),
   deleteToken: (id: string) => req<void>(`/tokens/${id}`, { method: "DELETE" }),
+
+  // admin: bulk import from a legacy hive.db (SQLite). Multipart upload — we let the
+  // browser set the content-type/boundary, so this bypasses the JSON `req` helper.
+  importSqlite: async (file: File): Promise<ImportResult & { warnings: string[] }> => {
+    const fd = new FormData();
+    fd.append("db", file);
+    const res = await fetch("/api/import/sqlite", { method: "POST", credentials: "include", body: fd });
+    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+    return res.json() as Promise<ImportResult & { warnings: string[] }>;
+  },
 };
