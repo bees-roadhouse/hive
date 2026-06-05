@@ -306,7 +306,7 @@ export const SearchPane: Component = () => {
       <p class="dim sm pad">
         {mode() === "semantic" ? "vector similarity via the local embedder" : "FTS5 keyword match"}
       </p>
-      <For each={hits()}>
+      <For each={hits()} fallback={<Show when={q().trim()}><p class="dim sm pad">no matches.</p></Show>}>
         {(h) => (
           <div class="hit">
             <span class="badge">{h.kind}</span>
