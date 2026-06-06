@@ -90,7 +90,7 @@ const Workspace = (props: {
             <For each={visibleTabs}>
               {(t) => (
                 <A href={`/${t.id}`} activeClass="active" end>
-                  <span class="nav-icon"><Icon name={t.id === "account" ? "settings" : t.id} /></span>
+                  <span class="nav-icon"><Icon name={t.id} /></span>
                   <span class="nav-label">{t.id}</span>
                   <Show when={t.id === "inbox" && (unread() ?? 0) > 0}>
                     <span class="nav-badge">{unread()}</span>
