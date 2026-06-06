@@ -69,6 +69,9 @@ importers:
       '@hive/shared':
         specifier: workspace:*
         version: link:../shared
+      '@solidjs/router':
+        specifier: ^0.16.1
+        version: 0.16.1(solid-js@1.9.13)
       '@tiptap/core':
         specifier: ^2.27.2
         version: 2.27.2(@tiptap/pm@2.27.2)
@@ -730,6 +733,11 @@ packages:
     resolution: {integrity: sha512-tkuFxhvKO/HlGd0VsINF6vHSYH8AF8W0TcNxKDK6JZmrehngFj78pToc8iemtnvwilDjs2G/qSzYFhe9U8q+fw==}
     cpu: [x64]
     os: [win32]
+
+  '@solidjs/router@0.16.1':
+    resolution: {integrity: sha512-IhyjedgC6LRpw/8CPGGI89FrV+r0xTHzOl2c4CRyzYQ1bLepJxbVI1LLKvsavMWY5TRBRacV7hAeOhuTXkjiqg==}
+    peerDependencies:
+      solid-js: ^1.8.6
 
   '@tiptap/core@2.27.2':
     resolution: {integrity: sha512-ABL1N6eoxzDzC1bYvkMbvyexHacszsKdVPYqhl5GwHLOvpZcv9VE9QaKwDILTyz5voCA0lGcAAXZp+qnXOk5lQ==}
@@ -2381,6 +2389,10 @@ snapshots:
 
   '@rollup/rollup-win32-x64-msvc@4.61.0':
     optional: true
+
+  '@solidjs/router@0.16.1(solid-js@1.9.13)':
+    dependencies:
+      solid-js: 1.9.13
 
   '@tiptap/core@2.27.2(@tiptap/pm@2.27.2)':
     dependencies:

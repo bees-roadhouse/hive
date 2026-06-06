@@ -183,6 +183,52 @@ export const Journal: Component = () => {
   const hasBufferedDays = createMemo(() => allDayGroups().length > visibleDays());
   const allDone = createMemo(() => fetchDone() && !hasBufferedDays());
 
+  // ---- right rail: anchored entities for entries currently in view ----
+  // Entry ids whose source <article> is intersecting the viewport (tracked by an
+  // IntersectionObserver in onMount). The rail derives its contents from these.
+  const [visibleEntryIds, setVisibleEntryIds] = createSignal<Set<string>>(new Set());
+  // The entry the reader is currently centred on — its rail items get a highlight.
+  const [activeEntryId, setActiveEntryId] = createSignal<string | null>(null);
+
+  type RailItem = { anchor: ResolvedAnchor; entryId: string; title: string };
+
+  // Anchors from in-view entries, deduped by entity (ref_id) and grouped by kind.
+  // Falls back to all loaded entries before the observer has reported anything.
+  const railGroups = createMemo(() => {
+    const visible = visibleEntryIds();
+    const entries = buffer();
+    const inView = visible.size > 0 ? entries.filter((e) => visible.has(e.id)) : entries;
+    const groups: Record<AnchorKind, RailItem[]> = { task: [], decision: [], event: [] };
+    const seen = new Set<string>();
+    for (const e of inView) {
+      for (const a of e.anchors) {
+        const key = a.ref_id || a.id;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const title = a.entity?.title?.trim() || a.text;
+        groups[a.kind].push({ anchor: a, entryId: e.id, title });
+      }
+    }
+    return groups;
+  });
+
+  const railTotal = createMemo(() => {
+    const g = railGroups();
+    return g.task.length + g.decision.length + g.event.length;
+  });
+
+  // Click a rail item → open the same anchor drawer and scroll its source entry
+  // into view (so the rail doubles as a table of contents).
+  const openFromRail = (item: RailItem) => {
+    setOpen(item.anchor);
+    const el = document.getElementById(`entry-${item.entryId}`);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.classList.add("entry-flash");
+      setTimeout(() => el.classList.remove("entry-flash"), 1200);
+    }
+  };
+
   const fetchUntilNewDay = async (): Promise<boolean> => {
     if (fetchDone()) return false;
     const startDayCount = allDayGroups().length;
@@ -234,6 +280,40 @@ export const Journal: Component = () => {
       { rootMargin: "300px" },
     );
     scrollObs.observe(sentinel);
+
+    // Track which entries are on screen so the right rail can reflect them.
+    // rootMargin trims the band to the middle of the viewport so the rail
+    // follows what the reader is actually looking at, not edge slivers.
+    const railObs = new IntersectionObserver(
+      (ents) => {
+        let mostVisible: { id: string; ratio: number } | null = null;
+        setVisibleEntryIds((prev) => {
+          const next = new Set(prev);
+          for (const ent of ents) {
+            const id = (ent.target as HTMLElement).dataset.entryId;
+            if (!id) continue;
+            if (ent.isIntersecting) next.add(id);
+            else next.delete(id);
+          }
+          return next;
+        });
+        for (const ent of ents) {
+          const id = (ent.target as HTMLElement).dataset.entryId;
+          if (id && ent.isIntersecting && (!mostVisible || ent.intersectionRatio > mostVisible.ratio)) {
+            mostVisible = { id, ratio: ent.intersectionRatio };
+          }
+        }
+        if (mostVisible) setActiveEntryId(mostVisible.id);
+      },
+      { rootMargin: "-15% 0px -45% 0px", threshold: [0, 0.25, 0.5, 1] },
+    );
+    const observeRail = () => {
+      feedEl?.querySelectorAll<HTMLElement>(".entry[data-entry-id]").forEach((el) => railObs.observe(el));
+    };
+    observeRail();
+    const railMo = new MutationObserver(observeRail);
+    railMo.observe(feedEl, { childList: true, subtree: true });
+    onCleanup(() => { railObs.disconnect(); railMo.disconnect(); });
 
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     let fadeObs: IntersectionObserver | undefined;
@@ -561,7 +641,8 @@ export const Journal: Component = () => {
         </button>
       </div>
 
-      {/* ---- day-by-day feed ---- */}
+      {/* ---- feed + anchored-entities rail ---- */}
+      <div class="journal-layout">
       <div ref={feedEl} class="feed">
         <For each={days()}>
           {(d) => (
@@ -575,7 +656,7 @@ export const Journal: Component = () => {
               </header>
               <For each={d.items}>
                 {(e) => (
-                  <article class="entry entry-fade">
+                  <article class="entry entry-fade" id={`entry-${e.id}`} data-entry-id={e.id}>
                     <header>
                       <span class="actor-chip">{e.author}</span>
                       <time>{relTime(e.created_at)}</time>
@@ -604,6 +685,49 @@ export const Journal: Component = () => {
             <span class="dim sm">no entries yet — write the first one.</span>
           </Show>
         </div>
+      </div>
+
+      {/* ---- right rail: entities anchored in the entries currently in view ---- */}
+      <aside class="journal-rail">
+        <div class="rail-head">
+          <span class="dim sm">in view</span>
+          <Show when={railTotal() > 0}>
+            <span class="badge">{railTotal()}</span>
+          </Show>
+        </div>
+        <Show
+          when={railTotal() > 0}
+          fallback={<p class="dim sm rail-empty">No anchored tasks, decisions, or events in the entries on screen. Tag text as you write to surface them here.</p>}
+        >
+          <For each={["task", "decision", "event"] as AnchorKind[]}>
+            {(kind) => (
+              <Show when={railGroups()[kind].length > 0}>
+                <div class="rail-group">
+                  <h4 class="rail-group-head">
+                    <span class={`rail-glyph rail-glyph-${kind}`}>{ANCHOR_GLYPH[kind]}</span>
+                    {kind === "task" ? "Tasks" : kind === "decision" ? "Decisions" : "Events"}
+                    <span class="dim sm">{railGroups()[kind].length}</span>
+                  </h4>
+                  <ul class="rail-list">
+                    <For each={railGroups()[kind]}>
+                      {(item) => (
+                        <li
+                          class={`rail-item rail-item-${kind}`}
+                          classList={{ "rail-item-active": item.entryId === activeEntryId() }}
+                          onClick={() => openFromRail(item)}
+                          title={item.title}
+                        >
+                          {item.title}
+                        </li>
+                      )}
+                    </For>
+                  </ul>
+                </div>
+              </Show>
+            )}
+          </For>
+        </Show>
+      </aside>
       </div>
 
       {/* ---- floating action button ---- */}
