@@ -2188,6 +2188,18 @@ function profileCard(p: Profile): string {
   return [head, ...secs].join("\n");
 }
 
+/** Journal entries have no stored title — derive one from the prose. Prefer the
+ *  first Markdown heading (`# …`), else the first non-empty line, truncated. */
+function deriveJournalTitle(body: string): string {
+  for (const raw of body.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    const h = line.match(/^#{1,6}\s+(.*)$/);
+    return snip((h ? h[1] : line).trim(), 80);
+  }
+  return "(untitled)";
+}
+
 /**
  * Compose a ready-to-inject memory brief for `identity` (optionally focused on
  * `peer`): profile cards, open tasks, unread inbox, recent relevant journal,
@@ -2226,7 +2238,11 @@ export async function recall(opts: {
     .filter((h) => h.kind === "journal")
     .map((h) => {
       const e = journal.get(h.id);
-      return e ? { ...h, author: e.author, created_at: e.created_at } : undefined;
+      // Title is derived from the body (no title column); adapters fold a
+      // heading into the prose, so prefer the first Markdown `#` heading.
+      return e
+        ? { ...h, title: deriveJournalTitle(e.body), author: e.author, created_at: e.created_at }
+        : undefined;
     })
     .filter((h): h is RecallJournalHit => h !== undefined);
 
