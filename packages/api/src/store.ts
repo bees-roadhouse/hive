@@ -28,7 +28,14 @@ import {
   type Person,
   type Phase,
   type PersonPatch,
+  type Profile,
+  type ProfilePatch,
+  type ProfileSource,
   type Project,
+  type ProjectRef,
+  type RecallData,
+  type RecallJournalHit,
+  type RecallResult,
   type ResolvedAnchor,
   type SearchHit,
   type Severity,
@@ -50,6 +57,7 @@ import {
   APP_VERSION,
   isAi,
   parseMentions,
+  RECALL_DEFAULT_BUDGET,
   TASK_STATUSES,
   DECISION_STATUSES,
   API_TOKEN_MAX_EXPIRY_DAYS,
@@ -275,6 +283,45 @@ export const people = {
     db.prepare("UPDATE people SET name = ?, slug = ?, kind = ?, owner = ? WHERE id = ?").run(name, slug, kind, owner, cur.id);
     const next: Person = { ...cur, name, slug, kind, owner };
     emit("person.updated", actor, { id: cur.id, name, kind });
+    return next;
+  },
+};
+
+// ---- profile (mutable per-actor card; the durable-identity write target) ----
+
+type ProfileRow = Omit<Profile, "body"> & { body: string };
+const toProfile = (r: ProfileRow): Profile => {
+  const parsed = json<{ sections?: Record<string, string> }>(r.body);
+  return { ...r, body: { sections: parsed.sections ?? {} } };
+};
+
+export const profiles = {
+  get(actor: string): Profile | undefined {
+    const r = db.prepare("SELECT * FROM profile WHERE actor = ?").get(actor) as ProfileRow | undefined;
+    return r ? toProfile(r) : undefined;
+  },
+
+  /** Deep-merge `sections` into body.sections (per-key replace), stamp updated_at,
+   *  source='manual'. Creates the card on first write. */
+  update(actor: string, patch: ProfilePatch, by = "system"): Profile {
+    const cur = profiles.get(actor);
+    const sections = { ...(cur?.body.sections ?? {}), ...(patch.sections ?? {}) };
+    const next: Profile = {
+      actor,
+      kind: patch.kind ?? cur?.kind ?? (isAi(actor) ? "ai" : "human"),
+      display_name: patch.display_name ?? cur?.display_name ?? "",
+      body: { sections },
+      source: "manual" as ProfileSource,
+      derived_at: cur?.derived_at ?? null,
+      updated_at: now(),
+    };
+    db.prepare(
+      `INSERT INTO profile (actor, kind, display_name, body, source, derived_at, updated_at)
+       VALUES (@actor, @kind, @display_name, @body, @source, @derived_at, @updated_at)
+       ON CONFLICT(actor) DO UPDATE SET kind=excluded.kind, display_name=excluded.display_name,
+         body=excluded.body, source=excluded.source, derived_at=excluded.derived_at, updated_at=excluded.updated_at`,
+    ).run({ ...next, body: JSON.stringify(next.body) });
+    emit("profile.updated", by, { actor, source: next.source });
     return next;
   },
 };
@@ -1962,6 +2009,29 @@ export interface SemanticOptions {
   rerank?: boolean;
   /** Scope results to entries this viewer may see (own + owned/shared/mentioned). */
   viewer?: string;
+  /** Boost (not filter) hits whose author/mentions/assignees include this actor. */
+  identity?: string;
+  /** Boost (not filter) hits whose author/mentions/assignees include this actor. */
+  peer?: string;
+}
+
+/** The actors associated with a hit: journal → author + mentions; task/decision/
+ *  event → assignees. Used to softly boost results toward the recall focus. */
+function hitActors(kind: string, refId: string): string[] {
+  if (kind === "journal") {
+    const r = db.prepare("SELECT author, mentions FROM journal WHERE id = ?").get(refId) as
+      | { author: string; mentions: string }
+      | undefined;
+    if (!r) return [];
+    return [r.author, ...json<string[]>(r.mentions)];
+  }
+  if (kind === "task" || kind === "decision" || kind === "event") {
+    const r = db.prepare(`SELECT assignees FROM ${kind} WHERE id = ?`).get(refId) as
+      | { assignees: string }
+      | undefined;
+    return r ? json<string[]>(r.assignees) : [];
+  }
+  return [];
 }
 
 const refKey = (kind: string, id: string) => `${kind}:${id}`;
@@ -2047,11 +2117,21 @@ export async function semanticSearch(query: string, opts: SemanticOptions = {}):
   // Drop keyword-only noise — a keyword hit with zero semantic relevance.
   if (hybrid) for (const [kk, s] of [...scores]) if (s.vector === 0 && s.keyword > 0) scores.delete(kk);
 
-  // 4. Blended sort.
+  // 4. Blended sort. When recall passes identity/peer, softly boost hits whose
+  // actors intersect that focus set (+0.1 if either matches) — a nudge, not a
+  // filter, so unrelated-but-relevant material still surfaces.
+  const focus = new Set([opts.identity, opts.peer].filter(Boolean) as string[]);
+  const scoped = (kk: string): number => {
+    if (!focus.size) return 0;
+    const [k, id] = splitKey(kk);
+    return hitActors(k, id).some((a) => focus.has(a)) ? 0.1 : 0;
+  };
   let ranked = [...scores.entries()]
     .map(([k, s]) => ({
       k,
-      score: s.keyword > 0 && s.vector > 0 ? s.vector * 0.7 + s.keyword * 0.2 + s.blanket : s.vector + s.blanket,
+      score:
+        (s.keyword > 0 && s.vector > 0 ? s.vector * 0.7 + s.keyword * 0.2 + s.blanket : s.vector + s.blanket) +
+        scoped(k),
     }))
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
@@ -2078,6 +2158,121 @@ export async function semanticSearch(query: string, opts: SemanticOptions = {}):
     };
   });
   return opts.viewer ? scopeHits(hits, opts.viewer) : hits;
+}
+
+// ---- recall (the read/inject composition: cards + scoped retrieval) ----
+
+/** Rough token estimate (~4 chars/token) used only to trim the brief to budget. */
+const estTokens = (s: string) => Math.ceil(s.length / 4);
+
+/** Append sections to the brief until the next one would exceed the token budget. */
+function assembleBrief(sections: string[], budget: number): string {
+  const out: string[] = [];
+  let used = 0;
+  for (const sec of sections) {
+    const cost = estTokens(sec) + 1;
+    if (out.length && used + cost > budget) break;
+    out.push(sec);
+    used += cost;
+  }
+  return out.join("\n\n");
+}
+
+function profileCard(p: Profile): string {
+  const head = `## ${p.display_name || p.actor} (${p.kind})`;
+  const secs = Object.entries(p.body.sections)
+    .filter(([, v]) => v.trim())
+    .map(([k, v]) => `**${k.replace(/_/g, " ")}:** ${v.trim()}`);
+  return [head, ...secs].join("\n");
+}
+
+/**
+ * Compose a ready-to-inject memory brief for `identity` (optionally focused on
+ * `peer`): profile cards, open tasks, unread inbox, recent relevant journal,
+ * recent events, touched projects. Deterministic assembly (no LLM), trimmed to
+ * `budget` tokens. Returns the markdown `brief` plus the structured `data`.
+ */
+export async function recall(opts: {
+  identity: string;
+  peer?: string;
+  query?: string;
+  budget?: number;
+}): Promise<RecallResult> {
+  const { identity, peer } = opts;
+  const budget = opts.budget ?? RECALL_DEFAULT_BUDGET;
+
+  const profileList: Profile[] = [];
+  const idCard = profiles.get(identity);
+  if (idCard) profileList.push(idCard);
+  const peerCard = peer ? profiles.get(peer) : undefined;
+  if (peerCard) profileList.push(peerCard);
+
+  const openTasks = tasks
+    .list({ assignee: identity })
+    .filter((t) => t.status !== "done");
+
+  const unread = inbox.list(identity, true);
+
+  // Default query (no explicit topic): the actors in focus plus the open-task
+  // titles — pulls "recent + open threads" toward the recall.
+  const query =
+    opts.query?.trim() ||
+    [identity, peer, ...openTasks.slice(0, 5).map((t) => t.title)].filter(Boolean).join(" ");
+
+  const rawHits = query ? await semanticSearch(query, { limit: 8, identity, peer }) : [];
+  const journalHits: RecallJournalHit[] = rawHits
+    .filter((h) => h.kind === "journal")
+    .map((h) => {
+      const e = journal.get(h.id);
+      return e ? { ...h, author: e.author, created_at: e.created_at } : undefined;
+    })
+    .filter((h): h is RecallJournalHit => h !== undefined);
+
+  const recentEvents = events.list().slice(0, 5);
+
+  // Projects touched by the identity's open tasks.
+  const projIds = new Set(openTasks.map((t) => t.project).filter(Boolean) as string[]);
+  const touchedProjects: ProjectRef[] = [...projIds]
+    .map((pid) => projects.get(pid))
+    .filter((p): p is Project => p !== undefined)
+    .map((p) => ({ id: p.id, name: p.name, slug: p.slug }));
+
+  const data: RecallData = {
+    profiles: profileList,
+    journal: journalHits,
+    tasks: openTasks,
+    inbox: unread,
+    events: recentEvents,
+    projects: touchedProjects,
+  };
+
+  // Deterministic markdown brief — cards first, then the working sections.
+  const sections: string[] = [`# Recall for ${identity}${peer ? ` · focus: ${peer}` : ""}`];
+  for (const p of profileList) sections.push(profileCard(p));
+  if (openTasks.length)
+    sections.push(
+      `## Open tasks (${identity})\n` +
+        openTasks.map((t) => `- [${t.status}] ${t.title}${t.due ? ` (due ${t.due})` : ""}`).join("\n"),
+    );
+  if (unread.length)
+    sections.push(
+      `## Unread inbox\n` +
+        unread.map((i) => `- from ${i.from} (${i.reason}): ${i.snippet}`).join("\n"),
+    );
+  if (journalHits.length)
+    sections.push(
+      `## Recent relevant journal\n` +
+        journalHits.map((h) => `- ${h.author}: ${h.title}`).join("\n"),
+    );
+  if (recentEvents.length)
+    sections.push(
+      `## Recent events\n` +
+        recentEvents.map((e) => `- ${e.title}${e.at ? ` (${e.at})` : ""}`).join("\n"),
+    );
+  if (touchedProjects.length)
+    sections.push(`## Projects\n` + touchedProjects.map((p) => `- ${p.name}`).join("\n"));
+
+  return { brief: assembleBrief(sections, budget), data };
 }
 
 // ---- worker status ----

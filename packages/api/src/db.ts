@@ -295,6 +295,19 @@ export function migrate(): void {
       created_at   TEXT NOT NULL,
       last_used_at TEXT
     );
+
+    -- Mutable per-actor card (humans + AIs): the durable "who they are" that
+    -- evolves, kept distinct from the write-once journal. body is JSON
+    -- { sections: { identity, preferences, working_style, relationships, … } }.
+    CREATE TABLE IF NOT EXISTS profile (
+      actor        TEXT PRIMARY KEY,
+      kind         TEXT NOT NULL DEFAULT 'human',
+      display_name TEXT NOT NULL DEFAULT '',
+      body         TEXT NOT NULL DEFAULT '{}',
+      source       TEXT NOT NULL DEFAULT 'manual',
+      derived_at   TEXT,
+      updated_at   TEXT NOT NULL
+    );
   `);
 
   // Idempotent column additions for DBs created before owner was introduced.
