@@ -1,4 +1,14 @@
-import { createEffect, createMemo, createResource, createSignal, For, Show, type Component } from "solid-js";
+import {
+  createEffect,
+  createMemo,
+  createResource,
+  createSignal,
+  For,
+  onCleanup,
+  Show,
+  Suspense,
+  type Component,
+} from "solid-js";
 import type {
   AnchorKind,
   Decision,
@@ -422,20 +432,56 @@ export const Events: Component = () => {
 
 // ---- Search ----
 
-export const SearchPane: Component = () => {
-  const [q, setQ] = createSignal("");
-  const [mode, setMode] = createSignal<"keyword" | "semantic">("keyword");
+// The results list is its own component reading its own resource, wrapped in a
+// local Suspense below. That keeps a refetch's pending state contained here —
+// reading a suspending resource at the page level would otherwise bubble to the
+// app-shell Suspense and flash the whole UI on every query change.
+const SearchResults: Component<{ query: string; mode: "keyword" | "semantic" }> = (props) => {
   const [hits] = createResource(
-    () => ({ q: q(), mode: mode() }),
+    () => ({ q: props.query, mode: props.mode }),
     (k) => (k.q.trim() ? api.search(k.q, k.mode) : Promise.resolve([] as SearchHit[])),
   );
+  return (
+    <For
+      each={hits()}
+      fallback={<Show when={props.query.trim()}><p class="dim sm pad">no matches.</p></Show>}
+    >
+      {(h) => (
+        <div class="hit">
+          <span class="badge">{h.kind}</span>
+          <strong>{h.title}</strong>
+          <Show when={h.snippet} fallback={<span class="snippet">score {h.score}</span>}>
+            <span class="snippet" innerHTML={h.snippet} />
+          </Show>
+        </div>
+      )}
+    </For>
+  );
+};
+
+export const SearchPane: Component = () => {
+  const [q, setQ] = createSignal(""); // live input value
+  const [query, setQuery] = createSignal(""); // debounced value that drives the search
+  const [mode, setMode] = createSignal<"keyword" | "semantic">("keyword");
+
+  // Debounce the live input into `query` so a search fires at most ~250ms after
+  // typing stops, not once per keystroke. The input stays fully responsive
+  // because it's bound to `q`, which the resource never reads.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const onType = (value: string) => {
+    setQ(value);
+    clearTimeout(timer);
+    timer = setTimeout(() => setQuery(value), 250);
+  };
+  onCleanup(() => clearTimeout(timer));
+
   return (
     <section>
       <div class="row">
         <input
           placeholder="search journal, tasks, decisions, events…"
           value={q()}
-          onInput={(e) => setQ(e.currentTarget.value)}
+          onInput={(e) => onType(e.currentTarget.value)}
         />
         <div class="seg">
           <button classList={{ active: mode() === "keyword" }} onClick={() => setMode("keyword")}>
@@ -449,17 +495,9 @@ export const SearchPane: Component = () => {
       <p class="dim sm pad">
         {mode() === "semantic" ? "vector similarity via the local embedder" : "FTS5 keyword match"}
       </p>
-      <For each={hits()} fallback={<Show when={q().trim()}><p class="dim sm pad">no matches.</p></Show>}>
-        {(h) => (
-          <div class="hit">
-            <span class="badge">{h.kind}</span>
-            <strong>{h.title}</strong>
-            <Show when={h.snippet} fallback={<span class="snippet">score {h.score}</span>}>
-              <span class="snippet" innerHTML={h.snippet} />
-            </Show>
-          </div>
-        )}
-      </For>
+      <Suspense fallback={<p class="dim sm pad">searching…</p>}>
+        <SearchResults query={query()} mode={mode()} />
+      </Suspense>
     </section>
   );
 };
