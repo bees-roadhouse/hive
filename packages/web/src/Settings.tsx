@@ -101,7 +101,7 @@ export const Settings: Component = () => {
         <button class="primary" type="submit">add source</button>
       </form>
 
-      <For each={sources()}>
+      <For each={sources()} fallback={<p class="dim sm pad">no sources yet — add one above.</p>}>
         {(s) => (
           <div class="source-row" classList={{ off: !s.enabled }}>
             <label class="sw">

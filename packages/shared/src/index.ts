@@ -113,12 +113,19 @@ export interface ApiToken {
   created_at: string;
   last_used_at: string | null;
   created_by: string;
+  /** ISO expiry; null = legacy non-expiring token. Resolution rejects expired tokens. */
+  expires_at: string | null;
+  // OAuth-minted tokens (kind='oauth') carry a client + granting human + scope;
+  // kind='pat' (or null) are admin-minted personal tokens.
   kind: "pat" | "oauth" | null;
   client_id: string | null;
   granted_by: string | null;
-  expires_at: string | null;
   scope: string | null;
 }
+
+/** API-token expiry policy. New tokens get DEFAULT days unless specified; never more than MAX. */
+export const API_TOKEN_MAX_EXPIRY_DAYS = 365;
+export const API_TOKEN_DEFAULT_EXPIRY_DAYS = 90;
 
 /** A dynamically-registered OAuth client (RFC 7591). */
 export interface OAuthClient {
@@ -146,6 +153,43 @@ export interface OAuthConsentContext {
 export interface AuthConfig {
   oidc: boolean;
   instanceName: string | null;
+}
+
+/** Bulk historical import (legacy hive.db → this instance). Rows carry their original
+ *  ids + timestamps; the importer is idempotent (existing ids are skipped). */
+export interface LegacyImport {
+  journal?: { id: string; author: string; body: string; tags: string[]; created_at: string }[];
+  projects?: { id: string; name: string; slug: string; created_at: string }[];
+  tasks?: {
+    id: string;
+    project: string | null;
+    title: string;
+    body: string;
+    status: string;
+    priority: string;
+    tags: string[];
+    assignees: string[];
+    due: string | null;
+    created_at: string;
+    updated_at: string;
+  }[];
+  links?: {
+    id: string;
+    source_kind: string;
+    source_id: string;
+    target_kind: string;
+    target_id: string;
+    rel: string;
+    created_at: string;
+  }[];
+}
+
+export type ImportCounts = { inserted: number; skipped: number };
+export interface ImportResult {
+  journal: ImportCounts;
+  projects: ImportCounts;
+  tasks: ImportCounts;
+  links: ImportCounts;
 }
 
 /** Public first-run state — the SPA reads this before anything else. */
@@ -481,6 +525,66 @@ export interface DashboardStats {
   entriesByAuthor: { author: string; count: number }[];
   /** How often each person is referenced via links (target_kind='person'), most to least. */
   calloutsByPerson: { name: string; slug: string; count: number }[];
+}
+
+// ---- profile (the mutable per-actor card; humans + AIs) ----
+
+/** Where a card's facts came from: hand-written vs synthesised from the journal. */
+export type ProfileSource = "manual" | "derived";
+
+/** Durable, mutable "who they are" card for an actor — distinct from the
+ *  immutable journal. `sections` holds free-form prose blocks (identity,
+ *  preferences, working_style, relationships, …) keyed by section name. */
+export interface Profile {
+  /** people.slug — the PK. */
+  actor: string;
+  kind: ActorKind;
+  display_name: string;
+  body: { sections: Record<string, string> };
+  source: ProfileSource;
+  derived_at: string | null;
+  updated_at: string;
+}
+
+export interface ProfilePatch {
+  display_name?: string;
+  kind?: ActorKind;
+  /** Section blocks to deep-merge into body.sections (replace per key). */
+  sections?: Record<string, string>;
+}
+
+// ---- recall (the read/inject composition) ----
+
+/** A journal hit returned by recall — a search hit plus the author + snippet. */
+export interface RecallJournalHit extends SearchHit {
+  author: string;
+  created_at: string;
+}
+
+/** A project touched by the recalled material. */
+export interface ProjectRef {
+  id: string;
+  name: string;
+  slug: string;
+}
+
+/** Everything recall composed, structured so adapters can render their own format. */
+export interface RecallData {
+  profiles: Profile[];
+  journal: RecallJournalHit[];
+  tasks: Task[];
+  inbox: InboxItem[];
+  events: EventItem[];
+  projects: ProjectRef[];
+}
+
+/** Default brief budget in (approximate) tokens. */
+export const RECALL_DEFAULT_BUDGET = 1500;
+
+export interface RecallResult {
+  /** Ready-to-inject markdown, trimmed to ~budget tokens. */
+  brief: string;
+  data: RecallData;
 }
 
 // ---- write payloads ----

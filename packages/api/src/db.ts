@@ -323,6 +323,19 @@ export function migrate(): void {
       used_at        TEXT                -- single-use marker; non-null = spent
     );
     CREATE INDEX IF NOT EXISTS oauth_codes_expiry ON oauth_auth_codes (expires_at);
+
+    -- Mutable per-actor card (humans + AIs): the durable "who they are" that
+    -- evolves, kept distinct from the write-once journal. body is JSON
+    -- { sections: { identity, preferences, working_style, relationships, … } }.
+    CREATE TABLE IF NOT EXISTS profile (
+      actor        TEXT PRIMARY KEY,
+      kind         TEXT NOT NULL DEFAULT 'human',
+      display_name TEXT NOT NULL DEFAULT '',
+      body         TEXT NOT NULL DEFAULT '{}',
+      source       TEXT NOT NULL DEFAULT 'manual',
+      derived_at   TEXT,
+      updated_at   TEXT NOT NULL
+    );
   `);
 
   // Idempotent column additions for DBs created before owner was introduced.
@@ -371,7 +384,8 @@ export function migrate(): void {
 
   // v0.1.2: OAuth tokens share the api_tokens table so tokens.resolve keeps
   // returning an actor for every consumer. New columns are nullable; an existing
-  // PAT reads as kind NULL (treated as 'pat') with no expiry.
+  // PAT reads as kind NULL (treated as 'pat') with no expiry. This loop also adds
+  // expires_at (the standalone guard from #35 on development is subsumed here).
   for (const [col, ddl] of [
     ["kind", "ALTER TABLE api_tokens ADD COLUMN kind TEXT"],
     ["client_id", "ALTER TABLE api_tokens ADD COLUMN client_id TEXT"],

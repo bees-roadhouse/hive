@@ -29,4 +29,8 @@ jobs:
         run: pnpm build
 
       - name: Seed smoke test (exercises the SQLite layer)
+        # Force the hash embedder so CI stays offline + fast — the default
+        # provider (local transformers/BGE) would download a model from the HF hub.
+        env:
+          HIVE_EMBED: hash
         run: pnpm seed

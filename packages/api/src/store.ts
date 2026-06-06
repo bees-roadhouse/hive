@@ -28,7 +28,14 @@ import {
   type Person,
   type Phase,
   type PersonPatch,
+  type Profile,
+  type ProfilePatch,
+  type ProfileSource,
   type Project,
+  type ProjectRef,
+  type RecallData,
+  type RecallJournalHit,
+  type RecallResult,
   type ResolvedAnchor,
   type SearchHit,
   type Severity,
@@ -51,8 +58,13 @@ import {
   APP_VERSION,
   isAi,
   parseMentions,
+  RECALL_DEFAULT_BUDGET,
   TASK_STATUSES,
   DECISION_STATUSES,
+  API_TOKEN_MAX_EXPIRY_DAYS,
+  API_TOKEN_DEFAULT_EXPIRY_DAYS,
+  type LegacyImport,
+  type ImportResult,
 } from "@hive/shared";
 import { db, tx } from "./db.ts";
 import { publish } from "./bus.ts";
@@ -288,6 +300,45 @@ export const people = {
   },
 };
 
+// ---- profile (mutable per-actor card; the durable-identity write target) ----
+
+type ProfileRow = Omit<Profile, "body"> & { body: string };
+const toProfile = (r: ProfileRow): Profile => {
+  const parsed = json<{ sections?: Record<string, string> }>(r.body);
+  return { ...r, body: { sections: parsed.sections ?? {} } };
+};
+
+export const profiles = {
+  get(actor: string): Profile | undefined {
+    const r = db.prepare("SELECT * FROM profile WHERE actor = ?").get(actor) as ProfileRow | undefined;
+    return r ? toProfile(r) : undefined;
+  },
+
+  /** Deep-merge `sections` into body.sections (per-key replace), stamp updated_at,
+   *  source='manual'. Creates the card on first write. */
+  update(actor: string, patch: ProfilePatch, by = "system"): Profile {
+    const cur = profiles.get(actor);
+    const sections = { ...(cur?.body.sections ?? {}), ...(patch.sections ?? {}) };
+    const next: Profile = {
+      actor,
+      kind: patch.kind ?? cur?.kind ?? (isAi(actor) ? "ai" : "human"),
+      display_name: patch.display_name ?? cur?.display_name ?? "",
+      body: { sections },
+      source: "manual" as ProfileSource,
+      derived_at: cur?.derived_at ?? null,
+      updated_at: now(),
+    };
+    db.prepare(
+      `INSERT INTO profile (actor, kind, display_name, body, source, derived_at, updated_at)
+       VALUES (@actor, @kind, @display_name, @body, @source, @derived_at, @updated_at)
+       ON CONFLICT(actor) DO UPDATE SET kind=excluded.kind, display_name=excluded.display_name,
+         body=excluded.body, source=excluded.source, derived_at=excluded.derived_at, updated_at=excluded.updated_at`,
+    ).run({ ...next, body: JSON.stringify(next.body) });
+    emit("profile.updated", by, { actor, source: next.source });
+    return next;
+  },
+};
+
 // ---- config (per-instance key/value, v0.1.1) ----
 
 export const config = {
@@ -400,27 +451,49 @@ export const tokens = {
   list: (): ApiToken[] =>
     db.prepare(`SELECT ${TOKEN_COLS} FROM api_tokens ORDER BY created_at DESC`).all() as ApiToken[],
 
-  create(input: { actor: string; label: string }, by = "system"): { token: string; record: ApiToken } {
+  /**
+   * Mint a bearer token. `expiresInDays` is clamped to [1, API_TOKEN_MAX_EXPIRY_DAYS];
+   * omitted → API_TOKEN_DEFAULT_EXPIRY_DAYS. The plaintext is returned once and never stored.
+   */
+  create(
+    input: { actor: string; label: string; expiresInDays?: number | null },
+    by = "system",
+  ): { token: string; record: ApiToken } {
     const person = people.ensure(input.actor, isAi(input.actor) ? "ai" : "human");
     const token = generateToken(API_TOKEN_PREFIX);
+    const requested = input.expiresInDays ?? API_TOKEN_DEFAULT_EXPIRY_DAYS;
+    const days = Math.min(API_TOKEN_MAX_EXPIRY_DAYS, Math.max(1, Math.floor(requested)));
+    const createdAt = now();
     const record: ApiToken = {
       id: id("tok"),
       actor: person.slug,
       label: input.label,
       created_by: by,
-      created_at: now(),
+      created_at: createdAt,
       last_used_at: null,
+      // Personal access token: no OAuth client binding, but it DOES expire per
+      // the #35 expiry policy (clamped [1, MAX] days above).
       kind: "pat",
       client_id: null,
       granted_by: null,
-      expires_at: null,
+      expires_at: new Date(Date.parse(createdAt) + days * 86_400_000).toISOString(),
       scope: null,
     };
     db.prepare(
-      "INSERT INTO api_tokens (id, token_hash, actor, label, created_by, created_at, last_used_at, kind) " +
-        "VALUES (@id, @token_hash, @actor, @label, @created_by, @created_at, @last_used_at, @kind)",
-    ).run({ id: record.id, token_hash: tokenHash(token), actor: record.actor, label: record.label, created_by: by, created_at: record.created_at, last_used_at: null, kind: "pat" });
-    emit("token.created", by, { id: record.id, actor: record.actor, label: record.label });
+      "INSERT INTO api_tokens (id, token_hash, actor, label, created_by, created_at, last_used_at, kind, expires_at) " +
+        "VALUES (@id, @token_hash, @actor, @label, @created_by, @created_at, @last_used_at, @kind, @expires_at)",
+    ).run({
+      id: record.id,
+      token_hash: tokenHash(token),
+      actor: record.actor,
+      label: record.label,
+      created_by: by,
+      created_at: record.created_at,
+      last_used_at: null,
+      kind: record.kind,
+      expires_at: record.expires_at,
+    });
+    emit("token.created", by, { id: record.id, actor: record.actor, label: record.label, expires_at: record.expires_at });
     return { token, record };
   },
 
@@ -463,13 +536,14 @@ export const tokens = {
     return { token, record };
   },
 
-  /** Resolve a bearer token to its actor (and stamp last_used), honoring expiry. */
+  /** Resolve a bearer token to its actor (and stamp last_used), honoring expiry
+   *  (expires_at NULL = legacy non-expiring token; past expiry → reject + reap). */
   resolve(token: string): string | undefined {
     const row = db.prepare("SELECT id, actor, expires_at FROM api_tokens WHERE token_hash = ?").get(tokenHash(token)) as
       | { id: string; actor: string; expires_at: string | null }
       | undefined;
     if (!row) return undefined;
-    if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) {
+    if (row.expires_at && Date.parse(row.expires_at) < Date.now()) {
       db.prepare("DELETE FROM api_tokens WHERE id = ?").run(row.id);
       return undefined;
     }
@@ -565,6 +639,91 @@ export const oauthCodes = {
     });
   },
 };
+
+// ---- Bulk historical import (legacy hive.db → this instance) ----
+
+/**
+ * Idempotent bulk import. Rows keep their original ids + timestamps; an id that
+ * already exists is left untouched (INSERT OR IGNORE) and counted as skipped — so
+ * re-running is safe. Unlike journal.append this does NOT fan out inbox/anchor/share
+ * side effects (inappropriate for backfilling history); it only persists + indexes.
+ */
+export function importLegacy(payload: LegacyImport): ImportResult {
+  const count = () => ({ inserted: 0, skipped: 0 });
+  const res: ImportResult = { journal: count(), projects: count(), tasks: count(), links: count() };
+
+  return tx(() => {
+    for (const p of payload.projects ?? []) {
+      const r = db
+        .prepare("INSERT OR IGNORE INTO projects (id, name, slug, created_at) VALUES (@id, @name, @slug, @created_at)")
+        .run(p);
+      r.changes ? res.projects.inserted++ : res.projects.skipped++;
+    }
+
+    for (const e of payload.journal ?? []) {
+      people.ensure(e.author, isAi(e.author) ? "ai" : "human");
+      const r = db
+        .prepare(
+          "INSERT OR IGNORE INTO journal (id, author, body, tags, mentions, created_at) " +
+            "VALUES (@id, @author, @body, @tags, @mentions, @created_at)",
+        )
+        .run({
+          id: e.id,
+          author: e.author,
+          body: e.body,
+          tags: JSON.stringify(e.tags ?? []),
+          mentions: JSON.stringify(parseMentions(e.body)),
+          created_at: e.created_at,
+        });
+      if (r.changes) {
+        indexEntity("journal", e.id, `${e.author}: ${snip(e.body, 50)}`, e.body, e.tags ?? []);
+        res.journal.inserted++;
+      } else {
+        res.journal.skipped++;
+      }
+    }
+
+    for (const t of payload.tasks ?? []) {
+      const status = TASK_STATUSES.includes(t.status as TaskStatus) ? t.status : "todo";
+      const r = db
+        .prepare(
+          "INSERT OR IGNORE INTO tasks (id, project, title, body, status, priority, tags, assignees, due, created_at, updated_at) " +
+            "VALUES (@id, @project, @title, @body, @status, @priority, @tags, @assignees, @due, @created_at, @updated_at)",
+        )
+        .run({
+          id: t.id,
+          project: t.project,
+          title: t.title,
+          body: t.body ?? "",
+          status,
+          priority: t.priority || "normal",
+          tags: JSON.stringify(t.tags ?? []),
+          assignees: JSON.stringify(t.assignees ?? []),
+          due: t.due,
+          created_at: t.created_at,
+          updated_at: t.updated_at,
+        });
+      if (r.changes) {
+        indexEntity("task", t.id, t.title, t.body ?? "", t.tags ?? []);
+        res.tasks.inserted++;
+      } else {
+        res.tasks.skipped++;
+      }
+    }
+
+    for (const l of payload.links ?? []) {
+      const r = db
+        .prepare(
+          "INSERT OR IGNORE INTO links (id, source_kind, source_id, target_kind, target_id, rel, created_at) " +
+            "VALUES (@id, @source_kind, @source_id, @target_kind, @target_id, @rel, @created_at)",
+        )
+        .run(l);
+      r.changes ? res.links.inserted++ : res.links.skipped++;
+    }
+
+    return res;
+  });
+}
 
 // ---- onboarding (first-run setup, v0.1.1) ----
 
@@ -2003,6 +2162,31 @@ export interface SemanticOptions {
   rerank?: boolean;
   /** Scope results to entries this viewer may see (own + owned/shared/mentioned). */
   viewer?: string;
+  /** Boost (not filter) hits whose author/mentions/assignees include this actor. */
+  identity?: string;
+  /** Boost (not filter) hits whose author/mentions/assignees include this actor. */
+  peer?: string;
+}
+
+/** The actors associated with a hit: journal → author + mentions; task/decision/
+ *  event → assignees. Used to softly boost results toward the recall focus. */
+function hitActors(kind: string, refId: string): string[] {
+  if (kind === "journal") {
+    const r = db.prepare("SELECT author, mentions FROM journal WHERE id = ?").get(refId) as
+      | { author: string; mentions: string }
+      | undefined;
+    if (!r) return [];
+    return [r.author, ...json<string[]>(r.mentions)];
+  }
+  // Hit kinds are singular; the tables are plural.
+  const table = { task: "tasks", decision: "decisions", event: "events" }[kind];
+  if (table) {
+    const r = db.prepare(`SELECT assignees FROM ${table} WHERE id = ?`).get(refId) as
+      | { assignees: string }
+      | undefined;
+    return r ? json<string[]>(r.assignees) : [];
+  }
+  return [];
 }
 
 const refKey = (kind: string, id: string) => `${kind}:${id}`;
@@ -2088,11 +2272,21 @@ export async function semanticSearch(query: string, opts: SemanticOptions = {}):
   // Drop keyword-only noise — a keyword hit with zero semantic relevance.
   if (hybrid) for (const [kk, s] of [...scores]) if (s.vector === 0 && s.keyword > 0) scores.delete(kk);
 
-  // 4. Blended sort.
+  // 4. Blended sort. When recall passes identity/peer, softly boost hits whose
+  // actors intersect that focus set (+0.1 if either matches) — a nudge, not a
+  // filter, so unrelated-but-relevant material still surfaces.
+  const focus = new Set([opts.identity, opts.peer].filter(Boolean) as string[]);
+  const scoped = (kk: string): number => {
+    if (!focus.size) return 0;
+    const [k, id] = splitKey(kk);
+    return hitActors(k, id).some((a) => focus.has(a)) ? 0.1 : 0;
+  };
   let ranked = [...scores.entries()]
     .map(([k, s]) => ({
       k,
-      score: s.keyword > 0 && s.vector > 0 ? s.vector * 0.7 + s.keyword * 0.2 + s.blanket : s.vector + s.blanket,
+      score:
+        (s.keyword > 0 && s.vector > 0 ? s.vector * 0.7 + s.keyword * 0.2 + s.blanket : s.vector + s.blanket) +
+        scoped(k),
     }))
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
@@ -2119,6 +2313,137 @@ export async function semanticSearch(query: string, opts: SemanticOptions = {}):
     };
   });
   return opts.viewer ? scopeHits(hits, opts.viewer) : hits;
+}
+
+// ---- recall (the read/inject composition: cards + scoped retrieval) ----
+
+/** Rough token estimate (~4 chars/token) used only to trim the brief to budget. */
+const estTokens = (s: string) => Math.ceil(s.length / 4);
+
+/** Append sections to the brief until the next one would exceed the token budget. */
+function assembleBrief(sections: string[], budget: number): string {
+  const out: string[] = [];
+  let used = 0;
+  for (const sec of sections) {
+    const cost = estTokens(sec) + 1;
+    if (out.length && used + cost > budget) break;
+    out.push(sec);
+    used += cost;
+  }
+  return out.join("\n\n");
+}
+
+function profileCard(p: Profile): string {
+  const head = `## ${p.display_name || p.actor} (${p.kind})`;
+  const secs = Object.entries(p.body.sections)
+    .filter(([, v]) => v.trim())
+    .map(([k, v]) => `**${k.replace(/_/g, " ")}:** ${v.trim()}`);
+  return [head, ...secs].join("\n");
+}
+
+/** Journal entries have no stored title — derive one from the prose. Prefer the
+ *  first Markdown heading (`# …`), else the first non-empty line, truncated. */
+function deriveJournalTitle(body: string): string {
+  for (const raw of body.split("\n")) {
+    const line = raw.trim();
+    if (!line) continue;
+    const h = line.match(/^#{1,6}\s+(.*)$/);
+    return snip((h ? h[1] : line).trim(), 80);
+  }
+  return "(untitled)";
+}
+
+/**
+ * Compose a ready-to-inject memory brief for `identity` (optionally focused on
+ * `peer`): profile cards, open tasks, unread inbox, recent relevant journal,
+ * recent events, touched projects. Deterministic assembly (no LLM), trimmed to
+ * `budget` tokens. Returns the markdown `brief` plus the structured `data`.
+ */
+export async function recall(opts: {
+  identity: string;
+  peer?: string;
+  query?: string;
+  budget?: number;
+}): Promise<RecallResult> {
+  const { identity, peer } = opts;
+  const budget = opts.budget ?? RECALL_DEFAULT_BUDGET;
+
+  const profileList: Profile[] = [];
+  const idCard = profiles.get(identity);
+  if (idCard) profileList.push(idCard);
+  const peerCard = peer ? profiles.get(peer) : undefined;
+  if (peerCard) profileList.push(peerCard);
+
+  const openTasks = tasks
+    .list({ assignee: identity })
+    .filter((t) => t.status !== "done");
+
+  const unread = inbox.list(identity, true);
+
+  // Default query (no explicit topic): the actors in focus plus the open-task
+  // titles — pulls "recent + open threads" toward the recall.
+  const query =
+    opts.query?.trim() ||
+    [identity, peer, ...openTasks.slice(0, 5).map((t) => t.title)].filter(Boolean).join(" ");
+
+  const rawHits = query ? await semanticSearch(query, { limit: 8, identity, peer }) : [];
+  const journalHits: RecallJournalHit[] = rawHits
+    .filter((h) => h.kind === "journal")
+    .map((h) => {
+      const e = journal.get(h.id);
+      // Title is derived from the body (no title column); adapters fold a
+      // heading into the prose, so prefer the first Markdown `#` heading.
+      return e
+        ? { ...h, title: deriveJournalTitle(e.body), author: e.author, created_at: e.created_at }
+        : undefined;
+    })
+    .filter((h): h is RecallJournalHit => h !== undefined);
+
+  const recentEvents = events.list().slice(0, 5);
+
+  // Projects touched by the identity's open tasks.
+  const projIds = new Set(openTasks.map((t) => t.project).filter(Boolean) as string[]);
+  const touchedProjects: ProjectRef[] = [...projIds]
+    .map((pid) => projects.get(pid))
+    .filter((p): p is Project => p !== undefined)
+    .map((p) => ({ id: p.id, name: p.name, slug: p.slug }));
+
+  const data: RecallData = {
+    profiles: profileList,
+    journal: journalHits,
+    tasks: openTasks,
+    inbox: unread,
+    events: recentEvents,
+    projects: touchedProjects,
+  };
+
+  // Deterministic markdown brief — cards first, then the working sections.
+  const sections: string[] = [`# Recall for ${identity}${peer ? ` · focus: ${peer}` : ""}`];
+  for (const p of profileList) sections.push(profileCard(p));
+  if (openTasks.length)
+    sections.push(
+      `## Open tasks (${identity})\n` +
+        openTasks.map((t) => `- [${t.status}] ${t.title}${t.due ? ` (due ${t.due})` : ""}`).join("\n"),
+    );
+  if (unread.length)
+    sections.push(
+      `## Unread inbox\n` +
+        unread.map((i) => `- from ${i.from} (${i.reason}): ${i.snippet}`).join("\n"),
+    );
+  if (journalHits.length)
+    sections.push(
+      `## Recent relevant journal\n` +
+        journalHits.map((h) => `- ${h.author}: ${h.title}`).join("\n"),
+    );
+  if (recentEvents.length)
+    sections.push(
+      `## Recent events\n` +
+        recentEvents.map((e) => `- ${e.title}${e.at ? ` (${e.at})` : ""}`).join("\n"),
+    );
+  if (touchedProjects.length)
+    sections.push(`## Projects\n` + touchedProjects.map((p) => `- ${p.name}`).join("\n"));
+
+  return { brief: assembleBrief(sections, budget), data };
 }
 
 // ---- worker status ----

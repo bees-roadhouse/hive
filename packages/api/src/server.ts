@@ -1,20 +1,26 @@
 import { createServer } from "node:http";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { getRequestListener } from "@hono/node-server";
 import { Hono } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type {
   DecisionPatch,
+  LegacyImport,
   NewJournalEntry,
   NewShare,
   NewSource,
   OnboardingPayload,
   PersonPatch,
+  ProfilePatch,
   SourcePatch,
   TaskPatch,
   UserRole,
 } from "@hive/shared";
 import { migrate } from "./db.ts";
+import { readLegacyDb } from "./legacy-import.ts";
 import { handleMcp } from "./mcp.ts";
 import { subscribe } from "./bus.ts";
 import { SESSION_COOKIE, SESSION_TTL_MS, tokenHash, verifyPkce } from "./auth.ts";
@@ -26,6 +32,7 @@ import {
   onboarding,
   sessions,
   tokens,
+  importLegacy,
   users,
   autocomplete,
   dashboard,
@@ -40,7 +47,9 @@ import {
   outbox,
   people,
   phases,
+  profiles,
   projects,
+  recall,
   search,
   semanticSearch,
   shares,
@@ -138,6 +147,10 @@ app.use("*", async (c, next) => {
 
 const actor = (c: { get: (k: "actor") => string | undefined }) => c.get("actor") ?? "anon";
 const requireAdmin = (c: { get: (k: "role") => UserRole | undefined }) => c.get("role") === "admin";
+// Admin gate that also accepts a Bearer token whose actor maps to an admin user
+// (sessions carry role directly; tokens don't, so resolve via the user record).
+const requireAdminActor = (c: { get: (k: "role" | "actor") => UserRole | string | undefined }): boolean =>
+  c.get("role") === "admin" || users.list().find((u) => u.actor === c.get("actor"))?.role === "admin";
 
 app.get("/api/healthz", (c) =>
   c.json({ ok: true, service: "hive-node", mcp: "/mcp", ts: new Date().toISOString() }),
@@ -212,15 +225,47 @@ app.post("/api/users", async (c) => {
 app.get("/api/tokens", (c) => (requireAdmin(c) ? c.json(tokens.list()) : c.json({ error: "forbidden" }, 403)));
 app.post("/api/tokens", async (c) => {
   if (!requireAdmin(c)) return c.json({ error: "forbidden" }, 403);
-  const body = (await c.req.json()) as { actor: string; label: string };
+  const body = (await c.req.json()) as { actor: string; label: string; expiresInDays?: number };
   if (!body?.actor?.trim() || !body?.label?.trim()) return c.json({ error: "actor and label required" }, 400);
-  // The plaintext token is returned ONCE here and never again.
+  // The plaintext token is returned ONCE here and never again. expiresInDays is clamped
+  // server-side to [1, API_TOKEN_MAX_EXPIRY_DAYS]; omitted → API_TOKEN_DEFAULT_EXPIRY_DAYS.
   const { token, record } = tokens.create(body, actor(c));
   return c.json({ token, record }, 201);
 });
 app.delete("/api/tokens/:id", (c) => {
   if (!requireAdmin(c)) return c.json({ error: "forbidden" }, 403);
   return tokens.remove(c.req.param("id")) ? c.body(null, 204) : c.json({ error: "not found" }, 404);
+});
+
+// ---- bulk historical import (admin) ----
+// Backfill from a legacy hive.db. Idempotent (existing ids skipped). Admin-only; an
+// admin's Bearer token qualifies (e.g. a one-shot programmatic migration).
+app.post("/api/import", async (c) => {
+  if (!requireAdminActor(c)) return c.json({ error: "forbidden" }, 403);
+  const payload = (await c.req.json()) as LegacyImport;
+  return c.json(importLegacy(payload));
+});
+
+// Upload a legacy hive.db (SQLite) straight from the dashboard. We persist it to a
+// temp file (better-sqlite3 needs a path), read it READ-ONLY, map → import, then delete.
+app.post("/api/import/sqlite", async (c) => {
+  if (!requireAdminActor(c)) return c.json({ error: "forbidden" }, 403);
+  const form = await c.req.parseBody();
+  const file = form["db"];
+  if (!(file instanceof File)) return c.json({ error: "multipart field 'db' (the .db file) required" }, 400);
+
+  const dir = mkdtempSync(join(tmpdir(), "hive-import-"));
+  const dbPath = join(dir, "legacy.db");
+  try {
+    writeFileSync(dbPath, Buffer.from(await file.arrayBuffer()));
+    const { payload, warnings } = readLegacyDb(dbPath);
+    const result = importLegacy(payload);
+    return c.json({ ...result, warnings });
+  } catch (e) {
+    return c.json({ error: `import failed: ${(e as Error).message}` }, 400);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 // ---- auth capabilities (SPA reads before login) ----
@@ -549,6 +594,22 @@ app.post("/api/people", async (c) => {
   return c.json(people.create(body, actor(c)), 201);
 });
 
+// ---- profile (mutable per-actor card) + recall (read/inject composition) ----
+app.get("/api/profile/:actor", (c) => {
+  const p = profiles.get(c.req.param("actor"));
+  return p ? c.json(p) : c.json({ error: "not found" }, 404);
+});
+app.post("/api/profile/:actor", async (c) => {
+  const patch = (await c.req.json()) as ProfilePatch;
+  return c.json(profiles.update(c.req.param("actor"), patch, actor(c)));
+});
+app.post("/api/recall", async (c) => {
+  const body = (await c.req.json()) as { identity?: string; peer?: string; query?: string; budget?: number };
+  const identity = body?.identity ?? actor(c);
+  if (!identity) return c.json({ error: "identity required" }, 400);
+  return c.json(await recall({ identity, peer: body?.peer, query: body?.query, budget: body?.budget }));
+});
+
 // ---- shares ----
 app.post("/api/shares", async (c) => {
   const body = (await c.req.json()) as NewShare;
@@ -593,6 +654,7 @@ app.get("/api/search", async (c) => {
   // ?mode=semantic uses the local embedder; default is FTS keyword search.
   // Semantic flags: &hybrid=0 to disable the keyword blend, &rerank=1 for the
   // cross-encoder pass, &threshold=<n> to drop weak vector matches.
+  // &identity / &peer softly boost hits scoped to those actors (recall's seam).
   // Results are scoped to the acting user's visible entries (permission-honoring,
   // like bookstack-mcp). ?viewer= overrides the x-hive-actor header.
   const viewer = c.req.query("viewer") ?? actor(c);
@@ -606,6 +668,8 @@ app.get("/api/search", async (c) => {
         rerank: flag("rerank"),
         threshold: thr ? Number(thr) : undefined,
         viewer,
+        identity: c.req.query("identity") || undefined,
+        peer: c.req.query("peer") || undefined,
       }),
     );
   }

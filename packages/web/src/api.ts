@@ -5,6 +5,7 @@ import type {
   EmbeddingStats,
   EventItem,
   GraphData,
+  ImportResult,
   InboxItem,
   JournalEntryView,
   JournalWriter,
@@ -59,14 +60,23 @@ export const getDoneRetentionHours = (): number => {
 export const setDoneRetentionHours = (hours: number): void =>
   localStorage.setItem(DONE_RETENTION_KEY, String(hours));
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api${path}`, {
-    ...init,
-    credentials: "include", // send the session cookie
-    headers: { "content-type": "application/json", ...init?.headers },
-  });
-  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
-  return (res.status === 204 ? undefined : await res.json()) as T;
+async function req<T>(path: string, init?: RequestInit, timeoutMs = 15000): Promise<T> {
+  // Bound every call so a slow/cold API (e.g. just-restarted hive-api) can't hang
+  // the UI indefinitely — the caller gets a rejection it can retry.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error("request timed out")), timeoutMs);
+  try {
+    const res = await fetch(`/api${path}`, {
+      ...init,
+      credentials: "include", // send the session cookie
+      signal: ctrl.signal,
+      headers: { "content-type": "application/json", ...init?.headers },
+    });
+    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+    return (res.status === 204 ? undefined : await res.json()) as T;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export const api = {
@@ -178,7 +188,20 @@ export const api = {
   addUser: (u: { name: string; email: string; password: string; role?: UserRole; kind?: "human" | "ai" }) =>
     req<SafeUser>("/users", { method: "POST", body: JSON.stringify(u) }),
   apiTokens: () => req<ApiToken[]>("/tokens"),
-  createToken: (actor: string, label: string) =>
-    req<{ token: string; record: ApiToken }>("/tokens", { method: "POST", body: JSON.stringify({ actor, label }) }),
+  createToken: (actor: string, label: string, expiresInDays?: number) =>
+    req<{ token: string; record: ApiToken }>("/tokens", {
+      method: "POST",
+      body: JSON.stringify({ actor, label, expiresInDays }),
+    }),
   deleteToken: (id: string) => req<void>(`/tokens/${id}`, { method: "DELETE" }),
+
+  // admin: bulk import from a legacy hive.db (SQLite). Multipart upload — we let the
+  // browser set the content-type/boundary, so this bypasses the JSON `req` helper.
+  importSqlite: async (file: File): Promise<ImportResult & { warnings: string[] }> => {
+    const fd = new FormData();
+    fd.append("db", file);
+    const res = await fetch("/api/import/sqlite", { method: "POST", credentials: "include", body: fd });
+    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+    return res.json() as Promise<ImportResult & { warnings: string[] }>;
+  },
 };
