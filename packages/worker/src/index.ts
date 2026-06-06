@@ -11,10 +11,11 @@ import {
   pollSources,
   setHeartbeat,
   setLastRun,
-  workerStatus,
 } from "@hive/api/store";
 import { db } from "@hive/api/db";
+import { logger } from "@hive/api/log";
 
+const log = logger("worker");
 const TICK_SECS = Number(process.env.HIVE_WORKER_TICK ?? 30);
 const once = process.argv.includes("--once");
 
@@ -32,11 +33,14 @@ async function drainOutbox(): Promise<number> {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
       } else {
         // "log" and unknown kinds just succeed (room to grow).
-        console.log(`[outbox:${job.kind}]`, JSON.stringify(job.payload));
+        log.debug(`outbox job ran`, { kind: job.kind });
       }
       outbox.complete(job.id);
       done++;
     } catch (err) {
+      // Expected/transient (a webhook 5xx, a flaky endpoint) — one clean line,
+      // no stack; the job is retried per its attempt count.
+      log.warn(`outbox job failed, will retry`, { kind: job.kind, attempt: job.attempts + 1, reason: (err as Error).message });
       outbox.fail(job.id, (err as Error).message, job.attempts + 1);
     }
   }
@@ -71,23 +75,27 @@ async function cycle(): Promise<void> {
   const stats = { at: new Date().toISOString(), polled, ingested, outbox: drained, embedded, maintenance };
   setLastRun(stats);
   cycles++;
-  console.log(
-    `🐝 worker cycle: polled ${polled} · ingested ${ingested} · outbox ${drained} · embedded ${embedded} · ${maintenance.join(", ")}`,
-  );
+  log.info("cycle complete", {
+    polled,
+    ingested,
+    outbox: drained,
+    embedded,
+    maintenance: maintenance.join(",") || "none",
+  });
 }
 
 async function main(): Promise<void> {
-  console.log(`🐝 hive worker starting (${once ? "once" : `loop every ${TICK_SECS}s`})`);
+  log.info(`starting`, { mode: once ? "once" : `loop`, tick_secs: once ? undefined : TICK_SECS });
   emit("worker.started", "worker", { once, tick: TICK_SECS });
   await cycle();
   if (once) {
-    console.log(JSON.stringify(workerStatus(), null, 2));
+    log.info("one-shot run done, exiting");
     process.exit(0);
   }
-  setInterval(() => cycle().catch((e) => console.error("cycle error", e)), TICK_SECS * 1000);
+  setInterval(() => cycle().catch((e) => log.unexpected("cycle threw", e)), TICK_SECS * 1000);
 }
 
 main().catch((e) => {
-  console.error("worker fatal", e);
+  log.unexpected("worker fatal, exiting", e);
   process.exit(1);
 });
