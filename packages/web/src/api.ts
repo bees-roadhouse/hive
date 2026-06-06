@@ -1,4 +1,6 @@
 import type {
+  ActorDeleteResult,
+  ActorMergeResult,
   AutocompleteItem,
   DashboardStats,
   Decision,
@@ -143,6 +145,23 @@ export const api = {
     req<Person>("/people", { method: "POST", body: JSON.stringify(p) }),
   patchPerson: (slug: string, patch: PersonPatch) =>
     req<Person>(`/people/${slug}`, { method: "PATCH", body: JSON.stringify(patch) }),
+
+  // admin: actor delete-with-cascade + merge. dryRun returns the per-table blast
+  // radius without mutating, so the UI can confirm before the real run.
+  previewDeleteActor: (slug: string) =>
+    req<ActorDeleteResult>(`/actors/${encodeURIComponent(slug)}?dryRun=1`, { method: "DELETE" }),
+  deleteActor: (slug: string) =>
+    req<ActorDeleteResult>(`/actors/${encodeURIComponent(slug)}`, { method: "DELETE" }),
+  previewMergeActor: (slug: string, into: string) =>
+    req<ActorMergeResult>(`/actors/${encodeURIComponent(slug)}/merge?dryRun=1`, {
+      method: "POST",
+      body: JSON.stringify({ into }),
+    }),
+  mergeActor: (slug: string, into: string) =>
+    req<ActorMergeResult>(`/actors/${encodeURIComponent(slug)}/merge`, {
+      method: "POST",
+      body: JSON.stringify({ into }),
+    }),
 
   topics: () => req<Topic[]>("/topics"),
   projects: () => req<Project[]>("/projects"),

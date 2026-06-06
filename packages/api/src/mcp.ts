@@ -4,6 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { ACTOR_NAMES } from "@hive/shared";
 import {
+  actors,
   dashboard,
   decisions,
   events,
@@ -21,6 +22,7 @@ import {
   sources,
   tasks,
   topics,
+  users,
   workerStatus,
 } from "./store.ts";
 
@@ -364,6 +366,45 @@ export function buildMcpServer(actor: string): McpServer {
       },
     },
     async ({ scope, ref, viewer }) => ok(shares.create({ scope, ref, viewer })),
+  );
+
+  // ---- admin: actor delete + merge (destructive; admin actors only) ----
+  // The MCP transport pins authorship to the bearer token's actor; an admin tool
+  // is gated by that actor mapping to a user with role 'admin' (same rule as the
+  // REST requireAdminActor). dryRun returns the counts without mutating.
+  const isAdmin = () => users.list().find((u) => u.actor === actor)?.role === "admin";
+  const forbidden = ok({ error: "forbidden — admin only" });
+
+  server.registerTool(
+    "actor_delete",
+    {
+      title: "Delete an actor and cascade all their data",
+      description:
+        "DESTRUCTIVE, admin-only. Removes the actor (people/users/sessions/tokens/profile) and cascades everything they authored: journal entries AND the tasks/decisions/events anchored to those entries, plus embeddings/search/links/inbox/shares so nothing is orphaned. Pass dry_run:true to preview per-table counts without mutating.",
+      inputSchema: { slug: z.string(), dry_run: z.boolean().optional() },
+    },
+    async ({ slug, dry_run }) => {
+      if (!isAdmin()) return forbidden;
+      if (!people.get(slug)) return ok({ error: "not found" });
+      return ok(dry_run ? actors.removePreview(slug) : actors.remove(slug));
+    },
+  );
+
+  server.registerTool(
+    "actor_merge",
+    {
+      title: "Merge one actor into another",
+      description:
+        "DESTRUCTIVE, admin-only. Folds `from` into `into`: reassigns journal authorship/mentions, task/decision/event assignees, inbox, shares, tokens, oauth grants, wire, sources, people.owner pointers, profile + login, then removes the `from` people row. Use to consolidate duplicate actors. Pass dry_run:true to preview counts.",
+      inputSchema: { from: z.string(), into: z.string(), dry_run: z.boolean().optional() },
+    },
+    async ({ from, into, dry_run }) => {
+      if (!isAdmin()) return forbidden;
+      if (from === into) return ok({ error: "cannot merge an actor into itself" });
+      if (!people.get(from)) return ok({ error: `from actor '${from}' not found` });
+      if (!people.get(into)) return ok({ error: `into actor '${into}' not found` });
+      return ok(dry_run ? actors.mergePreview(from, into) : actors.merge(from, into));
+    },
   );
 
   return server;

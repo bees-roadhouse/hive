@@ -2,7 +2,28 @@
 // spans of the prose anchored into tasks / decisions / events. Offsets are
 // computed from the text with a small helper so the entries stay readable.
 import { db, migrate } from "./db.ts";
-import { backfillIdentityCards, embeddings, journal, outbox, people, profiles, recall, seedActors, semanticSearch, sources } from "./store.ts";
+import {
+  actors,
+  backfillIdentityCards,
+  decisions,
+  deleteJournalEntry,
+  embeddings,
+  events,
+  inbox,
+  journal,
+  outbox,
+  people,
+  profiles,
+  recall,
+  seedActors,
+  semanticSearch,
+  sessions,
+  shares,
+  sources,
+  tasks,
+  tokens,
+  users,
+} from "./store.ts";
 import type { AnchorKind, AnchorFields } from "@hive/shared";
 
 migrate();
@@ -240,8 +261,172 @@ people.update("zane", { role: "Platform" }, "zane");
 if (profiles.get("zane")?.body.sections.role !== "Platform")
   throw new Error("seed: people.update did not mirror role into the card");
 
+// ============================================================================
+// Admin actor delete + merge smoke. Proves the cascade rule (an entry's
+// anchored tasks/decisions/events die with it, and no ref is left dangling) and
+// the merge reassignment. Uses throwaway actors so it never touches seed data.
+// ============================================================================
+
+const countWhere = (sql: string, ...args: unknown[]) =>
+  (db.prepare(sql).get(...args) as { n: number }).n;
+
+// ---- 1) delete-with-cascade ----
+{
+  people.upsert("ghostwriter", "Ghost Writer", "human");
+  // An admin login + token so the cascade has user/session/token rows to reap.
+  const gw = users.create(
+    { name: "Ghost Writer", actor: "ghostwriter", email: "ghost@example.com", password: "ghostpass1", role: "member" },
+    "seed",
+  );
+  sessions.create(gw.id); // a live session that must be reaped with the user
+  tokens.create({ actor: "ghostwriter", label: "ghost token" }, "seed");
+
+  // One rich entry: an anchored task + an anchored decision + an anchored event,
+  // plus a bracket-token task — all of which must vanish with the entry.
+  const body =
+    "Ghost plan: We will build the ghost feature. Decided to use the ghost approach for now. Kickoff meeting next week. Also [task: ghost bracket task].";
+  const span = (s: string) => ({ start: body.indexOf(s), end: body.indexOf(s) + s.length });
+  const entry = journal.append({
+    author: "ghostwriter",
+    body,
+    tags: ["ghost"],
+    anchors: [
+      { ...span("We will build the ghost feature"), kind: "task", fields: { title: "Build ghost feature", assignees: ["ghostwriter", "pia"] } },
+      { ...span("Decided to use the ghost approach for now"), kind: "decision", fields: { title: "Use the ghost approach" } },
+      { ...span("Kickoff meeting next week"), kind: "event", fields: { title: "Ghost kickoff" } },
+    ],
+  });
+  // @mention + share so there's cross-actor cleanup to verify.
+  journal.append({ author: "pia", body: "Following up with @ghostwriter on the ghost work.", tags: [] });
+  shares.create({ scope: "journal", ref: "ghostwriter", viewer: "pia" });
+  await embeddings.backfill(); // give the entry + entities embeddings to purge
+
+  // Capture the ids that must disappear.
+  const anchored = db.prepare("SELECT kind, ref_id FROM anchors WHERE entry_id = ?").all(entry.id) as {
+    kind: string;
+    ref_id: string;
+  }[];
+  const bracketTask = tasks.list().find((t) => t.title === "ghost bracket task");
+  if (!bracketTask) throw new Error("seed: bracket-token ghost task not created");
+  if (anchored.length !== 3) throw new Error(`seed: expected 3 anchored entities, got ${anchored.length}`);
+
+  // Preview must NOT mutate but must report the journal entry + entities.
+  const preview = actors.removePreview("ghostwriter");
+  if (!preview.dryRun) throw new Error("seed: removePreview did not flag dryRun");
+  if (preview.journal < 1 || preview.tasks < 1 || preview.decisions < 1 || preview.events < 1)
+    throw new Error(`seed: preview undercounts the cascade: ${JSON.stringify(preview)}`);
+  if (!people.get("ghostwriter")) throw new Error("seed: removePreview deleted the actor (should be dry run)");
+  if (!journal.get(entry.id)) throw new Error("seed: removePreview deleted the entry (should be dry run)");
+
+  // Real delete.
+  const res = actors.remove("ghostwriter");
+  if (res.dryRun) throw new Error("seed: remove reported dryRun");
+
+  // The actor is gone.
+  if (people.get("ghostwriter")) throw new Error("seed: people row survived delete");
+  if (users.list().some((u) => u.actor === "ghostwriter")) throw new Error("seed: user survived delete");
+  if (countWhere("SELECT count(*) n FROM sessions WHERE user_id = ?", gw.id) !== 0)
+    throw new Error("seed: session survived delete");
+  if (countWhere("SELECT count(*) n FROM api_tokens WHERE actor = ?", "ghostwriter") !== 0)
+    throw new Error("seed: api_token survived delete");
+  if (profiles.get("ghostwriter")) throw new Error("seed: profile survived delete");
+
+  // The entry and every anchored entity are gone.
+  if (journal.get(entry.id)) throw new Error("seed: authored entry survived delete");
+  for (const a of anchored) {
+    const tbl = a.kind === "task" ? "tasks" : a.kind === "decision" ? "decisions" : "events";
+    if (countWhere(`SELECT count(*) n FROM ${tbl} WHERE id = ?`, a.ref_id) !== 0)
+      throw new Error(`seed: anchored ${a.kind} ${a.ref_id} survived delete`);
+  }
+  if (tasks.get(bracketTask.id)) throw new Error("seed: bracket-token task survived delete");
+
+  // No dangling refs anywhere.
+  if (countWhere("SELECT count(*) n FROM anchors WHERE entry_id = ?", entry.id) !== 0)
+    throw new Error("seed: anchors survived delete");
+  if (countWhere("SELECT count(*) n FROM embeddings WHERE ref_id = ?", entry.id) !== 0)
+    throw new Error("seed: entry embedding survived delete");
+  for (const a of anchored) {
+    if (countWhere("SELECT count(*) n FROM embeddings WHERE ref_id = ?", a.ref_id) !== 0)
+      throw new Error(`seed: embedding for ${a.ref_id} survived delete`);
+    if (countWhere("SELECT count(*) n FROM search WHERE ref_id = ?", a.ref_id) !== 0)
+      throw new Error(`seed: search row for ${a.ref_id} survived delete`);
+    if (countWhere("SELECT count(*) n FROM links WHERE source_id = ? OR target_id = ?", a.ref_id, a.ref_id) !== 0)
+      throw new Error(`seed: link for ${a.ref_id} survived delete`);
+  }
+  if (countWhere("SELECT count(*) n FROM search WHERE ref_id = ?", entry.id) !== 0)
+    throw new Error("seed: entry search row survived delete");
+  if (countWhere("SELECT count(*) n FROM links WHERE source_id = ? OR target_id = ?", entry.id, entry.id) !== 0)
+    throw new Error("seed: entry links survived delete");
+  if (countWhere("SELECT count(*) n FROM shares WHERE viewer = ? OR (scope='journal' AND ref = ?)", "ghostwriter", "ghostwriter") !== 0)
+    throw new Error("seed: shares referencing the actor survived delete");
+  if (countWhere('SELECT count(*) n FROM inbox WHERE recipient = ? OR "from" = ?', "ghostwriter", "ghostwriter") !== 0)
+    throw new Error("seed: inbox referencing the actor survived delete");
+  // Pia's follow-up entry @mentioned ghostwriter — the mention must be scrubbed.
+  const piaFollowup = journal.list(50).find((e) => e.author === "pia" && e.body.includes("ghost work"));
+  if (piaFollowup && piaFollowup.mentions.includes("ghostwriter"))
+    throw new Error("seed: dangling @mention of deleted actor survived");
+}
+
+// ---- 2) merge / fold-ownership ----
+{
+  people.upsert("dupe-nate", "Nate (dupe)", "human");
+  people.upsert("main-nate", "Nate (main)", "human");
+  const dupeEntry = journal.append({
+    author: "dupe-nate",
+    body: "Dupe account log: shipped the merge feature. Decided merge folds ownership.",
+    tags: ["merge"],
+    anchors: [
+      { start: 0, end: 18, kind: "task", fields: { title: "Merge feature task", assignees: ["dupe-nate"] } },
+    ],
+  });
+  inbox.add("dupe-nate", "pia", "mention", "journal", dupeEntry.id, dupeEntry.id, "ping for dupe");
+  tokens.create({ actor: "dupe-nate", label: "dupe token" }, "seed");
+
+  const mPreview = actors.mergePreview("dupe-nate", "main-nate");
+  if (!mPreview.dryRun || mPreview.journal < 1)
+    throw new Error(`seed: mergePreview undercounts: ${JSON.stringify(mPreview)}`);
+  if (!people.get("dupe-nate")) throw new Error("seed: mergePreview removed the from actor (should be dry run)");
+
+  const m = actors.merge("dupe-nate", "main-nate");
+  if (m.journal < 1) throw new Error("seed: merge did not reassign any journal entries");
+
+  // `from` is gone; its data now belongs to `to`.
+  if (people.get("dupe-nate")) throw new Error("seed: from actor survived merge");
+  if (countWhere("SELECT count(*) n FROM journal WHERE author = ?", "dupe-nate") !== 0)
+    throw new Error("seed: journal still authored by merged-away actor");
+  if (journal.get(dupeEntry.id)?.author !== "main-nate")
+    throw new Error("seed: entry was not reassigned to the merge target");
+  // The anchored task's assignee moved to the target.
+  const movedTask = tasks.list().find((t) => t.title === "Merge feature task");
+  if (!movedTask) throw new Error("seed: merged task missing");
+  if (!movedTask.assignees.includes("main-nate") || movedTask.assignees.includes("dupe-nate"))
+    throw new Error(`seed: task assignee not folded into target: ${JSON.stringify(movedTask.assignees)}`);
+  if (countWhere("SELECT count(*) n FROM inbox WHERE recipient = ?", "dupe-nate") !== 0)
+    throw new Error("seed: inbox still addressed to merged-away actor");
+  if (countWhere("SELECT count(*) n FROM api_tokens WHERE actor = ?", "dupe-nate") !== 0)
+    throw new Error("seed: token still owned by merged-away actor");
+  if (countWhere("SELECT count(*) n FROM api_tokens WHERE actor = ?", "main-nate") < 1)
+    throw new Error("seed: token was not reassigned to the merge target");
+}
+
+// ---- 3) standalone deleteJournalEntry cascade ----
+{
+  const body = "Standalone entry: do the standalone task now.";
+  const e = journal.append({
+    author: "pia",
+    body,
+    tags: [],
+    anchors: [{ start: body.indexOf("do the standalone task now"), end: body.length - 1, kind: "task", fields: { title: "Standalone task" } }],
+  });
+  const standalone = tasks.list().find((t) => t.title === "Standalone task");
+  if (!standalone) throw new Error("seed: standalone task not created");
+  deleteJournalEntry(e.id);
+  if (journal.get(e.id)) throw new Error("seed: deleteJournalEntry left the entry");
+  if (tasks.get(standalone.id)) throw new Error("seed: deleteJournalEntry left the anchored task");
+}
+
 console.log(
   `🌱 seeded hive: people, journal + anchors, inboxes, a sample RSS source, a scrape source, an outbox job, ` +
-    `bracket-token entries, profile cards, and a recall smoke (embedded ${embedded} items, ${hits.length} semantic hits, ` +
-    `${r.data.journal.length} recalled journal hits).`,
+    `bracket-token entries, profile cards, a recall smoke (embedded ${embedded} items, ${hits.length} semantic hits, ` +
+    `${r.data.journal.length} recalled journal hits), and an admin actor delete+merge cascade smoke.`,
 );

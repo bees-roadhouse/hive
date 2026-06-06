@@ -855,6 +855,15 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 }
 .token-reveal code { font-size: 0.9rem; }
 button.danger { background: #5a2a2a; color: #f0d0d0; border: none; border-radius: 6px; padding: 0.25rem 0.6rem; cursor: pointer; }
+button.ghost.danger { background: transparent; color: #d98a8a; }
+.danger { color: #d98a8a; }
+
+/* ---- actor delete / merge ops (Admin writers rows) ---- */
+.actor-ops { display: inline-flex; align-items: center; gap: 0.35rem; }
+.actor-ops-panel { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; padding: 0.4rem 0.6rem; background: var(--panel); border: 1px solid #5a2a2a; border-radius: 8px; }
+.actor-ops-preview { display: flex; flex-direction: column; gap: 0.4rem; }
+.actor-ops-counts { display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; max-width: 28rem; }
+.actor-ops-counts .kv { border-bottom: none; padding: 0; gap: 0.35rem; }
 
 /* ---- people / identity profiles ---- */
 .person-card { border-bottom: 1px solid var(--line, #2a3038); padding: 0.3rem 0; }

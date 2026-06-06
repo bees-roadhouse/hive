@@ -192,6 +192,54 @@ export interface ImportResult {
   links: ImportCounts;
 }
 
+// ---- admin: actor delete + merge ----
+
+/** Per-table counts from an actor delete cascade. `dryRun` reports the same
+ *  shape WITHOUT mutating, so the UI can confirm "this will delete N…" first. */
+export interface ActorDeleteResult {
+  actor: string;
+  dryRun: boolean;
+  journal: number;
+  tasks: number;
+  decisions: number;
+  events: number;
+  anchors: number;
+  links: number;
+  embeddings: number;
+  search: number;
+  inbox: number;
+  shares: number;
+  profile: number;
+  users: number;
+  sessions: number;
+  api_tokens: number;
+  oauth_codes: number;
+  wire: number;
+  sources: number;
+  people: number;
+}
+
+/** Per-table counts from folding `from` into `to` (reassignment, not deletion;
+ *  `people`/`profile`/`users` for `from` are removed once their data is moved). */
+export interface ActorMergeResult {
+  from: string;
+  into: string;
+  dryRun: boolean;
+  journal: number;
+  tasks: number;
+  decisions: number;
+  events: number;
+  inbox: number;
+  shares: number;
+  api_tokens: number;
+  oauth_codes: number;
+  wire: number;
+  sources: number;
+  people_owner: number;
+  profile: number;
+  users: number;
+}
+
 /** Public first-run state — the SPA reads this before anything else. */
 export interface OnboardingStatus {
   completed: boolean;
