@@ -41,8 +41,25 @@ export const EMBED_DIM = USE_TRANSFORMERS ? (/bge-large/i.test(EMBED_REPO) ? 102
 const BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: ";
 const IS_BGE = /bge/i.test(EMBED_REPO);
 
-/** Whether a cross-encoder reranker is available for the active provider. */
-export const RERANK_AVAILABLE = USE_TRANSFORMERS;
+// Resilience latch: if the transformers model can't load on this host (missing
+// model cache, no network, incompatible ONNX runtime), we degrade to the hash
+// embedder instead of hard-failing every embed()/rerank()/semanticSearch() call.
+// Latched after the first failure so we don't retry-spam the load or the warning.
+let transformersFailed = false;
+function markTransformersUnavailable(err: unknown): void {
+  if (!transformersFailed) {
+    transformersFailed = true;
+    console.warn(
+      `[embed] transformers model unavailable, falling back to hash embeddings ` +
+        `(rerank disabled): ${(err as Error)?.message ?? err}`,
+    );
+  }
+}
+
+/** Whether a cross-encoder reranker is available right now — true only when the
+ * transformers provider is selected AND its model actually loaded. Goes false
+ * the moment a model load fails, so callers (semanticSearch) stop forcing rerank. */
+export const rerankAvailable = (): boolean => USE_TRANSFORMERS && !transformersFailed;
 
 // ---- vector <-> blob (packed little-endian f32, matching bookstack-mcp) -----
 
@@ -128,17 +145,33 @@ let extractorPromise: Promise<Extractor> | null = null;
 
 function getExtractor(): Promise<Extractor> {
   if (!extractorPromise) {
-    extractorPromise = import("@huggingface/transformers").then(({ pipeline }) =>
-      pipeline("feature-extraction", EMBED_REPO),
-    ) as Promise<Extractor>;
+    // Don't cache a rejected promise — on load failure, clear the cache so the
+    // latch (not a poisoned promise) governs the fallback, and rethrow so the
+    // caller degrades to hash.
+    extractorPromise = (
+      import("@huggingface/transformers").then(({ pipeline }) =>
+        pipeline("feature-extraction", EMBED_REPO),
+      ) as Promise<Extractor>
+    ).catch((err) => {
+      extractorPromise = null;
+      throw err;
+    });
   }
   return extractorPromise;
 }
 
+/** Embed via transformers; on any model-load/run failure, latch the provider as
+ *  unavailable and fall back to the hash embedder so callers never throw. */
 async function embedTransformers(text: string): Promise<number[]> {
-  const extractor = await getExtractor();
-  const out = await extractor(text, { pooling: "mean", normalize: true });
-  return Array.from(out.data);
+  if (transformersFailed) return embedHash(text);
+  try {
+    const extractor = await getExtractor();
+    const out = await extractor(text, { pooling: "mean", normalize: true });
+    return Array.from(out.data);
+  } catch (err) {
+    markTransformersUnavailable(err);
+    return embedHash(text);
+  }
 }
 
 // Cross-encoder: scores [query, doc] pairs jointly. Lazily loaded once.
@@ -153,8 +186,8 @@ let rerankPromise: Promise<RerankBundle> | null = null;
 
 function getReranker(): Promise<RerankBundle> {
   if (!rerankPromise) {
-    rerankPromise = import("@huggingface/transformers").then(
-      async ({ AutoTokenizer, AutoModelForSequenceClassification }) => {
+    rerankPromise = import("@huggingface/transformers")
+      .then(async ({ AutoTokenizer, AutoModelForSequenceClassification }) => {
         const [tokenizer, model] = await Promise.all([
           AutoTokenizer.from_pretrained(RERANK_REPO),
           AutoModelForSequenceClassification.from_pretrained(RERANK_REPO),
@@ -163,8 +196,13 @@ function getReranker(): Promise<RerankBundle> {
           tokenizer: (queries, opts) => tokenizer(queries, opts) as Record<string, unknown>,
           model: (inputs) => model(inputs),
         } as RerankBundle;
-      },
-    );
+      })
+      .catch((err) => {
+        // Same as the extractor: don't cache the rejection, latch + rethrow so
+        // rerank() returns null (search keeps working without the cross-encoder).
+        rerankPromise = null;
+        throw err;
+      });
   }
   return rerankPromise;
 }
@@ -185,18 +223,25 @@ export async function embedQuery(text: string): Promise<number[]> {
 }
 
 /** Cross-encoder relevance scores for each doc against the query, in input
- * order. Returns null when no reranker is available (hash provider). */
+ * order. Returns null when no reranker is available — the hash provider, or a
+ * transformers model that failed to load (search then keeps its blended order
+ * instead of crashing). */
 export async function rerank(query: string, docs: string[]): Promise<number[] | null> {
-  if (!USE_TRANSFORMERS || docs.length === 0) return null;
-  const { tokenizer, model } = await getReranker();
-  const inputs = tokenizer(new Array(docs.length).fill(query), {
-    text_pair: docs,
-    padding: true,
-    truncation: true,
-  });
-  const { logits } = await model(inputs);
-  // bge-reranker emits one logit per pair; sigmoid → a 0..1 relevance score.
-  return logits.sigmoid().tolist().map((row) => row[0]);
+  if (!USE_TRANSFORMERS || transformersFailed || docs.length === 0) return null;
+  try {
+    const { tokenizer, model } = await getReranker();
+    const inputs = tokenizer(new Array(docs.length).fill(query), {
+      text_pair: docs,
+      padding: true,
+      truncation: true,
+    });
+    const { logits } = await model(inputs);
+    // bge-reranker emits one logit per pair; sigmoid → a 0..1 relevance score.
+    return logits.sigmoid().tolist().map((row) => row[0]);
+  } catch (err) {
+    markTransformersUnavailable(err);
+    return null;
+  }
 }
 
 /** Stable content hash so we only re-embed when the text changes. */

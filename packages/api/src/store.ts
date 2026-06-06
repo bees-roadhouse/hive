@@ -90,7 +90,7 @@ import {
   EMBED_MODEL,
   fromBlob,
   rerank,
-  RERANK_AVAILABLE,
+  rerankAvailable,
   toBlob,
 } from "./embed.ts";
 import { parseFeed } from "./feed.ts";
@@ -2335,8 +2335,9 @@ export async function semanticSearch(query: string, opts: SemanticOptions = {}):
   const useBlanket = opts.blanket ?? true;
   // Precision forces the cross-encoder on; standard honors the `rerank` flag.
   // Either way it only engages when a reranker is actually available — so
-  // precision degrades to the standard blend (on the widened pool) under hash/CI.
-  const useRerank = (precision || (opts.rerank ?? false)) && RERANK_AVAILABLE;
+  // precision degrades to the standard blend (on the widened pool) under hash/CI
+  // OR when the transformers model failed to load on this host.
+  const useRerank = (precision || (opts.rerank ?? false)) && rerankAvailable();
   if (!query.trim()) return [];
 
   const items = embeddableItems();
