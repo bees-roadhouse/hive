@@ -12,7 +12,9 @@ import {
   outbox,
   people,
   phases,
+  profiles,
   projects,
+  recall,
   search,
   semanticSearch,
   shares,
@@ -189,6 +191,49 @@ export function buildMcpServer(): McpServer {
     },
     async ({ q, limit, hybrid, rerank, threshold }) =>
       ok(await semanticSearch(q, { limit: limit ?? 10, hybrid, rerank, threshold })),
+  );
+
+  // ---- memory: profile cards + recall composition ----
+  server.registerTool(
+    "profile_get",
+    {
+      title: "Get an actor's profile card",
+      description: "The mutable 'who they are' card for an actor (human or AI): identity, preferences, working style, relationships.",
+      inputSchema: { actor: z.string() },
+    },
+    async ({ actor }) => ok(profiles.get(actor) ?? { error: "not found" }),
+  );
+
+  server.registerTool(
+    "profile_update",
+    {
+      title: "Update an actor's profile card",
+      description:
+        "Write durable identity facts. `sections` deep-merges into the card's sections (replace per key); pass display_name/kind to set them. This is the memory-WRITE target for durable identity (episodic facts go to journal_append).",
+      inputSchema: {
+        actor: z.string(),
+        display_name: z.string().optional(),
+        kind: z.enum(["human", "ai"]).optional(),
+        sections: z.record(z.string()).optional(),
+      },
+    },
+    async ({ actor, ...patch }, _extra) => ok(profiles.update(actor, patch, "mcp")),
+  );
+
+  server.registerTool(
+    "recall",
+    {
+      title: "Recall memory for a session",
+      description:
+        "One-call session-start memory: composes profile cards (identity + optional peer), open tasks, unread inbox, recent relevant journal, recent events, and touched projects into a ready-to-inject markdown brief (trimmed to `budget` tokens) plus the structured data behind it.",
+      inputSchema: {
+        identity: z.string().describe("the AI/actor recalling (whose tasks/inbox to pull)"),
+        peer: z.string().optional().describe("optional focus actor, e.g. the human in the session"),
+        query: z.string().optional().describe("optional topic; defaults to recent + open threads"),
+        budget: z.number().int().optional().describe("approx token budget for the brief"),
+      },
+    },
+    async (args) => ok(await recall(args)),
   );
 
   // ---- worker configuration (sources) + status ----

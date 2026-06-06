@@ -14,6 +14,7 @@ import type {
   NewSource,
   OnboardingPayload,
   PersonPatch,
+  ProfilePatch,
   SourcePatch,
   TaskPatch,
   UserRole,
@@ -42,7 +43,9 @@ import {
   outbox,
   people,
   phases,
+  profiles,
   projects,
+  recall,
   search,
   seedActors,
   semanticSearch,
@@ -324,6 +327,22 @@ app.post("/api/people", async (c) => {
   const body = (await c.req.json()) as { name: string; kind?: "human" | "ai" };
   if (!body?.name?.trim()) return c.json({ error: "name required" }, 400);
   return c.json(people.create(body, actor(c)), 201);
+});
+
+// ---- profile (mutable per-actor card) + recall (read/inject composition) ----
+app.get("/api/profile/:actor", (c) => {
+  const p = profiles.get(c.req.param("actor"));
+  return p ? c.json(p) : c.json({ error: "not found" }, 404);
+});
+app.post("/api/profile/:actor", async (c) => {
+  const patch = (await c.req.json()) as ProfilePatch;
+  return c.json(profiles.update(c.req.param("actor"), patch, actor(c)));
+});
+app.post("/api/recall", async (c) => {
+  const body = (await c.req.json()) as { identity?: string; peer?: string; query?: string; budget?: number };
+  const identity = body?.identity ?? actor(c);
+  if (!identity) return c.json({ error: "identity required" }, 400);
+  return c.json(await recall({ identity, peer: body?.peer, query: body?.query, budget: body?.budget }));
 });
 
 // ---- shares ----

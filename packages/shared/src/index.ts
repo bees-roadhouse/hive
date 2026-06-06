@@ -487,6 +487,66 @@ export interface DashboardStats {
   calloutsByPerson: { name: string; slug: string; count: number }[];
 }
 
+// ---- profile (the mutable per-actor card; humans + AIs) ----
+
+/** Where a card's facts came from: hand-written vs synthesised from the journal. */
+export type ProfileSource = "manual" | "derived";
+
+/** Durable, mutable "who they are" card for an actor — distinct from the
+ *  immutable journal. `sections` holds free-form prose blocks (identity,
+ *  preferences, working_style, relationships, …) keyed by section name. */
+export interface Profile {
+  /** people.slug — the PK. */
+  actor: string;
+  kind: ActorKind;
+  display_name: string;
+  body: { sections: Record<string, string> };
+  source: ProfileSource;
+  derived_at: string | null;
+  updated_at: string;
+}
+
+export interface ProfilePatch {
+  display_name?: string;
+  kind?: ActorKind;
+  /** Section blocks to deep-merge into body.sections (replace per key). */
+  sections?: Record<string, string>;
+}
+
+// ---- recall (the read/inject composition) ----
+
+/** A journal hit returned by recall — a search hit plus the author + snippet. */
+export interface RecallJournalHit extends SearchHit {
+  author: string;
+  created_at: string;
+}
+
+/** A project touched by the recalled material. */
+export interface ProjectRef {
+  id: string;
+  name: string;
+  slug: string;
+}
+
+/** Everything recall composed, structured so adapters can render their own format. */
+export interface RecallData {
+  profiles: Profile[];
+  journal: RecallJournalHit[];
+  tasks: Task[];
+  inbox: InboxItem[];
+  events: EventItem[];
+  projects: ProjectRef[];
+}
+
+/** Default brief budget in (approximate) tokens. */
+export const RECALL_DEFAULT_BUDGET = 1500;
+
+export interface RecallResult {
+  /** Ready-to-inject markdown, trimmed to ~budget tokens. */
+  brief: string;
+  data: RecallData;
+}
+
 // ---- write payloads ----
 
 /** Fields the author may attach when anchoring a span. All optional. */

@@ -73,12 +73,15 @@ Two embedders behind the `embed.ts` seam, chosen by `HIVE_EMBED`:
 
 | `HIVE_EMBED`   | Model                          | Dim  | Notes |
 | -------------- | ------------------------------ | ---- | ----- |
-| `hash` (default) | `hash-ngram-v1`              | 256  | Deterministic, no download — instant in CI/sandbox/offline. No reranker. |
-| `transformers` | `Xenova/bge-large-en-v1.5` + `Xenova/bge-reranker-base` | 1024 | The real stack (same BGE models bookstack-mcp uses), via [@huggingface/transformers](https://github.com/huggingface/transformers.js) on onnxruntime. One-time model download. |
+| `transformers` (default) | `Xenova/bge-small-en-v1.5` + `Xenova/bge-reranker-base` | 384 | The real local stack: a small, ARM/CPU-friendly BGE model via [@huggingface/transformers](https://github.com/huggingface/transformers.js) on onnxruntime. One-time model download (mount a models cache in prod). |
+| `hash`         | `hash-ngram-v1`                | 256  | Deterministic, no download — instant offline. No reranker. CI selects this explicitly so the seed smoke stays fast + network-free. |
 
-Set `HIVE_EMBED=transformers` on the api **and** worker, then let the worker
-re-backfill. Override the repos with `HIVE_EMBED_MODEL` / `HIVE_RERANK_MODEL`
-(e.g. `Xenova/bge-small-en-v1.5` for a lighter 384d model).
+The default is the real local embedder — no env needed for a normal deploy.
+Override the model with `HIVE_EMBED_MODEL` (e.g. `Xenova/bge-large-en-v1.5` for
+1024d on a beefier host, or `Xenova/all-MiniLM-L6-v2` for a symmetric 384d model
+— the BGE query instruction is applied only to BGE models). Set `HIVE_EMBED=hash`
+to skip the model download (CI, offline dev). Flipping the model re-backfills only
+rows whose stored model no longer matches, so the worker recomputes on the next cycle.
 
 ## Quick start
 
@@ -154,8 +157,8 @@ fresh web session comes up ready to `pnpm dev`. Re-running is safe.
 | `HIVE_DB`      | `data/hive.db`          | api        |
 | `HIVE_API_URL` | `http://localhost:8787` | cli, web proxy |
 | `HIVE_ACTOR`   | `cli`                   | cli        |
-| `HIVE_EMBED`   | `hash`                  | api, worker — `transformers` for the real BGE stack |
-| `HIVE_EMBED_MODEL` | `Xenova/bge-large-en-v1.5` | api, worker (transformers mode) |
+| `HIVE_EMBED`   | `transformers`          | api, worker — set `hash` to skip the model download (CI/offline) |
+| `HIVE_EMBED_MODEL` | `Xenova/bge-small-en-v1.5` | api, worker (transformers mode) |
 | `HIVE_RERANK_MODEL` | `Xenova/bge-reranker-base` | api, worker (transformers mode) |
 
 ## Branching
