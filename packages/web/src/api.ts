@@ -58,14 +58,23 @@ export const getDoneRetentionHours = (): number => {
 export const setDoneRetentionHours = (hours: number): void =>
   localStorage.setItem(DONE_RETENTION_KEY, String(hours));
 
-async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api${path}`, {
-    ...init,
-    credentials: "include", // send the session cookie
-    headers: { "content-type": "application/json", ...init?.headers },
-  });
-  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
-  return (res.status === 204 ? undefined : await res.json()) as T;
+async function req<T>(path: string, init?: RequestInit, timeoutMs = 15000): Promise<T> {
+  // Bound every call so a slow/cold API (e.g. just-restarted hive-api) can't hang
+  // the UI indefinitely — the caller gets a rejection it can retry.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error("request timed out")), timeoutMs);
+  try {
+    const res = await fetch(`/api${path}`, {
+      ...init,
+      credentials: "include", // send the session cookie
+      signal: ctrl.signal,
+      headers: { "content-type": "application/json", ...init?.headers },
+    });
+    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+    return (res.status === 204 ? undefined : await res.json()) as T;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export const api = {

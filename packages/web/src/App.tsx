@@ -1,4 +1,4 @@
-import { createResource, createSignal, For, Show, Suspense, type Component } from "solid-js";
+import { createResource, createSignal, ErrorBoundary, For, Show, Suspense, type Component } from "solid-js";
 import { api, getActor, getCurrentUser, setCurrentUser } from "./api.ts";
 import { connectLive, liveRev } from "./live.ts";
 import { Journal } from "./Journal.tsx";
@@ -105,13 +105,36 @@ const Workspace: Component<{ instanceName: string | null; onLogout: () => void }
   );
 };
 
+// Splash shown while the boot probe runs (and across its retries).
+const Splash: Component<{ text: string }> = (props) => (
+  <div class="auth-screen">
+    <div class="auth-card">
+      <div class="auth-brand"><span class="logo">🐝</span></div>
+      <p class="dim">{props.text}</p>
+    </div>
+  </div>
+);
+
 export const App: Component = () => {
   // Boot: resolve onboarding state + current session before rendering anything.
+  // Each request is timeout-bounded (see api.req); we retry a few times so a
+  // just-restarted / cold hive-api recovers on its own instead of leaving the UI
+  // stuck on a splash. If it still can't be reached, the ErrorBoundary below
+  // surfaces a Retry button rather than hanging forever.
   const [boot, { refetch }] = createResource(async () => {
-    const status = await api.onboardingStatus();
-    const me = status.completed ? await api.me() : null;
-    if (me?.user) setCurrentUser(me.user);
-    return { status, signedIn: !!me?.user };
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const status = await api.onboardingStatus();
+        const me = status.completed ? await api.me() : null;
+        if (me?.user) setCurrentUser(me.user);
+        return { status, signedIn: !!me?.user };
+      } catch (e) {
+        lastErr = e;
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    }
+    throw lastErr;
   });
 
   const reload = () => refetch();
@@ -125,24 +148,28 @@ export const App: Component = () => {
   };
 
   return (
-    <Suspense
-      fallback={
+    <ErrorBoundary
+      fallback={(_err, reset) => (
         <div class="auth-screen">
           <div class="auth-card">
             <div class="auth-brand"><span class="logo">🐝</span></div>
-            <p class="dim">Loading…</p>
+            <h1>Can't reach hive</h1>
+            <p class="dim">The server didn't respond — it may be starting up. Give it a moment, then retry.</p>
+            <button class="logout" onClick={() => { reset(); refetch(); }}>Retry</button>
           </div>
         </div>
-      }
+      )}
     >
-      <Show when={boot()?.status.completed} fallback={<Onboarding onDone={reload} />}>
-        <Show
-          when={boot()?.signedIn}
-          fallback={<Login instanceName={boot()?.status.instanceName ?? null} onLogin={reload} />}
-        >
-          <Workspace instanceName={boot()?.status.instanceName ?? null} onLogout={onLogout} />
+      <Suspense fallback={<Splash text="Connecting to hive…" />}>
+        <Show when={boot()?.status.completed} fallback={<Onboarding onDone={reload} />}>
+          <Show
+            when={boot()?.signedIn}
+            fallback={<Login instanceName={boot()?.status.instanceName ?? null} onLogin={reload} />}
+          >
+            <Workspace instanceName={boot()?.status.instanceName ?? null} onLogout={onLogout} />
+          </Show>
         </Show>
-      </Show>
-    </Suspense>
+      </Suspense>
+    </ErrorBoundary>
   );
 };
