@@ -14,14 +14,19 @@
 }
 
 * { box-sizing: border-box; }
+html, body { height: 100%; }
 body { margin: 0; background: var(--bg); color: var(--ink); }
+#root { min-height: 100dvh; display: flex; flex-direction: column; }
 
 /* ---- shell: fixed left sidebar + scrolling content ---- */
-.app { display: flex; min-height: 100vh; }
+/* Fills the viewport at any width: the sidebar is fixed-width, the content
+   area takes all remaining space. Readable measures live on the prose column
+   and the journal layout, never on the whole content pane. */
+.app { display: flex; flex: 1; min-height: 100dvh; width: 100%; }
 
 .sidebar {
   position: sticky; top: 0; align-self: flex-start;
-  width: 200px; min-width: 200px; height: 100vh;
+  width: 200px; min-width: 200px; height: 100dvh;
   display: flex; flex-direction: column; gap: 0.5rem;
   background: var(--panel); border-right: 1px solid var(--line);
   padding: 1rem 0.7rem;
@@ -54,7 +59,16 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .foot-note { font-size: 0.68rem; line-height: 1.4; }
 .foot-note code { font-size: 0.68rem; }
 
-main { flex: 1; min-width: 0; max-width: 1000px; padding: 1.25rem 1.75rem 2.5rem; }
+/* Content area fills ALL space the sidebar leaves, at every width — no width
+   cap, so there's never a dead gutter on wide/ultrawide displays. Readability
+   on text-heavy pages is held by per-page measures inside this (.prose is
+   70ch, the journal is a feed+rail grid), not by capping the whole pane. It
+   scrolls internally so the sidebar stays put. */
+main {
+  flex: 1; min-width: 0; width: 100%;
+  height: 100dvh; overflow-y: auto;
+  padding: 1.25rem clamp(1rem, 3vw, 2.5rem) 2.5rem;
+}
 .page-title { text-transform: capitalize; margin: 0 0 1rem; font-size: 1.4rem; }
 
 @media (max-width: 720px) {
@@ -64,7 +78,9 @@ main { flex: 1; min-width: 0; max-width: 1000px; padding: 1.25rem 1.75rem 2.5rem
   .sidebar nav button { width: auto; }
   .sidebar-foot { border-top: none; padding-top: 0; flex-direction: row; align-items: center; margin-left: auto; }
   .foot-note { display: none; }
-  main { padding: 1rem; }
+  /* Sidebar is stacked on top now, so the content pane scrolls with the page
+     rather than owning its own viewport-height scroll region. */
+  main { height: auto; overflow-y: visible; max-width: 100%; padding: 1rem; }
 }
 
 button, select, input, textarea {
@@ -1072,11 +1088,17 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
 
 /* Two-column layout: scrolling feed + a sticky rail that tracks what's on
    screen. The rail collapses below the feed on narrow viewports. */
+/* The journal is a reading view, so it's the one place a readable cap earns
+   its keep: the feed + rail sit in a centred column that grows with the
+   viewport but stops before prose lines get unwieldy on ultrawide. The rest
+   of the app (boards, dashboard, wire) fills edge-to-edge via `main`. */
 .journal-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 232px;
   gap: 1.5rem;
   align-items: start;
+  max-width: 1100px;
+  margin-inline: auto;
 }
 .journal-layout .feed { min-width: 0; }
 
