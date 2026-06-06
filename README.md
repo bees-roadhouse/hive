@@ -7,9 +7,10 @@ knowledge-graph links, and a wire event log).
 **Zero-infra**: a single-file SQLite database, so it spins up instantly in a
 fresh container.
 
-> This replaced an earlier Rust workspace (Postgres + pgvector + a 9-phase auth
-> stack). That tradeoff means: no auth, and semantic search runs a local
-> embedder rather than a hosted model — see [Semantic search](#semantic-search).
+> Node.js + Solid.js (it replaced an earlier Rust/Postgres prototype; this is the
+> system of record now). Auth is bearer API tokens plus cookie sessions; semantic
+> search runs a local on-box embedder rather than a hosted model — see
+> [Semantic search](#semantic-search).
 
 ## Stack
 
