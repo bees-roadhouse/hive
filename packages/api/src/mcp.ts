@@ -65,7 +65,10 @@ export function buildMcpServer(actor: string): McpServer {
         "(char-offset spans of the body) to emerge tasks/decisions/events anchored " +
         "to the exact text. @mention actors (" +
         ACTOR_NAMES.join(", ") +
-        ") to notify their inbox. Read with the *_list / *_get / search / dashboard tools.",
+        ") to notify their inbox. Read with the *_list / *_get / search / dashboard tools. " +
+        "For relevance retrieval prefer semantic_search with `mode: \"precision\"` (the " +
+        "four-stage cross-encoder cascade) — it's the recommended high-quality path; drop " +
+        "to `mode: \"standard\"` only for a broader sweep.",
     },
   );
 
@@ -204,17 +207,35 @@ export function buildMcpServer(actor: string): McpServer {
     {
       title: "Semantic search",
       description:
-        "Hybrid semantic search across journal/tasks/decisions/events: vector + keyword blend, link-graph boost, optional cross-encoder rerank.",
+        "Semantic search across journal/tasks/decisions/events. " +
+        "**Default to `mode: \"precision\"`** — it runs the four-stage cascade " +
+        "(semantic → keyword → Markov-blanket → cross-encoder rerank) and picks the " +
+        "most-relevant item more accurately than the standard heuristic blend. Use " +
+        "`mode: \"standard\"` for a wider sweep (blanket-adjacent material); both modes " +
+        "return the same shape, so A/B is a single `mode` swap. " +
+        "`precision` is recommended for \"find the right one\"; `standard` for \"find " +
+        "everything relevant.\" When no cross-encoder is configured, `precision` falls " +
+        "back to `standard` on a widened candidate pool (it never errors). " +
+        "The Markov-blanket link-graph boost is on by default; pass `blanket: false` to disable it. " +
+        "On `standard`, pass `rerank: true` to layer the cross-encoder on top of the top-N.",
       inputSchema: {
         q: z.string(),
         limit: z.number().int().optional(),
+        mode: z
+          .enum(["standard", "precision"])
+          .optional()
+          .describe("ranking strategy; 'precision' (recommended) runs the 4-stage cascade, 'standard' is the wider heuristic blend"),
         hybrid: z.boolean().optional(),
-        rerank: z.boolean().optional(),
+        rerank: z
+          .boolean()
+          .optional()
+          .describe("standard-mode only: layer the cross-encoder on the top-N (always on for precision)"),
+        blanket: z.boolean().optional().describe("apply the Markov-blanket link-graph boost (default true)"),
         threshold: z.number().optional(),
       },
     },
-    async ({ q, limit, hybrid, rerank, threshold }) =>
-      ok(await semanticSearch(q, { limit: limit ?? 10, hybrid, rerank, threshold })),
+    async ({ q, limit, mode, hybrid, rerank, blanket, threshold }) =>
+      ok(await semanticSearch(q, { limit: limit ?? 10, mode, hybrid, rerank, blanket, threshold })),
   );
 
   // ---- memory: profile cards + recall composition ----

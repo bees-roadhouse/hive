@@ -24,6 +24,7 @@ import {
   tokens,
   users,
 } from "./store.ts";
+import { RERANK_AVAILABLE } from "./embed.ts";
 import type { AnchorKind, AnchorFields } from "@hive/shared";
 
 migrate();
@@ -219,6 +220,45 @@ if (embedded === 0) throw new Error("seed: embeddings.backfill embedded nothing"
 // Semantic search smoke — the seeded entries talk about the Solid UI rewrite.
 const hits = await semanticSearch("Solid UI rewrite", { limit: 5 });
 if (hits.length === 0) throw new Error("seed: semantic_search returned no hits after backfill");
+
+// ---- search mode (standard / precision) + blanket flag smoke ----
+// CI runs the hash embedder (RERANK_AVAILABLE=false), so precision must FALL
+// BACK to standard cleanly and still return hits — never error, never empty.
+{
+  const Q = "Solid UI rewrite";
+  const std = await semanticSearch(Q, { limit: 5, mode: "standard" });
+  if (std.length === 0) throw new Error("seed: standard mode returned no hits");
+
+  const prec = await semanticSearch(Q, { limit: 5, mode: "precision" });
+  if (prec.length === 0)
+    throw new Error("seed: precision mode returned no hits (fallback to standard must still produce results)");
+
+  // Under the hash provider the cross-encoder is unavailable, so precision is a
+  // clean fallback to the standard blend — same hit on top, no throw.
+  if (!RERANK_AVAILABLE && prec[0].id !== std[0].id)
+    throw new Error("seed: precision fallback diverged from standard despite no reranker");
+
+  // Default (no mode) === standard.
+  const def = await semanticSearch(Q, { limit: 5 });
+  if (def.length === 0 || def[0].id !== std[0].id)
+    throw new Error("seed: default mode did not match standard");
+
+  // Blanket flag on (default) vs off — both must return hits; toggling it must
+  // not error or empty the result set.
+  const blanketOn = await semanticSearch(Q, { limit: 5, blanket: true });
+  const blanketOff = await semanticSearch(Q, { limit: 5, blanket: false });
+  if (blanketOn.length === 0 || blanketOff.length === 0)
+    throw new Error("seed: blanket flag toggling produced an empty result set");
+
+  // The standard `rerank` flag is also a clean no-op under hash (no reranker).
+  const reranked = await semanticSearch(Q, { limit: 5, mode: "standard", rerank: true });
+  if (reranked.length === 0) throw new Error("seed: standard+rerank returned no hits under hash");
+
+  console.log(
+    `   · search modes ok (rerank ${RERANK_AVAILABLE ? "available" : "unavailable → precision falls back"}): ` +
+      `standard ${std.length}, precision ${prec.length}, blanket on/off ${blanketOn.length}/${blanketOff.length}`,
+  );
+}
 
 // Recall smoke — compose Pia's session-start brief focused on Nate. Exercises
 // profile cards + scoped semantic retrieval + open tasks + inbox in one call.

@@ -2238,14 +2238,28 @@ export function embeddingStats(): EmbeddingStats {
   };
 }
 
+/** Ranking strategy, mirroring bookstack-mcp.
+ *  - `standard` — vector + keyword + Markov-blanket blend (free, known-good
+ *    baseline; the schema default so hash/CI with no reranker still works).
+ *  - `precision` — the four-stage cascade (semantic → keyword → Markov-blanket
+ *    → cross-encoder rerank). Recommended high-quality "find the right one"
+ *    path. Falls back to `standard` cleanly when no reranker is available. */
+export type SearchMode = "standard" | "precision";
+
 export interface SemanticOptions {
   limit?: number;
   /** Drop vector matches scoring below this cosine value (default 0). */
   threshold?: number;
   /** Blend FTS keyword ranks into the score (default true). */
   hybrid?: boolean;
-  /** Re-order the top-N with the cross-encoder, when one is available. */
+  /** Re-order the top-N with the cross-encoder, when one is available (default
+   *  false on `standard`; always on for `precision`). */
   rerank?: boolean;
+  /** Apply the Markov-blanket boost from the links graph (default true). */
+  blanket?: boolean;
+  /** Ranking strategy (default 'standard'). 'precision' runs the 4-stage
+   *  cascade and falls back to 'standard' when no cross-encoder is available. */
+  mode?: SearchMode;
   /** Scope results to entries this viewer may see (own + owned/shared/mentioned). */
   viewer?: string;
   /** Boost (not filter) hits whose author/mentions/assignees include this actor. */
@@ -2295,22 +2309,44 @@ function blanketNeighbors(kind: string, id: string): string[] {
 }
 
 /**
- * Semantic search, mirroring bookstack-mcp's hybrid pipeline: a brute-force
- * cosine vector pass, an optional FTS keyword blend (0.7 vector / 0.2 keyword),
- * a Markov-blanket boost from the links graph, and an optional cross-encoder
- * rerank of the top-N. Falls back to top-k vector hits so a non-empty corpus
- * never returns nothing.
+ * Semantic search, mirroring bookstack-mcp's hybrid pipeline. Two modes (same
+ * JSON shape, so A/B is a single `mode` swap):
+ *
+ * - `standard` (default): a brute-force cosine vector pass, an optional FTS
+ *   keyword blend (0.7 vector / 0.2 keyword), a Markov-blanket boost from the
+ *   links graph, and an optional cross-encoder rerank of the top-N (the
+ *   `rerank` flag). Free, known-good baseline.
+ * - `precision`: bookstack-mcp's four-stage cascade — a wider candidate pool
+ *   (semantic N×4 → keyword-blended N×3 → blanket-blended N×2 → cross-encoder
+ *   rerank → N). The cross-encoder is always on. When no reranker is available
+ *   (hash provider / CI), precision FALLS BACK to the standard blend on the
+ *   widened pool — it never errors.
+ *
+ * The Markov-blanket boost is on by default; pass `blanket: false` to disable
+ * it. Always falls back to top-k vector hits so a non-empty corpus never
+ * returns nothing.
  */
 export async function semanticSearch(query: string, opts: SemanticOptions = {}): Promise<SearchHit[]> {
   const limit = opts.limit ?? 10;
   const threshold = opts.threshold ?? 0;
+  const mode: SearchMode = opts.mode === "precision" ? "precision" : "standard";
+  const precision = mode === "precision";
   const hybrid = opts.hybrid ?? true;
-  const useRerank = (opts.rerank ?? false) && RERANK_AVAILABLE;
+  const useBlanket = opts.blanket ?? true;
+  // Precision forces the cross-encoder on; standard honors the `rerank` flag.
+  // Either way it only engages when a reranker is actually available — so
+  // precision degrades to the standard blend (on the widened pool) under hash/CI.
+  const useRerank = (precision || (opts.rerank ?? false)) && RERANK_AVAILABLE;
   if (!query.trim()) return [];
 
   const items = embeddableItems();
   const titleOf = new Map(items.map((i) => [refKey(i.kind, i.id), i.title]));
   const textOf = new Map(items.map((i) => [refKey(i.kind, i.id), i.text]));
+
+  // Cascade over-fetch (issue #80 shape): precision widens each stage's pool so
+  // the cross-encoder sees a strong candidate set. Standard keeps the lean N×2.
+  const stage1Pool = precision ? Math.max(limit * 4, limit) : Math.max(limit * 2, limit);
+  const stage2Pool = precision ? Math.max(limit * 3, limit) : limit * 2;
 
   // 1. Vector pass — full cosine over model-matched blobs. The model+dim filter
   // means a partial backfill (mixed models) never compares across dimensions.
@@ -2323,15 +2359,17 @@ export async function semanticSearch(query: string, opts: SemanticOptions = {}):
     .sort((a, b) => b.score - a.score);
   const passing = scoredAll.filter((h) => h.score >= threshold);
   const rawHitKeys = new Set(passing.map((h) => h.k));
-  const vhits = passing.slice(0, Math.max(limit * 2, limit));
+  const vhits = passing.slice(0, stage1Pool);
 
   type Score = { vector: number; keyword: number; blanket: number };
   const scores = new Map<string, Score>();
   for (const h of vhits) scores.set(h.k, { vector: h.score, keyword: 0, blanket: 0 });
 
-  // 2. Keyword pass (FTS) — rank-based score, decaying from the top.
+  // 2. Keyword pass (FTS) — rank-based score, decaying from the top. In
+  // precision the surviving candidates are trimmed to the stage-2 pool by the
+  // vector/keyword blend so downstream stages see the strongest signal.
   if (hybrid) {
-    const kw = search(query, limit * 2);
+    const kw = search(query, stage2Pool);
     const total = kw.length || 1;
     kw.forEach((r, i) => {
       const kk = refKey(r.kind, r.id);
@@ -2339,20 +2377,32 @@ export async function semanticSearch(query: string, opts: SemanticOptions = {}):
       s.keyword = 1 - i / total;
       scores.set(kk, s);
     });
+    if (precision && scores.size > stage2Pool) {
+      const kept = new Set(
+        [...scores.entries()]
+          .sort(([, a], [, b]) => b.vector * 0.6 + b.keyword * 0.4 - (a.vector * 0.6 + a.keyword * 0.4))
+          .slice(0, stage2Pool)
+          .map(([k]) => k),
+      );
+      for (const k of [...scores.keys()]) if (!kept.has(k)) scores.delete(k);
+    }
   }
 
-  // 3. Markov-blanket boost: neighbor in the final set (+0.05, cap 0.15),
-  // neighbor that had a vector hit but didn't make the cut (+0.02, cap 0.06).
-  const scoredKeys = new Set(scores.keys());
-  for (const [kk, s] of scores) {
-    const [k, id] = splitKey(kk);
-    let strong = 0;
-    let weak = 0;
-    for (const nk of blanketNeighbors(k, id)) {
-      if (scoredKeys.has(nk)) strong++;
-      else if (rawHitKeys.has(nk)) weak++;
+  // 3. Markov-blanket boost (on unless `blanket:false`): neighbor in the final
+  // set (+0.05, cap 0.15), neighbor that had a vector hit but didn't make the
+  // cut (+0.02, cap 0.06).
+  if (useBlanket) {
+    const scoredKeys = new Set(scores.keys());
+    for (const [kk, s] of scores) {
+      const [k, id] = splitKey(kk);
+      let strong = 0;
+      let weak = 0;
+      for (const nk of blanketNeighbors(k, id)) {
+        if (scoredKeys.has(nk)) strong++;
+        else if (rawHitKeys.has(nk)) weak++;
+      }
+      if (strong || weak) s.blanket = Math.min(strong * 0.05, 0.15) + Math.min(weak * 0.02, 0.06);
     }
-    if (strong || weak) s.blanket = Math.min(strong * 0.05, 0.15) + Math.min(weak * 0.02, 0.06);
   }
 
   // Drop keyword-only noise — a keyword hit with zero semantic relevance.
@@ -2367,21 +2417,29 @@ export async function semanticSearch(query: string, opts: SemanticOptions = {}):
     const [k, id] = splitKey(kk);
     return hitActors(k, id).some((a) => focus.has(a)) ? 0.1 : 0;
   };
+  // Precision leans a touch more on keyword + blanket (the cross-encoder makes
+  // the final call anyway); standard keeps the conservative 0.7/0.2 blend.
+  const [wVec, wKw] = precision ? [0.55, 0.25] : [0.7, 0.2];
+  // Precision keeps a wider top-N going into the rerank (stage-4 pool = N×2),
+  // then truncates to `limit` after the cross-encoder reorders it.
+  const preRerankN = precision && useRerank ? Math.max(limit * 2, limit) : limit;
   let ranked = [...scores.entries()]
     .map(([k, s]) => ({
       k,
       score:
-        (s.keyword > 0 && s.vector > 0 ? s.vector * 0.7 + s.keyword * 0.2 + s.blanket : s.vector + s.blanket) +
+        (s.keyword > 0 && s.vector > 0 ? s.vector * wVec + s.keyword * wKw + s.blanket : s.vector + s.blanket) +
         scoped(k),
     }))
     .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+    .slice(0, preRerankN);
 
-  // 5. Cross-encoder rerank of the top-N (re-orders only; candidate set stays).
+  // 5. Cross-encoder rerank (precision stage 4, or the standard `rerank` flag):
+  // re-orders the candidate set; precision then trims to `limit`.
   if (useRerank && ranked.length) {
     const rr = await rerank(query, ranked.map((r) => textOf.get(r.k) ?? ""));
     if (rr) ranked = ranked.map((r, i) => ({ k: r.k, score: rr[i] })).sort((a, b) => b.score - a.score);
   }
+  ranked = ranked.slice(0, limit);
 
   // 6. Fallback — never return empty when vectors exist.
   if (ranked.length === 0 && scoredAll.length) {
@@ -2472,7 +2530,10 @@ export async function recall(opts: {
     opts.query?.trim() ||
     [identity, peer, ...openTasks.slice(0, 5).map((t) => t.title)].filter(Boolean).join(" ");
 
-  const rawHits = query ? await semanticSearch(query, { limit: 8, identity, peer }) : [];
+  // Recall wants the single most-relevant material, so it asks for precision
+  // (the cross-encoder cascade) — which degrades to the standard blend cleanly
+  // when no reranker is configured (hash provider / CI).
+  const rawHits = query ? await semanticSearch(query, { limit: 8, identity, peer, mode: "precision" }) : [];
   const journalHits: RecallJournalHit[] = rawHits
     .filter((h) => h.kind === "journal")
     .map((h) => {
