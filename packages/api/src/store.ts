@@ -2025,8 +2025,10 @@ function hitActors(kind: string, refId: string): string[] {
     if (!r) return [];
     return [r.author, ...json<string[]>(r.mentions)];
   }
-  if (kind === "task" || kind === "decision" || kind === "event") {
-    const r = db.prepare(`SELECT assignees FROM ${kind} WHERE id = ?`).get(refId) as
+  // Hit kinds are singular; the tables are plural.
+  const table = { task: "tasks", decision: "decisions", event: "events" }[kind];
+  if (table) {
+    const r = db.prepare(`SELECT assignees FROM ${table} WHERE id = ?`).get(refId) as
       | { assignees: string }
       | undefined;
     return r ? json<string[]>(r.assignees) : [];

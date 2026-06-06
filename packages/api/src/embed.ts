@@ -1,38 +1,45 @@
 // Local embedder + cross-encoder for semantic search, mirroring how
 // bees-roadhouse/bookstack-mcp does it (fastembed + BGE there; the Node-native
-// equivalent here is @huggingface/transformers running the same BGE ONNX
-// models from the HF hub).
+// equivalent here is @huggingface/transformers running BGE ONNX models from the
+// HF hub).
 //
 // Two providers behind one seam, chosen by $HIVE_EMBED:
-//   hash         (default) — deterministic hashed bag-of-ngrams, 256d. No model
-//                 download, instant in CI/sandbox/offline. No reranker.
-//   transformers          — the real stack: Xenova/bge-large-en-v1.5 (1024d,
-//                 mean-pooled + L2-normalized) for embeddings and
-//                 Xenova/bge-reranker-base as the cross-encoder. Same models
-//                 bookstack-mcp uses. One-time model download (~heavy), so it
-//                 is opt-in: set HIVE_EMBED=transformers and let the worker
-//                 re-backfill — embeddings carry their model, so the next cycle
-//                 recomputes every row whose model no longer matches.
+//   transformers (default) — the real stack: a small ARM-friendly BGE model,
+//                 Xenova/bge-small-en-v1.5 (384d, mean-pooled + L2-normalized),
+//                 ONNX via @huggingface/transformers, plus Xenova/bge-reranker-base
+//                 as the cross-encoder. Runs on CPU/ARM. One-time model download,
+//                 so deployments mount a models cache; embeddings carry their
+//                 model, so flipping the model re-backfills only mismatched rows.
+//   hash                   — deterministic hashed bag-of-ngrams, 256d. No model
+//                 download, instant offline. No reranker. CI selects this
+//                 explicitly (HIVE_EMBED=hash) so the seed smoke stays fast and
+//                 network-free; it is NOT the default deployments get.
 //
 // embed()/embedQuery()/rerank() are async (the ONNX pipelines are). cosine()/
 // contentHash()/blob helpers stay sync. Embedding only happens on the worker's
 // backfill path and the read-side semanticSearch — never inside a better-sqlite3
 // write transaction — so the async boundary is clean.
 
-const PROVIDER = (process.env.HIVE_EMBED ?? "hash").toLowerCase();
+const PROVIDER = (process.env.HIVE_EMBED ?? "transformers").toLowerCase();
 const USE_TRANSFORMERS = PROVIDER === "transformers";
 
-const EMBED_REPO = process.env.HIVE_EMBED_MODEL ?? "Xenova/bge-large-en-v1.5";
+// Default to a small (384d) BGE model that runs on ARM/CPU. Override with
+// HIVE_EMBED_MODEL (e.g. Xenova/bge-large-en-v1.5 for 1024d on a beefier host,
+// or Xenova/all-MiniLM-L6-v2 for a symmetric 384d model — see BGE detection below).
+const EMBED_REPO = process.env.HIVE_EMBED_MODEL ?? "Xenova/bge-small-en-v1.5";
 const RERANK_REPO = process.env.HIVE_RERANK_MODEL ?? "Xenova/bge-reranker-base";
 
 export const EMBED_MODEL = USE_TRANSFORMERS ? EMBED_REPO : "hash-ngram-v1";
 // Nominal dimension for status display. The authoritative dim of a stored
-// vector is its own length (written to the `dim` column at upsert time).
-export const EMBED_DIM = USE_TRANSFORMERS ? 1024 : 256;
+// vector is its own length (written to the `dim` column at upsert time). bge-small
+// and all-MiniLM are both 384d; bge-large is 1024d.
+export const EMBED_DIM = USE_TRANSFORMERS ? (/bge-large/i.test(EMBED_REPO) ? 1024 : 384) : 256;
 
-// bge models are asymmetric: queries get an instruction prefix, passages don't.
+// BGE models are asymmetric: queries get an instruction prefix, passages don't.
 // This is the exact instruction bookstack-mcp's fastembed BGE applies internally.
+// Non-BGE models (e.g. all-MiniLM) are symmetric — no prefix.
 const BGE_QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: ";
+const IS_BGE = /bge/i.test(EMBED_REPO);
 
 /** Whether a cross-encoder reranker is available for the active provider. */
 export const RERANK_AVAILABLE = USE_TRANSFORMERS;
@@ -169,10 +176,12 @@ export async function embed(text: string): Promise<number[]> {
   return USE_TRANSFORMERS ? embedTransformers(text) : embedHash(text);
 }
 
-/** Embed a search query. For bge this adds the retrieval instruction prefix;
- * for the hash provider it is identical to embed(). */
+/** Embed a search query. For BGE this adds the retrieval instruction prefix; a
+ * symmetric model (e.g. all-MiniLM) embeds the query as-is; the hash provider is
+ * identical to embed(). */
 export async function embedQuery(text: string): Promise<number[]> {
-  return USE_TRANSFORMERS ? embedTransformers(`${BGE_QUERY_INSTRUCTION}${text}`) : embedHash(text);
+  if (!USE_TRANSFORMERS) return embedHash(text);
+  return embedTransformers(IS_BGE ? `${BGE_QUERY_INSTRUCTION}${text}` : text);
 }
 
 /** Cross-encoder relevance scores for each doc against the query, in input

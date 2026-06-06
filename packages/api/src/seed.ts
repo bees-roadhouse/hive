@@ -2,7 +2,7 @@
 // spans of the prose anchored into tasks / decisions / events. Offsets are
 // computed from the text with a small helper so the entries stay readable.
 import { migrate } from "./db.ts";
-import { journal, outbox, profiles, recall, seedActors, sources } from "./store.ts";
+import { embeddings, journal, outbox, profiles, recall, seedActors, semanticSearch, sources } from "./store.ts";
 import type { AnchorKind, AnchorFields } from "@hive/shared";
 
 migrate();
@@ -179,6 +179,17 @@ profiles.update(
 // Second write proves section deep-merge (adds a key, keeps the rest).
 profiles.update("pia", { sections: { preferences: "Born-green PRs; verify before trust." } }, "pia");
 
+// Backfill embeddings so the semantic path is exercised end-to-end. In CI this
+// runs under HIVE_EMBED=hash (no model download); a real deploy uses the default
+// local BGE provider. Either way the read-side semantic_search + recall journal
+// section should be populated below.
+const embedded = await embeddings.backfill();
+if (embedded === 0) throw new Error("seed: embeddings.backfill embedded nothing");
+
+// Semantic search smoke — the seeded entries talk about the Solid UI rewrite.
+const hits = await semanticSearch("Solid UI rewrite", { limit: 5 });
+if (hits.length === 0) throw new Error("seed: semantic_search returned no hits after backfill");
+
 // Recall smoke — compose Pia's session-start brief focused on Nate. Exercises
 // profile cards + scoped semantic retrieval + open tasks + inbox in one call.
 const r = await recall({ identity: "pia", peer: "nate" });
@@ -187,5 +198,13 @@ if (!piaCard) throw new Error("seed: recall returned no Pia profile card");
 if (!piaCard.body.sections.preferences || !piaCard.body.sections.identity)
   throw new Error("seed: profile sections did not deep-merge across updates");
 if (!r.brief.includes("Recall for pia")) throw new Error("seed: recall brief missing header");
+// The journal section was empty before embeddings existed; with the backfill it
+// must now surface scoped journal hits.
+if (r.data.journal.length === 0)
+  throw new Error("seed: recall journal section empty after embedding backfill");
 
-console.log("🌱 seeded hive: people, journal + anchors, inboxes, a sample RSS source, a scrape source, an outbox job, bracket-token entries, profile cards, and a recall smoke.");
+console.log(
+  `🌱 seeded hive: people, journal + anchors, inboxes, a sample RSS source, a scrape source, an outbox job, ` +
+    `bracket-token entries, profile cards, and a recall smoke (embedded ${embedded} items, ${hits.length} semantic hits, ` +
+    `${r.data.journal.length} recalled journal hits).`,
+);
