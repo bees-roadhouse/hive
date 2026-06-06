@@ -31,13 +31,19 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .brand-name { font-size: 1.3rem; font-weight: 700; }
 
 .sidebar nav { display: flex; flex-direction: column; gap: 0.15rem; flex: 1; }
-.sidebar nav button {
+.sidebar nav button,
+.sidebar nav a {
   display: flex; align-items: center; gap: 0.6rem; width: 100%;
   background: transparent; border: 1px solid transparent; border-radius: 8px;
   padding: 0.5rem 0.65rem; text-align: left; text-transform: capitalize; color: var(--dim);
+  text-decoration: none; cursor: pointer; font: inherit;
+  transition: background 0.15s ease, color 0.15s ease, transform 0.12s ease;
 }
-.sidebar nav button:hover { background: var(--panel2); color: var(--ink); border-color: transparent; }
-.sidebar nav button.active { background: var(--honey); color: #1a1407; font-weight: 600; border-color: var(--honey); }
+.sidebar nav button:hover,
+.sidebar nav a:hover { background: var(--panel2); color: var(--ink); border-color: transparent; }
+.sidebar nav a:active { transform: translateX(1px); }
+.sidebar nav button.active,
+.sidebar nav a.active { background: var(--honey); color: #1a1407; font-weight: 600; border-color: var(--honey); }
 .nav-icon { width: 1.2rem; text-align: center; font-size: 0.95rem; }
 .nav-label { flex: 1; }
 .nav-badge { background: #ff5a3c; color: #fff; border-radius: 999px; font-size: 0.65rem; padding: 0 0.35rem; font-weight: 700; }
@@ -849,3 +855,142 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 }
 .token-reveal code { font-size: 0.9rem; }
 button.danger { background: #5a2a2a; color: #f0d0d0; border: none; border-radius: 6px; padding: 0.25rem 0.6rem; cursor: pointer; }
+
+/* ============================================================
+   motion + life — route transitions, micro-interactions,
+   list entrances, loading skeletons. CSS-first; all motion is
+   suppressed under prefers-reduced-motion at the bottom.
+   ============================================================ */
+
+/* ---- route transition: each page fades + lifts in on navigation ---- */
+/* The .route-view node is keyed on the path segment in App.tsx, so it
+   remounts per route and this animation re-runs on every navigation. */
+.route-view { animation: route-in 0.26s cubic-bezier(0.22, 1, 0.36, 1) both; }
+@keyframes route-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.page-title { animation: title-in 0.3s ease both; }
+@keyframes title-in {
+  from { opacity: 0; transform: translateY(-3px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ---- staggered list/card entrance ---- */
+/* Driven from the freshly-mounted route, so items glide in once per visit
+   without touching each board component. Cap the stagger so long lists
+   don't crawl in. */
+.route-view .card,
+.route-view .decision,
+.route-view .inbox-item,
+.route-view .entity-row,
+.route-view .project-card,
+.route-view .kpi,
+.route-view .panel {
+  animation: item-in 0.32s ease both;
+}
+@keyframes item-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.route-view .card:nth-child(1),
+.route-view .inbox-item:nth-child(1),
+.route-view .decision:nth-child(1),
+.route-view .entity-row:nth-child(1) { animation-delay: 0.02s; }
+.route-view .card:nth-child(2),
+.route-view .inbox-item:nth-child(2),
+.route-view .decision:nth-child(2),
+.route-view .entity-row:nth-child(2) { animation-delay: 0.05s; }
+.route-view .card:nth-child(3),
+.route-view .inbox-item:nth-child(3),
+.route-view .decision:nth-child(3),
+.route-view .entity-row:nth-child(3) { animation-delay: 0.08s; }
+.route-view .card:nth-child(4),
+.route-view .inbox-item:nth-child(4),
+.route-view .decision:nth-child(4),
+.route-view .entity-row:nth-child(4) { animation-delay: 0.11s; }
+.route-view .card:nth-child(n+5),
+.route-view .inbox-item:nth-child(n+5),
+.route-view .decision:nth-child(n+5),
+.route-view .entity-row:nth-child(n+5) { animation-delay: 0.13s; }
+
+/* ---- micro-interactions ---- */
+/* Cards lift slightly on hover and depress on click for tactile feedback. */
+.card { transition: border-color 0.15s ease, transform 0.12s ease, box-shadow 0.15s ease; }
+.card:hover { transform: translateY(-2px); box-shadow: 0 4px 14px rgba(0,0,0,0.3); }
+.card:active { transform: translateY(0); box-shadow: none; }
+
+.decision, .project-card, .inbox-item, .entity-row, .kpi, .panel, .emb, .worker-status, .source-row {
+  transition: border-color 0.15s ease, transform 0.12s ease;
+}
+.kpi:hover { transform: translateY(-2px); }
+
+/* Primary/honey buttons get a soft press. */
+button { transition: border-color 0.15s ease, background 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease; }
+button:active:not(:disabled) { transform: translateY(1px); }
+button.primary:hover:not(:disabled), .journal-new-btn:hover:not(:disabled) {
+  box-shadow: 0 3px 12px rgba(245, 179, 1, 0.35);
+}
+
+/* Segmented toggles slide their active state subtly. */
+.seg button { transition: background 0.18s ease, color 0.18s ease; }
+
+/* Unread badge pops in when it appears. */
+.nav-badge, .unread-pill { animation: badge-pop 0.25s cubic-bezier(0.22, 1, 0.36, 1) both; }
+@keyframes badge-pop {
+  from { transform: scale(0.4); opacity: 0; }
+  60%  { transform: scale(1.12); }
+  to   { transform: scale(1); opacity: 1; }
+}
+
+/* ---- SSE "alive" highlight ---- */
+/* Apply .just-landed to an item that just arrived over the live stream for a
+   brief honey wash that fades back to rest. */
+.just-landed { animation: just-landed 1.4s ease both; }
+@keyframes just-landed {
+  0%   { background: rgba(245, 179, 1, 0.22); border-color: var(--honey); }
+  100% { background: inherit; border-color: var(--line); }
+}
+
+/* ---- loading skeletons ---- */
+/* Drop-in shimmer placeholders for data-fetching panes. */
+.skeleton {
+  display: block;
+  border-radius: 8px;
+  background: linear-gradient(90deg, var(--panel) 25%, var(--panel2) 37%, var(--panel) 63%);
+  background-size: 400% 100%;
+  animation: skeleton-shimmer 1.4s ease infinite;
+}
+@keyframes skeleton-shimmer {
+  from { background-position: 100% 0; }
+  to   { background-position: -100% 0; }
+}
+.skeleton-list { display: flex; flex-direction: column; gap: 0.6rem; padding: 0.4rem 0; }
+.skeleton-row { height: 3.4rem; }
+.skeleton-line { height: 0.95rem; }
+.skeleton-line.short { width: 45%; }
+.skeleton-line.mid { width: 70%; }
+.skeleton-board { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.75rem; }
+.skeleton-board .skeleton-card { height: 4.5rem; }
+@media (max-width: 760px) { .skeleton-board { grid-template-columns: 1fr 1fr; } }
+
+/* ---- spinner (inline, for buttons / small async bits) ---- */
+.spinner {
+  display: inline-block; width: 1em; height: 1em; vertical-align: -0.15em;
+  border: 2px solid var(--line); border-top-color: var(--honey);
+  border-radius: 50%; animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---- reduced motion: honour the user's preference everywhere ---- */
+@media (prefers-reduced-motion: reduce) {
+  .route-view, .page-title,
+  .route-view .card, .route-view .decision, .route-view .inbox-item,
+  .route-view .entity-row, .route-view .project-card, .route-view .kpi,
+  .route-view .panel, .nav-badge, .unread-pill, .just-landed {
+    animation: none;
+  }
+  .card:hover, .kpi:hover { transform: none; box-shadow: none; }
+  .skeleton { animation: none; }
+  .spinner { animation-duration: 2s; }
+}

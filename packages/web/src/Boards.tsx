@@ -1,4 +1,4 @@
-import { createResource, createSignal, For, Show, type Component } from "solid-js";
+import { createEffect, createResource, createSignal, For, Show, type Component } from "solid-js";
 import type {
   AnchorKind,
   Decision,
@@ -16,7 +16,7 @@ import { TASK_STATUSES } from "@hive/shared";
 import { api, getDoneRetentionHours, setDoneRetentionHours } from "./api.ts";
 import { liveRev } from "./live.ts";
 import { Icon } from "./icons.tsx";
-import { DECISION_GLYPH, relTime, TASK_GLYPH } from "./lib.tsx";
+import { DECISION_GLYPH, relTime, SkeletonList, TASK_GLYPH } from "./lib.tsx";
 import { Markdown } from "./markdown.tsx";
 
 // ---- due-date helpers ----
@@ -325,11 +325,23 @@ export const SearchPane: Component = () => {
 
 export const Wire: Component = () => {
   const [events] = createResource(() => ({ _r: liveRev() }), () => api.wire());
+  // Track which event ids we've already shown so newly-arrived ones (pushed over
+  // the live SSE stream) get a brief honey "just-landed" wash. The first load
+  // isn't flagged — only events that appear after we've seen a baseline.
+  let seen: Set<string> | null = null;
+  const isFresh = (e: WireEvent): boolean => {
+    if (seen === null) return false;
+    return !seen.has(e.id);
+  };
+  createEffect(() => {
+    const list = (events() as WireEvent[]) ?? [];
+    seen = new Set(list.map((e) => e.id));
+  });
   return (
     <section class="wire">
       <For each={events() as WireEvent[]} fallback={<p class="dim sm pad">no activity yet — the wire shows live events as you and the agents work.</p>}>
         {(e) => (
-          <div class="wire-row">
+          <div class="wire-row" classList={{ "just-landed": isFresh(e) }}>
             <time>{relTime(e.created_at)}</time>
             <span class="actor-chip sm">{e.actor}</span>
             <code>{e.kind}</code>
@@ -347,7 +359,7 @@ export const PeopleView: Component = () => {
   return (
     <section>
       <p class="dim pad">People known to hive. Created automatically when referenced in journal entries, or added from Admin.</p>
-      <Show when={people()} fallback={<p class="dim sm">loading…</p>}>
+      <Show when={people()} fallback={<SkeletonList rows={6} />}>
         <For each={people() as Person[]} fallback={<p class="dim sm">no people yet — reference someone in a journal entry.</p>}>
           {(p) => (
             <div class="entity-row">
@@ -370,7 +382,7 @@ export const TopicsView: Component = () => {
   return (
     <section>
       <p class="dim pad">Topics extracted from <code>[topic:…]</code> references in journal entries.</p>
-      <Show when={topics()} fallback={<p class="dim sm">loading…</p>}>
+      <Show when={topics()} fallback={<SkeletonList rows={6} />}>
         <For each={topics() as Topic[]} fallback={<p class="dim sm">no topics yet — reference a topic in a journal entry.</p>}>
           {(t) => (
             <div class="entity-row">
@@ -434,7 +446,7 @@ export const ProjectsView: Component = () => {
   return (
     <section>
       <p class="dim pad">Projects with their phases and task counts. Projects are created automatically when a task references one.</p>
-      <Show when={projects()} fallback={<p class="dim sm">loading…</p>}>
+      <Show when={projects()} fallback={<SkeletonList rows={4} />}>
         <For each={projects() as Project[]} fallback={<p class="dim sm">no projects yet — assign a task a project in a journal entry.</p>}>
           {(p) => <ProjectCard p={p} />}
         </For>

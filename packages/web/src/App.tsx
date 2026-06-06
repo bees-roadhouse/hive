@@ -1,4 +1,5 @@
-import { createResource, createSignal, ErrorBoundary, For, Show, Suspense, type Component } from "solid-js";
+import { createResource, ErrorBoundary, For, Show, Suspense, type Component, type JSX } from "solid-js";
+import { Navigate, Route, Router, A, useLocation } from "@solidjs/router";
 import { api, getActor, getCurrentUser, setCurrentUser } from "./api.ts";
 import { connectLive, liveRev } from "./live.ts";
 import { Journal } from "./Journal.tsx";
@@ -32,77 +33,96 @@ const TABS = [
 ] as const;
 type Tab = (typeof TABS)[number]["id"];
 
-// The signed-in workspace (rendered only after auth resolves).
-const Workspace: Component<{ instanceName: string | null; onLogout: () => void }> = (props) => {
-  const [tab, setTab] = createSignal<Tab>("journal");
-  const user = getCurrentUser();
-  const isAdmin = user?.role === "admin";
-  const actor = () => getActor();
-  connectLive(); // open the SSE stream now that we're authenticated
+// Each tab maps 1:1 to a route path (/journal, /inbox, …) so the URL reflects
+// the current page and deep-links, refresh, and back/forward all work.
+const PAGES: Record<Tab, Component> = {
+  journal: Journal,
+  inbox: Inbox,
+  dashboard: Dashboard,
+  tasks: Tasks,
+  decisions: Decisions,
+  events: Events,
+  people: PeopleView,
+  topics: TopicsView,
+  projects: ProjectsView,
+  graph: Graph,
+  search: SearchPane,
+  wire: Wire,
+  admin: Admin,
+  account: Account,
+  settings: Settings,
+};
 
-  const [unread] = createResource(
-    () => ({ actor: actor(), _r: liveRev() }),
-    (k) => api.inbox(k.actor, true).then((items) => items.length),
-  );
+// The signed-in shell: fixed sidebar + the routed page. Rendered as the Router's
+// root layout so every route shares one chrome and a route transition can wrap
+// the swapping content.
+const Workspace = (props: {
+  instanceName: string | null;
+  onLogout: () => void;
+}): ((rp: { children?: JSX.Element }) => JSX.Element) => {
+  return (routeProps) => {
+    const user = getCurrentUser();
+    const isAdmin = user?.role === "admin";
+    const actor = () => getActor();
+    const location = useLocation();
+    connectLive(); // open the SSE stream now that we're authenticated
 
-  // The account tab (user + token admin) is admin-only.
-  const visibleTabs = TABS.filter((t) => t.id !== "account" || isAdmin);
+    const [unread] = createResource(
+      () => ({ actor: actor(), _r: liveRev() }),
+      (k) => api.inbox(k.actor, true).then((items) => items.length),
+    );
 
-  return (
-    <div class="app">
-      <aside class="sidebar">
-        <div class="brand">
-          <span class="logo">🐝</span>
-          <span class="brand-name">{props.instanceName ?? "hive"}</span>
-        </div>
+    // The account tab (user + token admin) is admin-only.
+    const visibleTabs = TABS.filter((t) => t.id !== "account" || isAdmin);
+    // Title comes from the leading path segment so it stays in sync with the URL.
+    const pageTitle = () => location.pathname.replace(/^\//, "").split("/")[0] || "journal";
 
-        <nav>
-          <For each={visibleTabs}>
-            {(t) => (
-              <button classList={{ active: tab() === t.id }} onClick={() => setTab(t.id)}>
-                <span class="nav-icon"><Icon name={t.id === "account" ? "settings" : t.id} /></span>
-                <span class="nav-label">{t.id}</span>
-                <Show when={t.id === "inbox" && (unread() ?? 0) > 0}>
-                  <span class="nav-badge">{unread()}</span>
-                </Show>
-              </button>
-            )}
-          </For>
-        </nav>
-
-        <div class="sidebar-foot">
-          <div class="signed-in">
-            <span class="dim">signed in as</span>
-            <strong>{user?.name ?? actor()}</strong>
-            <span class="dim">{user?.role}</span>
+    return (
+      <div class="app">
+        <aside class="sidebar">
+          <div class="brand">
+            <span class="logo">🐝</span>
+            <span class="brand-name">{props.instanceName ?? "hive"}</span>
           </div>
-          <button class="logout" onClick={props.onLogout}>Sign out</button>
-          <div class="foot-note dim">
-            journal-first · MCP-first <code>POST /mcp</code>
-          </div>
-        </div>
-      </aside>
 
-      <main>
-        <h2 class="page-title">{tab()}</h2>
-        <Show when={tab() === "journal"}><Journal /></Show>
-        <Show when={tab() === "inbox"}><Inbox /></Show>
-        <Show when={tab() === "dashboard"}><Dashboard /></Show>
-        <Show when={tab() === "tasks"}><Tasks /></Show>
-        <Show when={tab() === "decisions"}><Decisions /></Show>
-        <Show when={tab() === "events"}><Events /></Show>
-        <Show when={tab() === "people"}><PeopleView /></Show>
-        <Show when={tab() === "topics"}><TopicsView /></Show>
-        <Show when={tab() === "projects"}><ProjectsView /></Show>
-        <Show when={tab() === "graph"}><Graph /></Show>
-        <Show when={tab() === "search"}><SearchPane /></Show>
-        <Show when={tab() === "wire"}><Wire /></Show>
-        <Show when={tab() === "admin"}><Admin /></Show>
-        <Show when={tab() === "account" && isAdmin}><Account /></Show>
-        <Show when={tab() === "settings"}><Settings /></Show>
-      </main>
-    </div>
-  );
+          <nav>
+            <For each={visibleTabs}>
+              {(t) => (
+                <A href={`/${t.id}`} activeClass="active" end>
+                  <span class="nav-icon"><Icon name={t.id === "account" ? "settings" : t.id} /></span>
+                  <span class="nav-label">{t.id}</span>
+                  <Show when={t.id === "inbox" && (unread() ?? 0) > 0}>
+                    <span class="nav-badge">{unread()}</span>
+                  </Show>
+                </A>
+              )}
+            </For>
+          </nav>
+
+          <div class="sidebar-foot">
+            <div class="signed-in">
+              <span class="dim">signed in as</span>
+              <strong>{user?.name ?? actor()}</strong>
+              <span class="dim">{user?.role}</span>
+            </div>
+            <button class="logout" onClick={props.onLogout}>Sign out</button>
+            <div class="foot-note dim">
+              journal-first · MCP-first <code>POST /mcp</code>
+            </div>
+          </div>
+        </aside>
+
+        <main>
+          <h2 class="page-title">{pageTitle()}</h2>
+          {/* keyed on the leading path segment so each page remounts and re-runs
+              the entrance animation when the route changes */}
+          <Show when={pageTitle()} keyed>
+            {(_seg) => <div class="route-view">{routeProps.children}</div>}
+          </Show>
+        </main>
+      </div>
+    );
+  };
 };
 
 // Splash shown while the boot probe runs (and across its retries).
@@ -166,7 +186,22 @@ export const App: Component = () => {
             when={boot()?.signedIn}
             fallback={<Login instanceName={boot()?.status.instanceName ?? null} onLogin={reload} />}
           >
-            <Workspace instanceName={boot()?.status.instanceName ?? null} onLogout={onLogout} />
+            <Router root={Workspace({ instanceName: boot()?.status.instanceName ?? null, onLogout })}>
+              <Route path="/" component={() => <Navigate href="/journal" />} />
+              <For each={TABS}>
+                {(t) => (
+                  <Route
+                    path={`/${t.id}`}
+                    component={
+                      t.id === "account" && getCurrentUser()?.role !== "admin"
+                        ? () => <Navigate href="/journal" />
+                        : PAGES[t.id]
+                    }
+                  />
+                )}
+              </For>
+              <Route path="*" component={() => <Navigate href="/journal" />} />
+            </Router>
           </Show>
         </Show>
       </Suspense>

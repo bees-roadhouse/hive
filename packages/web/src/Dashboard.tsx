@@ -1,4 +1,4 @@
-import { createResource, createSignal, For, Show, type Component } from "solid-js";
+import { createEffect, createResource, createSignal, For, Show, type Component } from "solid-js";
 import type { DashboardStats, WireEvent } from "@hive/shared";
 import { ACTORS, DECISION_STATUSES, TASK_STATUSES } from "@hive/shared";
 import { api } from "./api.ts";
@@ -275,6 +275,13 @@ const AgentFeed: Component<{ events: WireEvent[] }> = (props) => {
   const agentEvents = () =>
     props.events.filter((e) => AI_ACTORS.has(e.actor)).slice(0, 18);
 
+  // Flash agent rows that just arrived over the live stream (skip first paint).
+  let seen: Set<string> | null = null;
+  const isFresh = (e: WireEvent): boolean => seen !== null && !seen.has(e.id);
+  createEffect(() => {
+    seen = new Set(agentEvents().map((e) => e.id));
+  });
+
   const actorColor = (actor: string): string => {
     const m: Record<string, string> = {
       pia: KIND_COLORS.journal,
@@ -291,7 +298,7 @@ const AgentFeed: Component<{ events: WireEvent[] }> = (props) => {
       </Show>
       <For each={agentEvents()}>
         {(ev) => (
-          <div class="agent-row">
+          <div class="agent-row" classList={{ "just-landed": isFresh(ev) }}>
             <span
               class="agent-actor"
               style={{ background: actorColor(ev.actor) + "28", color: actorColor(ev.actor) }}
