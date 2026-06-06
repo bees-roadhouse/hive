@@ -87,6 +87,8 @@ import {
   RERANK_AVAILABLE,
   toBlob,
 } from "./embed.ts";
+import { parseFeed } from "./feed.ts";
+import { parsePage } from "./scrape.ts";
 
 const now = () => new Date().toISOString();
 const id = (prefix: string) => `${prefix}_${nanoid(12)}`;
@@ -1820,6 +1822,50 @@ export function ingest(
     added++;
   }
   return added;
+}
+
+/**
+ * Poll feed/scrape sources into wire events. The single implementation shared by
+ * the worker's tick loop and the on-demand `POST /api/sources/poll` route.
+ * With no `id`, polls every due+enabled source (the worker path); with an `id`,
+ * polls that one source if it's enabled (the "refresh now" path), ignoring its
+ * interval. Per-source failures are recorded via markPolled, never thrown, so one
+ * bad feed can't abort the batch. Emits feed.item/scrape.item (→ SSE) via ingest.
+ */
+export async function pollSources(opts: { id?: string } = {}): Promise<{ polled: number; ingested: number }> {
+  let targets: Source[];
+  if (opts.id) {
+    const s = sources.get(opts.id);
+    targets = s && s.enabled ? [s] : [];
+  } else {
+    targets = sources.due();
+  }
+
+  let polled = 0;
+  let ingested = 0;
+  for (const source of targets) {
+    polled++;
+    try {
+      const ctrl = new AbortController();
+      const t = setTimeout(() => ctrl.abort(), 10_000);
+      const res = await fetch(source.url, { signal: ctrl.signal });
+      clearTimeout(t);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (source.kind === "scrape") {
+        const items = parsePage(await res.text(), source.url);
+        const count = ingestScrape(source, items);
+        ingested += count;
+        sources.markPolled(source.id, `ok · ${count} new of ${items.length} items`);
+      } else {
+        const items = parseFeed(await res.text());
+        ingested += ingest(source, items);
+        sources.markPolled(source.id, `ok · ${items.length} items`);
+      }
+    } catch (err) {
+      sources.markPolled(source.id, `error · ${(err as Error).message}`);
+    }
+  }
+  return { polled, ingested };
 }
 
 /** Ingest scraped page items into wire events (deduped by guid = resolved URL). */
