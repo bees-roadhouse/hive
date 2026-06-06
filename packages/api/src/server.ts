@@ -48,6 +48,7 @@ import {
   outbox,
   people,
   phases,
+  pollSources,
   profiles,
   projects,
   recall,
@@ -703,6 +704,15 @@ app.patch("/api/sources/:id", async (c) => {
 app.delete("/api/sources/:id", (c) =>
   sources.remove(c.req.param("id"), actor(c)) ? c.body(null, 204) : c.json({ error: "not found" }, 404),
 );
+// On-demand poll (the GUI "refresh now"). Admin-gated like the worker/import
+// routes. Body optional { id } polls one source; omitted polls all due sources.
+// Shares the worker's pollSources() — feed.item/scrape.item events fan out over SSE.
+app.post("/api/sources/poll", async (c) => {
+  if (!requireAdminActor(c)) return c.json({ error: "forbidden" }, 403);
+  const body = (await c.req.json().catch(() => ({}))) as { id?: string };
+  if (body.id && !sources.get(body.id)) return c.json({ error: "not found" }, 404);
+  return c.json(await pollSources({ id: body.id }));
+});
 
 // ---- worker status + outbox + embeddings (admin) ----
 app.get("/api/worker", (c) => c.json(workerStatus()));
