@@ -109,6 +109,14 @@ export const api = {
   search: (query: string, mode: "keyword" | "semantic" = "keyword") =>
     req<SearchHit[]>(`/search?q=${encodeURIComponent(query)}&mode=${mode}`),
   wire: () => req<WireEvent[]>("/wire"),
+  // Trigger an immediate source poll (worker normally polls on a schedule).
+  // The backend endpoint may not exist yet — callers should catch and fall
+  // back to a plain wire refetch.
+  pollSources: (id?: string) =>
+    req<{ polled: number; ingested: number }>("/sources/poll", {
+      method: "POST",
+      body: JSON.stringify(id ? { id } : {}),
+    }),
   dashboard: () => req<DashboardStats>("/dashboard"),
   graph: () => req<GraphData>("/graph"),
   embeddings: () => req<EmbeddingStats>("/embeddings"),

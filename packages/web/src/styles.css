@@ -994,3 +994,59 @@ button.primary:hover:not(:disabled), .journal-new-btn:hover:not(:disabled) {
   .skeleton { animation: none; }
   .spinner { animation-duration: 2s; }
 }
+
+/* ============================================================
+   wire — live news / info feed
+   ============================================================ */
+
+/* Top bar: live indicator on the left, filter + refresh on the right. */
+.wire-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem;
+  padding-bottom: 0.75rem; border-bottom: 1px solid var(--line);
+}
+.wire-live { display: flex; align-items: center; gap: 0.45rem; }
+.wire-controls { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+.wire-filter button { text-transform: lowercase; }
+.wire-refresh { display: inline-flex; align-items: center; gap: 0.4rem; white-space: nowrap; }
+
+/* News item card — headline + snippet + source/category/severity meta. */
+.news-card {
+  display: flex; gap: 0.7rem; align-items: flex-start;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; padding: 0.8rem 0.9rem; margin-bottom: 0.6rem;
+  transition: border-color 0.15s ease, transform 0.12s ease, box-shadow 0.15s ease;
+}
+.news-card:hover { border-color: var(--accent); transform: translateY(-1px); }
+.news-body { flex: 1; min-width: 0; }
+.news-head { display: flex; align-items: baseline; gap: 0.5rem; }
+.news-title { font-weight: 600; color: var(--ink); text-decoration: none; line-height: 1.4; }
+a.news-title:hover { color: var(--honey); text-decoration: underline; }
+.news-snippet {
+  margin: 0.3rem 0 0; color: var(--dim); font-size: 0.88rem; line-height: 1.5;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.news-meta { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin-top: 0.5rem; }
+.news-cat { text-transform: capitalize; letter-spacing: 0; }
+
+/* Severity: a small dot at the card's leading edge + an optional badge. */
+.sev-dot { flex: none; width: 9px; height: 9px; border-radius: 50%; margin-top: 0.4rem; background: var(--dim); }
+.sev-critical { color: #ff4d4d; }
+.sev-high { color: #ff7a59; }
+.sev-medium { color: var(--accent); }
+.sev-low { color: var(--task); }
+.sev-info { color: var(--dim); }
+.sev-dot.sev-critical { background: #ff4d4d; box-shadow: 0 0 7px rgba(255,77,77,0.6); }
+.sev-dot.sev-high { background: #ff7a59; }
+.sev-dot.sev-medium { background: var(--accent); }
+.sev-dot.sev-low { background: var(--task); }
+.sev-dot.sev-info { background: var(--dim); }
+.sev-badge { text-transform: uppercase; }
+.sev-badge.sev-critical { background: rgba(255,77,77,0.16); color: #ff6b6b; }
+.sev-badge.sev-high { background: rgba(255,122,89,0.16); color: #ff7a59; }
+.sev-badge.sev-medium { background: rgba(245,179,1,0.16); color: var(--accent); }
+.sev-badge.sev-low { background: rgba(111,179,255,0.16); color: var(--task); }
+
+@media (prefers-reduced-motion: reduce) {
+  .news-card:hover { transform: none; }
+}
