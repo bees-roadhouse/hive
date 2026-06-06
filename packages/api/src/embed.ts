@@ -19,6 +19,9 @@
 // contentHash()/blob helpers stay sync. Embedding only happens on the worker's
 // backfill path and the read-side semanticSearch — never inside a better-sqlite3
 // write transaction — so the async boundary is clean.
+import { accessSync, constants as fsConstants, mkdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { logger } from "./log.ts";
 
 const log = logger("embed");
@@ -141,6 +144,55 @@ function embedHash(text: string): number[] {
 
 // ---- transformers provider -------------------------------------------------
 
+/**
+ * Where transformers.js writes its downloaded-model cache. Its DEFAULT is a
+ * `.cache/` dir INSIDE node_modules — which a non-root container (uid 1000)
+ * can't create, so v4.2.0 throws `EACCES … mkdir … /node_modules/.../.cache`
+ * and the model never loads. Point it at a writable, configurable path instead:
+ * HIVE_MODEL_CACHE → HF_HOME → /data/models (the mounted data volume, where the
+ * SQLite db already lives). If that path can't be created/written, fall back to
+ * the OS temp dir so we still never try to write under node_modules.
+ */
+function resolveModelCacheDir(): string {
+  const candidate = process.env.HIVE_MODEL_CACHE ?? process.env.HF_HOME ?? "/data/models";
+  for (const dir of [candidate, join(tmpdir(), "hive-models")]) {
+    try {
+      mkdirSync(dir, { recursive: true });
+      accessSync(dir, fsConstants.W_OK);
+      return dir;
+    } catch {
+      // try the next candidate (temp dir)
+    }
+  }
+  // Last resort: the temp dir itself (mkdir above would have created the
+  // subdir on most hosts; this keeps us off node_modules regardless).
+  return tmpdir();
+}
+const MODEL_CACHE_DIR = resolveModelCacheDir();
+
+/**
+ * Import @huggingface/transformers once and pin its cache dir BEFORE any model
+ * load. Both getExtractor and getReranker go through here so the cache-dir
+ * config (and the dynamic import) happens in exactly one place.
+ */
+let transformersModule: Promise<typeof import("@huggingface/transformers")> | null = null;
+function loadTransformers(): Promise<typeof import("@huggingface/transformers")> {
+  if (!transformersModule) {
+    transformersModule = import("@huggingface/transformers")
+      .then((mod) => {
+        // Must be set before the first pipeline()/from_pretrained() call.
+        mod.env.cacheDir = MODEL_CACHE_DIR;
+        log.info("transformers model cache configured", { cacheDir: MODEL_CACHE_DIR });
+        return mod;
+      })
+      .catch((err) => {
+        transformersModule = null; // don't cache a rejected import
+        throw err;
+      });
+  }
+  return transformersModule;
+}
+
 type Extractor = (
   text: string,
   opts: { pooling: "mean"; normalize: boolean },
@@ -153,7 +205,7 @@ function getExtractor(): Promise<Extractor> {
     // latch (not a poisoned promise) governs the fallback, and rethrow so the
     // caller degrades to hash.
     extractorPromise = (
-      import("@huggingface/transformers").then(({ pipeline }) =>
+      loadTransformers().then(({ pipeline }) =>
         pipeline("feature-extraction", EMBED_REPO),
       ) as Promise<Extractor>
     ).catch((err) => {
@@ -190,7 +242,7 @@ let rerankPromise: Promise<RerankBundle> | null = null;
 
 function getReranker(): Promise<RerankBundle> {
   if (!rerankPromise) {
-    rerankPromise = import("@huggingface/transformers")
+    rerankPromise = loadTransformers()
       .then(async ({ AutoTokenizer, AutoModelForSequenceClassification }) => {
         const [tokenizer, model] = await Promise.all([
           AutoTokenizer.from_pretrained(RERANK_REPO),
