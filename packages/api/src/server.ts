@@ -680,21 +680,29 @@ app.get("/api/links/:id", (c) => c.json(links.forEntity(c.req.param("id"))));
 app.get("/api/search", async (c) => {
   const q = c.req.query("q") ?? "";
   const limit = Number(c.req.query("limit") ?? 25);
-  // ?mode=semantic uses the local embedder; default is FTS keyword search.
+  // ?mode= picks the engine: 'semantic' / 'standard' run the local-embedder
+  // standard blend; 'precision' runs the four-stage cross-encoder cascade
+  // (falling back to standard when no reranker is configured). Anything else
+  // (default) is FTS keyword search.
   // Semantic flags: &hybrid=0 to disable the keyword blend, &rerank=1 for the
-  // cross-encoder pass, &threshold=<n> to drop weak vector matches.
+  // cross-encoder pass (standard only; always on for precision), &blanket=0 to
+  // turn off the Markov-blanket boost, &threshold=<n> to drop weak vector matches.
   // &identity / &peer softly boost hits scoped to those actors (recall's seam).
   // Results are scoped to the acting user's visible entries (permission-honoring,
   // like bookstack-mcp). ?viewer= overrides the x-hive-actor header.
   const viewer = c.req.query("viewer") ?? actor(c);
-  if (c.req.query("mode") === "semantic") {
+  const modeParam = c.req.query("mode");
+  if (modeParam === "semantic" || modeParam === "standard" || modeParam === "precision") {
     const flag = (name: string) => c.req.query(name) === "1" || c.req.query(name) === "true";
+    const off = (name: string) => c.req.query(name) === "0" || c.req.query(name) === "false";
     const thr = c.req.query("threshold");
     return c.json(
       await semanticSearch(q, {
         limit,
-        hybrid: c.req.query("hybrid") !== "0" && c.req.query("hybrid") !== "false",
+        mode: modeParam === "precision" ? "precision" : "standard",
+        hybrid: !off("hybrid"),
         rerank: flag("rerank"),
+        blanket: off("blanket") ? false : undefined,
         threshold: thr ? Number(thr) : undefined,
         viewer,
         identity: c.req.query("identity") || undefined,

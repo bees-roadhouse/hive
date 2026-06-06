@@ -110,7 +110,7 @@ export const api = {
   markAllRead: (recipient: string) =>
     req<{ marked: number }>(`/inbox/${recipient}/read`, { method: "POST" }),
 
-  search: (query: string, mode: "keyword" | "semantic" = "keyword") =>
+  search: (query: string, mode: "keyword" | "semantic" | "precision" = "keyword") =>
     req<SearchHit[]>(`/search?q=${encodeURIComponent(query)}&mode=${mode}`),
   wire: () => req<WireEvent[]>("/wire"),
   // Trigger an immediate source poll (worker normally polls on a schedule).
