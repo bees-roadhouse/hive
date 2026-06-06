@@ -24,7 +24,7 @@ import {
   tokens,
   users,
 } from "./store.ts";
-import { RERANK_AVAILABLE } from "./embed.ts";
+import { embed, embedQuery, rerank, rerankAvailable } from "./embed.ts";
 import type { AnchorKind, AnchorFields } from "@hive/shared";
 
 migrate();
@@ -222,7 +222,7 @@ const hits = await semanticSearch("Solid UI rewrite", { limit: 5 });
 if (hits.length === 0) throw new Error("seed: semantic_search returned no hits after backfill");
 
 // ---- search mode (standard / precision) + blanket flag smoke ----
-// CI runs the hash embedder (RERANK_AVAILABLE=false), so precision must FALL
+// CI runs the hash embedder (rerankAvailable()=false), so precision must FALL
 // BACK to standard cleanly and still return hits — never error, never empty.
 {
   const Q = "Solid UI rewrite";
@@ -235,7 +235,7 @@ if (hits.length === 0) throw new Error("seed: semantic_search returned no hits a
 
   // Under the hash provider the cross-encoder is unavailable, so precision is a
   // clean fallback to the standard blend — same hit on top, no throw.
-  if (!RERANK_AVAILABLE && prec[0].id !== std[0].id)
+  if (!rerankAvailable() && prec[0].id !== std[0].id)
     throw new Error("seed: precision fallback diverged from standard despite no reranker");
 
   // Default (no mode) === standard.
@@ -255,9 +255,24 @@ if (hits.length === 0) throw new Error("seed: semantic_search returned no hits a
   if (reranked.length === 0) throw new Error("seed: standard+rerank returned no hits under hash");
 
   console.log(
-    `   · search modes ok (rerank ${RERANK_AVAILABLE ? "available" : "unavailable → precision falls back"}): ` +
+    `   · search modes ok (rerank ${rerankAvailable() ? "available" : "unavailable → precision falls back"}): ` +
       `standard ${std.length}, precision ${prec.length}, blanket on/off ${blanketOn.length}/${blanketOff.length}`,
   );
+}
+
+// ---- embedder resilience seam ----
+// The deployed transformers embedder can fail to load (missing model cache /
+// offline). embed/embedQuery/rerank must DEGRADE, never throw. Under hash here
+// the seam is exercised directly: rerank() returns null cleanly and the embed
+// functions produce vectors. (The transformers→hash fallback path itself is
+// covered by a bogus-model manual check noted in the PR.)
+{
+  const v1 = await embed("resilience probe");
+  const v2 = await embedQuery("resilience probe");
+  if (v1.length === 0 || v2.length === 0) throw new Error("seed: embed/embedQuery returned empty vector");
+  const rr = await rerank("q", ["a", "b"]);
+  if (rerankAvailable() === false && rr !== null)
+    throw new Error("seed: rerank() must return null when no reranker is available");
 }
 
 // Recall smoke — compose Pia's session-start brief focused on Nate. Exercises
