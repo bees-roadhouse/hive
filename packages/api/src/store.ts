@@ -65,6 +65,8 @@ import {
   API_TOKEN_DEFAULT_EXPIRY_DAYS,
   type LegacyImport,
   type ImportResult,
+  type ActorDeleteResult,
+  type ActorMergeResult,
 } from "@hive/shared";
 import { db, tx } from "./db.ts";
 import { publish } from "./bus.ts";
@@ -2556,4 +2558,371 @@ export function workerStatus(): WorkerStatus {
     outbox: outbox.counts(),
     embeddings: { count: embeddings.count(), model: EMBED_MODEL },
   };
+}
+
+// ============================================================================
+// Admin: delete an actor (cascade all their data) or merge one into another.
+// Both run inside tx() so a mid-operation failure rolls back fully. Each returns
+// per-table counts; a dryRun computes the same counts WITHOUT mutating so the UI
+// can confirm the blast radius before the real run.
+// ============================================================================
+
+const EMERGED_KINDS = ["task", "decision", "event"] as const;
+type EmergedKind = (typeof EMERGED_KINDS)[number];
+const EMERGED_TABLE: Record<EmergedKind, string> = {
+  task: "tasks",
+  decision: "decisions",
+  event: "events",
+};
+// Result objects pluralize the per-kind count fields (tasks/decisions/events).
+const COUNT_KEY: Record<EmergedKind, "tasks" | "decisions" | "events"> = {
+  task: "tasks",
+  decision: "decisions",
+  event: "events",
+};
+
+/** Strip the search-index + embeddings + link rows pointing at a structured
+ *  entity or journal entry. Shared by entity and entry deletes. */
+function purgeEntityIndexes(kind: string, refId: string): { search: number; embeddings: number; links: number } {
+  const search = db.prepare("DELETE FROM search WHERE kind = ? AND ref_id = ?").run(kind, refId).changes;
+  const embeddings = db.prepare("DELETE FROM embeddings WHERE ref_kind = ? AND ref_id = ?").run(kind, refId).changes;
+  // Links are undirected for cleanup: any edge that touches this id, either end.
+  const linkRow = { kind, refId };
+  const links = db
+    .prepare(
+      "DELETE FROM links WHERE (source_kind = @kind AND source_id = @refId) OR (target_kind = @kind AND target_id = @refId)",
+    )
+    .run(linkRow).changes;
+  return { search, embeddings, links };
+}
+
+/** Delete one anchored entity (task/decision/event) and everything that points
+ *  at it: its anchors row, inbox items, search/embeddings/links, and any
+ *  decision that supersedes it (the supersedes pointer is cleared). */
+function deleteEntity(kind: EmergedKind, refId: string, acc: ActorDeleteResult): void {
+  // A decision being deleted may be referenced by a newer decision's `supersedes`.
+  if (kind === "decision") {
+    db.prepare("UPDATE decisions SET supersedes = NULL WHERE supersedes = ?").run(refId);
+  }
+  acc[COUNT_KEY[kind]] += db.prepare(`DELETE FROM ${EMERGED_TABLE[kind]} WHERE id = ?`).run(refId).changes;
+  acc.anchors += db.prepare("DELETE FROM anchors WHERE ref_id = ? AND kind = ?").run(refId, kind).changes;
+  acc.inbox += db.prepare("DELETE FROM inbox WHERE ref_id = ? AND ref_kind = ?").run(refId, kind).changes;
+  const idx = purgeEntityIndexes(kind, refId);
+  acc.search += idx.search;
+  acc.embeddings += idx.embeddings;
+  acc.links += idx.links;
+}
+
+/**
+ * Delete a journal entry and cascade everything that emerged from it: the
+ * tasks/decisions/events anchored to its spans (and each of those entities'
+ * own anchors/inbox/search/embeddings/links), then the entry's own anchors,
+ * inbox notifications, entry-scoped shares, search/embeddings/links, and the
+ * journal row itself. Accumulates counts into `acc` (callers pre-zero it).
+ *
+ * Reused by actors.remove for each authored entry, and exposed standalone for
+ * deleting a single entry. Must run inside a tx() (callers wrap it).
+ */
+export function deleteJournalEntry(entryId: string, acc?: ActorDeleteResult): ActorDeleteResult {
+  const a = acc ?? blankDeleteResult("");
+  // Entities anchored to spans of this entry — the cascade's core rule.
+  const anchored = db
+    .prepare("SELECT DISTINCT kind, ref_id FROM anchors WHERE entry_id = ?")
+    .all(entryId) as { kind: string; ref_id: string }[];
+  for (const an of anchored) {
+    if ((EMERGED_KINDS as readonly string[]).includes(an.kind)) {
+      deleteEntity(an.kind as EmergedKind, an.ref_id, a);
+    }
+  }
+  // Entities whose origin_entry_id is this entry but that weren't anchored
+  // (bracket-token tasks link via "anchors" rel but always carry origin_entry_id;
+  // belt-and-suspenders so nothing emerged from this entry is left orphaned).
+  for (const kind of EMERGED_KINDS) {
+    const rows = db
+      .prepare(`SELECT id FROM ${EMERGED_TABLE[kind]} WHERE origin_entry_id = ?`)
+      .all(entryId) as { id: string }[];
+    for (const r of rows) deleteEntity(kind, r.id, a);
+  }
+  // The entry's own dependents.
+  a.anchors += db.prepare("DELETE FROM anchors WHERE entry_id = ?").run(entryId).changes;
+  a.inbox += db.prepare("DELETE FROM inbox WHERE entry_id = ? OR (ref_kind = 'journal' AND ref_id = ?)").run(
+    entryId,
+    entryId,
+  ).changes;
+  a.shares += db.prepare("DELETE FROM shares WHERE scope = 'entry' AND ref = ?").run(entryId).changes;
+  const idx = purgeEntityIndexes("journal", entryId);
+  a.search += idx.search;
+  a.embeddings += idx.embeddings;
+  a.links += idx.links;
+  a.journal += db.prepare("DELETE FROM journal WHERE id = ?").run(entryId).changes;
+  return a;
+}
+
+function blankDeleteResult(actorSlug: string): ActorDeleteResult {
+  return {
+    actor: actorSlug,
+    dryRun: false,
+    journal: 0, tasks: 0, decisions: 0, events: 0, anchors: 0, links: 0,
+    embeddings: 0, search: 0, inbox: 0, shares: 0, profile: 0, users: 0,
+    sessions: 0, api_tokens: 0, oauth_codes: 0, wire: 0, sources: 0, people: 0,
+  };
+}
+
+/** Remove `slug` from a JSON string-array column value; returns the new JSON or
+ *  null when unchanged. */
+function withoutSlug(jsonArr: string, slug: string): string | null {
+  const arr = json<string[]>(jsonArr);
+  const next = arr.filter((x) => x !== slug);
+  return next.length === arr.length ? null : JSON.stringify(next);
+}
+
+/** Replace `from`→`to` in a JSON string-array column, deduping; null if unchanged. */
+function replaceSlug(jsonArr: string, from: string, to: string): string | null {
+  const arr = json<string[]>(jsonArr);
+  if (!arr.includes(from)) return null;
+  const next = [...new Set(arr.map((x) => (x === from ? to : x)))];
+  return JSON.stringify(next);
+}
+
+export const actors = {
+  /**
+   * Preview a delete WITHOUT mutating: counts every row that a real remove would
+   * delete or scrub. Runs the whole cascade inside a transaction that always
+   * rolls back, so the numbers match the live run exactly.
+   */
+  removePreview(slug: string): ActorDeleteResult {
+    try {
+      tx(() => {
+        const acc = actorsRemoveInTx(slug);
+        acc.dryRun = true;
+        throw new RollbackPreview(acc);
+      });
+    } catch (e) {
+      if (e instanceof RollbackPreview) return e.result as ActorDeleteResult;
+      throw e;
+    }
+    throw new Error("unreachable"); // the preview always rolls back
+  },
+
+  /** Delete an actor and cascade ALL their data. Transactional. */
+  remove(slug: string): ActorDeleteResult {
+    const acc = tx(() => actorsRemoveInTx(slug));
+    emit("actor.removed", "admin", { actor: slug, journal: acc.journal });
+    return acc;
+  },
+
+  /** Preview a merge WITHOUT mutating. */
+  mergePreview(fromSlug: string, toSlug: string): ActorMergeResult {
+    try {
+      tx(() => {
+        const acc = actorsMergeInTx(fromSlug, toSlug);
+        acc.dryRun = true;
+        throw new RollbackPreview(acc);
+      });
+    } catch (e) {
+      if (e instanceof RollbackPreview) return e.result as ActorMergeResult;
+      throw e;
+    }
+    throw new Error("unreachable"); // the preview always rolls back
+  },
+
+  /** Fold `fromSlug` into `toSlug`: reassign all authorship/ownership/refs, then
+   *  remove the `from` people/profile/users rows. Transactional. */
+  merge(fromSlug: string, toSlug: string): ActorMergeResult {
+    const acc = tx(() => actorsMergeInTx(fromSlug, toSlug));
+    emit("actor.merged", "admin", { from: fromSlug, into: toSlug, journal: acc.journal });
+    return acc;
+  },
+};
+
+/** Sentinel used to roll back a preview transaction while still returning its
+ *  computed counts. better-sqlite3's db.transaction rethrows, so we catch it. */
+class RollbackPreview<T> extends Error {
+  readonly result: T;
+  constructor(result: T) {
+    super("preview rollback");
+    this.result = result;
+  }
+}
+
+/** The mutating body of actors.remove, run inside a caller's tx(). */
+function actorsRemoveInTx(slug: string): ActorDeleteResult {
+  const acc = blankDeleteResult(slug);
+
+  // 1. Every journal entry the actor authored — cascade each (this folds in the
+  //    anchored tasks/decisions/events + their indexes).
+  const entries = db.prepare("SELECT id FROM journal WHERE author = ?").all(slug) as { id: string }[];
+  for (const e of entries) deleteJournalEntry(e.id, acc);
+
+  // 2. assignee scrub on entities NOT already deleted above: drop the slug from
+  //    tasks/decisions/events assignee arrays so nothing assigns to a ghost.
+  for (const kind of EMERGED_KINDS) {
+    const rows = db
+      .prepare(`SELECT id, assignees FROM ${EMERGED_TABLE[kind]} WHERE assignees LIKE ?`)
+      .all(`%"${slug}"%`) as { id: string; assignees: string }[];
+    for (const r of rows) {
+      const next = withoutSlug(r.assignees, slug);
+      if (next !== null) {
+        db.prepare(`UPDATE ${EMERGED_TABLE[kind]} SET assignees = ? WHERE id = ?`).run(next, r.id);
+      }
+    }
+  }
+
+  // 3. journal.mentions scrub on surviving entries (other authors who @mentioned slug).
+  const mentionRows = db.prepare("SELECT id, mentions FROM journal WHERE mentions LIKE ?").all(`%"${slug}"%`) as {
+    id: string;
+    mentions: string;
+  }[];
+  for (const r of mentionRows) {
+    const next = withoutSlug(r.mentions, slug);
+    if (next !== null) db.prepare("UPDATE journal SET mentions = ? WHERE id = ?").run(next, r.id);
+  }
+
+  // 4. Inbox: anything to/from the actor (remaining items not tied to a deleted entry).
+  acc.inbox += db.prepare('DELETE FROM inbox WHERE recipient = ? OR "from" = ?').run(slug, slug).changes;
+
+  // 5. Shares: as viewer, or journal-scoped shares OF this author's stream.
+  acc.shares += db
+    .prepare("DELETE FROM shares WHERE viewer = ? OR (scope = 'journal' AND ref = ?)")
+    .run(slug, slug).changes;
+
+  // 6. Profile card.
+  acc.profile += db.prepare("DELETE FROM profile WHERE actor = ?").run(slug).changes;
+
+  // 7. Login + credentials. Sessions hang off the user row (user_id), so reap
+  //    them first, then the user, then any bearer tokens for this actor.
+  const usrRows = db.prepare("SELECT id FROM users WHERE actor = ?").all(slug) as { id: string }[];
+  for (const u of usrRows) {
+    acc.sessions += db.prepare("DELETE FROM sessions WHERE user_id = ?").run(u.id).changes;
+  }
+  acc.users += db.prepare("DELETE FROM users WHERE actor = ?").run(slug).changes;
+  acc.api_tokens += db
+    .prepare("DELETE FROM api_tokens WHERE actor = ? OR created_by = ? OR granted_by = ?")
+    .run(slug, slug, slug).changes;
+  acc.oauth_codes += db
+    .prepare("DELETE FROM oauth_auth_codes WHERE ai_actor = ? OR granted_by = ?")
+    .run(slug, slug).changes;
+
+  // 8. Wire events authored by the actor.
+  acc.wire += db.prepare("DELETE FROM wire WHERE actor = ?").run(slug).changes;
+
+  // 9. Sources the actor owns; null out a `notify` that pointed at them.
+  acc.sources += db.prepare("DELETE FROM sources WHERE owner = ?").run(slug).changes;
+  db.prepare("UPDATE sources SET notify = NULL WHERE notify = ?").run(slug);
+
+  // 10. people.owner pointers (AIs this actor owned) → null, then the row itself.
+  db.prepare("UPDATE people SET owner = NULL WHERE owner = ?").run(slug);
+  acc.people += db.prepare("DELETE FROM people WHERE slug = ?").run(slug).changes;
+
+  return acc;
+}
+
+function blankMergeResult(from: string, into: string): ActorMergeResult {
+  return {
+    from, into, dryRun: false,
+    journal: 0, tasks: 0, decisions: 0, events: 0, inbox: 0, shares: 0,
+    api_tokens: 0, oauth_codes: 0, wire: 0, sources: 0, people_owner: 0, profile: 0, users: 0,
+  };
+}
+
+/** The mutating body of actors.merge, run inside a caller's tx(). */
+function actorsMergeInTx(fromSlug: string, toSlug: string): ActorMergeResult {
+  if (fromSlug === toSlug) throw new Error("cannot merge an actor into itself");
+  const acc = blankMergeResult(fromSlug, toSlug);
+
+  // Reassign authorship + scrub the slug everywhere it acts as an identity.
+  acc.journal += db.prepare("UPDATE journal SET author = ? WHERE author = ?").run(toSlug, fromSlug).changes;
+
+  // journal.mentions: rewrite from→to (dedupe) on every entry that mentioned from.
+  const mentionRows = db.prepare("SELECT id, mentions FROM journal WHERE mentions LIKE ?").all(`%"${fromSlug}"%`) as {
+    id: string;
+    mentions: string;
+  }[];
+  for (const r of mentionRows) {
+    const next = replaceSlug(r.mentions, fromSlug, toSlug);
+    if (next !== null) db.prepare("UPDATE journal SET mentions = ? WHERE id = ?").run(next, r.id);
+  }
+
+  // Assignees on tasks/decisions/events: from→to (dedupe).
+  for (const kind of EMERGED_KINDS) {
+    const rows = db
+      .prepare(`SELECT id, assignees FROM ${EMERGED_TABLE[kind]} WHERE assignees LIKE ?`)
+      .all(`%"${fromSlug}"%`) as { id: string; assignees: string }[];
+    for (const r of rows) {
+      const next = replaceSlug(r.assignees, fromSlug, toSlug);
+      if (next !== null) {
+        db.prepare(`UPDATE ${EMERGED_TABLE[kind]} SET assignees = ? WHERE id = ?`).run(next, r.id);
+        acc[COUNT_KEY[kind]]++;
+      }
+    }
+  }
+
+  // Inbox: recipient + "from".
+  acc.inbox += db.prepare("UPDATE inbox SET recipient = ? WHERE recipient = ?").run(toSlug, fromSlug).changes;
+  acc.inbox += db.prepare('UPDATE inbox SET "from" = ? WHERE "from" = ?').run(toSlug, fromSlug).changes;
+  // Drop any now-self-addressed items the move created (recipient === from).
+  db.prepare('DELETE FROM inbox WHERE recipient = "from"').run();
+
+  // Shares: viewer + journal-scoped ref. A move can collide with an existing
+  // (scope,ref,viewer) row (unique index), so reassign only where no twin exists,
+  // and delete the leftover duplicates.
+  for (const [col, where] of [
+    ["viewer", "viewer = ?"],
+    ["ref", "scope = 'journal' AND ref = ?"],
+  ] as const) {
+    const rows = db.prepare(`SELECT id, scope, ref, viewer FROM shares WHERE ${where}`).all(fromSlug) as Share[];
+    for (const s of rows) {
+      const nextRef = col === "ref" ? toSlug : s.ref;
+      const nextViewer = col === "viewer" ? toSlug : s.viewer;
+      const twin = db
+        .prepare("SELECT 1 FROM shares WHERE scope = ? AND ref = ? AND viewer = ? AND id != ?")
+        .get(s.scope, nextRef, nextViewer, s.id);
+      if (twin) {
+        db.prepare("DELETE FROM shares WHERE id = ?").run(s.id);
+      } else {
+        db.prepare(`UPDATE shares SET ${col} = ? WHERE id = ?`).run(toSlug, s.id);
+        acc.shares++;
+      }
+    }
+  }
+
+  // Tokens + oauth codes: re-point actor + the granting/creating columns.
+  acc.api_tokens += db.prepare("UPDATE api_tokens SET actor = ? WHERE actor = ?").run(toSlug, fromSlug).changes;
+  db.prepare("UPDATE api_tokens SET created_by = ? WHERE created_by = ?").run(toSlug, fromSlug);
+  db.prepare("UPDATE api_tokens SET granted_by = ? WHERE granted_by = ?").run(toSlug, fromSlug);
+  acc.oauth_codes += db.prepare("UPDATE oauth_auth_codes SET ai_actor = ? WHERE ai_actor = ?").run(toSlug, fromSlug).changes;
+  db.prepare("UPDATE oauth_auth_codes SET granted_by = ? WHERE granted_by = ?").run(toSlug, fromSlug);
+
+  // Wire authorship.
+  acc.wire += db.prepare("UPDATE wire SET actor = ? WHERE actor = ?").run(toSlug, fromSlug).changes;
+
+  // Sources owned by / notifying from.
+  acc.sources += db.prepare("UPDATE sources SET owner = ? WHERE owner = ?").run(toSlug, fromSlug).changes;
+  db.prepare("UPDATE sources SET notify = ? WHERE notify = ?").run(toSlug, fromSlug);
+
+  // people.owner pointers (AIs the `from` human owned) now point at `to`.
+  acc.people_owner += db.prepare("UPDATE people SET owner = ? WHERE owner = ?").run(toSlug, fromSlug).changes;
+
+  // Profile/identity + login: the `to` card/account wins. Move the `from` card
+  // only if `to` has none, else drop the `from` card; same for the user account.
+  const toHasProfile = db.prepare("SELECT 1 FROM profile WHERE actor = ?").get(toSlug);
+  if (toHasProfile) {
+    acc.profile += db.prepare("DELETE FROM profile WHERE actor = ?").run(fromSlug).changes;
+  } else {
+    acc.profile += db.prepare("UPDATE profile SET actor = ? WHERE actor = ?").run(toSlug, fromSlug).changes;
+  }
+  const toHasUser = db.prepare("SELECT 1 FROM users WHERE actor = ?").get(toSlug);
+  if (toHasUser) {
+    // `to` already logs in; drop the `from` account + its sessions.
+    const usrRows = db.prepare("SELECT id FROM users WHERE actor = ?").all(fromSlug) as { id: string }[];
+    for (const u of usrRows) db.prepare("DELETE FROM sessions WHERE user_id = ?").run(u.id);
+    acc.users += db.prepare("DELETE FROM users WHERE actor = ?").run(fromSlug).changes;
+  } else {
+    acc.users += db.prepare("UPDATE users SET actor = ? WHERE actor = ?").run(toSlug, fromSlug).changes;
+  }
+
+  // Finally remove the folded-away people row.
+  db.prepare("DELETE FROM people WHERE slug = ?").run(fromSlug);
+
+  return acc;
 }

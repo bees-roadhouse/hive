@@ -26,6 +26,7 @@ import { subscribe } from "./bus.ts";
 import { SESSION_COOKIE, SESSION_TTL_MS, tokenHash, verifyPkce } from "./auth.ts";
 import { authUrl, discover, exchangeCode, oidcConfig, verifyIdToken } from "./oidc.ts";
 import {
+  actors,
   backfillIdentityCards,
   config,
   oauthClients,
@@ -270,6 +271,30 @@ app.post("/api/import/sqlite", async (c) => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---- actor lifecycle (admin): delete-with-cascade + merge ----
+// Both are destructive and admin-gated. Pass ?dryRun=1 to get the per-table
+// counts WITHOUT mutating — the UI shows the blast radius before confirm.
+const isDryRun = (c: { req: { query: (k: string) => string | undefined } }) =>
+  c.req.query("dryRun") === "1" || c.req.query("dryRun") === "true";
+
+app.delete("/api/actors/:slug", (c) => {
+  if (!requireAdminActor(c)) return c.json({ error: "forbidden" }, 403);
+  const slug = c.req.param("slug");
+  if (!people.get(slug)) return c.json({ error: "not found" }, 404);
+  return c.json(isDryRun(c) ? actors.removePreview(slug) : actors.remove(slug));
+});
+
+app.post("/api/actors/:slug/merge", async (c) => {
+  if (!requireAdminActor(c)) return c.json({ error: "forbidden" }, 403);
+  const from = c.req.param("slug");
+  const { into } = ((await c.req.json().catch(() => ({}))) as { into?: string }) ?? {};
+  if (!into?.trim()) return c.json({ error: "into (target actor slug) required" }, 400);
+  if (from === into) return c.json({ error: "cannot merge an actor into itself" }, 400);
+  if (!people.get(from)) return c.json({ error: `from actor '${from}' not found` }, 404);
+  if (!people.get(into)) return c.json({ error: `into actor '${into}' not found` }, 404);
+  return c.json(isDryRun(c) ? actors.mergePreview(from, into) : actors.merge(from, into));
 });
 
 // ---- auth capabilities (SPA reads before login) ----

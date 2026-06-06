@@ -1,8 +1,133 @@
-import { createResource, createSignal, For, Show, type Component } from "solid-js";
-import type { Person } from "@hive/shared";
+import { createMemo, createResource, createSignal, For, Show, type Component } from "solid-js";
+import type { ActorDeleteResult, ActorMergeResult, Person } from "@hive/shared";
 import { api } from "./api.ts";
 import { relTime } from "./lib.tsx";
 import { liveRev } from "./live.ts";
+
+// ---- actor delete / merge confirm panel ----
+// Both ops are destructive, so the flow is preview → review counts → confirm.
+// The preview hits the same store path under ?dryRun=1, so the numbers shown
+// match the real run exactly.
+
+/** Non-zero per-table counts from a delete/merge result, for the confirm summary. */
+const nonZeroCounts = (r: Record<string, unknown>): [string, number][] =>
+  Object.entries(r)
+    .filter(([k, v]) => typeof v === "number" && v > 0 && k !== "dryRun")
+    .map(([k, v]) => [k, v as number]);
+
+const ActorOps: Component<{ person: Person; people: Person[]; onDone: () => void }> = (props) => {
+  const [mode, setMode] = createSignal<"delete" | "merge" | null>(null);
+  const [target, setTarget] = createSignal(""); // merge-into slug
+  const [preview, setPreview] = createSignal<ActorDeleteResult | ActorMergeResult | null>(null);
+  const [busy, setBusy] = createSignal(false);
+  const [err, setErr] = createSignal<string | null>(null);
+
+  const others = createMemo(() => props.people.filter((p) => p.slug !== props.person.slug));
+
+  const reset = () => {
+    setMode(null);
+    setTarget("");
+    setPreview(null);
+    setErr(null);
+  };
+
+  const runPreview = async () => {
+    setErr(null);
+    setBusy(true);
+    try {
+      const r =
+        mode() === "delete"
+          ? await api.previewDeleteActor(props.person.slug)
+          : await api.previewMergeActor(props.person.slug, target());
+      setPreview(r);
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const confirm = async () => {
+    setErr(null);
+    setBusy(true);
+    try {
+      if (mode() === "delete") await api.deleteActor(props.person.slug);
+      else await api.mergeActor(props.person.slug, target());
+      reset();
+      props.onDone();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <span class="actor-ops">
+      <Show
+        when={mode()}
+        fallback={
+          <>
+            <button class="ghost" onClick={() => setMode("merge")}>merge…</button>
+            <button class="ghost danger" onClick={() => setMode("delete")}>delete…</button>
+          </>
+        }
+      >
+        <div class="actor-ops-panel">
+          <Show when={mode() === "merge"}>
+            <label class="dim sm">
+              into&nbsp;
+              <select value={target()} onChange={(e) => { setTarget(e.currentTarget.value); setPreview(null); }}>
+                <option value="">pick target…</option>
+                <For each={others()}>{(o) => <option value={o.slug}>{o.name} ({o.slug})</option>}</For>
+              </select>
+            </label>
+          </Show>
+
+          <Show when={!preview()}>
+            <button
+              class="primary"
+              disabled={busy() || (mode() === "merge" && !target())}
+              onClick={runPreview}
+            >
+              {busy() ? "…" : "preview"}
+            </button>
+          </Show>
+
+          <Show when={preview()}>
+            {(p) => (
+              <div class="actor-ops-preview">
+                <p class="sm">
+                  <strong class="danger">
+                    {mode() === "delete"
+                      ? `Delete ${props.person.name} and cascade:`
+                      : `Fold ${props.person.name} → ${target()}:`}
+                  </strong>
+                </p>
+                <div class="actor-ops-counts">
+                  <For each={nonZeroCounts(p() as unknown as Record<string, unknown>)} fallback={<span class="dim sm">nothing to change.</span>}>
+                    {([k, n]) => (
+                      <span class="kv sm">
+                        <code>{k}</code>
+                        <span>{n}</span>
+                      </span>
+                    )}
+                  </For>
+                </div>
+                <button class="primary danger" disabled={busy()} onClick={confirm}>
+                  {busy() ? "…" : mode() === "delete" ? "confirm delete" : "confirm merge"}
+                </button>
+              </div>
+            )}
+          </Show>
+
+          <button class="ghost" onClick={reset} disabled={busy()}>cancel</button>
+          <Show when={err()}>{(e) => <span class="danger sm">{e()}</span>}</Show>
+        </div>
+      </Show>
+    </span>
+  );
+};
 
 // ---- Writers management ----
 
@@ -107,6 +232,7 @@ const WritersSection: Component = () => {
                       </label>
                     </Show>
                     <button class="ghost" onClick={() => startEdit(p)}>edit</button>
+                    <ActorOps person={p} people={people() ?? []} onDone={refetch} />
                   </>
                 }
               >
