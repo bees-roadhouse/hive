@@ -1,4 +1,4 @@
-import { createSignal, Show, type Component } from "solid-js";
+import { createResource, createSignal, Show, type Component } from "solid-js";
 import { api, setCurrentUser } from "./api.ts";
 
 // Login screen. Shown when onboarding is complete but no valid session exists.
@@ -7,6 +7,12 @@ export const Login: Component<{ instanceName: string | null; onLogin: () => void
   const [password, setPassword] = createSignal("");
   const [error, setError] = createSignal<string | null>(null);
   const [busy, setBusy] = createSignal(false);
+  const [cfg] = createResource(() => api.authConfig());
+
+  const ssoLogin = () => {
+    const returnTo = window.location.pathname + window.location.search;
+    window.location.href = `/api/auth/oidc/start?return_to=${encodeURIComponent(returnTo)}`;
+  };
 
   const submit = async (e: Event) => {
     e.preventDefault();
@@ -45,6 +51,9 @@ export const Login: Component<{ instanceName: string | null; onLogin: () => void
         <button type="submit" disabled={busy()}>
           {busy() ? "Signing in…" : "Sign in"}
         </button>
+        <Show when={cfg()?.oidc}>
+          <button type="button" class="logout" onClick={ssoLogin}>Sign in with SSO</button>
+        </Show>
       </form>
     </div>
   );

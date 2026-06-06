@@ -237,6 +237,8 @@ export function migrate(): void {
       name       TEXT NOT NULL,
       kind       TEXT NOT NULL DEFAULT 'human',
       owner      TEXT,
+      bio        TEXT,
+      role       TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -296,6 +298,32 @@ export function migrate(): void {
       last_used_at TEXT
     );
 
+    -- OAuth 2.1 dynamic client registration (RFC 7591). MCP clients are public
+    -- (PKCE, no secret), so we store no client_secret.
+    CREATE TABLE IF NOT EXISTS oauth_clients (
+      client_id     TEXT PRIMARY KEY,
+      client_name   TEXT NOT NULL,
+      redirect_uris TEXT NOT NULL,   -- JSON array of exact-match strings
+      grant_types   TEXT NOT NULL,   -- JSON array
+      created_at    TEXT NOT NULL
+    );
+
+    -- OAuth authorization codes: single-use, short TTL, hashed at rest, bound to
+    -- the granted AI identity + the granting human.
+    CREATE TABLE IF NOT EXISTS oauth_auth_codes (
+      code_hash      TEXT PRIMARY KEY,   -- sha256(plaintext code)
+      client_id      TEXT NOT NULL,
+      redirect_uri   TEXT NOT NULL,
+      code_challenge TEXT NOT NULL,      -- PKCE S256 challenge
+      ai_actor       TEXT NOT NULL,      -- people.slug, kind='ai'
+      granted_by     TEXT NOT NULL,      -- granting human's actor
+      scope          TEXT NOT NULL,
+      created_at     TEXT NOT NULL,
+      expires_at     TEXT NOT NULL,
+      used_at        TEXT                -- single-use marker; non-null = spent
+    );
+    CREATE INDEX IF NOT EXISTS oauth_codes_expiry ON oauth_auth_codes (expires_at);
+
     -- Mutable per-actor card (humans + AIs): the durable "who they are" that
     -- evolves, kept distinct from the write-once journal. body is JSON
     -- { sections: { identity, preferences, working_style, relationships, … } }.
@@ -348,12 +376,25 @@ export function migrate(): void {
     db.exec("ALTER TABLE people ADD COLUMN owner TEXT");
   }
 
-  // api_tokens.expires_at — tokens predating expiry support keep NULL (= non-expiring).
-  const hasTokenExpiry = db
-    .prepare("SELECT 1 FROM pragma_table_info('api_tokens') WHERE name='expires_at'")
-    .get();
-  if (!hasTokenExpiry) {
-    db.exec("ALTER TABLE api_tokens ADD COLUMN expires_at TEXT");
+  // Identity profile (bio + role), editable in the UI and self-updatable via MCP.
+  for (const col of ["bio", "role"]) {
+    const has = db.prepare("SELECT 1 FROM pragma_table_info('people') WHERE name=?").get(col);
+    if (!has) db.exec(`ALTER TABLE people ADD COLUMN ${col} TEXT`);
+  }
+
+  // v0.1.2: OAuth tokens share the api_tokens table so tokens.resolve keeps
+  // returning an actor for every consumer. New columns are nullable; an existing
+  // PAT reads as kind NULL (treated as 'pat') with no expiry. This loop also adds
+  // expires_at (the standalone guard from #35 on development is subsumed here).
+  for (const [col, ddl] of [
+    ["kind", "ALTER TABLE api_tokens ADD COLUMN kind TEXT"],
+    ["client_id", "ALTER TABLE api_tokens ADD COLUMN client_id TEXT"],
+    ["granted_by", "ALTER TABLE api_tokens ADD COLUMN granted_by TEXT"],
+    ["expires_at", "ALTER TABLE api_tokens ADD COLUMN expires_at TEXT"],
+    ["scope", "ALTER TABLE api_tokens ADD COLUMN scope TEXT"],
+  ] as const) {
+    const has = db.prepare("SELECT 1 FROM pragma_table_info('api_tokens') WHERE name=?").get(col);
+    if (!has) db.exec(ddl);
   }
 
   // ---- v0.1.1 onboarding gate ----

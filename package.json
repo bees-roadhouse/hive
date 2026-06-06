@@ -1,7 +1,7 @@
 {
   "name": "hive-node",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.3",
   "description": "A fun Node.js + Solid.js rewrite of hive — the shared state (tasks, journal, notes, search) for the Bee's Roadhouse AI configs.",
   "type": "module",
   "engines": {
@@ -15,6 +15,7 @@
     "worker:once": "pnpm --filter @hive/worker once",
     "build": "pnpm --filter @hive/shared build && pnpm -r --filter @hive/api --filter @hive/web --filter @hive/cli --filter @hive/worker build",
     "seed": "pnpm --filter @hive/api seed",
+    "import": "pnpm --filter @hive/api import",
     "hive": "pnpm --filter @hive/cli start --"
   },
   "packageManager": "pnpm@11.5.0"

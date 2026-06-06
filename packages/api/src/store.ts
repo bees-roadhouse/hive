@@ -49,6 +49,7 @@ import {
   type WireEvent,
   type WorkerStatus,
   type ApiToken,
+  type OAuthClient,
   type OnboardingStatus,
   type SafeUser,
   type User,
@@ -69,8 +70,11 @@ import { db, tx } from "./db.ts";
 import { publish } from "./bus.ts";
 import {
   API_TOKEN_PREFIX,
+  AUTH_CODE_PREFIX,
+  AUTH_CODE_TTL_MS,
   generateToken,
   hashPassword,
+  OAUTH_TOKEN_TTL_MS,
   SESSION_PREFIX,
   SESSION_TTL_MS,
   tokenHash,
@@ -246,13 +250,18 @@ export const people = {
     return db.prepare("SELECT * FROM people WHERE slug = ?").get(slug) as Person | undefined;
   },
 
+  /** AI identities a given human owns — the grantable set for OAuth consent. */
+  aisOwnedBy(ownerSlug: string): Person[] {
+    return db.prepare("SELECT * FROM people WHERE kind = 'ai' AND owner = ? ORDER BY slug").all(ownerSlug) as Person[];
+  },
+
   ensure(name: string, kind: "human" | "ai" = "human"): Person {
     const slug = slugify(name);
     const existing = people.bySlug(slug);
     if (existing) return existing;
-    const p: Person = { id: id("per"), name, slug, kind, owner: null, created_at: now() };
+    const p: Person = { id: id("per"), name, slug, kind, owner: null, bio: null, role: null, created_at: now() };
     db.prepare(
-      "INSERT INTO people (id, name, slug, kind, owner, created_at) VALUES (@id, @name, @slug, @kind, @owner, @created_at)",
+      "INSERT INTO people (id, name, slug, kind, owner, bio, role, created_at) VALUES (@id, @name, @slug, @kind, @owner, @bio, @role, @created_at)",
     ).run(p);
     return p;
   },
@@ -260,9 +269,9 @@ export const people = {
   upsert(slug: string, name: string, kind: Person["kind"], owner: string | null = null): Person {
     const existing = people.bySlug(slug);
     if (existing) return existing;
-    const p: Person = { id: id("per"), slug, name, kind, owner, created_at: now() };
+    const p: Person = { id: id("per"), slug, name, kind, owner, bio: null, role: null, created_at: now() };
     db.prepare(
-      "INSERT INTO people (id, slug, name, kind, owner, created_at) VALUES (@id, @slug, @name, @kind, @owner, @created_at)",
+      "INSERT INTO people (id, slug, name, kind, owner, bio, role, created_at) VALUES (@id, @slug, @name, @kind, @owner, @bio, @role, @created_at)",
     ).run(p);
     return p;
   },
@@ -279,9 +288,22 @@ export const people = {
     const name = patch.name ?? cur.name;
     const kind = patch.kind ?? cur.kind;
     const owner = patch.owner !== undefined ? patch.owner : cur.owner;
+    const bio = patch.bio !== undefined ? patch.bio : cur.bio;
+    const role = patch.role !== undefined ? patch.role : cur.role;
     const slug = patch.name ? slugify(name) : cur.slug;
-    db.prepare("UPDATE people SET name = ?, slug = ?, kind = ?, owner = ? WHERE id = ?").run(name, slug, kind, owner, cur.id);
-    const next: Person = { ...cur, name, slug, kind, owner };
+    db.prepare("UPDATE people SET name = ?, slug = ?, kind = ?, owner = ?, bio = ?, role = ? WHERE id = ?").run(
+      name, slug, kind, owner, bio, role, cur.id,
+    );
+    // The profile card is the canonical identity store; mirror any bio/role edit
+    // into it (as sections.bio / sections.role) so every writer (REST, MCP, UI)
+    // converges on one source of truth. The column is kept for now (drop = later).
+    if (patch.bio !== undefined || patch.role !== undefined) {
+      const sections: Record<string, string> = {};
+      if (patch.bio !== undefined) sections.bio = patch.bio ?? "";
+      if (patch.role !== undefined) sections.role = patch.role ?? "";
+      profiles.update(slug, { display_name: name, kind, sections }, actor);
+    }
+    const next: Person = { ...cur, name, slug, kind, owner, bio, role };
     emit("person.updated", actor, { id: cur.id, name, kind });
     return next;
   },
@@ -325,6 +347,35 @@ export const profiles = {
     return next;
   },
 };
+
+/**
+ * One-time reconciliation (#31 → #37): the profile card is the canonical identity
+ * store now. Fold any legacy people.bio/role into each actor's card as
+ * sections.bio / sections.role. Idempotent and non-destructive — only fills a
+ * card section that's missing/blank, so a card the actor has since edited (or a
+ * value already migrated) is never clobbered. The people columns are left intact
+ * (dropping them is a separate follow-up). Safe to run on every boot.
+ */
+export function backfillIdentityCards(): number {
+  const rows = db
+    .prepare("SELECT slug, name, kind, bio, role FROM people WHERE bio IS NOT NULL OR role IS NOT NULL")
+    .all() as { slug: string; name: string; kind: Person["kind"]; bio: string | null; role: string | null }[];
+  let migrated = 0;
+  for (const p of rows) {
+    const card = profiles.get(p.slug);
+    const sections: Record<string, string> = {};
+    if (p.bio?.trim() && !card?.body.sections.bio?.trim()) sections.bio = p.bio.trim();
+    if (p.role?.trim() && !card?.body.sections.role?.trim()) sections.role = p.role.trim();
+    if (Object.keys(sections).length === 0) continue;
+    profiles.update(
+      p.slug,
+      { display_name: card?.display_name || p.name, kind: p.kind, sections },
+      "migration",
+    );
+    migrated++;
+  }
+  return migrated;
+}
 
 // ---- config (per-instance key/value, v0.1.1) ----
 
@@ -431,13 +482,12 @@ export const sessions = {
 
 // ---- API tokens (programmatic clients: CLI, MCP, AI agents) ----
 
+const TOKEN_COLS =
+  "id, actor, label, created_by, created_at, last_used_at, kind, client_id, granted_by, expires_at, scope";
+
 export const tokens = {
   list: (): ApiToken[] =>
-    db
-      .prepare(
-        "SELECT id, actor, label, created_by, created_at, last_used_at, expires_at FROM api_tokens ORDER BY created_at DESC",
-      )
-      .all() as ApiToken[],
+    db.prepare(`SELECT ${TOKEN_COLS} FROM api_tokens ORDER BY created_at DESC`).all() as ApiToken[],
 
   /**
    * Mint a bearer token. `expiresInDays` is clamped to [1, API_TOKEN_MAX_EXPIRY_DAYS];
@@ -459,23 +509,78 @@ export const tokens = {
       created_by: by,
       created_at: createdAt,
       last_used_at: null,
+      // Personal access token: no OAuth client binding, but it DOES expire per
+      // the #35 expiry policy (clamped [1, MAX] days above).
+      kind: "pat",
+      client_id: null,
+      granted_by: null,
       expires_at: new Date(Date.parse(createdAt) + days * 86_400_000).toISOString(),
+      scope: null,
     };
     db.prepare(
-      "INSERT INTO api_tokens (id, token_hash, actor, label, created_by, created_at, last_used_at, expires_at) " +
-        "VALUES (@id, @token_hash, @actor, @label, @created_by, @created_at, @last_used_at, @expires_at)",
-    ).run({ ...record, token_hash: tokenHash(token) });
+      "INSERT INTO api_tokens (id, token_hash, actor, label, created_by, created_at, last_used_at, kind, expires_at) " +
+        "VALUES (@id, @token_hash, @actor, @label, @created_by, @created_at, @last_used_at, @kind, @expires_at)",
+    ).run({
+      id: record.id,
+      token_hash: tokenHash(token),
+      actor: record.actor,
+      label: record.label,
+      created_by: by,
+      created_at: record.created_at,
+      last_used_at: null,
+      kind: record.kind,
+      expires_at: record.expires_at,
+    });
     emit("token.created", by, { id: record.id, actor: record.actor, label: record.label, expires_at: record.expires_at });
     return { token, record };
   },
 
-  /** Resolve a bearer token to its actor (and stamp last_used), or undefined if missing/expired. */
+  /** Mint a long-lived OAuth access token (consent flow), bound to the AI actor,
+   *  the granting human, and the client. Returns the plaintext once. */
+  createOAuth(input: { actor: string; clientId: string; grantedBy: string; scope: string; label?: string }): {
+    token: string;
+    record: ApiToken;
+  } {
+    const token = generateToken(API_TOKEN_PREFIX);
+    const record: ApiToken = {
+      id: id("tok"),
+      actor: input.actor,
+      label: input.label ?? `oauth · ${input.clientId}`,
+      created_by: input.grantedBy,
+      created_at: now(),
+      last_used_at: null,
+      kind: "oauth",
+      client_id: input.clientId,
+      granted_by: input.grantedBy,
+      expires_at: new Date(Date.now() + OAUTH_TOKEN_TTL_MS).toISOString(),
+      scope: input.scope,
+    };
+    db.prepare(
+      "INSERT INTO api_tokens (id, token_hash, actor, label, created_by, created_at, last_used_at, kind, client_id, granted_by, expires_at, scope) " +
+        "VALUES (@id, @token_hash, @actor, @label, @created_by, @created_at, NULL, 'oauth', @client_id, @granted_by, @expires_at, @scope)",
+    ).run({
+      id: record.id,
+      token_hash: tokenHash(token),
+      actor: record.actor,
+      label: record.label,
+      created_by: record.created_by,
+      created_at: record.created_at,
+      client_id: record.client_id,
+      granted_by: record.granted_by,
+      expires_at: record.expires_at,
+      scope: record.scope,
+    });
+    emit("token.granted", input.grantedBy, { id: record.id, actor: record.actor, client_id: input.clientId });
+    return { token, record };
+  },
+
+  /** Resolve a bearer token to its actor (and stamp last_used), honoring expiry
+   *  (expires_at NULL = legacy non-expiring token; past expiry → reject + reap). */
   resolve(token: string): string | undefined {
     const row = db.prepare("SELECT id, actor, expires_at FROM api_tokens WHERE token_hash = ?").get(tokenHash(token)) as
       | { id: string; actor: string; expires_at: string | null }
       | undefined;
     if (!row) return undefined;
-    // expires_at NULL = legacy non-expiring token. Past expiry → reject (and reap it).
     if (row.expires_at && Date.parse(row.expires_at) < Date.now()) {
       db.prepare("DELETE FROM api_tokens WHERE id = ?").run(row.id);
       return undefined;
@@ -485,6 +590,92 @@ export const tokens = {
   },
 
   remove: (tokenId: string): boolean => db.prepare("DELETE FROM api_tokens WHERE id = ?").run(tokenId).changes > 0,
+
+  /** Revoke every token minted by a given OAuth client_id (used on code replay). */
+  revokeByClient: (clientId: string): number =>
+    db.prepare("DELETE FROM api_tokens WHERE client_id = ?").run(clientId).changes,
+};
+
+// ---- OAuth 2.1 authorization server: clients + codes ----
+
+export const oauthClients = {
+  register(input: { client_name: string; redirect_uris: string[]; grant_types?: string[] }): OAuthClient {
+    const client: OAuthClient = {
+      client_id: id("oauthc"),
+      client_name: input.client_name,
+      redirect_uris: input.redirect_uris,
+      grant_types: input.grant_types ?? ["authorization_code"],
+      created_at: now(),
+    };
+    db.prepare("INSERT INTO oauth_clients (client_id, client_name, redirect_uris, grant_types, created_at) VALUES (?, ?, ?, ?, ?)").run(
+      client.client_id,
+      client.client_name,
+      JSON.stringify(client.redirect_uris),
+      JSON.stringify(client.grant_types),
+      client.created_at,
+    );
+    return client;
+  },
+  get(clientId: string): OAuthClient | undefined {
+    const r = db.prepare("SELECT * FROM oauth_clients WHERE client_id = ?").get(clientId) as
+      | { client_id: string; client_name: string; redirect_uris: string; grant_types: string; created_at: string }
+      | undefined;
+    if (!r) return undefined;
+    return { ...r, redirect_uris: json<string[]>(r.redirect_uris), grant_types: json<string[]>(r.grant_types) };
+  },
+  count: (): number => (db.prepare("SELECT COUNT(*) AS n FROM oauth_clients").get() as { n: number }).n,
+};
+
+interface AuthCode {
+  client_id: string;
+  redirect_uri: string;
+  code_challenge: string;
+  ai_actor: string;
+  granted_by: string;
+  scope: string;
+}
+
+export const oauthCodes = {
+  create(input: AuthCode): string {
+    const code = generateToken(AUTH_CODE_PREFIX);
+    db.prepare(
+      "INSERT INTO oauth_auth_codes (code_hash, client_id, redirect_uri, code_challenge, ai_actor, granted_by, scope, created_at, expires_at, used_at) " +
+        "VALUES (@code_hash, @client_id, @redirect_uri, @code_challenge, @ai_actor, @granted_by, @scope, @created_at, @expires_at, NULL)",
+    ).run({
+      ...input,
+      code_hash: tokenHash(code),
+      created_at: now(),
+      expires_at: new Date(Date.now() + AUTH_CODE_TTL_MS).toISOString(),
+    });
+    return code;
+  },
+
+  /** Single-use redemption under a transaction. Returns the bound grant, or a
+   *  reason: 'replay' (already used — caller should revoke), 'expired', or
+   *  undefined (unknown). Marks the code used on success. */
+  redeem(code: string): { ok: true; grant: AuthCode } | { ok: false; reason: "replay" | "expired" | "unknown" } {
+    db.prepare("DELETE FROM oauth_auth_codes WHERE expires_at < ?").run(now()); // opportunistic sweep
+    return tx(() => {
+      const r = db.prepare("SELECT * FROM oauth_auth_codes WHERE code_hash = ?").get(tokenHash(code)) as
+        | (AuthCode & { expires_at: string; used_at: string | null })
+        | undefined;
+      if (!r) return { ok: false, reason: "unknown" } as const;
+      if (r.used_at) return { ok: false, reason: "replay" } as const;
+      if (new Date(r.expires_at).getTime() < Date.now()) return { ok: false, reason: "expired" } as const;
+      db.prepare("UPDATE oauth_auth_codes SET used_at = ? WHERE code_hash = ?").run(now(), tokenHash(code));
+      return {
+        ok: true,
+        grant: {
+          client_id: r.client_id,
+          redirect_uri: r.redirect_uri,
+          code_challenge: r.code_challenge,
+          ai_actor: r.ai_actor,
+          granted_by: r.granted_by,
+          scope: r.scope,
+        },
+      } as const;
+    });
+  },
 };
 
 // ---- Bulk historical import (legacy hive.db → this instance) ----

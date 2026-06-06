@@ -11,6 +11,7 @@ import { Account } from "./Account.tsx";
 import { Graph } from "./Graph.tsx";
 import { Onboarding } from "./Onboarding.tsx";
 import { Login } from "./Login.tsx";
+import { OAuthConsent } from "./OAuthConsent.tsx";
 import { Icon } from "./icons.tsx";
 import { Decisions, Events, PeopleView, ProjectsView, SearchPane, Tasks, TopicsView, Wire } from "./Boards.tsx";
 
@@ -186,22 +187,31 @@ export const App: Component = () => {
             when={boot()?.signedIn}
             fallback={<Login instanceName={boot()?.status.instanceName ?? null} onLogin={reload} />}
           >
-            <Router root={Workspace({ instanceName: boot()?.status.instanceName ?? null, onLogout })}>
-              <Route path="/" component={() => <Navigate href="/journal" />} />
-              <For each={TABS}>
-                {(t) => (
-                  <Route
-                    path={`/${t.id}`}
-                    component={
-                      t.id === "account" && getCurrentUser()?.role !== "admin"
-                        ? () => <Navigate href="/journal" />
-                        : PAGES[t.id]
-                    }
-                  />
-                )}
-              </For>
-              <Route path="*" component={() => <Navigate href="/journal" />} />
-            </Router>
+            {/* OAuth consent is a standalone full-page screen (no workspace
+                chrome), so it short-circuits BEFORE the router that owns the
+                authenticated app shell. window.location (not useLocation) since
+                this sits outside the Router context. */}
+            <Show
+              when={window.location.pathname !== "/consent"}
+              fallback={<OAuthConsent />}
+            >
+              <Router root={Workspace({ instanceName: boot()?.status.instanceName ?? null, onLogout })}>
+                <Route path="/" component={() => <Navigate href="/journal" />} />
+                <For each={TABS}>
+                  {(t) => (
+                    <Route
+                      path={`/${t.id}`}
+                      component={
+                        t.id === "account" && getCurrentUser()?.role !== "admin"
+                          ? () => <Navigate href="/journal" />
+                          : PAGES[t.id]
+                      }
+                    />
+                  )}
+                </For>
+                <Route path="*" component={() => <Navigate href="/journal" />} />
+              </Router>
+            </Show>
           </Show>
         </Show>
       </Suspense>

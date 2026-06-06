@@ -4,6 +4,14 @@
 // a sha256 hash (the plaintext is shown to the client once and never persisted).
 import { createHash, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 
+/** PKCE S256 verify: base64url(sha256(verifier)) === challenge (constant-time). */
+export function verifyPkce(verifier: string, challenge: string): boolean {
+  const computed = createHash("sha256").update(verifier).digest("base64url");
+  const a = Buffer.from(computed);
+  const b = Buffer.from(challenge);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 const SCRYPT_KEYLEN = 64;
 
 /** Hash a password as `scrypt$<saltHex>$<hashHex>`. */
@@ -34,6 +42,11 @@ export function tokenHash(token: string): string {
 
 export const SESSION_PREFIX = "hive_sess";
 export const API_TOKEN_PREFIX = "hive_pat";
+export const AUTH_CODE_PREFIX = "hive_ac";
 export const SESSION_COOKIE = "hive_session";
 /** Session lifetime: 30 days. */
 export const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+/** OAuth authorization-code lifetime: 60 seconds (single-use). */
+export const AUTH_CODE_TTL_MS = 60 * 1000;
+/** OAuth access-token lifetime: 1 year (renewable via re-consent). */
+export const OAUTH_TOKEN_TTL_MS = 365 * 24 * 60 * 60 * 1000;

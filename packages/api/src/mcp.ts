@@ -54,7 +54,7 @@ const anchorSchema = z
   .describe("a span of `body` that becomes a structured task/decision/event");
 
 /** Build a fresh server instance (stateless transport ⇒ one per request). */
-export function buildMcpServer(): McpServer {
+export function buildMcpServer(actor: string): McpServer {
   const server = new McpServer(
     { name: "hive", version: "0.1.0" },
     {
@@ -74,15 +74,16 @@ export function buildMcpServer(): McpServer {
       description:
         "Write an immutable prose entry. Optionally attach anchors: each is a {start,end} char span of `body` that materialises a task/decision/event anchored to that text. @mentions notify inboxes. " +
         "Inline bracket tokens also emerge entities: [person: Name], [topic: Name], [project: Name], [phase: Name], [task: Title]. " +
-        "A [task: Title] in the entry auto-assigns to the author. A [person: X] that matches a known actor also fans to their inbox.",
+        "A [task: Title] in the entry auto-assigns to the author. A [person: X] that matches a known actor also fans to their inbox. " +
+        "You write as your authenticated identity — authorship is taken from your token, not a parameter.",
       inputSchema: {
-        author: z.enum(ACTOR_NAMES as [string, ...string[]]),
         body: z.string().describe("the prose (Markdown supported); this is the source of truth"),
         tags: z.array(z.string()).optional(),
         anchors: z.array(anchorSchema).optional(),
       },
     },
-    async (args) => ok(journal.append(args as any)),
+    // Author is the token's actor — a client cannot write as someone else.
+    async (args) => ok(journal.append({ ...(args as any), author: actor }, actor)),
   );
 
   server.registerTool(
@@ -99,6 +100,27 @@ export function buildMcpServer(): McpServer {
     "journal_get",
     { title: "Get a journal entry", inputSchema: { id: z.string() } },
     async ({ id }) => ok(journal.get(id) ?? { error: "not found" }),
+  );
+
+  // Self-service identity editor. The profile card (profile_update) is the
+  // canonical identity store; this writes bio/role onto the caller's OWN card as
+  // sections.bio / sections.role (keeping the actor-scoped self-edit semantics —
+  // you can't edit anyone else's). Kept as a distinct, simpler tool so an agent
+  // can update its own one-liner identity without the full card surface.
+  server.registerTool(
+    "identity_update",
+    {
+      title: "Update your identity (bio/role)",
+      description:
+        "Keep your own identity current — set your bio and/or role. Writes sections.bio / sections.role on your own profile card (your authenticated identity; you can't edit anyone else's).",
+      inputSchema: { bio: z.string().optional(), role: z.string().optional() },
+    },
+    async ({ bio, role }) => {
+      const sections: Record<string, string> = {};
+      if (bio !== undefined) sections.bio = bio;
+      if (role !== undefined) sections.role = role;
+      return ok(profiles.update(actor, { sections }, actor));
+    },
   );
 
   server.registerTool(
@@ -119,7 +141,7 @@ export function buildMcpServer(): McpServer {
       inputSchema: { id: z.string(), status: z.enum(["todo", "doing", "blocked", "done"]) },
     },
     async ({ id, status }, _extra) =>
-      ok(tasks.update(id, { status }, "mcp") ?? { error: "not found" }),
+      ok(tasks.update(id, { status }, actor) ?? { error: "not found" }),
   );
 
   server.registerTool(
@@ -261,7 +283,7 @@ export function buildMcpServer(): McpServer {
         owner: z.enum(ACTOR_NAMES as [string, ...string[]]).nullish(),
       },
     },
-    async (args) => ok(sources.create(args as any, "mcp")),
+    async (args) => ok(sources.create(args as any, actor)),
   );
 
   server.registerTool(
@@ -277,13 +299,13 @@ export function buildMcpServer(): McpServer {
         notify: z.string().optional(),
       },
     },
-    async ({ id, ...patch }) => ok(sources.update(id, patch as any, "mcp") ?? { error: "not found" }),
+    async ({ id, ...patch }) => ok(sources.update(id, patch as any, actor) ?? { error: "not found" }),
   );
 
   server.registerTool(
     "sources_remove",
     { title: "Remove an ingest source", inputSchema: { id: z.string() } },
-    async ({ id }) => ok({ removed: sources.remove(id, "mcp") }),
+    async ({ id }) => ok({ removed: sources.remove(id, actor) }),
   );
 
   server.registerTool(
@@ -347,8 +369,9 @@ export function buildMcpServer(): McpServer {
   return server;
 }
 
-/** Handle a raw Node request at /mcp (stateless Streamable HTTP). */
-export async function handleMcp(req: IncomingMessage, res: ServerResponse): Promise<void> {
+/** Handle a raw Node request at /mcp (stateless Streamable HTTP). `actor` is the
+ *  identity resolved from the caller's bearer token — it pins authorship. */
+export async function handleMcp(req: IncomingMessage, res: ServerResponse, actor: string): Promise<void> {
   res.setHeader("access-control-allow-origin", "*");
   res.setHeader("access-control-allow-headers", "content-type, mcp-session-id, mcp-protocol-version");
   res.setHeader("access-control-allow-methods", "POST, OPTIONS");
@@ -369,7 +392,7 @@ export async function handleMcp(req: IncomingMessage, res: ServerResponse): Prom
     return;
   }
 
-  const server = buildMcpServer();
+  const server = buildMcpServer(actor);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on("close", () => {
     transport.close();

@@ -23,10 +23,14 @@ export interface Person {
   kind: ActorKind;
   /** For AI writers: the slug of their human owner. null for humans. */
   owner: string | null;
+  /** Freeform identity profile — who they are / what they do. */
+  bio: string | null;
+  /** Short role/title, e.g. "VP of Technology". */
+  role: string | null;
   created_at: string;
 }
 
-export type PersonPatch = Partial<Pick<Person, "name" | "kind" | "owner">>;
+export type PersonPatch = Partial<Pick<Person, "name" | "kind" | "owner" | "bio" | "role">>;
 
 // ---- shares ----
 
@@ -73,7 +77,7 @@ export const isAi = (name: string) => ACTORS.find((a) => a.name === name)?.kind 
 /** The app version that introduced auth + onboarding. The DB records the
  *  version that initialized it; databases created before this never show the
  *  onboarding wizard. */
-export const APP_VERSION = "0.1.1";
+export const APP_VERSION = "0.1.3";
 
 export type UserRole = "admin" | "member";
 
@@ -99,7 +103,9 @@ export interface SafeUser {
 }
 
 /** A bearer token for programmatic clients (CLI, MCP, AI agents). The plaintext
- *  is shown once at creation; only its hash is stored. */
+ *  is shown once at creation; only its hash is stored. `kind='oauth'` tokens were
+ *  minted via the OAuth consent flow and carry a client + expiry; `kind='pat'`
+ *  (or null) are admin-minted personal tokens with no expiry. */
 export interface ApiToken {
   id: string;
   actor: string;
@@ -109,11 +115,45 @@ export interface ApiToken {
   created_by: string;
   /** ISO expiry; null = legacy non-expiring token. Resolution rejects expired tokens. */
   expires_at: string | null;
+  // OAuth-minted tokens (kind='oauth') carry a client + granting human + scope;
+  // kind='pat' (or null) are admin-minted personal tokens.
+  kind: "pat" | "oauth" | null;
+  client_id: string | null;
+  granted_by: string | null;
+  scope: string | null;
 }
 
 /** API-token expiry policy. New tokens get DEFAULT days unless specified; never more than MAX. */
 export const API_TOKEN_MAX_EXPIRY_DAYS = 365;
 export const API_TOKEN_DEFAULT_EXPIRY_DAYS = 90;
+
+/** A dynamically-registered OAuth client (RFC 7591). */
+export interface OAuthClient {
+  client_id: string;
+  client_name: string;
+  redirect_uris: string[];
+  grant_types: string[];
+  created_at: string;
+}
+
+/** An AI identity a signed-in human owns and may grant via the consent flow. */
+export interface AiIdentity {
+  slug: string;
+  name: string;
+}
+
+/** Payload the consent screen reads to render the grant UI. */
+export interface OAuthConsentContext {
+  client_name: string;
+  identities: AiIdentity[];
+  csrf: string;
+}
+
+/** Public auth capabilities the SPA reads before login. */
+export interface AuthConfig {
+  oidc: boolean;
+  instanceName: string | null;
+}
 
 /** Bulk historical import (legacy hive.db → this instance). Rows carry their original
  *  ids + timestamps; the importer is idempotent (existing ids are skipped). */

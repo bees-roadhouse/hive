@@ -459,18 +459,47 @@ export const Wire: Component = () => {
 // ---- People view ----
 
 export const PeopleView: Component = () => {
-  const [people] = createResource(() => ({ _r: liveRev() }), () => api.people());
+  const [people, { refetch }] = createResource(() => ({ _r: liveRev() }), () => api.people());
+  const [editing, setEditing] = createSignal<string | null>(null);
+  const [bio, setBio] = createSignal("");
+  const [role, setRole] = createSignal("");
+  const open = (p: Person) => {
+    setEditing(p.slug);
+    setBio(p.bio ?? "");
+    setRole(p.role ?? "");
+  };
+  const save = async (slug: string) => {
+    await api.patchPerson(slug, { bio: bio(), role: role() });
+    setEditing(null);
+    refetch();
+  };
   return (
     <section>
-      <p class="dim pad">People known to hive. Created automatically when referenced in journal entries, or added from Admin.</p>
+      <p class="dim pad">Identities known to hive — humans and AIs. Click one to edit its profile (bio + role). AIs can also keep their own profile updated via MCP.</p>
       <Show when={people()} fallback={<SkeletonList rows={6} />}>
         <For each={people() as Person[]} fallback={<p class="dim sm">no people yet — reference someone in a journal entry.</p>}>
           {(p) => (
-            <div class="entity-row">
-              <span class="entity-icon"><Icon name="person" size={16} /></span>
-              <span class="entity-name">{p.name}</span>
-              <span class={`badge kind-badge-${p.kind}`}>{p.kind}</span>
-              <span class="dim sm entity-slug">{p.slug}</span>
+            <div class="person-card">
+              <div class="entity-row person-head" onClick={() => (editing() === p.slug ? setEditing(null) : open(p))}>
+                <span class="entity-icon"><Icon name="person" size={16} /></span>
+                <span class="entity-name">{p.name}</span>
+                <Show when={p.role}><span class="badge">{p.role}</span></Show>
+                <span class={`badge kind-badge-${p.kind}`}>{p.kind}</span>
+                <span class="dim sm entity-slug">{p.slug}</span>
+              </div>
+              <Show when={p.bio && editing() !== p.slug}>
+                <p class="dim sm person-bio">{p.bio}</p>
+              </Show>
+              <Show when={editing() === p.slug}>
+                <div class="person-edit">
+                  <input placeholder="role (e.g. VP of Technology)" value={role()} onInput={(e) => setRole(e.currentTarget.value)} />
+                  <textarea placeholder="bio — who they are / what they do" rows="3" value={bio()} onInput={(e) => setBio(e.currentTarget.value)} />
+                  <div class="consent-actions">
+                    <button class="logout" onClick={() => setEditing(null)}>Cancel</button>
+                    <button type="button" onClick={() => save(p.slug)}>Save</button>
+                  </div>
+                </div>
+              </Show>
             </div>
           )}
         </For>

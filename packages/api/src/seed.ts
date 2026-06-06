@@ -1,8 +1,8 @@
 // Seed hive the way it's meant to be used: by writing journal entries, with
 // spans of the prose anchored into tasks / decisions / events. Offsets are
 // computed from the text with a small helper so the entries stay readable.
-import { migrate } from "./db.ts";
-import { embeddings, journal, outbox, profiles, recall, seedActors, semanticSearch, sources } from "./store.ts";
+import { db, migrate } from "./db.ts";
+import { backfillIdentityCards, embeddings, journal, outbox, people, profiles, recall, seedActors, semanticSearch, sources } from "./store.ts";
 import type { AnchorKind, AnchorFields } from "@hive/shared";
 
 migrate();
@@ -217,6 +217,28 @@ if (r.data.journal.length === 0)
 const planned = await recall({ identity: "pia", query: "Solid UI rewrite plan milestones" });
 const headingHit = planned.data.journal.find((h) => h.title === "Solid UI rewrite plan");
 if (!headingHit) throw new Error("seed: recall did not derive the journal title from the body heading");
+
+// ---- identity reconciliation smoke (#31 bio/role → #37 card, canonical) ----
+// 1) A legacy person with bio/role only in the people columns (no card) must be
+//    folded into the card by backfillIdentityCards.
+people.upsert("zane", "Zane Legacy", "human");
+// Set the legacy columns directly (NOT via people.update, which would mirror to
+// the card) to simulate pre-reconciliation data: bio/role in the column, no card.
+db.prepare("UPDATE people SET bio = ?, role = ? WHERE slug = ?").run("Built the old wire scraper.", "Infra", "zane");
+const migrated = backfillIdentityCards();
+if (migrated < 1) throw new Error("seed: backfillIdentityCards migrated nothing");
+const zane = profiles.get("zane");
+if (zane?.body.sections.bio !== "Built the old wire scraper." || zane?.body.sections.role !== "Infra")
+  throw new Error("seed: people.bio/role did not fold into the profile card");
+// 2) Backfill is non-destructive: a hand-edited card section is not clobbered.
+profiles.update("zane", { sections: { bio: "Edited bio wins." } }, "zane");
+backfillIdentityCards();
+if (profiles.get("zane")?.body.sections.bio !== "Edited bio wins.")
+  throw new Error("seed: backfill clobbered an existing card section");
+// 3) people.update mirrors bio/role edits into the card (one source of truth).
+people.update("zane", { role: "Platform" }, "zane");
+if (profiles.get("zane")?.body.sections.role !== "Platform")
+  throw new Error("seed: people.update did not mirror role into the card");
 
 console.log(
   `🌱 seeded hive: people, journal + anchors, inboxes, a sample RSS source, a scrape source, an outbox job, ` +

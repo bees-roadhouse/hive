@@ -23,8 +23,13 @@ import { migrate } from "./db.ts";
 import { readLegacyDb } from "./legacy-import.ts";
 import { handleMcp } from "./mcp.ts";
 import { subscribe } from "./bus.ts";
-import { SESSION_COOKIE, SESSION_TTL_MS } from "./auth.ts";
+import { SESSION_COOKIE, SESSION_TTL_MS, tokenHash, verifyPkce } from "./auth.ts";
+import { authUrl, discover, exchangeCode, oidcConfig, verifyIdToken } from "./oidc.ts";
 import {
+  backfillIdentityCards,
+  config,
+  oauthClients,
+  oauthCodes,
   onboarding,
   sessions,
   tokens,
@@ -47,7 +52,6 @@ import {
   projects,
   recall,
   search,
-  seedActors,
   semanticSearch,
   shares,
   sources,
@@ -59,7 +63,10 @@ import {
 } from "./store.ts";
 
 migrate();
-seedActors();
+// Fold any legacy people.bio/role into the canonical profile card (idempotent).
+backfillIdentityCards();
+// No actor seeding: the instance holds only who you onboard, import, or create.
+// (seedActors stays exported for the demo `pnpm seed`.)
 
 type Principal = "session" | "token";
 type Env = { Variables: { actor?: string; principal?: Principal; role?: UserRole } };
@@ -89,7 +96,27 @@ const PUBLIC_PATHS = new Set([
   "/api/onboarding",
   "/api/auth/login",
   "/api/auth/me",
+  "/api/auth/config",
+  // OAuth 2.1 AS + OIDC: discovery, registration, token, the authorize entry
+  // (its session check is internal), and the OIDC redirect endpoints.
+  "/.well-known/oauth-authorization-server",
+  "/.well-known/oauth-protected-resource",
+  "/oauth/register",
+  "/oauth/token",
+  "/authorize",
+  "/api/auth/oidc/start",
+  "/api/auth/oidc/callback",
 ]);
+
+// The public origin of this instance — all OAuth metadata URLs derive from it.
+// Prefer explicit config/env; fall back to the request's host.
+function issuerFor(host?: string): string {
+  return (
+    config.get("instance.url") ??
+    process.env.HIVE_PUBLIC_URL ??
+    `http://${host ?? `localhost:${process.env.PORT ?? 8787}`}`
+  );
+}
 
 app.use("*", async (c, next) => {
   // Resolve the principal if any credentials are present.
@@ -244,6 +271,241 @@ app.post("/api/import/sqlite", async (c) => {
   }
 });
 
+// ---- auth capabilities (SPA reads before login) ----
+app.get("/api/auth/config", (c) =>
+  c.json({ oidc: !!oidcConfig(), instanceName: config.get("instance.name") ?? null }),
+);
+
+// ============================================================================
+// OAuth 2.1 Authorization Server (AI identity consent flow)
+// ============================================================================
+const MAX_OAUTH_CLIENTS = 200; // DCR is unauthenticated; cap to bound abuse.
+
+// --- Discovery metadata (RFC 8414 + RFC 9728) ---
+app.get("/.well-known/oauth-authorization-server", (c) => {
+  const iss = issuerFor(c.req.header("host"));
+  return c.json({
+    issuer: iss,
+    authorization_endpoint: `${iss}/authorize`,
+    token_endpoint: `${iss}/oauth/token`,
+    registration_endpoint: `${iss}/oauth/register`,
+    response_types_supported: ["code"],
+    grant_types_supported: ["authorization_code"],
+    code_challenge_methods_supported: ["S256"],
+    token_endpoint_auth_methods_supported: ["none"],
+    scopes_supported: ["mcp"],
+  });
+});
+
+app.get("/.well-known/oauth-protected-resource", (c) => {
+  const iss = issuerFor(c.req.header("host"));
+  return c.json({
+    resource: `${iss}/mcp`,
+    authorization_servers: [iss],
+    bearer_methods_supported: ["header"],
+    scopes_supported: ["mcp"],
+  });
+});
+
+// --- Dynamic Client Registration (RFC 7591) ---
+const validRedirect = (u: string): boolean => {
+  try {
+    const url = new URL(u);
+    return (url.protocol === "https:" || url.protocol === "http:") && !url.hash;
+  } catch {
+    return false;
+  }
+};
+
+app.post("/oauth/register", async (c) => {
+  if (oauthClients.count() >= MAX_OAUTH_CLIENTS) return c.json({ error: "too_many_clients" }, 429);
+  const body = (await c.req.json().catch(() => ({}))) as { redirect_uris?: string[]; client_name?: string };
+  const redirect_uris = body.redirect_uris ?? [];
+  if (!Array.isArray(redirect_uris) || redirect_uris.length === 0 || !redirect_uris.every(validRedirect))
+    return c.json({ error: "invalid_redirect_uri" }, 400);
+  const client = oauthClients.register({
+    client_name: (body.client_name ?? "MCP client").slice(0, 200),
+    redirect_uris,
+  });
+  return c.json(
+    {
+      client_id: client.client_id,
+      client_name: client.client_name,
+      redirect_uris: client.redirect_uris,
+      grant_types: client.grant_types,
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+    },
+    201,
+  );
+});
+
+// --- Authorization endpoint (browser entry). Validates, then hands off to the
+//     SPA consent screen. Never redirects on a bad client/redirect_uri. ---
+const htmlError = (c: any, msg: string) =>
+  c.html(`<!doctype html><meta charset=utf-8><title>Authorization error</title>
+<body style="font-family:system-ui;background:#0e1116;color:#e6e9ee;padding:3rem">
+<h1>🐝 Authorization error</h1><p>${msg}</p></body>`, 400);
+
+app.get("/authorize", (c) => {
+  const q = c.req.query();
+  const client = q.client_id ? oauthClients.get(q.client_id) : undefined;
+  if (!client) return htmlError(c, "Unknown client_id.");
+  if (!q.redirect_uri || !client.redirect_uris.includes(q.redirect_uri))
+    return htmlError(c, "redirect_uri does not match a registered URI.");
+  // Past this point a bad request MAY be redirected back to the (validated) client.
+  const back = (err: string) => c.redirect(`${q.redirect_uri}?error=${err}${q.state ? `&state=${encodeURIComponent(q.state)}` : ""}`);
+  if (q.response_type !== "code") return back("unsupported_response_type");
+  if (q.code_challenge_method !== "S256" || !q.code_challenge) return back("invalid_request");
+  // Hand to the SPA consent route (same origin). The session check happens there
+  // (the /oauth/authorize/context call requires a logged-in human).
+  const p = new URLSearchParams({
+    client_id: q.client_id!,
+    redirect_uri: q.redirect_uri,
+    code_challenge: q.code_challenge,
+    state: q.state ?? "",
+    scope: q.scope ?? "mcp",
+  });
+  return c.redirect(`/consent?${p}`);
+});
+
+// CSRF token bound to the session cookie (stateless double-submit).
+const csrfFor = (sessionCookie: string) => tokenHash(`${sessionCookie}:oauth-csrf`);
+
+// --- Consent context: who's asking + which AI identities the human may grant ---
+app.get("/oauth/authorize/context", (c) => {
+  if (c.get("principal") !== "session") return c.json({ error: "session_required" }, 401);
+  const client = oauthClients.get(c.req.query("client_id") ?? "");
+  if (!client) return c.json({ error: "unknown_client" }, 404);
+  const actorSlug = c.get("actor")!;
+  const identities = people.aisOwnedBy(actorSlug).map((p) => ({ slug: p.slug, name: p.name }));
+  const cookie = getCookie(c, SESSION_COOKIE) ?? "";
+  return c.json({ client_name: client.client_name, identities, csrf: csrfFor(cookie) });
+});
+
+// --- Consent grant: issue an auth code bound to the chosen AI identity ---
+app.post("/oauth/authorize/grant", async (c) => {
+  if (c.get("principal") !== "session") return c.json({ error: "session_required" }, 401);
+  // CSRF: per-session token + same-origin Origin check (not SameSite alone).
+  const origin = c.req.header("origin");
+  if (origin && origin !== issuerFor(c.req.header("host"))) return c.json({ error: "bad_origin" }, 403);
+  const body = (await c.req.json()) as {
+    client_id: string;
+    redirect_uri: string;
+    code_challenge: string;
+    state?: string;
+    scope?: string;
+    ai_actor: string;
+    csrf: string;
+  };
+  const cookie = getCookie(c, SESSION_COOKIE) ?? "";
+  if (!body.csrf || body.csrf !== csrfFor(cookie)) return c.json({ error: "bad_csrf" }, 403);
+  const client = oauthClients.get(body.client_id);
+  if (!client || !client.redirect_uris.includes(body.redirect_uri)) return c.json({ error: "invalid_client" }, 400);
+  const owner = c.get("actor")!;
+  const owned = people.aisOwnedBy(owner).some((p) => p.slug === body.ai_actor);
+  if (!owned) return c.json({ error: "not_your_identity" }, 403);
+  const code = oauthCodes.create({
+    client_id: body.client_id,
+    redirect_uri: body.redirect_uri,
+    code_challenge: body.code_challenge,
+    ai_actor: body.ai_actor,
+    granted_by: owner,
+    scope: body.scope ?? "mcp",
+  });
+  const redirect = `${body.redirect_uri}?code=${encodeURIComponent(code)}${body.state ? `&state=${encodeURIComponent(body.state)}` : ""}`;
+  return c.json({ redirect });
+});
+
+// --- Token endpoint: exchange code (+PKCE) for a long-lived AI access token ---
+app.post("/oauth/token", async (c) => {
+  const form = await c.req.parseBody().catch(() => ({}) as Record<string, string>);
+  const grant_type = String(form.grant_type ?? "");
+  if (grant_type !== "authorization_code") return c.json({ error: "unsupported_grant_type" }, 400);
+  const code = String(form.code ?? "");
+  const verifier = String(form.code_verifier ?? "");
+  const redirect_uri = String(form.redirect_uri ?? "");
+  const client_id = String(form.client_id ?? "");
+  if (!code || !verifier) return c.json({ error: "invalid_request" }, 400);
+
+  const result = oauthCodes.redeem(code);
+  if (!result.ok) {
+    if (result.reason === "replay") {
+      // Code reuse — treat as compromise: revoke any token already minted for this client.
+      tokens.revokeByClient(client_id);
+    }
+    return c.json({ error: "invalid_grant" }, 400);
+  }
+  const grant = result.grant;
+  if (grant.client_id !== client_id || grant.redirect_uri !== redirect_uri)
+    return c.json({ error: "invalid_grant" }, 400);
+  if (!verifyPkce(verifier, grant.code_challenge)) return c.json({ error: "invalid_grant" }, 400);
+
+  const { token } = tokens.createOAuth({
+    actor: grant.ai_actor,
+    clientId: grant.client_id,
+    grantedBy: grant.granted_by,
+    scope: grant.scope,
+  });
+  return c.json({
+    access_token: token,
+    token_type: "Bearer",
+    scope: grant.scope,
+    expires_in: Math.floor((365 * 24 * 60 * 60 * 1000) / 1000),
+  });
+});
+
+// ============================================================================
+// OIDC human login (dormant unless OIDC_ISSUER is configured)
+// ============================================================================
+const OIDC_STATE_COOKIE = "hive_oidc_state";
+const OIDC_NONCE_COOKIE = "hive_oidc_nonce";
+const OIDC_RETURN_COOKIE = "hive_oidc_return";
+
+app.get("/api/auth/oidc/start", async (c) => {
+  const cfg = oidcConfig();
+  if (!cfg) return c.json({ error: "oidc_not_configured" }, 404);
+  const disco = await discover(cfg);
+  const state = tokenHash(`${Date.now()}:${Math.random()}`);
+  const nonce = tokenHash(`${Math.random()}:${Date.now()}`);
+  const opts = { httpOnly: true, sameSite: "Lax" as const, path: "/", maxAge: 600 };
+  setCookie(c, OIDC_STATE_COOKIE, state, opts);
+  setCookie(c, OIDC_NONCE_COOKIE, nonce, opts);
+  const rt = c.req.query("return_to");
+  if (rt) setCookie(c, OIDC_RETURN_COOKIE, rt, opts);
+  return c.redirect(authUrl(disco.authorization_endpoint, cfg, state, nonce));
+});
+
+app.get("/api/auth/oidc/callback", async (c) => {
+  const cfg = oidcConfig();
+  if (!cfg) return c.json({ error: "oidc_not_configured" }, 404);
+  const code = c.req.query("code");
+  const state = c.req.query("state");
+  if (!code || !state || state !== getCookie(c, OIDC_STATE_COOKIE)) return htmlError(c, "Invalid OIDC state.");
+  const nonce = getCookie(c, OIDC_NONCE_COOKIE) ?? "";
+  try {
+    const disco = await discover(cfg);
+    const { id_token } = await exchangeCode(cfg, disco.token_endpoint, code);
+    const claims = await verifyIdToken(cfg, disco.jwks_uri, id_token, nonce);
+    const email = claims.email.toLowerCase();
+    let user = users.byEmail(email);
+    if (!user) {
+      const domain = email.split("@")[1] ?? "";
+      if (!cfg.allowedDomains.includes(domain)) return htmlError(c, "No hive account for this email, and its domain isn't allowed.");
+      const safe = users.create({ name: claims.name ?? email, email, password: tokenHash(`${Math.random()}`), kind: "human" }, "oidc");
+      user = users.byId(safe.id);
+    }
+    if (!user) return htmlError(c, "Could not provision an account.");
+    const session = sessions.create(user.id);
+    setCookie(c, SESSION_COOKIE, session, { httpOnly: true, sameSite: "Lax", path: "/", maxAge: SESSION_TTL_MS / 1000 });
+    const back = getCookie(c, OIDC_RETURN_COOKIE) || "/";
+    deleteCookie(c, OIDC_RETURN_COOKIE, { path: "/" });
+    return c.redirect(back);
+  } catch (err) {
+    return htmlError(c, `OIDC sign-in failed: ${(err as Error).message}`);
+  }
+});
+
 // ---- journal (the one write path) ----
 app.get("/api/journal/writers", (c) => {
   const viewer = c.req.query("viewer");
@@ -319,8 +581,14 @@ app.get("/api/people/:slug", (c) => {
   return p ? c.json(p) : c.json({ error: "not found" }, 404);
 });
 app.patch("/api/people/:slug", async (c) => {
+  const slug = c.req.param("slug");
+  const target = people.get(slug);
+  if (!target) return c.json({ error: "not found" }, 404);
+  // Editable by an admin, the AI's owner, or the identity itself.
+  const me = c.get("actor");
+  if (!requireAdmin(c) && target.owner !== me && target.slug !== me) return c.json({ error: "forbidden" }, 403);
   const patch = (await c.req.json()) as PersonPatch;
-  const p = people.update(c.req.param("slug"), patch, actor(c));
+  const p = people.update(slug, patch, actor(c));
   return p ? c.json(p) : c.json({ error: "not found" }, 404);
 });
 app.post("/api/people", async (c) => {
@@ -523,18 +791,26 @@ createServer((req, res) => {
   if (path === "/mcp") {
     // MCP is the programmatic surface — require a valid Bearer token (OPTIONS
     // preflight passes through so handleMcp can answer CORS).
-    if (req.method !== "OPTIONS" && (onboarding.required() || !rawActor(req))) {
-      res.writeHead(401, { "content-type": "application/json", "access-control-allow-origin": "*" });
+    const principal = req.method === "OPTIONS" ? null : rawActor(req);
+    if (req.method !== "OPTIONS" && (onboarding.required() || !principal)) {
+      const issuer = issuerFor(req.headers.host);
+      res.writeHead(401, {
+        "content-type": "application/json",
+        "access-control-allow-origin": "*",
+        // RFC 9728: point MCP clients at the protected-resource metadata so they
+        // can discover the authorization server and run the OAuth consent flow.
+        "www-authenticate": `Bearer resource_metadata="${issuer}/.well-known/oauth-protected-resource"`,
+      });
       res.end(
         JSON.stringify({
           jsonrpc: "2.0",
-          error: { code: -32001, message: "Unauthorized — provide a Bearer API token." },
+          error: { code: -32001, message: "Unauthorized — authorize via OAuth or provide a Bearer API token." },
           id: null,
         }),
       );
       return;
     }
-    handleMcp(req, res).catch((err) => {
+    handleMcp(req, res, principal?.actor ?? "anon").catch((err) => {
       console.error("mcp error", err);
       if (!res.headersSent) res.writeHead(500).end();
     });
