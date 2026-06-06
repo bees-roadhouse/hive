@@ -1,4 +1,4 @@
-import { createResource, createSignal, For, Show, type Component } from "solid-js";
+import { createEffect, createResource, createSignal, For, Show, type Component } from "solid-js";
 import type {
   AnchorKind,
   Decision,
@@ -7,6 +7,7 @@ import type {
   Person,
   Project,
   SearchHit,
+  Severity,
   Task,
   TaskStatus,
   Topic,
@@ -16,7 +17,7 @@ import { TASK_STATUSES } from "@hive/shared";
 import { api, getDoneRetentionHours, setDoneRetentionHours } from "./api.ts";
 import { liveRev } from "./live.ts";
 import { Icon } from "./icons.tsx";
-import { DECISION_GLYPH, relTime, TASK_GLYPH } from "./lib.tsx";
+import { DECISION_GLYPH, relTime, SkeletonList, TASK_GLYPH } from "./lib.tsx";
 import { Markdown } from "./markdown.tsx";
 
 // ---- due-date helpers ----
@@ -321,21 +322,136 @@ export const SearchPane: Component = () => {
   );
 };
 
-// ---- Wire ----
+// ---- Wire (news + info feed) ----
+
+// feed.item / scrape.item events carry a rich payload the worker ingests from
+// RSS/scrape sources. Everything else on the wire is internal activity.
+type NewsPayload = {
+  title?: string;
+  url?: string | null;
+  body?: string;
+  source?: string;
+  category?: string | null;
+  severity?: Severity;
+};
+const NEWS_KINDS = new Set(["feed.item", "scrape.item"]);
+const isNews = (e: WireEvent): boolean => NEWS_KINDS.has(e.kind);
+const newsPayload = (e: WireEvent): NewsPayload => (e.payload ?? {}) as NewsPayload;
+
+type WireFilter = "news" | "activity" | "all";
+
+const NewsCard: Component<{ e: WireEvent; fresh: boolean }> = (props) => {
+  const p = () => newsPayload(props.e);
+  const sev = () => p().severity ?? "info";
+  return (
+    <article class="news-card" classList={{ "just-landed": props.fresh }}>
+      <span class={`sev-dot sev-${sev()}`} title={sev()} />
+      <div class="news-body">
+        <div class="news-head">
+          <Show
+            when={p().url}
+            fallback={<span class="news-title">{p().title ?? props.e.kind}</span>}
+          >
+            <a class="news-title" href={p().url!} target="_blank" rel="noopener noreferrer">
+              {p().title ?? p().url}
+            </a>
+          </Show>
+        </div>
+        <Show when={p().body}>
+          <p class="news-snippet">{(p().body ?? "").slice(0, 240)}</p>
+        </Show>
+        <div class="news-meta">
+          <span class="actor-chip sm">{p().source ?? props.e.actor}</span>
+          <Show when={p().category}>
+            <span class="badge news-cat">{p().category}</span>
+          </Show>
+          <Show when={sev() !== "info"}>
+            <span class={`badge sev-badge sev-${sev()}`}>{sev()}</span>
+          </Show>
+          <time class="dim sm">{relTime(props.e.created_at)}</time>
+        </div>
+      </div>
+    </article>
+  );
+};
 
 export const Wire: Component = () => {
-  const [events] = createResource(() => ({ _r: liveRev() }), () => api.wire());
+  const [events, { refetch }] = createResource(() => ({ _r: liveRev() }), () => api.wire());
+  const [filter, setFilter] = createSignal<WireFilter>("news");
+  const [refreshing, setRefreshing] = createSignal(false);
+  const [lastRefresh, setLastRefresh] = createSignal<string>(new Date().toISOString());
+
+  // Track which event ids we've already shown so newly-arrived ones (pushed over
+  // the live SSE stream, or pulled by a manual refresh) get a brief honey
+  // "just-landed" wash. The first load isn't flagged — only events that appear
+  // after we've seen a baseline.
+  let seen: Set<string> | null = null;
+  const isFresh = (e: WireEvent): boolean => seen !== null && !seen.has(e.id);
+  createEffect(() => {
+    const list = (events() as WireEvent[]) ?? [];
+    seen = new Set(list.map((e) => e.id));
+  });
+
+  const shown = (): WireEvent[] => {
+    const all = (events() as WireEvent[]) ?? [];
+    const f = filter();
+    if (f === "all") return all;
+    if (f === "news") return all.filter(isNews);
+    return all.filter((e) => !isNews(e));
+  };
+
+  // "Refresh now": always refetch the wire immediately (real today). Also ask
+  // the backend to poll sources for genuinely new items — that endpoint may
+  // not exist yet, so swallow its failure and keep the instant refetch.
+  const refreshNow = async () => {
+    if (refreshing()) return;
+    setRefreshing(true);
+    try {
+      await api.pollSources().catch(() => undefined);
+      await refetch();
+      setLastRefresh(new Date().toISOString());
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
   return (
     <section class="wire">
-      <For each={events() as WireEvent[]} fallback={<p class="dim sm pad">no activity yet — the wire shows live events as you and the agents work.</p>}>
-        {(e) => (
-          <div class="wire-row">
-            <time>{relTime(e.created_at)}</time>
-            <span class="actor-chip sm">{e.actor}</span>
-            <code>{e.kind}</code>
+      <div class="wire-bar">
+        <div class="wire-live">
+          <span class="live-dot" />
+          <span class="dim sm">live · updated {relTime(lastRefresh())}</span>
+        </div>
+        <div class="wire-controls">
+          <div class="seg wire-filter">
+            <button classList={{ active: filter() === "news" }} onClick={() => setFilter("news")}>news</button>
+            <button classList={{ active: filter() === "activity" }} onClick={() => setFilter("activity")}>activity</button>
+            <button classList={{ active: filter() === "all" }} onClick={() => setFilter("all")}>all</button>
           </div>
-        )}
-      </For>
+          <button class="primary wire-refresh" onClick={refreshNow} disabled={refreshing()}>
+            <Show when={refreshing()} fallback={<>↻ refresh now</>}>
+              <span class="spinner" /> refreshing…
+            </Show>
+          </button>
+        </div>
+      </div>
+
+      <Show when={filter() === "news"}>
+        <For each={shown()} fallback={<p class="dim sm pad">no news yet — add an RSS or scrape source in Settings; items land here as the worker polls them.</p>}>
+          {(e) => <NewsCard e={e} fresh={isFresh(e)} />}
+        </For>
+      </Show>
+      <Show when={filter() !== "news"}>
+        <For each={shown()} fallback={<p class="dim sm pad">no activity yet — the wire shows live events as you and the agents work.</p>}>
+          {(e) => (
+            <div class="wire-row" classList={{ "just-landed": isFresh(e) }}>
+              <time>{relTime(e.created_at)}</time>
+              <span class="actor-chip sm">{e.actor}</span>
+              <code>{e.kind}</code>
+            </div>
+          )}
+        </For>
+      </Show>
     </section>
   );
 };
@@ -360,8 +476,8 @@ export const PeopleView: Component = () => {
   return (
     <section>
       <p class="dim pad">Identities known to hive — humans and AIs. Click one to edit its profile (bio + role). AIs can also keep their own profile updated via MCP.</p>
-      <Show when={people()} fallback={<p class="dim sm">loading…</p>}>
-        <For each={people() as Person[]} fallback={<p class="dim sm">no people yet.</p>}>
+      <Show when={people()} fallback={<SkeletonList rows={6} />}>
+        <For each={people() as Person[]} fallback={<p class="dim sm">no people yet — reference someone in a journal entry.</p>}>
           {(p) => (
             <div class="person-card">
               <div class="entity-row person-head" onClick={() => (editing() === p.slug ? setEditing(null) : open(p))}>
@@ -399,7 +515,7 @@ export const TopicsView: Component = () => {
   return (
     <section>
       <p class="dim pad">Topics extracted from <code>[topic:…]</code> references in journal entries.</p>
-      <Show when={topics()} fallback={<p class="dim sm">loading…</p>}>
+      <Show when={topics()} fallback={<SkeletonList rows={6} />}>
         <For each={topics() as Topic[]} fallback={<p class="dim sm">no topics yet — reference a topic in a journal entry.</p>}>
           {(t) => (
             <div class="entity-row">
@@ -463,7 +579,7 @@ export const ProjectsView: Component = () => {
   return (
     <section>
       <p class="dim pad">Projects with their phases and task counts. Projects are created automatically when a task references one.</p>
-      <Show when={projects()} fallback={<p class="dim sm">loading…</p>}>
+      <Show when={projects()} fallback={<SkeletonList rows={4} />}>
         <For each={projects() as Project[]} fallback={<p class="dim sm">no projects yet — assign a task a project in a journal entry.</p>}>
           {(p) => <ProjectCard p={p} />}
         </For>

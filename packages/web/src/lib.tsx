@@ -21,6 +21,16 @@ export const DECISION_GLYPH: Record<DecisionStatus, string> = {
   superseded: "⊘",
 };
 
+/** Shimmer placeholder rows shown while a list resource is still loading. */
+export function SkeletonList(props: { rows?: number }): JSX.Element {
+  const rows = () => Array.from({ length: props.rows ?? 5 });
+  return (
+    <div class="skeleton-list" aria-hidden="true">
+      <For each={rows()}>{() => <div class="skeleton skeleton-row" />}</For>
+    </div>
+  );
+}
+
 export const relTime = (iso: string) => {
   const s = (Date.now() - new Date(iso).getTime()) / 1000;
   if (s < 60) return "just now";
