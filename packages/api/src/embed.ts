@@ -147,13 +147,35 @@ type Extractor = (
 ) => Promise<{ data: Float32Array }>;
 let extractorPromise: Promise<Extractor> | null = null;
 
+// transformers.js caches downloaded models to `.cache` INSIDE node_modules, which
+// is read-only for the non-root container (EACCES). Point its on-disk cache at the
+// writable data volume (hive-data is mounted at /data on api + worker) so models
+// download + cache instead of silently failing into the hash fallback. Set once,
+// lazily, on the same dynamic import the loaders use — the hash/CI path never loads
+// transformers. Override the path with HIVE_MODEL_CACHE.
+let hfModule: Promise<typeof import("@huggingface/transformers")> | null = null;
+function loadTransformers(): Promise<typeof import("@huggingface/transformers")> {
+  if (!hfModule) {
+    hfModule = import("@huggingface/transformers")
+      .then((m) => {
+        m.env.cacheDir = process.env.HIVE_MODEL_CACHE ?? "/data/models";
+        return m;
+      })
+      .catch((err) => {
+        hfModule = null; // don't cache a rejection
+        throw err;
+      });
+  }
+  return hfModule;
+}
+
 function getExtractor(): Promise<Extractor> {
   if (!extractorPromise) {
     // Don't cache a rejected promise — on load failure, clear the cache so the
     // latch (not a poisoned promise) governs the fallback, and rethrow so the
     // caller degrades to hash.
     extractorPromise = (
-      import("@huggingface/transformers").then(({ pipeline }) =>
+      loadTransformers().then(({ pipeline }) =>
         pipeline("feature-extraction", EMBED_REPO),
       ) as Promise<Extractor>
     ).catch((err) => {
@@ -190,7 +212,7 @@ let rerankPromise: Promise<RerankBundle> | null = null;
 
 function getReranker(): Promise<RerankBundle> {
   if (!rerankPromise) {
-    rerankPromise = import("@huggingface/transformers")
+    rerankPromise = loadTransformers()
       .then(async ({ AutoTokenizer, AutoModelForSequenceClassification }) => {
         const [tokenizer, model] = await Promise.all([
           AutoTokenizer.from_pretrained(RERANK_REPO),
