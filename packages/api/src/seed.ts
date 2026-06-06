@@ -151,6 +151,15 @@ outbox.enqueue("log", { note: "hello from the seed — worker will drain this" }
   write("nate", body, [], ["roadhouse"]);
 }
 
+// An entry that folds a Markdown heading into the prose — recall should derive
+// the journal-hit title from this `#` heading, not from a stored column.
+{
+  const body =
+    "# Solid UI rewrite plan\n\nLaying out the milestones for the Node + Solid port with @pia. " +
+    "Editor first, then the dashboard.";
+  write("cera", body, [], ["rewrite"]);
+}
+
 // Profile cards — the durable identity layer. Sections deep-merge across writes.
 profiles.update(
   "nate",
@@ -202,6 +211,12 @@ if (!r.brief.includes("Recall for pia")) throw new Error("seed: recall brief mis
 // must now surface scoped journal hits.
 if (r.data.journal.length === 0)
   throw new Error("seed: recall journal section empty after embedding backfill");
+// Journal titles are DERIVED from the body (no title column). The heading entry
+// must surface its Markdown `#` heading as the hit title — never the synthetic
+// "author: slice" form.
+const planned = await recall({ identity: "pia", query: "Solid UI rewrite plan milestones" });
+const headingHit = planned.data.journal.find((h) => h.title === "Solid UI rewrite plan");
+if (!headingHit) throw new Error("seed: recall did not derive the journal title from the body heading");
 
 console.log(
   `🌱 seeded hive: people, journal + anchors, inboxes, a sample RSS source, a scrape source, an outbox job, ` +
