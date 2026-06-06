@@ -19,6 +19,9 @@
 // contentHash()/blob helpers stay sync. Embedding only happens on the worker's
 // backfill path and the read-side semanticSearch — never inside a better-sqlite3
 // write transaction — so the async boundary is clean.
+import { logger } from "./log.ts";
+
+const log = logger("embed");
 
 const PROVIDER = (process.env.HIVE_EMBED ?? "transformers").toLowerCase();
 const USE_TRANSFORMERS = PROVIDER === "transformers";
@@ -49,10 +52,11 @@ let transformersFailed = false;
 function markTransformersUnavailable(err: unknown): void {
   if (!transformersFailed) {
     transformersFailed = true;
-    console.warn(
-      `[embed] transformers model unavailable, falling back to hash embeddings ` +
-        `(rerank disabled): ${(err as Error)?.message ?? err}`,
-    );
+    // Expected, handled condition (no model cache / offline / bad runtime):
+    // one clean line, no stack — search just keeps working on the hash path.
+    log.warn("embeddings model unavailable, using keyword fallback (rerank disabled)", {
+      reason: (err as Error)?.message ?? String(err),
+    });
   }
 }
 

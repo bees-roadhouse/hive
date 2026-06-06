@@ -20,6 +20,7 @@ import type {
   UserRole,
 } from "@hive/shared";
 import { migrate } from "./db.ts";
+import { logger } from "./log.ts";
 import { readLegacyDb } from "./legacy-import.ts";
 import { handleMcp } from "./mcp.ts";
 import { subscribe } from "./bus.ts";
@@ -63,6 +64,8 @@ import {
   wire,
   workerStatus,
 } from "./store.ts";
+
+const log = logger("api");
 
 migrate();
 // Fold any legacy people.bio/role into the canonical profile card (idempotent).
@@ -854,7 +857,7 @@ createServer((req, res) => {
       return;
     }
     handleMcp(req, res, principal?.actor ?? "anon").catch((err) => {
-      console.error("mcp error", err);
+      log.unexpected("MCP request handler threw", err);
       if (!res.headersSent) res.writeHead(500).end();
     });
     return;
@@ -870,5 +873,5 @@ createServer((req, res) => {
   }
   honoListener(req, res);
 }).listen(port, () => {
-  console.log(`🐝 hive-api (node) on http://localhost:${port}  ·  MCP at /mcp`);
+  log.info("listening", { url: `http://localhost:${port}`, mcp: "/mcp" });
 });

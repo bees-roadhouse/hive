@@ -10,6 +10,9 @@
 import Database from "better-sqlite3";
 import { nanoid } from "nanoid";
 import { parseMentions } from "@hive/shared";
+import { logger } from "./log.ts";
+
+const log = logger("import");
 import { db, migrate } from "./db.ts";
 
 const now = () => new Date().toISOString();
@@ -175,5 +178,5 @@ export function runImport(sourcePath: string): ImportCounts {
 const sourceArg = process.argv[2];
 if (sourceArg) {
   const c = runImport(sourceArg);
-  console.log("🐝 import complete:", JSON.stringify(c, null, 2));
+  log.info("import complete", c as unknown as Record<string, unknown>);
 }
