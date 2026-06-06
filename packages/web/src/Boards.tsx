@@ -1,4 +1,4 @@
-import { createEffect, createResource, createSignal, For, Show, type Component } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, Show, type Component } from "solid-js";
 import type {
   AnchorKind,
   Decision,
@@ -124,10 +124,20 @@ const RETENTION_OPTIONS: { label: string; hours: number }[] = [
   { label: "always", hours: Infinity },
 ];
 
+type GroupBy = "status" | "assignee";
+
+// Sentinel column key for tasks with no assignee, in assignee grouping.
+const UNASSIGNED = "__unassigned__";
+
 export const Tasks: Component = () => {
-  const [tasks, { refetch }] = createResource(() => ({ _r: liveRev() }), () => api.tasks());
+  const [tasks, { refetch, mutate }] = createResource(() => ({ _r: liveRev() }), () => api.tasks());
+  const [projects] = createResource(() => ({ _r: liveRev() }), () => api.projects());
   const [showDone, setShowDone] = createSignal(false);
   const [retentionHours, setRetentionHoursState] = createSignal(getDoneRetentionHours());
+  const [groupBy, setGroupBy] = createSignal<GroupBy>("status");
+  const [projectFilter, setProjectFilter] = createSignal<string>(""); // "" = all
+  const [dragId, setDragId] = createSignal<string | null>(null);
+  const [overCol, setOverCol] = createSignal<string | null>(null);
 
   const cycle = async (t: Task) => {
     const next = TASK_STATUSES[(TASK_STATUSES.indexOf(t.status) + 1) % TASK_STATUSES.length];
@@ -140,25 +150,111 @@ export const Tasks: Component = () => {
     setRetentionHoursState(hours);
   };
 
-  /** Filter tasks for a given status column, applying done-retention for the "done" column. */
-  const visibleTasks = (status: TaskStatus): Task[] => {
+  /** Map a project id → its display name, for the cards' project chip. */
+  const projectName = (id: string | null): string | undefined =>
+    id ? (projects() ?? []).find((p) => p.id === id)?.name ?? id : undefined;
+
+  /** Tasks after the project filter + the done-retention rule, before grouping. */
+  const filtered = createMemo<Task[]>(() => {
     const all = tasks() ?? [];
-    if (status !== "done") return all.filter((t) => t.status === status);
+    const proj = projectFilter();
     const retention = retentionHours();
+    const cutoff = Date.now() - retention * 3_600_000;
     return all.filter((t) => {
-      if (t.status !== "done") return false;
-      if (showDone()) return true; // override: show all
+      if (proj && t.project !== proj) return false;
+      if (t.status !== "done") return true;
+      if (showDone()) return true; // override: show all done
       if (!Number.isFinite(retention)) return true; // "always" setting
-      const cutoff = Date.now() - retention * 3_600_000;
       return new Date(t.updated_at).getTime() >= cutoff;
     });
+  });
+
+  // Columns depend on the grouping. Status grouping is the fixed four buckets;
+  // assignee grouping derives its columns from whoever appears in the filtered
+  // set (plus an "unassigned" bucket when any task has no assignee).
+  const columns = createMemo<{ key: string; label: string; glyph?: string }[]>(() => {
+    if (groupBy() === "status") {
+      return TASK_STATUSES.map((s) => ({ key: s, label: s, glyph: TASK_GLYPH[s] }));
+    }
+    const who = new Set<string>();
+    let anyUnassigned = false;
+    for (const t of filtered()) {
+      if (t.assignees.length === 0) anyUnassigned = true;
+      else for (const a of t.assignees) who.add(a);
+    }
+    const cols = [...who].sort().map((a) => ({ key: a, label: a }));
+    if (anyUnassigned) cols.push({ key: UNASSIGNED, label: "unassigned" });
+    return cols.length ? cols : [{ key: UNASSIGNED, label: "unassigned" }];
+  });
+
+  /** Tasks that belong in a given column under the active grouping. */
+  const tasksFor = (key: string): Task[] => {
+    if (groupBy() === "status") return filtered().filter((t) => t.status === key);
+    if (key === UNASSIGNED) return filtered().filter((t) => t.assignees.length === 0);
+    return filtered().filter((t) => t.assignees.includes(key));
+  };
+
+  // Dropping a card on a column re-statuses it (status grouping) or reassigns it
+  // (assignee grouping). Optimistic: patch the resource locally first, then
+  // persist; on failure, refetch to snap back to server truth.
+  const drop = async (key: string) => {
+    const id = dragId();
+    setDragId(null);
+    setOverCol(null);
+    if (!id) return;
+    const t = (tasks() ?? []).find((x) => x.id === id);
+    if (!t) return;
+
+    if (groupBy() === "status") {
+      if (t.status === key) return;
+      const status = key as TaskStatus;
+      mutate((prev) => (prev ?? []).map((x) => (x.id === id ? { ...x, status } : x)));
+      try {
+        await api.patchTask(id, { status });
+      } finally {
+        refetch();
+      }
+    } else {
+      // Reassign: a single-owner column means the dropped task becomes owned by
+      // that one person (UNASSIGNED clears assignees). No-op if already there.
+      const next = key === UNASSIGNED ? [] : [key];
+      const same =
+        t.assignees.length === next.length && t.assignees.every((a, i) => a === next[i]);
+      if (same) return;
+      mutate((prev) => (prev ?? []).map((x) => (x.id === id ? { ...x, assignees: next } : x)));
+      try {
+        await api.patchTask(id, { assignees: next });
+      } finally {
+        refetch();
+      }
+    }
   };
 
   return (
     <section>
       <div class="tasks-header">
-        <p class="dim pad">Tasks emerge from journal entries. Click a card to advance its status.</p>
+        <p class="dim pad">
+          Tasks emerge from journal entries. Click a card to advance its status, or drag it between
+          columns.
+        </p>
         <div class="tasks-controls">
+          <div class="seg" role="group" aria-label="group tasks by">
+            <button classList={{ active: groupBy() === "status" }} onClick={() => setGroupBy("status")}>
+              by status
+            </button>
+            <button classList={{ active: groupBy() === "assignee" }} onClick={() => setGroupBy("assignee")}>
+              by assignee
+            </button>
+          </div>
+          <label class="task-project-filter">
+            <span class="dim sm">project</span>
+            <select value={projectFilter()} onChange={(e) => setProjectFilter(e.currentTarget.value)}>
+              <option value="">all projects</option>
+              <For each={projects() ?? []}>
+                {(p) => <option value={p.id}>{p.name}</option>}
+              </For>
+            </select>
+          </label>
           <label class="show-done-toggle">
             <input
               type="checkbox"
@@ -183,16 +279,46 @@ export const Tasks: Component = () => {
           </div>
         </div>
       </div>
-      <div class="board">
-        <For each={TASK_STATUSES}>
-          {(status) => (
-            <div class="col">
+      <div class="board" classList={{ "board-assignee": groupBy() === "assignee" }}>
+        <For each={columns()}>
+          {(col) => (
+            <div
+              class="col"
+              classList={{ "col-drop": overCol() === col.key }}
+              onDragOver={(e) => {
+                e.preventDefault();
+                if (overCol() !== col.key) setOverCol(col.key);
+              }}
+              onDragLeave={(e) => {
+                // Only clear when actually leaving the column, not crossing a child.
+                if (!e.currentTarget.contains(e.relatedTarget as Node)) setOverCol(null);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                void drop(col.key);
+              }}
+            >
               <h3>
-                {TASK_GLYPH[status]} {status}
+                {col.glyph ? `${col.glyph} ` : ""}
+                {col.label}
               </h3>
-              <For each={visibleTasks(status)}>
+              <For each={tasksFor(col.key)}>
                 {(t) => (
-                  <div class="card" onClick={() => cycle(t)}>
+                  <div
+                    class="card"
+                    classList={{ dragging: dragId() === t.id }}
+                    draggable={true}
+                    onDragStart={(e) => {
+                      setDragId(t.id);
+                      e.dataTransfer?.setData("text/plain", t.id);
+                      if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+                    }}
+                    onDragEnd={() => {
+                      setDragId(null);
+                      setOverCol(null);
+                    }}
+                    onClick={() => cycle(t)}
+                  >
                     <div class="card-meta-row">
                       <span class={`pri pri-${t.priority}`}>{t.priority}</span>
                       <Show when={t.due}>
@@ -202,10 +328,26 @@ export const Tasks: Component = () => {
                       </Show>
                     </div>
                     <div class="card-title">{t.title}</div>
+                    {/* In assignee grouping the column already says who owns it,
+                        so surface status on the card instead; in status grouping
+                        show the project for context. */}
+                    <Show
+                      when={groupBy() === "assignee"}
+                      fallback={
+                        <Show when={projectName(t.project)}>
+                          <span class="badge task-project-badge">{projectName(t.project)}</span>
+                        </Show>
+                      }
+                    >
+                      <span class="badge">{TASK_GLYPH[t.status]} {t.status}</span>
+                    </Show>
                     <Assignees who={t.assignees} />
                   </div>
                 )}
               </For>
+              <Show when={tasksFor(col.key).length === 0}>
+                <p class="dim sm col-empty">drop here</p>
+              </Show>
             </div>
           )}
         </For>

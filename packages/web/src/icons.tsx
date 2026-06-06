@@ -39,8 +39,13 @@ function paths(name: string): JSX.Element {
           <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
         </>
       );
-    case "decisions": // diamond — echoes the ◆ anchor glyph
-      return <path d="M12 2.5 21.5 12 12 21.5 2.5 12z" />;
+    case "decisions": // balance scale — a decision weighed
+      return (
+        <>
+          <path d="M12 3v17M7 20h10" />
+          <path d="M5 7h14M5 7l-2.5 5h5zM19 7l-2.5 5h5z" />
+        </>
+      );
     case "events": // clock — echoes the ◷ anchor glyph
       return (
         <>
@@ -64,14 +69,18 @@ function paths(name: string): JSX.Element {
           <path d="M21 21l-4.3-4.3" />
         </>
       );
-    case "wire": // activity pulse
-      return <path d="M22 12h-4l-3 8L9 4l-3 8H2" />;
-    case "admin": // sliders
+    case "wire": // broadcast / rss — waves radiating from a node
       return (
         <>
-          <path d="M3 7h9M16 7h5M3 17h5M12 17h9" />
-          <circle cx="14" cy="7" r="2" />
-          <circle cx="10" cy="17" r="2" />
+          <circle cx="5" cy="19" r="1.5" />
+          <path d="M5 12a7 7 0 0 1 7 7M5 5a14 14 0 0 1 14 14" />
+        </>
+      );
+    case "admin": // shield — guarded surface, with a check
+      return (
+        <>
+          <path d="M12 2.5l8 3v6c0 4.6-3.3 7.9-8 10-4.7-2.1-8-5.4-8-10v-6z" />
+          <path d="M9 11.8l2 2 4-4.5" />
         </>
       );
     case "settings": // cog
@@ -84,19 +93,30 @@ function paths(name: string): JSX.Element {
     case "hex": // honeycomb cell — the day-page marker
       return <path d="M12 2.5l8.2 4.75v9.5L12 21.5l-8.2-4.75v-9.5z" />;
     case "person": // user outline — head + shoulders
+    case "account": // the signed-in user — same single-figure glyph
       return (
         <>
           <circle cx="12" cy="8" r="3.5" />
           <path d="M4.5 21c0-4.1 3.4-7.5 7.5-7.5s7.5 3.4 7.5 7.5" />
         </>
       );
+    case "people": // two figures — the identities directory (distinct from a single person)
+      return (
+        <>
+          <circle cx="9" cy="8" r="3" />
+          <path d="M3.5 20c0-3.3 2.5-6 5.5-6s5.5 2.7 5.5 6" />
+          <path d="M16 5.2a3 3 0 0 1 0 5.6M17.5 14.2c2.4.5 4 2.9 4 5.8" />
+        </>
+      );
     case "topic": // hash / tag
+    case "topics":
       return (
         <>
           <path d="M4 9h16M4 15h16M9 4l-2 16M17 4l-2 16" />
         </>
       );
     case "project": // folder / layers
+    case "projects":
       return (
         <>
           <path d="M3 7h7l2 2.5H21v10.5a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1z" />

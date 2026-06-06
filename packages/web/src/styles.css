@@ -151,11 +151,25 @@ blockquote.origin { font-size: 0.82rem; }
 .show-done-toggle { display: flex; align-items: center; gap: 0.3rem; font-size: 0.82rem; color: var(--dim); cursor: pointer; }
 .show-done-toggle input { margin: 0; }
 .board { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0.75rem; }
+/* Assignee grouping has a variable number of columns, so it auto-fills tracks
+   that wrap once they get below a comfortable width. */
+.board-assignee { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+/* Each column is a drop target — give it a floor so an empty bucket can still
+   receive a card, and show a dashed honey outline while a card hovers it. */
+.col { border: 1px dashed transparent; border-radius: 10px; padding: 0.3rem; min-height: 4rem; transition: border-color 0.15s ease, background 0.15s ease; }
+.col-drop { border-color: var(--honey); background: rgba(245,179,1,0.06); }
+.col-empty { text-align: center; padding: 0.6rem 0; opacity: 0.5; }
 .col h3 { text-transform: capitalize; color: var(--dim); font-size: 0.85rem; margin: 0 0 0.5rem; }
-.card { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--task); border-radius: 8px; padding: 0.6rem; margin-bottom: 0.5rem; cursor: pointer; }
+.card { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--task); border-radius: 8px; padding: 0.6rem; margin-bottom: 0.5rem; cursor: grab; }
 .card:hover { border-color: var(--accent); }
+.card:active { cursor: grabbing; }
+/* The card being dragged dims + lifts so its origin is obvious. */
+.card.dragging { opacity: 0.45; }
 .card-title { margin-top: 0.2rem; }
 .card-meta-row { display: flex; align-items: center; justify-content: space-between; gap: 0.3rem; flex-wrap: wrap; }
+.task-project-badge { text-transform: none; letter-spacing: 0; margin-top: 0.35rem; display: inline-block; }
+.task-project-filter { display: flex; align-items: center; gap: 0.35rem; font-size: 0.82rem; }
+.task-project-filter select { padding: 0.25rem 0.4rem; font-size: 0.82rem; }
 /* Due-date badges on task cards */
 .due-badge { font-size: 0.68rem; border-radius: 999px; padding: 0.05rem 0.4rem; background: var(--line); color: var(--dim); }
 .due-badge.overdue { background: rgba(255,90,60,0.18); color: #ff7a59; font-weight: 600; }
@@ -402,7 +416,9 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 }
 
 @media (max-width: 760px) {
-  .board, .kpis { grid-template-columns: 1fr 1fr; }
+  /* Status board collapses to two columns; the assignee board keeps its
+     auto-fill tracks so they wrap naturally. */
+  .board:not(.board-assignee), .kpis { grid-template-columns: 1fr 1fr; }
   .dash-grid { grid-template-columns: 1fr; }
   .emb-grid { grid-template-columns: 1fr; }
 }
