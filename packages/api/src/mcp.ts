@@ -102,19 +102,25 @@ export function buildMcpServer(actor: string): McpServer {
     async ({ id }) => ok(journal.get(id) ?? { error: "not found" }),
   );
 
-  // NOTE: #31's self-service bio/role editor and #37's memory-card profile_update
-  // collided on the name `profile_update` at merge. Renamed this one to
-  // `identity_update` so both ship; the two profile mechanisms (people.bio/role
-  // vs the `profile` card table) should be reconciled into one model separately.
+  // Self-service identity editor. The profile card (profile_update) is the
+  // canonical identity store; this writes bio/role onto the caller's OWN card as
+  // sections.bio / sections.role (keeping the actor-scoped self-edit semantics —
+  // you can't edit anyone else's). Kept as a distinct, simpler tool so an agent
+  // can update its own one-liner identity without the full card surface.
   server.registerTool(
     "identity_update",
     {
       title: "Update your identity (bio/role)",
       description:
-        "Keep your own identity current — set your bio and/or role on your people record. Writes to your authenticated identity (you can't edit anyone else's).",
+        "Keep your own identity current — set your bio and/or role. Writes sections.bio / sections.role on your own profile card (your authenticated identity; you can't edit anyone else's).",
       inputSchema: { bio: z.string().optional(), role: z.string().optional() },
     },
-    async ({ bio, role }) => ok(people.update(actor, { bio, role }, actor) ?? { error: "no profile for your identity" }),
+    async ({ bio, role }) => {
+      const sections: Record<string, string> = {};
+      if (bio !== undefined) sections.bio = bio;
+      if (role !== undefined) sections.role = role;
+      return ok(profiles.update(actor, { sections }, actor));
+    },
   );
 
   server.registerTool(

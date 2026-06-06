@@ -294,6 +294,15 @@ export const people = {
     db.prepare("UPDATE people SET name = ?, slug = ?, kind = ?, owner = ?, bio = ?, role = ? WHERE id = ?").run(
       name, slug, kind, owner, bio, role, cur.id,
     );
+    // The profile card is the canonical identity store; mirror any bio/role edit
+    // into it (as sections.bio / sections.role) so every writer (REST, MCP, UI)
+    // converges on one source of truth. The column is kept for now (drop = later).
+    if (patch.bio !== undefined || patch.role !== undefined) {
+      const sections: Record<string, string> = {};
+      if (patch.bio !== undefined) sections.bio = patch.bio ?? "";
+      if (patch.role !== undefined) sections.role = patch.role ?? "";
+      profiles.update(slug, { display_name: name, kind, sections }, actor);
+    }
     const next: Person = { ...cur, name, slug, kind, owner, bio, role };
     emit("person.updated", actor, { id: cur.id, name, kind });
     return next;
@@ -338,6 +347,35 @@ export const profiles = {
     return next;
   },
 };
+
+/**
+ * One-time reconciliation (#31 → #37): the profile card is the canonical identity
+ * store now. Fold any legacy people.bio/role into each actor's card as
+ * sections.bio / sections.role. Idempotent and non-destructive — only fills a
+ * card section that's missing/blank, so a card the actor has since edited (or a
+ * value already migrated) is never clobbered. The people columns are left intact
+ * (dropping them is a separate follow-up). Safe to run on every boot.
+ */
+export function backfillIdentityCards(): number {
+  const rows = db
+    .prepare("SELECT slug, name, kind, bio, role FROM people WHERE bio IS NOT NULL OR role IS NOT NULL")
+    .all() as { slug: string; name: string; kind: Person["kind"]; bio: string | null; role: string | null }[];
+  let migrated = 0;
+  for (const p of rows) {
+    const card = profiles.get(p.slug);
+    const sections: Record<string, string> = {};
+    if (p.bio?.trim() && !card?.body.sections.bio?.trim()) sections.bio = p.bio.trim();
+    if (p.role?.trim() && !card?.body.sections.role?.trim()) sections.role = p.role.trim();
+    if (Object.keys(sections).length === 0) continue;
+    profiles.update(
+      p.slug,
+      { display_name: card?.display_name || p.name, kind: p.kind, sections },
+      "migration",
+    );
+    migrated++;
+  }
+  return migrated;
+}
 
 // ---- config (per-instance key/value, v0.1.1) ----
 

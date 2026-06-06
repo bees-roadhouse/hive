@@ -26,6 +26,7 @@ import { subscribe } from "./bus.ts";
 import { SESSION_COOKIE, SESSION_TTL_MS, tokenHash, verifyPkce } from "./auth.ts";
 import { authUrl, discover, exchangeCode, oidcConfig, verifyIdToken } from "./oidc.ts";
 import {
+  backfillIdentityCards,
   config,
   oauthClients,
   oauthCodes,
@@ -62,6 +63,8 @@ import {
 } from "./store.ts";
 
 migrate();
+// Fold any legacy people.bio/role into the canonical profile card (idempotent).
+backfillIdentityCards();
 // No actor seeding: the instance holds only who you onboard, import, or create.
 // (seedActors stays exported for the demo `pnpm seed`.)
 
