@@ -298,6 +298,18 @@ export function migrate(): void {
       last_used_at TEXT
     );
 
+    -- External identity mappings: platform user IDs → centralized people slug.
+    -- Enables cross-platform memory: Discord, Telegram, etc. all resolve to one actor.
+    CREATE TABLE IF NOT EXISTS identities (
+      id          TEXT PRIMARY KEY,
+      platform    TEXT NOT NULL,
+      platform_id TEXT NOT NULL,
+      actor       TEXT NOT NULL,
+      created_at  TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS identities_platform ON identities (platform, platform_id);
+    CREATE INDEX IF NOT EXISTS identities_actor ON identities (actor);
+
     -- OAuth 2.1 dynamic client registration (RFC 7591). MCP clients are public
     -- (PKCE, no secret), so we store no client_secret.
     CREATE TABLE IF NOT EXISTS oauth_clients (

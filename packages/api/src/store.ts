@@ -54,6 +54,8 @@ import {
   type SafeUser,
   type User,
   type UserRole,
+  type Identity,
+  type NewIdentity,
   ACTORS,
   APP_VERSION,
   isAi,
@@ -310,6 +312,91 @@ export const people = {
     const next: Person = { ...cur, name, slug, kind, owner, bio, role };
     emit("person.updated", actor, { id: cur.id, name, kind });
     return next;
+  },
+};
+
+// ---- identities (external platform IDs → centralized actor) ----
+
+export const identities = {
+  list(): Identity[] {
+    return db.prepare("SELECT * FROM identities ORDER BY platform, platform_id").all() as Identity[];
+  },
+
+  get(id: string): Identity | undefined {
+    return db.prepare("SELECT * FROM identities WHERE id = ?").get(id) as Identity | undefined;
+  },
+
+  /** Resolve a platform ID to an actor slug, or undefined if unlinked. */
+  resolve(platform: string, platformId: string): string | undefined {
+    const row = db
+      .prepare("SELECT actor FROM identities WHERE platform = ? AND platform_id = ?")
+      .get(platform, platformId) as { actor: string } | undefined;
+    return row?.actor;
+  },
+
+  /** List all platform identities linked to a given actor. */
+  forActor(actor: string): Identity[] {
+    return db.prepare("SELECT * FROM identities WHERE actor = ? ORDER BY platform").all(actor) as Identity[];
+  },
+
+  create(input: NewIdentity, by = "system"): Identity {
+    const existing = identities.resolve(input.platform, input.platform_id);
+    if (existing) {
+      // Return the existing identity if the same platform+id combo already exists
+      return identities.list().find(
+        (i) => i.platform === input.platform && i.platform_id === input.platform_id,
+      )!;
+    }
+    const item: Identity = {
+      id: id("idm"),
+      platform: input.platform,
+      platform_id: input.platform_id,
+      actor: input.actor,
+      created_at: now(),
+    };
+    db.prepare(
+      "INSERT INTO identities (id, platform, platform_id, actor, created_at) VALUES (@id, @platform, @platform_id, @actor, @created_at)",
+    ).run(item);
+    emit("identity.created", by, { id: item.id, platform: item.platform, actor: item.actor });
+    return item;
+  },
+
+  /** Upsert: resolve if exists, otherwise create person + identity mapping. */
+  resolveOrCreate(
+    platform: string,
+    platformId: string,
+    displayName: string,
+    by = "system",
+  ): { actor: string; identity: Identity; created: boolean } {
+    const existingActor = identities.resolve(platform, platformId);
+    if (existingActor) {
+      const identity = identities.list().find(
+        (i) => i.platform === platform && i.platform_id === platformId,
+      )!;
+      return { actor: existingActor, identity, created: false };
+    }
+    // Auto-provision a new human actor
+    const person = people.ensure(displayName, "human");
+    const identity = identities.create({ platform, platform_id: platformId, actor: person.slug }, by);
+    return { actor: person.slug, identity, created: true };
+  },
+
+  update(id: string, patch: { actor?: string }, by = "system"): Identity | undefined {
+    const cur = identities.get(id);
+    if (!cur) return undefined;
+    const actor = patch.actor ?? cur.actor;
+    db.prepare("UPDATE identities SET actor = ? WHERE id = ?").run(actor, id);
+    const next: Identity = { ...cur, actor };
+    emit("identity.updated", by, { id, actor });
+    return next;
+  },
+
+  remove(id: string, by = "system"): boolean {
+    const cur = identities.get(id);
+    if (!cur) return false;
+    db.prepare("DELETE FROM identities WHERE id = ?").run(id);
+    emit("identity.removed", by, { id, platform: cur.platform, actor: cur.actor });
+    return true;
   },
 };
 
@@ -2507,11 +2594,19 @@ function deriveJournalTitle(body: string): string {
 export async function recall(opts: {
   identity: string;
   peer?: string;
+  peer_platform?: string;
+  peer_platform_id?: string;
   query?: string;
   budget?: number;
 }): Promise<RecallResult> {
-  const { identity, peer } = opts;
+  const { identity } = opts;
+  let { peer } = opts;
   const budget = opts.budget ?? RECALL_DEFAULT_BUDGET;
+
+  // Resolve platform-based peer to actor slug
+  if (!peer && opts.peer_platform && opts.peer_platform_id) {
+    peer = identities.resolve(opts.peer_platform, opts.peer_platform_id);
+  }
 
   const profileList: Profile[] = [];
   const idCard = profiles.get(identity);

@@ -8,6 +8,7 @@ import {
   dashboard,
   decisions,
   events,
+  identities,
   inbox,
   journal,
   outbox,
@@ -126,6 +127,68 @@ export function buildMcpServer(actor: string): McpServer {
       if (role !== undefined) sections.role = role;
       return ok(profiles.update(actor, { sections }, actor));
     },
+  );
+
+  // ---- external identity mapping (cross-platform memory) ----
+
+  server.registerTool(
+    "identity_link",
+    {
+      title: "Link a platform identity to an actor",
+      description:
+        "Map an external platform user ID (e.g. discord:12345) to a centralized actor slug. " +
+        "Enables cross-platform memory: the same human talking on Discord and Telegram resolves to one actor.",
+      inputSchema: {
+        platform: z.string().describe("platform name: discord, telegram, slack, etc."),
+        platform_id: z.string().describe("the platform's native user ID"),
+        actor: z.string().describe("the people.slug this platform ID maps to"),
+      },
+    },
+    async ({ platform, platform_id, actor: targetActor }) => {
+      const p = people.get(targetActor);
+      if (!p) return ok({ error: `actor '${targetActor}' not found` });
+      const result = identities.create({ platform, platform_id, actor: targetActor }, actor);
+      return ok({ linked: true, identity: result });
+    },
+  );
+
+  server.registerTool(
+    "identity_resolve",
+    {
+      title: "Resolve a platform ID to an actor",
+      description: "Look up which actor a platform user ID maps to, if any.",
+      inputSchema: {
+        platform: z.string(),
+        platform_id: z.string(),
+      },
+    },
+    async ({ platform, platform_id }) => {
+      const resolved = identities.resolve(platform, platform_id);
+      return ok({ actor: resolved ?? null });
+    },
+  );
+
+  server.registerTool(
+    "identity_list",
+    {
+      title: "List linked identities",
+      description: "List all platform identity mappings for a given actor.",
+      inputSchema: { actor: z.string().optional() },
+    },
+    async ({ actor: targetActor }) => {
+      const list = targetActor ? identities.forActor(targetActor) : identities.list();
+      return ok({ count: list.length, identities: list });
+    },
+  );
+
+  server.registerTool(
+    "identity_unlink",
+    {
+      title: "Unlink a platform identity",
+      description: "Remove a platform ID → actor mapping by identity id.",
+      inputSchema: { id: z.string() },
+    },
+    async ({ id }) => ok({ removed: identities.remove(id, actor) }),
   );
 
   server.registerTool(
@@ -273,7 +336,9 @@ export function buildMcpServer(actor: string): McpServer {
         "One-call session-start memory: composes profile cards (identity + optional peer), open tasks, unread inbox, recent relevant journal, recent events, and touched projects into a ready-to-inject markdown brief (trimmed to `budget` tokens) plus the structured data behind it.",
       inputSchema: {
         identity: z.string().describe("the AI/actor recalling (whose tasks/inbox to pull)"),
-        peer: z.string().optional().describe("optional focus actor, e.g. the human in the session"),
+        peer: z.string().optional().describe("optional focus actor, e.g. the human in the session (by slug)"),
+        peer_platform: z.string().optional().describe("platform name for resolving peer by platform ID (discord, telegram, etc.)"),
+        peer_platform_id: z.string().optional().describe("the platform's native user ID for the peer"),
         query: z.string().optional().describe("optional topic; defaults to recent + open threads"),
         budget: z.number().int().optional().describe("approx token budget for the brief"),
       },
