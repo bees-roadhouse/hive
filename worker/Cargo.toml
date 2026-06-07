@@ -1,0 +1,39 @@
+[package]
+name = "hive-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Workspace
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+sqlx = { workspace = true }
+reqwest = { workspace = true }
+
+# ML
+ort = { workspace = true }
+ndarray = { workspace = true }
+tokenizers = { workspace = true }
+
+# Local
+hive-shared = { path = "../shared" }
+
+# Async helpers
+futures = "0.3"
+tokio-cron-scheduler = "0.13"
+dotenvy = { workspace = true }
+
+# Feed parsing
+rss = "2.0"
+atom_syndication = "0.12"
+
+[dev-dependencies]
+tokio-test = "0.4"
