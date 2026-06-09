@@ -50,7 +50,7 @@ dotenvy = "0.15"
 # --- Embeddings / ML ---
 # Using ort (ONNX Runtime) for cross-platform HF model support
 # Alternative: candle-core for pure Rust (limited model support)
-ort = { version = "2.0", features = ["ndarray"] }
+ort = { version = "2.0.0-rc.12", features = ["ndarray"] }
 ndarray = { version = "0.16", features = ["serde"] }
 tokenizers = "0.21"
 rayon = "1.10"
