@@ -13,12 +13,19 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:hive.db".to_string());
+    let path = std::env::var("HIVE_DB").unwrap_or_else(|_| "data/hive.db".to_string());
     let opts = sqlx::sqlite::SqliteConnectOptions::new()
-        .filename(&database_url.replace("sqlite:", ""))
-        .create_if_missing(true);
+        .filename(&path)
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_secs(30));
     let pool = sqlx::SqlitePool::connect_with(opts).await?;
 
     let worker = Worker::new(pool);
-    worker.run().await
+    if std::env::args().any(|a| a == "--once" || a == "once") {
+        worker.run_once().await
+    } else {
+        worker.run().await
+    }
 }

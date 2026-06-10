@@ -1,10 +1,3 @@
-mod auth;
-mod db;
-mod mcp;
-mod routes;
-mod store;
-
-use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
@@ -18,22 +11,21 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:hive.db".to_string());
-    let pool = db::init_db(&database_url).await?;
+    let pool = hive_api::db::init().await?;
+    hive_api::db::assert_fts5(&pool).await?;
 
-    let store = store::Store::new(pool);
-    let state = Arc::new(routes::AppStateInner::new(store));
+    let store = hive_api::store::Store::new(pool);
+    // Fold any legacy people.bio/role into the canonical profile card (idempotent).
+    store.backfill_identity_cards().await?;
 
-    let app = routes::router(state);
+    let app = hive_api::routes::router(store);
 
-    let port = std::env::var("PORT")
+    let port: u16 = std::env::var("PORT")
         .ok()
-        .and_then(|p| p.parse::<u16>().ok())
+        .and_then(|p| p.parse().ok())
         .unwrap_or(7878);
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-
-    tracing::info!("Hive API listening on http://0.0.0.0:{}", port);
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    tracing::info!(url = %format!("http://localhost:{port}"), mcp = "/mcp", "listening");
     axum::serve(listener, app).await?;
-
     Ok(())
 }

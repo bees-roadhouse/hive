@@ -1,5 +1,5 @@
 [workspace]
-members = ["shared", "api", "worker", "mcp"]
+members = ["shared", "embed", "api", "worker"]
 resolver = "2"
 
 [workspace.package]
@@ -31,12 +31,13 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono", "uuid"] }
 
 # --- Auth / Crypto ---
-argon2 = "0.5"
 jsonwebtoken = "9.3"
 rand = "0.8"
 sha2 = "0.10"
 base64 = "0.22"
-bcrypt = "0.16"
+scrypt = "0.11"
+subtle = "2.6"
+hex = "0.4"
 
 # --- Time / IDs ---
 chrono = { version = "0.4", features = ["serde"] }
@@ -44,20 +45,17 @@ uuid = { version = "1.11", features = ["v4", "serde"] }
 nanoid = "0.4"
 
 # --- Config / Env ---
-config = "0.15"
 dotenvy = "0.15"
 
-# --- Embeddings / ML ---
-# Using ort (ONNX Runtime) for cross-platform HF model support
-# Alternative: candle-core for pure Rust (limited model support)
+# --- Embeddings / ML (the hive-embed crate wraps these) ---
 ort = { version = "2.0.0-rc.12", features = ["ndarray"] }
 ndarray = { version = "0.16", features = ["serde"] }
 tokenizers = "0.21"
-rayon = "1.10"
 
-# --- MCP ---
-# We'll build MCP protocol manually over stdio/SSE
-# No stable Rust crate yet; the protocol is simple JSON-RPC 2.0
+# --- Feeds ---
+rss = "2.0"
+atom_syndication = "0.12"
 
 # --- Shared workspace crates ---
 hive-shared = { path = "shared" }
+hive-embed = { path = "embed" }
