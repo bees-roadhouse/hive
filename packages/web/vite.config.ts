@@ -9,7 +9,7 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": {
-        target: process.env.HIVE_API_URL ?? "http://localhost:8787",
+        target: process.env.HIVE_API_URL ?? "http://localhost:7878",
         changeOrigin: true,
       },
     },

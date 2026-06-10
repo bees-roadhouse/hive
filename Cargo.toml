@@ -50,7 +50,11 @@ dotenvy = "0.15"
 # --- Embeddings / ML (the hive-embed crate wraps these) ---
 ort = { version = "2.0.0-rc.12", features = ["ndarray"] }
 ndarray = { version = "0.16", features = ["serde"] }
-tokenizers = "0.21"
+# default-features off: esaxx_fast statically links the MSVC C++ runtime and
+# collides with onnxruntime's dynamic CRT on Windows; onig avoids that.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+# 0.4+: huggingface.co serves relative redirect Locations that 0.3 can't follow.
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "default-tls"] }
 
 # --- Feeds ---
 rss = "2.0"

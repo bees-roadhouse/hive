@@ -1,9 +1,130 @@
-// /api/search, /api/recall, /api/dashboard, /api/graph. Owned by the search workstream.
+// /api/search, /api/recall, /api/dashboard, /api/graph, /api/autocomplete,
+// /api/embeddings — parity with server.ts. Owned by the search workstream.
 
-use axum::Router;
+use std::collections::HashMap;
 
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Json};
+use axum::routing::{get, post};
+use axum::{Extension, Router};
+use serde::Deserialize;
+
+use crate::error::{err, ApiResult};
+use crate::middleware::AuthCtx;
+use crate::store::recall::RecallOptions;
+use crate::store::semantic::SemanticOptions;
 use crate::store::Store;
 
 pub fn router() -> Router<Store> {
     Router::new()
+        .route("/api/search", get(search))
+        .route("/api/recall", post(recall))
+        .route("/api/dashboard", get(dashboard))
+        .route("/api/graph", get(graph))
+        .route("/api/autocomplete", get(autocomplete))
+        .route("/api/embeddings", get(embeddings))
+}
+
+/// GET /api/search — ?mode=semantic|standard|precision routes to the semantic
+/// engine (flags: hybrid/rerank/blanket/threshold/identity/peer/viewer);
+/// anything else is FTS keyword search. Results are scoped to the acting
+/// user's visible entries; ?viewer= overrides.
+async fn search(
+    State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
+    Query(q): Query<HashMap<String, String>>,
+) -> ApiResult {
+    let query = q.get("q").cloned().unwrap_or_default();
+    let limit: usize = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(25);
+    let viewer = q
+        .get("viewer")
+        .cloned()
+        .unwrap_or_else(|| ctx.actor().to_string());
+
+    let mode = q.get("mode").map(String::as_str);
+    if matches!(
+        mode,
+        Some("semantic") | Some("standard") | Some("precision")
+    ) {
+        let flag = |name: &str| matches!(q.get(name).map(String::as_str), Some("1") | Some("true"));
+        let off = |name: &str| matches!(q.get(name).map(String::as_str), Some("0") | Some("false"));
+        let opts = SemanticOptions {
+            limit: Some(limit),
+            mode: Some(if mode == Some("precision") {
+                "precision".to_string()
+            } else {
+                "standard".to_string()
+            }),
+            hybrid: Some(!off("hybrid")),
+            rerank: Some(flag("rerank")),
+            blanket: if off("blanket") { Some(false) } else { None },
+            threshold: q.get("threshold").and_then(|t| t.parse().ok()),
+            viewer: Some(viewer),
+            identity: q.get("identity").filter(|v| !v.is_empty()).cloned(),
+            peer: q.get("peer").filter(|v| !v.is_empty()).cloned(),
+        };
+        return Ok(Json(s.semantic_search(&query, opts).await?).into_response());
+    }
+    Ok(Json(s.search(&query, limit, Some(&viewer)).await?).into_response())
+}
+
+#[derive(Deserialize, Default)]
+struct RecallBody {
+    identity: Option<String>,
+    peer: Option<String>,
+    query: Option<String>,
+    budget: Option<usize>,
+}
+
+/// POST /api/recall — identity defaults to the acting user.
+async fn recall(
+    State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
+    Json(body): Json<RecallBody>,
+) -> ApiResult {
+    let identity = body.identity.unwrap_or_else(|| ctx.actor().to_string());
+    if identity.is_empty() {
+        return Ok(err(StatusCode::BAD_REQUEST, "identity required"));
+    }
+    let result = s
+        .recall(
+            &identity,
+            RecallOptions {
+                peer: body.peer,
+                query: body.query,
+                budget: body.budget,
+            },
+        )
+        .await?;
+    Ok(Json(result).into_response())
+}
+
+async fn dashboard(State(s): State<Store>) -> ApiResult {
+    Ok(Json(s.dashboard().await?).into_response())
+}
+
+async fn graph(State(s): State<Store>) -> ApiResult {
+    Ok(Json(s.graph().await?).into_response())
+}
+
+#[derive(Deserialize)]
+struct AutocompleteQuery {
+    q: Option<String>,
+    kinds: Option<String>,
+}
+
+async fn autocomplete(
+    State(s): State<Store>,
+    Query(params): Query<AutocompleteQuery>,
+) -> ApiResult {
+    let q = params.q.unwrap_or_default();
+    let kinds = params
+        .kinds
+        .map(|k| k.split(',').map(|s| s.trim().to_string()).collect());
+    Ok(Json(s.autocomplete(&q, kinds).await?).into_response())
+}
+
+async fn embeddings(State(s): State<Store>) -> ApiResult {
+    Ok(Json(s.embedding_stats().await?).into_response())
 }

@@ -18,6 +18,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
+#[cfg(feature = "onnx")]
+pub mod onnx;
+
 pub const HASH_DIM: usize = 256;
 pub const HASH_MODEL: &str = "hash-ngram-v1";
 pub const BGE_QUERY_INSTRUCTION: &str = "Represent this sentence for searching relevant passages: ";
@@ -99,6 +102,27 @@ pub fn set_onnx_provider(p: Box<dyn OnnxProvider>) {
     let _ = ONNX.set(p);
 }
 
+/// Lazy auto-install (Node parity: transformers.js pipelines are lazy
+/// promises — nothing loads until the first embed/rerank). When the `onnx`
+/// feature is on, the provider is transformers, and nobody wired an engine
+/// explicitly, the first embed()/rerank_available() call installs the default
+/// ort engine. The engine itself defers model download/load to first use, so
+/// this is cheap; any later load failure surfaces as Err and latches to hash.
+fn ensure_default_engine() {
+    #[cfg(feature = "onnx")]
+    {
+        static INSTALL_ONCE: OnceLock<()> = OnceLock::new();
+        INSTALL_ONCE.get_or_init(|| {
+            if provider_is_transformers()
+                && !TRANSFORMERS_FAILED.load(Ordering::Relaxed)
+                && ONNX.get().is_none()
+            {
+                onnx::install_default();
+            }
+        });
+    }
+}
+
 fn mark_transformers_unavailable(reason: &str) {
     TRANSFORMERS_FAILED.store(true, Ordering::Relaxed);
     if !WARNED.swap(true, Ordering::Relaxed) {
@@ -113,14 +137,17 @@ fn mark_transformers_unavailable(reason: &str) {
 
 /// Whether a cross-encoder reranker is available right now.
 pub fn rerank_available() -> bool {
-    provider_is_transformers()
-        && !TRANSFORMERS_FAILED.load(Ordering::Relaxed)
-        && ONNX.get().map(|p| p.supports_rerank()).unwrap_or(false)
+    if !provider_is_transformers() || TRANSFORMERS_FAILED.load(Ordering::Relaxed) {
+        return false;
+    }
+    ensure_default_engine();
+    ONNX.get().map(|p| p.supports_rerank()).unwrap_or(false)
 }
 
 /// Embed a passage/document into a unit-length vector for the active provider.
 pub fn embed(text: &str) -> Vec<f32> {
     if provider_is_transformers() && !TRANSFORMERS_FAILED.load(Ordering::Relaxed) {
+        ensure_default_engine();
         if let Some(engine) = ONNX.get() {
             match engine.embed(text) {
                 Ok(v) => return v,
