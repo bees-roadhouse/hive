@@ -32,6 +32,24 @@ export interface Person {
 
 export type PersonPatch = Partial<Pick<Person, "name" | "kind" | "owner" | "bio" | "role">>;
 
+// ---- external identities (platform user IDs → centralized actor) ----
+
+export interface Identity {
+  id: string;
+  platform: string;
+  platform_id: string;
+  actor: string;
+  created_at: string;
+}
+
+export interface NewIdentity {
+  platform: string;
+  platform_id: string;
+  actor: string;
+}
+
+export type IdentityPatch = Partial<Pick<Identity, "actor">>;
+
 // ---- shares ----
 
 export type ShareScope = "entry" | "journal";

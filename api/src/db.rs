@@ -1,43 +1,43 @@
-import Database from "better-sqlite3";
-import { APP_VERSION } from "@hive/shared";
-import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+// SQLite is the whole datastore — parity port of packages/api/src/db.ts.
+// Schema statements mirror the Node API byte-for-byte (CREATE TABLE IF NOT
+// EXISTS + idempotent column adds) so this binary boots cleanly on a database
+// the Node API created, and vice versa. The only addition is the `identities`
+// table (cross-platform identity mapping, a Rust-branch feature).
 
-// SQLite is the whole datastore — zero infra, spins up instantly in a fresh
-// container. FTS5 (bundled in better-sqlite3) gives unified search across the
-// journal and every structured entity that emerges from it.
+use anyhow::Result;
+use hive_shared::APP_VERSION;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::{Row, SqlitePool};
 
-// fileURLToPath (not URL.pathname) so Windows drive paths resolve correctly —
-// `.pathname` yields "/C:/…" which resolve() then turns into "C:\C:\…".
-const DB_PATH = process.env.HIVE_DB
-  ? resolve(process.env.HIVE_DB)
-  : fileURLToPath(new URL("../../../data/hive.db", import.meta.url));
+use crate::auth::now_iso;
 
-mkdirSync(dirname(DB_PATH), { recursive: true });
+/// Resolve the database path: $HIVE_DB or ./data/hive.db next to the workspace.
+pub fn db_path() -> String {
+    std::env::var("HIVE_DB").unwrap_or_else(|_| "data/hive.db".to_string())
+}
 
-export const db = new Database(DB_PATH);
-db.pragma("journal_mode = WAL");
-db.pragma("foreign_keys = ON");
+pub async fn open(path: &str) -> Result<SqlitePool> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let opts = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_secs(30));
+    // better-sqlite3 is single-connection; SQLite WAL handles one writer at a
+    // time. A small pool keeps reads concurrent without writer contention.
+    let pool = SqlitePoolOptions::new()
+        .max_connections(8)
+        .connect_with(opts)
+        .await?;
+    Ok(pool)
+}
 
-export function migrate(): void {
-  // Was this a brand-new database? `journal` is the oldest core table, so its
-  // absence before this migrate run means a genuinely fresh install (→ run
-  // onboarding). A DB that predates v0.1.1 already has it (→ skip onboarding).
-  const fresh = !db
-    .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal'")
-    .get();
-
-  // Storage-format migration: embeddings.vec moved from JSON-text to packed
-  // little-endian f32 BLOB (matching bookstack-mcp). Drop a stale TEXT-format
-  // table so the worker re-backfills it in the new format. Runs once — after
-  // recreation the column type is BLOB and this is a no-op.
-  const vecCol = db
-    .prepare("SELECT type FROM pragma_table_info('embeddings') WHERE name = 'vec'")
-    .get() as { type: string } | undefined;
-  if (vecCol && vecCol.type.toUpperCase() !== "BLOB") db.exec("DROP TABLE embeddings");
-
-  db.exec(`
+const SCHEMA: &str = r#"
     -- The journal is the source of truth: append-only, write-once prose.
     CREATE TABLE IF NOT EXISTS journal (
       id         TEXT PRIMARY KEY,
@@ -66,14 +66,6 @@ export function migrate(): void {
       id         TEXT PRIMARY KEY,
       name       TEXT NOT NULL UNIQUE,
       slug       TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS people (
-      id         TEXT PRIMARY KEY,
-      name       TEXT NOT NULL,
-      slug       TEXT NOT NULL UNIQUE,
-      kind       TEXT NOT NULL DEFAULT 'human',
       created_at TEXT NOT NULL
     );
 
@@ -170,15 +162,6 @@ export function migrate(): void {
       created_at TEXT NOT NULL
     );
 
-    -- Unified full-text index across journal + every structured kind.
-    CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(
-      kind UNINDEXED,
-      ref_id UNINDEXED,
-      title,
-      body,
-      tokenize = 'porter unicode61'
-    );
-
     -- Worker config: external feeds the worker polls into wire events.
     CREATE TABLE IF NOT EXISTS sources (
       id            TEXT PRIMARY KEY,
@@ -210,7 +193,7 @@ export function migrate(): void {
     );
     CREATE INDEX IF NOT EXISTS outbox_pending ON outbox (status, run_after);
 
-    -- Local embeddings for semantic search (vector stored as JSON float array).
+    -- Local embeddings for semantic search (vec = packed little-endian f32 BLOB).
     CREATE TABLE IF NOT EXISTS embeddings (
       ref_kind   TEXT NOT NULL,
       ref_id     TEXT NOT NULL,
@@ -230,7 +213,6 @@ export function migrate(): void {
     );
 
     -- Writers: every human and AI that can author journal entries.
-    -- kind='ai' rows carry owner (a human slug) for visibility scoping.
     CREATE TABLE IF NOT EXISTS people (
       id         TEXT PRIMARY KEY,
       slug       TEXT NOT NULL UNIQUE,
@@ -243,8 +225,6 @@ export function migrate(): void {
     );
 
     -- Shares: explicit visibility grants.
-    -- scope='entry' → ref is a journal entry id (shared with viewer).
-    -- scope='journal' → ref is an author slug (viewer sees all entries by that author).
     CREATE TABLE IF NOT EXISTS shares (
       id         TEXT PRIMARY KEY,
       scope      TEXT NOT NULL,
@@ -255,8 +235,7 @@ export function migrate(): void {
     CREATE INDEX IF NOT EXISTS shares_viewer ON shares (viewer, scope);
     CREATE UNIQUE INDEX IF NOT EXISTS shares_uniq ON shares (scope, ref, viewer);
 
-    -- Key/value instance config (v0.1.1). Holds app.version, onboarding.completed,
-    -- instance.name, and anything else that's per-deployment rather than content.
+    -- Key/value instance config.
     CREATE TABLE IF NOT EXISTS config (
       key        TEXT PRIMARY KEY,
       value      TEXT NOT NULL,
@@ -287,7 +266,6 @@ export function migrate(): void {
     CREATE INDEX IF NOT EXISTS sessions_user ON sessions (user_id);
 
     -- Bearer tokens for programmatic clients (CLI, MCP, AI agents).
-    -- token_hash = sha256(plaintext). The plaintext is returned once at creation.
     CREATE TABLE IF NOT EXISTS api_tokens (
       id           TEXT PRIMARY KEY,
       token_hash   TEXT NOT NULL UNIQUE,
@@ -298,47 +276,31 @@ export function migrate(): void {
       last_used_at TEXT
     );
 
-    -- External identity mappings: platform user IDs → centralized people slug.
-    -- Enables cross-platform memory: Discord, Telegram, etc. all resolve to one actor.
-    CREATE TABLE IF NOT EXISTS identities (
-      id          TEXT PRIMARY KEY,
-      platform    TEXT NOT NULL,
-      platform_id TEXT NOT NULL,
-      actor       TEXT NOT NULL,
-      created_at  TEXT NOT NULL
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS identities_platform ON identities (platform, platform_id);
-    CREATE INDEX IF NOT EXISTS identities_actor ON identities (actor);
-
-    -- OAuth 2.1 dynamic client registration (RFC 7591). MCP clients are public
-    -- (PKCE, no secret), so we store no client_secret.
+    -- OAuth 2.1 dynamic client registration (RFC 7591).
     CREATE TABLE IF NOT EXISTS oauth_clients (
       client_id     TEXT PRIMARY KEY,
       client_name   TEXT NOT NULL,
-      redirect_uris TEXT NOT NULL,   -- JSON array of exact-match strings
-      grant_types   TEXT NOT NULL,   -- JSON array
+      redirect_uris TEXT NOT NULL,
+      grant_types   TEXT NOT NULL,
       created_at    TEXT NOT NULL
     );
 
-    -- OAuth authorization codes: single-use, short TTL, hashed at rest, bound to
-    -- the granted AI identity + the granting human.
+    -- OAuth authorization codes: single-use, short TTL, hashed at rest.
     CREATE TABLE IF NOT EXISTS oauth_auth_codes (
-      code_hash      TEXT PRIMARY KEY,   -- sha256(plaintext code)
+      code_hash      TEXT PRIMARY KEY,
       client_id      TEXT NOT NULL,
       redirect_uri   TEXT NOT NULL,
-      code_challenge TEXT NOT NULL,      -- PKCE S256 challenge
-      ai_actor       TEXT NOT NULL,      -- people.slug, kind='ai'
-      granted_by     TEXT NOT NULL,      -- granting human's actor
+      code_challenge TEXT NOT NULL,
+      ai_actor       TEXT NOT NULL,
+      granted_by     TEXT NOT NULL,
       scope          TEXT NOT NULL,
       created_at     TEXT NOT NULL,
       expires_at     TEXT NOT NULL,
-      used_at        TEXT                -- single-use marker; non-null = spent
+      used_at        TEXT
     );
     CREATE INDEX IF NOT EXISTS oauth_codes_expiry ON oauth_auth_codes (expires_at);
 
-    -- Mutable per-actor card (humans + AIs): the durable "who they are" that
-    -- evolves, kept distinct from the write-once journal. body is JSON
-    -- { sections: { identity, preferences, working_style, relationships, … } }.
+    -- Mutable per-actor card (humans + AIs).
     CREATE TABLE IF NOT EXISTS profile (
       actor        TEXT PRIMARY KEY,
       kind         TEXT NOT NULL DEFAULT 'human',
@@ -348,87 +310,185 @@ export function migrate(): void {
       derived_at   TEXT,
       updated_at   TEXT NOT NULL
     );
-  `);
 
-  // Idempotent column additions for DBs created before owner was introduced.
-  // Must run after the CREATE TABLE block so the table exists on fresh DBs.
-  const hasOwner = db
-    .prepare("SELECT 1 FROM pragma_table_info('sources') WHERE name='owner'")
-    .get();
-  if (!hasOwner) {
-    db.exec("ALTER TABLE sources ADD COLUMN owner TEXT");
-  }
+    -- Cross-platform identity mapping (Rust-branch addition): Discord/Telegram/
+    -- Slack user ids → a people.slug.
+    CREATE TABLE IF NOT EXISTS identities (
+      id          TEXT PRIMARY KEY,
+      platform    TEXT NOT NULL,
+      platform_id TEXT NOT NULL,
+      actor       TEXT NOT NULL,
+      created_at  TEXT NOT NULL,
+      UNIQUE (platform, platform_id)
+    );
+"#;
 
-  const hasTaskPhase = db
-    .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name='phase'")
-    .get();
-  if (!hasTaskPhase) {
-    db.exec("ALTER TABLE tasks ADD COLUMN phase TEXT");
-  }
+/// Unified full-text index — created separately because sqlx's prepared-statement
+/// path can't batch a CREATE VIRTUAL TABLE with other statements.
+const SCHEMA_FTS: &str = r#"
+    CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(
+      kind UNINDEXED,
+      ref_id UNINDEXED,
+      title,
+      body,
+      tokenize = 'porter unicode61'
+    );
+"#;
 
-  const hasTaskDue = db
-    .prepare("SELECT 1 FROM pragma_table_info('tasks') WHERE name='due'")
-    .get();
-  if (!hasTaskDue) {
-    db.exec("ALTER TABLE tasks ADD COLUMN due TEXT");
-  }
+pub async fn migrate(pool: &SqlitePool) -> Result<()> {
+    // Was this a brand-new database? `journal` is the oldest core table, so its
+    // absence before this migrate run means a genuinely fresh install (→ run
+    // onboarding). A DB that predates v0.1.1 already has it (→ skip onboarding).
+    let fresh = sqlx::query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal'")
+        .fetch_optional(pool)
+        .await?
+        .is_none();
 
-  const hasProjectSlug = db
-    .prepare("SELECT 1 FROM pragma_table_info('projects') WHERE name='slug'")
-    .get();
-  if (!hasProjectSlug) {
-    db.exec("ALTER TABLE projects ADD COLUMN slug TEXT NOT NULL DEFAULT ''");
-  }
+    // Storage-format migration: embeddings.vec moved from JSON-text to packed
+    // little-endian f32 BLOB. Drop a stale TEXT-format table so the worker
+    // re-backfills it in the new format.
+    let vec_col: Option<String> =
+        sqlx::query_scalar("SELECT type FROM pragma_table_info('embeddings') WHERE name = 'vec'")
+            .fetch_optional(pool)
+            .await?;
+    if let Some(t) = vec_col {
+        if t.to_uppercase() != "BLOB" {
+            sqlx::raw_sql("DROP TABLE embeddings").execute(pool).await?;
+        }
+    }
 
-  // people.owner — guard for DBs bootstrapped before this column was added.
-  const hasPeopleOwner = db
-    .prepare("SELECT 1 FROM pragma_table_info('people') WHERE name='owner'")
-    .get();
-  if (!hasPeopleOwner) {
-    db.exec("ALTER TABLE people ADD COLUMN owner TEXT");
-  }
+    sqlx::raw_sql(SCHEMA).execute(pool).await?;
+    sqlx::raw_sql(SCHEMA_FTS).execute(pool).await?;
 
-  // Identity profile (bio + role), editable in the UI and self-updatable via MCP.
-  for (const col of ["bio", "role"]) {
-    const has = db.prepare("SELECT 1 FROM pragma_table_info('people') WHERE name=?").get(col);
-    if (!has) db.exec(`ALTER TABLE people ADD COLUMN ${col} TEXT`);
-  }
+    // Idempotent column additions for DBs created before these columns existed.
+    add_column_if_missing(
+        pool,
+        "sources",
+        "owner",
+        "ALTER TABLE sources ADD COLUMN owner TEXT",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "tasks",
+        "phase",
+        "ALTER TABLE tasks ADD COLUMN phase TEXT",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "tasks",
+        "due",
+        "ALTER TABLE tasks ADD COLUMN due TEXT",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "projects",
+        "slug",
+        "ALTER TABLE projects ADD COLUMN slug TEXT NOT NULL DEFAULT ''",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "people",
+        "owner",
+        "ALTER TABLE people ADD COLUMN owner TEXT",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "people",
+        "bio",
+        "ALTER TABLE people ADD COLUMN bio TEXT",
+    )
+    .await?;
+    add_column_if_missing(
+        pool,
+        "people",
+        "role",
+        "ALTER TABLE people ADD COLUMN role TEXT",
+    )
+    .await?;
+    // v0.1.2: OAuth tokens share the api_tokens table; existing PATs read as
+    // kind NULL (treated as 'pat') with no expiry.
+    for (col, ddl) in [
+        ("kind", "ALTER TABLE api_tokens ADD COLUMN kind TEXT"),
+        (
+            "client_id",
+            "ALTER TABLE api_tokens ADD COLUMN client_id TEXT",
+        ),
+        (
+            "granted_by",
+            "ALTER TABLE api_tokens ADD COLUMN granted_by TEXT",
+        ),
+        (
+            "expires_at",
+            "ALTER TABLE api_tokens ADD COLUMN expires_at TEXT",
+        ),
+        ("scope", "ALTER TABLE api_tokens ADD COLUMN scope TEXT"),
+    ] {
+        add_column_if_missing(pool, "api_tokens", col, ddl).await?;
+    }
 
-  // v0.1.2: OAuth tokens share the api_tokens table so tokens.resolve keeps
-  // returning an actor for every consumer. New columns are nullable; an existing
-  // PAT reads as kind NULL (treated as 'pat') with no expiry. This loop also adds
-  // expires_at (the standalone guard from #35 on development is subsumed here).
-  for (const [col, ddl] of [
-    ["kind", "ALTER TABLE api_tokens ADD COLUMN kind TEXT"],
-    ["client_id", "ALTER TABLE api_tokens ADD COLUMN client_id TEXT"],
-    ["granted_by", "ALTER TABLE api_tokens ADD COLUMN granted_by TEXT"],
-    ["expires_at", "ALTER TABLE api_tokens ADD COLUMN expires_at TEXT"],
-    ["scope", "ALTER TABLE api_tokens ADD COLUMN scope TEXT"],
-  ] as const) {
-    const has = db.prepare("SELECT 1 FROM pragma_table_info('api_tokens') WHERE name=?").get(col);
-    if (!has) db.exec(ddl);
-  }
+    // Onboarding gate: stamp the app version once; a fresh DB needs the wizard,
+    // a DB that predates v0.1.1 is treated as already set up.
+    let has_version: Option<String> =
+        sqlx::query_scalar("SELECT value FROM config WHERE key = 'app.version'")
+            .fetch_optional(pool)
+            .await?;
+    if has_version.is_none() {
+        set_config(pool, "app.version", APP_VERSION).await?;
+        set_config(
+            pool,
+            "onboarding.completed",
+            if fresh { "false" } else { "true" },
+        )
+        .await?;
+    }
 
-  // ---- v0.1.1 onboarding gate ----
-  // The first time this schema initializes a DB, stamp the app version and
-  // decide whether onboarding is required. A fresh DB needs the wizard; a DB
-  // that predates v0.1.1 (already had `journal`) is treated as already set up,
-  // so existing deployments never get bounced through onboarding.
-  const cfg = (key: string): string | undefined =>
-    (db.prepare("SELECT value FROM config WHERE key = ?").get(key) as { value: string } | undefined)?.value;
-  const setCfg = (key: string, value: string): void => {
-    db.prepare(
-      "INSERT INTO config (key, value, updated_at) VALUES (?, ?, ?) " +
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-    ).run(key, value, new Date().toISOString());
-  };
-  if (!cfg("app.version")) {
-    setCfg("app.version", APP_VERSION);
-    setCfg("onboarding.completed", fresh ? "false" : "true");
-  }
+    Ok(())
 }
 
-/** Wrap a unit of work in a transaction. */
-export function tx<T>(fn: () => T): T {
-  return db.transaction(fn)();
+async fn add_column_if_missing(pool: &SqlitePool, table: &str, col: &str, ddl: &str) -> Result<()> {
+    let has = sqlx::query("SELECT 1 FROM pragma_table_info(?) WHERE name = ?")
+        .bind(table)
+        .bind(col)
+        .fetch_optional(pool)
+        .await?;
+    if has.is_none() {
+        sqlx::raw_sql(ddl).execute(pool).await?;
+    }
+    Ok(())
+}
+
+async fn set_config(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO config (key, value, updated_at) VALUES (?, ?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+    )
+    .bind(key)
+    .bind(value)
+    .bind(now_iso())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Open + migrate in one call (the boot path for both api and tests).
+pub async fn init() -> Result<SqlitePool> {
+    let path = db_path();
+    let pool = open(&path).await?;
+    migrate(&pool).await?;
+    Ok(pool)
+}
+
+/// Verify the FTS5 module is actually available in the bundled SQLite.
+pub async fn assert_fts5(pool: &SqlitePool) -> Result<()> {
+    let n: i64 = sqlx::query("SELECT count(*) AS n FROM pragma_module_list WHERE name = 'fts5'")
+        .fetch_one(pool)
+        .await?
+        .try_get("n")?;
+    anyhow::ensure!(n > 0, "bundled SQLite lacks FTS5 — search cannot work");
+    Ok(())
 }

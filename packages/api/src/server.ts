@@ -30,6 +30,7 @@ import {
   actors,
   backfillIdentityCards,
   config,
+  identities,
   oauthClients,
   oauthCodes,
   onboarding,
@@ -298,6 +299,42 @@ app.post("/api/actors/:slug/merge", async (c) => {
   if (!people.get(from)) return c.json({ error: `from actor '${from}' not found` }, 404);
   if (!people.get(into)) return c.json({ error: `into actor '${into}' not found` }, 404);
   return c.json(isDryRun(c) ? actors.mergePreview(from, into) : actors.merge(from, into));
+});
+
+// ---- identities (cross-platform user ID mapping) ----
+app.get("/api/identities", (c) => {
+  const actorFilter = c.req.query("actor");
+  return c.json(actorFilter ? identities.forActor(actorFilter) : identities.list());
+});
+
+app.post("/api/identities", async (c) => {
+  const body = (await c.req.json()) as { platform?: string; platform_id?: string; actor?: string };
+  if (!body?.platform?.trim() || !body?.platform_id?.trim() || !body?.actor?.trim())
+    return c.json({ error: "platform, platform_id, actor required" }, 400);
+  const p = people.get(body.actor);
+  if (!p) return c.json({ error: `actor '${body.actor}' not found` }, 404);
+  return c.json(identities.create(body as any, actor(c)), 201);
+});
+
+app.get("/api/identities/:id", (c) => {
+  const item = identities.get(c.req.param("id"));
+  return item ? c.json(item) : c.json({ error: "not found" }, 404);
+});
+
+app.patch("/api/identities/:id", async (c) => {
+  const body = (await c.req.json()) as { actor?: string };
+  if (!body?.actor?.trim()) return c.json({ error: "actor required" }, 400);
+  const result = identities.update(c.req.param("id"), body, actor(c));
+  return result ? c.json(result) : c.json({ error: "not found" }, 404);
+});
+
+app.delete("/api/identities/:id", (c) => {
+  return identities.remove(c.req.param("id"), actor(c)) ? c.body(null, 204) : c.json({ error: "not found" }, 404);
+});
+
+app.get("/api/identities/resolve/:platform/:platform_id", (c) => {
+  const resolved = identities.resolve(c.req.param("platform"), c.req.param("platform_id"));
+  return resolved ? c.json({ actor: resolved }) : c.json({ actor: null }, 404);
 });
 
 // ---- auth capabilities (SPA reads before login) ----
@@ -636,10 +673,26 @@ app.post("/api/profile/:actor", async (c) => {
   return c.json(profiles.update(c.req.param("actor"), patch, actor(c)));
 });
 app.post("/api/recall", async (c) => {
-  const body = (await c.req.json()) as { identity?: string; peer?: string; query?: string; budget?: number };
+  const body = (await c.req.json()) as {
+    identity?: string;
+    peer?: string;
+    peer_platform?: string;
+    peer_platform_id?: string;
+    query?: string;
+    budget?: number;
+  };
   const identity = body?.identity ?? actor(c);
   if (!identity) return c.json({ error: "identity required" }, 400);
-  return c.json(await recall({ identity, peer: body?.peer, query: body?.query, budget: body?.budget }));
+  return c.json(
+    await recall({
+      identity,
+      peer: body?.peer,
+      peer_platform: body?.peer_platform,
+      peer_platform_id: body?.peer_platform_id,
+      query: body?.query,
+      budget: body?.budget,
+    }),
+  );
 });
 
 // ---- shares ----

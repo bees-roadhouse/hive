@@ -9,3 +9,9 @@ data
 *.log
 .env
 .env.*
+# Rust build artifacts + local databases never enter the build context.
+target
+**/target
+*.db
+*.db-wal
+*.db-shm

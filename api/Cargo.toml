@@ -1,0 +1,47 @@
+[package]
+name = "hive-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+chrono = { workspace = true }
+sqlx = { workspace = true }
+reqwest = { workspace = true }
+
+hive-shared = { workspace = true }
+hive-embed = { workspace = true }
+
+# Auth
+jsonwebtoken = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+scrypt = { workspace = true }
+subtle = { workspace = true }
+hex = { workspace = true }
+
+# Feeds (pollSources runs api-side too; the worker reuses it)
+rss = { workspace = true }
+
+# Misc
+nanoid = { workspace = true }
+dotenvy = { workspace = true }
+async-stream = "0.3"
+futures = "0.3"
+urlencoding = "2.1"
+
+[dev-dependencies]
+tempfile = "3"

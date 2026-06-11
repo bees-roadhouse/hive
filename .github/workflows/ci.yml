@@ -34,3 +34,40 @@ jobs:
         env:
           HIVE_EMBED: hash
         run: pnpm seed
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev libsqlite3-dev cmake
+
+      # Matches rust-toolchain.toml so local fmt/clippy and CI agree.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: hive-rust
+
+      - name: Cargo fmt
+        run: cargo fmt --all --check
+
+      - name: Cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Cargo build
+        run: cargo build --workspace --all-targets
+
+      - name: Cargo test
+        # Hash embedder keeps CI offline + fast (the transformers provider would
+        # try to download BGE models from the HF hub on first embed).
+        env:
+          HIVE_EMBED: hash
+        run: cargo test --workspace
