@@ -1,67 +1,78 @@
 # Hive Rust Rewrite
 
-A complete Rust rewrite of the Hive API (Axum) and Worker (ONNX Runtime) with cross-platform identity mapping for multi-user memory.
+A drop-in Rust replacement for the Node hive API + worker: one Axum binary
+serves the full REST surface, the MCP server, the SSE stream, AND the Solid.js
+SPA (no nginx container). A second binary runs the worker. Both speak the exact
+wire format, auth formats, and SQLite schema the Node API uses — an existing
+database, its scrypt password hashes, its `hive_pat_*` tokens, and its
+timestamps all keep working unchanged.
 
 ## Architecture
 
 | Component | Tech | Port | Notes |
 |-----------|------|------|-------|
-| API | Rust (Axum) | 7878 | Full REST + SSE + MCP |
-| Worker | Rust (ONNX Runtime) | — | Feed polling, embeddings |
-| Web | Node/TS (kept for now) | 8091 | Will be re-implemented later |
-| DB | SQLite (WAL) | — | Shared via volume |
+| API + Web | Rust (Axum) | 7878 | REST + OAuth 2.1 AS + MCP + SSE + SPA static serving |
+| Worker | Rust | — | Feed polling, outbox drain, embeddings backfill, maintenance |
+| DB | SQLite (WAL, FTS5) | — | Shared via volume; schema identical to the Node API |
+| Embeddings | ort (ONNX Runtime) | — | bge-small + bge-reranker via `hive-embed`; hash fallback offline |
 
 ## Quick Start
 
 ```bash
-# Build the dev image (Rust + .NET + Zig + 1Password CLI + Node)
-docker build -f Dockerfile.dev -t beesroadhouse/hive-dev:latest .
+# Local dev (API on :7878, serves packages/web/dist if built)
+pnpm --filter @hive/web build
+cargo run -p hive-api
 
-# Run everything
-docker compose -f docker-compose.hybrid.yml up --build
+# Worker (HIVE_WORKER_TICK seconds per cycle, default 30; `--once` for one cycle)
+cargo run -p hive-worker
+
+# Containers (single image, both binaries, no nginx)
+docker compose -f docker/docker-compose.rust.yml up --build
 ```
+
+Key env: `HIVE_DB` (default `data/hive.db`), `PORT` (7878), `HIVE_WEB_DIST`
+(SPA dist dir), `HIVE_EMBED` (`transformers`|`hash`), `HIVE_EMBED_MODEL`,
+`HIVE_RERANK_MODEL`, `HIVE_MODEL_CACHE` (default `/data/models`),
+`HIVE_PUBLIC_URL`, `OIDC_ISSUER`/`OIDC_CLIENT_ID`/`OIDC_CLIENT_SECRET`/
+`OIDC_ALLOWED_DOMAINS`.
 
 ## Cargo Workspace
 
 ```
 .
-├── Cargo.toml          # Workspace root
-├── shared/             # Domain types (hive-shared crate)
-├── api/                # Axum HTTP server
-│   ├── src/
-│   │   ├── main.rs     # Entry point
-│   │   ├── db.rs       # SQLite + migrations
-│   │   ├── auth.rs     # Argon2, JWT, sessions
-│   │   ├── store.rs    # All DB operations
-│   │   ├── routes.rs   # Axum handlers
-│   │   └── mcp.rs      # MCP JSON-RPC protocol
-│   └── migrations/
-│       └── 001_initial.sql
-├── worker/             # Background worker
-│   ├── src/
-│   │   ├── main.rs     # Entry point
-│   │   ├── lib.rs      # Polling loop
-│   │   └── embed.rs    # ONNX Runtime embeddings
-└── mcp/                # MCP client SDK (placeholder)
+├── Cargo.toml            # Workspace root (toolchain pinned in rust-toolchain.toml)
+├── shared/               # hive-shared: domain types, exact @hive/shared parity
+├── embed/                # hive-embed: embedder seam — ort BGE engine (feature
+│                         #   "onnx", default on) + hash-ngram-v1 fallback latch
+├── api/                  # hive-api: the server
+│   └── src/
+│       ├── main.rs       # boot: open DB, migrate, backfill cards, serve
+│       ├── db.rs         # schema parity with packages/api/src/db.ts
+│       ├── auth.rs       # scrypt, sha256 token hashes, PKCE, cookie consts
+│       ├── middleware.rs # CORS + principal resolution + onboarding/auth gate
+│       ├── store/        # one module per resource (impl Store blocks)
+│       ├── routes/       # one router per area, merged in routes/mod.rs
+│       ├── mcp.rs        # MCP tools (full Node toolset + identity_* extras)
+│       └── legacy_import.rs  # legacy hive.db reader (read-only)
+└── worker/               # hive-worker: tick loop reusing the api store
 ```
 
-## Features
+## Parity notes
 
-- **Cross-platform identity mapping**: Discord, Telegram, Slack user IDs → centralized actor slug
-- **MCP-first**: Model Context Protocol server with `identity_link`, `identity_resolve`, `recall`, `journal_create`, `tasks_list`, etc.
-- **SSE event bus**: Real-time wire log fan-out via `/api/events`
-- **FTS5 search**: Full-text search over journal entries
-- **Semantic search**: ONNX Runtime embeddings with cosine similarity
-- **Auth**: Session cookies + Bearer API tokens + OAuth 2.1 consent flow (placeholder)
+- **Auth/data compat is bit-level**: scrypt `scrypt$salt$hash` (N=16384,r=8,p=1),
+  sha256-hex token storage, `hive_sess_/hive_pat_/hive_ac_` prefixes, JS
+  `toISOString()` timestamps (lexicographic sort-compatible), `prefix_nanoid(12)` ids.
+- **Search**: FTS5 (porter unicode61) keyword + semantic standard|precision
+  cascade (hybrid blend, Markov-blanket boost, cross-encoder rerank) with the
+  #46/#47 degrade paths; embeddings stored as LE-f32 blobs with FNV-1a content
+  hashes — interchangeable with rows the Node worker wrote.
+- **OAuth 2.1**: discovery, dynamic client registration, consent flow with CSRF
+  double-submit, PKCE S256, single-use 60s codes with replay revocation.
+- **SSE** at `/api/stream` (25s heartbeat), `data:` frames in bus.ts shape.
+- **Identity mapping** (Rust-branch addition): `identities` table + REST + MCP
+  tools mapping Discord/Telegram/Slack user ids → actor slugs.
 
-## Docker Image
+## CI
 
-The `Dockerfile.dev` includes:
-- Rust 1.84 + cargo-watch + sqlx-cli + trunk + wasm-bindgen
-- .NET 9.0 SDK
-- Node 22 + pnpm
-- Zig 0.13.0
-- 1Password CLI (op)
-- Python 3 + uv + pyjwt
-
-Perfect for Hermes agent containers needing multi-toolchain support.
+The `rust` job gates `cargo fmt --check`, `clippy -D warnings`, build, and
+tests (hash embedder, offline). Toolchain pinned to match `rust-toolchain.toml`.

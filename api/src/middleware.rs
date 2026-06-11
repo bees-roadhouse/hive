@@ -159,7 +159,10 @@ fn apply_cors(res: &mut Response, origin: Option<&HeaderValue>) {
     }
     headers.insert(
         "access-control-allow-headers",
-        HeaderValue::from_static("content-type, authorization, x-hive-actor"),
+        // mcp-* headers: browser MCP clients send them on /mcp preflight.
+        HeaderValue::from_static(
+            "content-type, authorization, x-hive-actor, mcp-session-id, mcp-protocol-version",
+        ),
     );
     headers.insert(
         "access-control-allow-methods",

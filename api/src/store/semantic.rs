@@ -210,8 +210,9 @@ impl Store {
         Ok(hits)
     }
 
-    /// Every item worth embedding (store.ts `embeddableItems`).
-    pub(crate) async fn embeddable_items(&self) -> Result<Vec<EmbeddableItem>> {
+    /// Every item worth embedding (store.ts `embeddableItems`). Public: the
+    /// worker's backfill iterates this exactly like Node's worker does.
+    pub async fn embeddable_items(&self) -> Result<Vec<EmbeddableItem>> {
         let mut out: Vec<EmbeddableItem> = Vec::new();
         let mut push = |kind: &str, id: String, title: String, text: String| {
             let embed_text = format!("[{kind}] {title}\n\n{text}");
