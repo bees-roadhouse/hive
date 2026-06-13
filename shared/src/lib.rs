@@ -1394,11 +1394,12 @@ pub fn slugify(s: &str) -> String {
     out
 }
 
-/// Truncate to n chars with a `…` suffix (parity with store snip; char-safe).
+/// Node `snip`: truncate to n UTF-16 code units (JS `.length`/`.slice`
+/// semantics — emoji count as 2) with a `…` suffix.
 pub fn snip(s: &str, n: usize) -> String {
-    if s.chars().count() > n {
-        let truncated: String = s.chars().take(n).collect();
-        format!("{truncated}…")
+    let units: Vec<u16> = s.encode_utf16().collect();
+    if units.len() > n {
+        format!("{}…", String::from_utf16_lossy(&units[..n]))
     } else {
         s.to_string()
     }
@@ -1438,12 +1439,19 @@ mod tests {
     }
 
     #[test]
-    fn snip_is_char_safe() {
+    fn snip_counts_utf16_units_like_js() {
         assert_eq!(snip("short", 140), "short");
         let long = "é".repeat(200);
         let s = snip(&long, 140);
         assert!(s.ends_with('…'));
         assert_eq!(s.chars().count(), 141);
+        // '😀' is 2 UTF-16 units: JS snip("😀".repeat(80), 140) keeps 70 emoji.
+        let emoji = "😀".repeat(80);
+        let s = snip(&emoji, 140);
+        assert!(s.ends_with('…'));
+        assert_eq!(s.chars().count(), 71);
+        // At exactly n units JS does not truncate.
+        assert_eq!(snip(&"😀".repeat(70), 140), "😀".repeat(70));
     }
 
     #[test]
