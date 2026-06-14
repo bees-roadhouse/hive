@@ -154,6 +154,17 @@ export interface OAuthClient {
   created_at: string;
 }
 
+/** A registered OAuth client plus live token stats, for the admin connected-apps view. */
+export interface OAuthClientStatus {
+  client_id: string;
+  client_name: string;
+  created_at: string;
+  /** Count of this client's currently-active (non-expired) oauth tokens. */
+  active_tokens: number;
+  /** Most-recent last_used_at across this client's tokens (null = never used). */
+  last_used_at: string | null;
+}
+
 /** An AI identity a signed-in human owns and may grant via the consent flow. */
 export interface AiIdentity {
   slug: string;

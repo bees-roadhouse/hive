@@ -13,10 +13,21 @@ export const OAuthConsent: Component = () => {
   const state = params.get("state") ?? "";
   const scope = params.get("scope") ?? "mcp";
 
+  // Token-lifetime presets (seconds). The server clamps to [1h, 1 year].
+  const LIFETIMES = [
+    { label: "7 days", secs: 7 * 24 * 60 * 60 },
+    { label: "30 days", secs: 30 * 24 * 60 * 60 },
+    { label: "90 days", secs: 90 * 24 * 60 * 60 },
+    { label: "1 year", secs: 365 * 24 * 60 * 60 },
+  ];
+
   const [ctx] = createResource(() => api.oauthContext(clientId));
   const [chosen, setChosen] = createSignal<string>("");
+  const [ttl, setTtl] = createSignal<number>(365 * 24 * 60 * 60);
   const [error, setError] = createSignal<string | null>(null);
   const [busy, setBusy] = createSignal(false);
+
+  const ttlLabel = () => LIFETIMES.find((l) => l.secs === ttl())?.label ?? "1 year";
 
   const approve = async () => {
     const ident = chosen() || ctx()?.identities[0]?.slug;
@@ -31,6 +42,7 @@ export const OAuthConsent: Component = () => {
         scope,
         ai_actor: ident,
         csrf: ctx()!.csrf,
+        token_ttl_secs: ttl(),
       });
       window.location.href = redirect;
     } catch (err) {
@@ -63,7 +75,13 @@ export const OAuthConsent: Component = () => {
                 <For each={ctx()!.identities}>{(i) => <option value={i.slug}>{i.name} ({i.slug})</option>}</For>
               </select>
             </label>
-            <p class="dim">This issues a long-lived token (1 year) that identifies every MCP action as that AI. You can revoke it anytime from the Account tab.</p>
+            <label>
+              Access lasts
+              <select value={ttl()} onChange={(e) => setTtl(Number(e.currentTarget.value))}>
+                <For each={LIFETIMES}>{(l) => <option value={l.secs}>{l.label}</option>}</For>
+              </select>
+            </label>
+            <p class="dim">This issues a token valid for {ttlLabel()} that identifies every MCP action as that AI. You can revoke it anytime from the Account tab.</p>
             <Show when={error()}><p class="auth-error">{error()}</p></Show>
             <div class="consent-actions">
               <button class="logout" onClick={deny} disabled={busy()}>Deny</button>

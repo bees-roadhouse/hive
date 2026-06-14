@@ -17,8 +17,15 @@ pub const SESSION_COOKIE: &str = "hive_session";
 pub const SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 /// OAuth authorization-code lifetime: 60 seconds (single-use).
 pub const AUTH_CODE_TTL_SECS: i64 = 60;
-/// OAuth access-token lifetime: 1 year (renewable via re-consent).
+/// OAuth access-token lifetime: 1 year (renewable via re-consent). This is the
+/// DEFAULT when the consent flow doesn't request a specific lifetime.
 pub const OAUTH_TOKEN_TTL_SECS: i64 = 365 * 24 * 60 * 60;
+/// OAuth access-token lifetime ceiling: 1 year. A requested lifetime is clamped
+/// up to this.
+pub const OAUTH_TOKEN_TTL_MAX_SECS: i64 = 365 * 24 * 60 * 60;
+/// OAuth access-token lifetime floor: 1 hour. A requested lifetime is clamped
+/// down to this.
+pub const OAUTH_TOKEN_TTL_MIN_SECS: i64 = 60 * 60;
 
 const SCRYPT_KEYLEN: usize = 64;
 

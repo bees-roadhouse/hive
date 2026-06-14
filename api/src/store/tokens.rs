@@ -9,7 +9,8 @@ use serde_json::json;
 use sqlx::Row;
 
 use crate::auth::{
-    generate_token, iso_in_days, iso_in_secs, token_hash, API_TOKEN_PREFIX, OAUTH_TOKEN_TTL_SECS,
+    generate_token, iso_in_days, iso_in_secs, token_hash, API_TOKEN_PREFIX,
+    OAUTH_TOKEN_TTL_MAX_SECS, OAUTH_TOKEN_TTL_MIN_SECS, OAUTH_TOKEN_TTL_SECS,
 };
 
 use super::{new_id, now_iso, Store};
@@ -84,15 +85,20 @@ impl Store {
         Ok((token, record))
     }
 
-    /// Mint a long-lived OAuth access token (consent flow). Plaintext returned once.
+    /// Mint a long-lived OAuth access token (consent flow). Plaintext returned
+    /// once. `expires_in_secs` is clamped to [MIN, MAX]; omitted → DEFAULT.
     pub async fn tokens_create_oauth(
         &self,
         actor: &str,
         client_id: &str,
         granted_by: &str,
         scope: &str,
+        expires_in_secs: Option<i64>,
     ) -> Result<(String, ApiToken)> {
         let token = generate_token(API_TOKEN_PREFIX);
+        let ttl_secs = expires_in_secs
+            .unwrap_or(OAUTH_TOKEN_TTL_SECS)
+            .clamp(OAUTH_TOKEN_TTL_MIN_SECS, OAUTH_TOKEN_TTL_MAX_SECS);
         let record = ApiToken {
             id: new_id("tok"),
             actor: actor.to_string(),
@@ -103,7 +109,7 @@ impl Store {
             kind: Some("oauth".to_string()),
             client_id: Some(client_id.to_string()),
             granted_by: Some(granted_by.to_string()),
-            expires_at: Some(iso_in_secs(OAUTH_TOKEN_TTL_SECS)),
+            expires_at: Some(iso_in_secs(ttl_secs)),
             scope: Some(scope.to_string()),
         };
         crate::pgq::query(

@@ -7,10 +7,10 @@ use std::sync::OnceLock;
 use anyhow::{anyhow, bail, Result as AnyResult};
 use axum::body::Bytes;
 use axum::extract::rejection::FormRejection;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Json, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Extension, Form, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -20,8 +20,11 @@ use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::auth::{csrf_for, token_hash, verify_pkce, SESSION_COOKIE, SESSION_TTL_SECS};
-use crate::error::{err, ApiResult};
+use crate::auth::{
+    csrf_for, token_hash, verify_pkce, OAUTH_TOKEN_TTL_MAX_SECS, OAUTH_TOKEN_TTL_MIN_SECS,
+    OAUTH_TOKEN_TTL_SECS, SESSION_COOKIE, SESSION_TTL_SECS,
+};
+use crate::error::{err, forbidden, ApiResult};
 use crate::middleware::{cookie_value, issuer_for, AuthCtx};
 use crate::store::oauth::{AuthCodeGrant, RedeemOutcome};
 use crate::store::users::NewUser;
@@ -49,6 +52,8 @@ pub fn router() -> Router<Store> {
         .route("/oauth/authorize/context", get(consent_context))
         .route("/oauth/authorize/grant", post(consent_grant))
         .route("/oauth/token", post(token))
+        .route("/api/oauth/clients", get(clients_list))
+        .route("/api/oauth/clients/{client_id}", delete(clients_revoke))
         .route("/api/auth/oidc/start", get(oidc_start))
         .route("/api/auth/oidc/callback", get(oidc_callback))
 }
@@ -261,6 +266,14 @@ struct GrantBody {
     scope: Option<String>,
     ai_actor: Option<String>,
     csrf: Option<String>,
+    /// Requested access-token lifetime (seconds); clamped server-side.
+    token_ttl_secs: Option<i64>,
+}
+
+/// Clamp a requested OAuth token lifetime to [MIN, MAX]; None stays None (the
+/// mint step then applies the server default).
+fn clamp_token_ttl(secs: Option<i64>) -> Option<i64> {
+    secs.map(|s| s.clamp(OAUTH_TOKEN_TTL_MIN_SECS, OAUTH_TOKEN_TTL_MAX_SECS))
 }
 
 async fn consent_grant(
@@ -311,6 +324,7 @@ async fn consent_grant(
             ai_actor,
             granted_by: owner,
             scope: body.scope.unwrap_or_else(|| "mcp".to_string()),
+            token_ttl_secs: clamp_token_ttl(body.token_ttl_secs),
         })
         .await?;
     let state = body.state.unwrap_or_default();
@@ -367,21 +381,51 @@ async fn token(State(s): State<Store>, form: Result<Form<TokenForm>, FormRejecti
         return Ok(err(StatusCode::BAD_REQUEST, "invalid_grant"));
     }
 
+    // The lifetime chosen at consent (clamped) governs the real expiry, so the
+    // OAuth response reports the actual `expires_in` rather than a hardcoded year.
+    let expires_in = grant
+        .token_ttl_secs
+        .unwrap_or(OAUTH_TOKEN_TTL_SECS)
+        .clamp(OAUTH_TOKEN_TTL_MIN_SECS, OAUTH_TOKEN_TTL_MAX_SECS);
     let (token, _record) = s
         .tokens_create_oauth(
             &grant.ai_actor,
             &grant.client_id,
             &grant.granted_by,
             &grant.scope,
+            grant.token_ttl_secs,
         )
         .await?;
     Ok(Json(json!({
         "access_token": token,
         "token_type": "Bearer",
         "scope": grant.scope,
-        "expires_in": 31_536_000,
+        "expires_in": expires_in,
     }))
     .into_response())
+}
+
+// ---- Connected apps (admin): list registered clients + revoke all tokens ----
+
+/// Admin: list OAuth clients with their active-token counts and last-used time.
+async fn clients_list(State(s): State<Store>, Extension(ctx): Extension<AuthCtx>) -> ApiResult {
+    if !ctx.is_admin() {
+        return Ok(forbidden());
+    }
+    Ok(Json(s.oauth_clients_list().await?).into_response())
+}
+
+/// Admin: revoke every token a client holds (disconnects the app).
+async fn clients_revoke(
+    State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
+    Path(client_id): Path<String>,
+) -> ApiResult {
+    if !ctx.is_admin() {
+        return Ok(forbidden());
+    }
+    let revoked = s.tokens_revoke_by_client(&client_id).await?;
+    Ok(Json(json!({ "revoked": revoked })).into_response())
 }
 
 // ============================================================================
