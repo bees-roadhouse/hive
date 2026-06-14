@@ -32,7 +32,9 @@ RUN pnpm --filter @hive/shared build \
 # ----- rust: release build of hive-api + hive-worker -----
 # rust-toolchain.toml pins 1.94.1; rustup in the base image installs the pinned
 # toolchain on first cargo invocation if the image's minor differs.
-FROM rust:1.94-bookworm AS build
+# Trixie, not bookworm: ort's prebuilt onnxruntime static libs are compiled
+# against glibc >= 2.38 (__isoc23_strtol*); bookworm's 2.36 fails to link.
+FROM rust:1.94-trixie AS build
 WORKDIR /src
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY shared ./shared
@@ -48,7 +50,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && cp target/release/hive-api target/release/hive-worker /out/
 
 # ----- runtime: slim debian, both binaries + the web dist -----
-FROM debian:bookworm-slim AS runtime
+# trixie-slim to match the build stage's glibc (the binaries link 2.38+ symbols).
+FROM debian:trixie-slim AS runtime
 # ca-certificates for outbound TLS (reqwest/rustls feed polling); curl for the
 # compose healthcheck.
 RUN apt-get update && apt-get install -y --no-install-recommends \
