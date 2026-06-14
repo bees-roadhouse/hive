@@ -18,6 +18,7 @@ use hive_shared::{
 };
 use serde_json::{json, Map, Value};
 
+use crate::middleware::AuthCtx;
 use crate::store::recall::RecallOptions;
 use crate::store::semantic::SemanticOptions;
 use crate::store::tasks::TaskFilter;
@@ -939,30 +940,50 @@ impl<'a> Args<'a> {
 /// thrown handler errors become isError content, an unknown tool is the SDK's
 /// "MCP error -32602: Tool X not found" isError result. `actor` is the
 /// authenticated identity (authorship pin).
-pub async fn call_tool(store: &Store, actor: &str, name: &str, args: &Map<String, Value>) -> Value {
-    match dispatch(store, actor, name, args).await {
+pub async fn call_tool(
+    store: &Store,
+    ctx: &AuthCtx,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Value {
+    match dispatch(store, ctx, name, args).await {
         Ok(v) => v,
         Err(ToolFailure::Invalid(v)) => v,
         Err(ToolFailure::Store(e)) => tool_error(&e.to_string()),
     }
 }
 
-async fn dispatch(store: &Store, actor: &str, name: &str, args: &Map<String, Value>) -> ToolResult {
+async fn dispatch(
+    store: &Store,
+    ctx: &AuthCtx,
+    name: &str,
+    args: &Map<String, Value>,
+) -> ToolResult {
+    // Authorship pin is the authenticated identity; reads/writes are scoped to
+    // its per-user namespace (admins are unscoped).
+    let actor = ctx.actor();
+    let viewer: Option<String> = if ctx.is_admin() {
+        None
+    } else {
+        Some(ctx.namespace_user().to_string())
+    };
     match name {
-        "journal_append" => journal_append(store, actor, args).await,
+        "journal_append" => journal_append(store, ctx, args).await,
         "journal_list" => {
             let mut a = Args::new("journal_list", args);
             let limit = a.opt_int("limit", Some(1), Some(200));
             a.finish()?;
             Ok(ok_content(
-                &store.journal_list(limit.unwrap_or(30), 0).await?,
+                &store
+                    .visible_journal(&ctx.visibility(), None, limit.unwrap_or(30), 0)
+                    .await?,
             ))
         }
         "journal_get" => {
             let mut a = Args::new("journal_get", args);
             let id = a.req_str("id");
             a.finish()?;
-            match store.journal_get(id.unwrap()).await? {
+            match store.journal_get(id.unwrap(), &ctx.visibility()).await? {
                 Some(e) => Ok(ok_content(&e)),
                 None => Ok(ok_content(&json!({"error": "not found"}))),
             }
@@ -1052,9 +1073,16 @@ async fn dispatch(store: &Store, actor: &str, name: &str, args: &Map<String, Val
             let limit = a.opt_int("limit", None, None);
             a.finish()?;
             let limit = limit.unwrap_or(25).max(0) as usize;
-            Ok(ok_content(&store.search(&q.unwrap(), limit, None).await?))
+            Ok(ok_content(
+                &store.search(&q.unwrap(), limit, viewer.as_deref()).await?,
+            ))
         }
-        "dashboard" => Ok(ok_content(&store.dashboard().await?)),
+        "dashboard" => {
+            if !ctx.is_admin() {
+                return Ok(ok_content(&json!({"error": "admin only"})));
+            }
+            Ok(ok_content(&store.dashboard().await?))
+        }
         "semantic_search" => {
             let mut a = Args::new("semantic_search", args);
             let q = a.req_str("q").map(String::from);
@@ -1074,6 +1102,7 @@ async fn dispatch(store: &Store, actor: &str, name: &str, args: &Map<String, Val
                 rerank,
                 blanket,
                 threshold,
+                viewer: viewer.clone(),
                 ..Default::default()
             };
             Ok(ok_content(&store.semantic_search(&q.unwrap(), opts).await?))
@@ -1149,6 +1178,7 @@ async fn dispatch(store: &Store, actor: &str, name: &str, args: &Map<String, Val
                 peer,
                 query,
                 budget: budget.map(|b| b.max(0) as usize),
+                viewer: viewer.clone(),
             };
             Ok(ok_content(&store.recall(&identity.unwrap(), opts).await?))
         }
@@ -1348,7 +1378,7 @@ async fn dispatch(store: &Store, actor: &str, name: &str, args: &Map<String, Val
     }
 }
 
-async fn journal_append(store: &Store, actor: &str, args: &Map<String, Value>) -> ToolResult {
+async fn journal_append(store: &Store, ctx: &AuthCtx, args: &Map<String, Value>) -> ToolResult {
     let mut a = Args::new("journal_append", args);
     a.req_str("body");
     a.finish()?;
@@ -1356,9 +1386,15 @@ async fn journal_append(store: &Store, actor: &str, args: &Map<String, Value>) -
     // serde message inside the SDK's "Input validation error" wrapper.
     let mut input: NewJournalEntry = serde_json::from_value(Value::Object(args.clone()))
         .map_err(|e| invalid_args("journal_append", &e.to_string()))?;
-    // Author is the token's actor — a client cannot write as someone else.
-    input.author = Some(actor.to_string());
-    Ok(ok_content(&store.journal_append(input, Some(actor)).await?))
+    // Author is the token's actor — a client cannot write as someone else. The
+    // entry lands in the writing principal's namespace (its granting user).
+    let actor = ctx.actor().to_string();
+    input.author = Some(actor.clone());
+    Ok(ok_content(
+        &store
+            .journal_append(input, Some(&actor), ctx.namespace_owner())
+            .await?,
+    ))
 }
 
 /// mcp.ts isAdmin(): the token's actor maps to a user with role 'admin'.

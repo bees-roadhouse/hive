@@ -39,7 +39,15 @@ impl AuthCtx {
     /// The human user whose namespace governs visibility (falls back to the
     /// acting identity when no distinct granter is known).
     pub fn namespace_user(&self) -> &str {
-        self.namespace_user.as_deref().unwrap_or_else(|| self.actor())
+        self.namespace_user
+            .as_deref()
+            .unwrap_or_else(|| self.actor())
+    }
+
+    /// The owner to stamp on writes — the namespace user when authenticated,
+    /// else None (a system/anon write lands in the global/continuous history).
+    pub fn namespace_owner(&self) -> Option<&str> {
+        self.namespace_user.as_deref()
     }
 
     /// Session-principal admin (Node `requireAdmin`).

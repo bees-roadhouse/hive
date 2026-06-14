@@ -150,7 +150,15 @@ impl Store {
     /// Drop search hits a viewer can't see (store.ts `scopeHits`). The ACL set
     /// comes from journal.rs's `visible_entry_ids`.
     async fn scope_hits(&self, hits: Vec<SearchHit>, viewer: &str) -> Result<Vec<SearchHit>> {
-        let visible = self.visible_entry_ids(viewer).await?;
+        // `viewer` is always a concrete namespace user here (admins search
+        // unscoped — the route passes viewer=None). The visible set is already
+        // namespace-gated inside visible_entry_ids.
+        let visible = self
+            .visible_entry_ids(&crate::middleware::Visibility::Namespace(
+                viewer.to_string(),
+            ))
+            .await?
+            .unwrap_or_default();
         let mut out = Vec::with_capacity(hits.len());
         for h in hits {
             if h.kind == EntityKind::Journal {
