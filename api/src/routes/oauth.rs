@@ -53,10 +53,6 @@ pub fn router() -> Router<Store> {
         .route("/api/auth/oidc/callback", get(oidc_callback))
 }
 
-fn host_of(headers: &HeaderMap) -> Option<&str> {
-    headers.get(header::HOST).and_then(|v| v.to_str().ok())
-}
-
 /// 302 redirect (Hono's `c.redirect` default status).
 fn redirect(location: &str) -> AnyResult<Response> {
     let mut res = StatusCode::FOUND.into_response();
@@ -85,7 +81,7 @@ fn query_string(pairs: &[(&str, &str)]) -> String {
 // ---- Discovery metadata (RFC 8414 + RFC 9728) ----
 
 async fn authorization_server_metadata(State(s): State<Store>, headers: HeaderMap) -> ApiResult {
-    let iss = issuer_for(&s, host_of(&headers)).await;
+    let iss = issuer_for(&s, &headers).await;
     Ok(Json(json!({
         "issuer": iss,
         "authorization_endpoint": format!("{iss}/authorize"),
@@ -101,7 +97,7 @@ async fn authorization_server_metadata(State(s): State<Store>, headers: HeaderMa
 }
 
 async fn protected_resource_metadata(State(s): State<Store>, headers: HeaderMap) -> ApiResult {
-    let iss = issuer_for(&s, host_of(&headers)).await;
+    let iss = issuer_for(&s, &headers).await;
     Ok(Json(json!({
         "resource": format!("{iss}/mcp"),
         "authorization_servers": [iss],
@@ -278,7 +274,7 @@ async fn consent_grant(
     }
     // CSRF: per-session token + same-origin Origin check (not SameSite alone).
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        if origin != issuer_for(&s, host_of(&headers)).await {
+        if origin != issuer_for(&s, &headers).await {
             return Ok(err(StatusCode::FORBIDDEN, "bad_origin"));
         }
     }

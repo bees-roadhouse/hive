@@ -6,7 +6,7 @@
 // own auth so they can shape their 401s (www-authenticate, raw JSON).
 
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Json, Response};
 use hive_shared::UserRole;
@@ -170,18 +170,86 @@ fn apply_cors(res: &mut Response, origin: Option<&HeaderValue>) {
     );
 }
 
+/// First value of a possibly comma-joined proxy header, trimmed.
+fn first_forwarded(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// The public origin of this instance — all OAuth metadata URLs derive from it.
-pub async fn issuer_for(store: &Store, host: Option<&str>) -> String {
+/// An explicit `instance.url` config or `HIVE_PUBLIC_URL` wins; otherwise the
+/// origin is reconstructed from the request, honoring the reverse proxy's
+/// `X-Forwarded-Proto`/`X-Forwarded-Host` (Traefik terminates TLS, so the app
+/// sees plain HTTP — without this the metadata would advertise `http://` and
+/// break OAuth 2.1 clients like Claude Desktop). This also yields the right
+/// origin whether the client arrived via the LAN host or the public one.
+pub async fn issuer_for(store: &Store, headers: &HeaderMap) -> String {
     if let Ok(Some(url)) = store.config_get("instance.url").await {
         return url;
     }
     if let Ok(url) = std::env::var("HIVE_PUBLIC_URL") {
         return url;
     }
-    let port = std::env::var("PORT").unwrap_or_else(|_| "7878".to_string());
-    format!(
-        "http://{}",
-        host.map(String::from)
-            .unwrap_or(format!("localhost:{port}"))
-    )
+    let proto = first_forwarded(headers, "x-forwarded-proto").unwrap_or_else(|| "http".to_string());
+    let host = first_forwarded(headers, "x-forwarded-host")
+        .or_else(|| {
+            headers
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| {
+            let port = std::env::var("PORT").unwrap_or_else(|_| "7878".to_string());
+            format!("localhost:{port}")
+        });
+    format!("{proto}://{host}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_forwarded;
+    use axum::http::header::HeaderName;
+    use axum::http::HeaderMap;
+
+    fn hm(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn forwarded_proto_and_host_drive_the_issuer() {
+        // Behind Traefik: X-Forwarded-Proto=https must win over the plain HTTP
+        // the app actually sees, and the comma-joined first value is taken.
+        let h = hm(&[
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-host", "hive.home.beesroadhouse.com"),
+            ("host", "hive-api:7878"),
+        ]);
+        assert_eq!(
+            first_forwarded(&h, "x-forwarded-proto").as_deref(),
+            Some("https")
+        );
+        assert_eq!(
+            first_forwarded(&h, "x-forwarded-host").as_deref(),
+            Some("hive.home.beesroadhouse.com")
+        );
+
+        let chained = hm(&[("x-forwarded-proto", "https, http")]);
+        assert_eq!(
+            first_forwarded(&chained, "x-forwarded-proto").as_deref(),
+            Some("https")
+        );
+
+        let none = hm(&[("host", "h:7878")]);
+        assert_eq!(first_forwarded(&none, "x-forwarded-proto"), None);
+    }
 }
