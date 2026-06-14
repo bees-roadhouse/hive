@@ -28,7 +28,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [api, web, worker]
+        # `rust` builds the all-in-one Axum image (docker/Dockerfile.rust):
+        # one binary serves the API + the SPA, plus the worker. The Node
+        # images (api/web/worker) keep publishing until the Rust stack is
+        # proven in prod — additive, not a swap.
+        image: [api, web, worker, rust]
     steps:
       - uses: actions/checkout@v4
 
@@ -66,7 +70,7 @@ jobs:
       packages: write
     strategy:
       matrix:
-        image: [api, web, worker]
+        image: [api, web, worker, rust]
     steps:
       - uses: actions/checkout@v4
 
@@ -147,6 +151,10 @@ jobs:
             ## Container images
 
             ```
+            # All-in-one Rust stack (API + SPA + worker from one image):
+            podman pull ghcr.io/${{ github.repository_owner }}/hive-rust:${{ steps.vars.outputs.version }}
+
+            # Node stack (api + web + worker):
             podman pull ghcr.io/${{ github.repository_owner }}/hive-api:${{ steps.vars.outputs.version }}
             podman pull ghcr.io/${{ github.repository_owner }}/hive-web:${{ steps.vars.outputs.version }}
             podman pull ghcr.io/${{ github.repository_owner }}/hive-worker:${{ steps.vars.outputs.version }}
