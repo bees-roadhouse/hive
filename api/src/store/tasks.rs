@@ -55,7 +55,7 @@ pub struct TaskFilter {
 impl Store {
     /// Priority-then-recency sort, filters applied after the fetch (as Node does).
     pub async fn tasks_list(&self, filter: TaskFilter) -> Result<Vec<Task>> {
-        let rows = sqlx::query(
+        let rows = crate::pgq::query(
             "SELECT * FROM tasks ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC",
         )
         .fetch_all(self.db())
@@ -91,7 +91,7 @@ impl Store {
     }
 
     pub async fn tasks_get(&self, task_id: &str) -> Result<Option<Task>> {
-        let row = sqlx::query("SELECT * FROM tasks WHERE id = ?")
+        let row = crate::pgq::query("SELECT * FROM tasks WHERE id = ?")
             .bind(task_id)
             .fetch_optional(self.db())
             .await?;
@@ -122,7 +122,7 @@ impl Store {
             created_at: ts.clone(),
             updated_at: ts,
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO tasks (id, project, phase, due, title, body, status, priority, tags, assignees, origin_entry_id, anchor_text, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
@@ -168,7 +168,7 @@ impl Store {
             updated_at: now_iso(),
             ..current
         };
-        sqlx::query(
+        crate::pgq::query(
             "UPDATE tasks SET title=?, body=?, status=?, priority=?, tags=?, assignees=?, updated_at=? WHERE id=?",
         )
         .bind(&next.title)
@@ -193,7 +193,7 @@ impl Store {
     }
 }
 
-pub(crate) fn row_to_task(r: &sqlx::sqlite::SqliteRow) -> Result<Task> {
+pub(crate) fn row_to_task(r: &sqlx::postgres::PgRow) -> Result<Task> {
     Ok(Task {
         id: r.try_get("id")?,
         title: r.try_get("title")?,

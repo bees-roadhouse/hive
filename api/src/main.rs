@@ -12,7 +12,6 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let pool = hive_api::db::init().await?;
-    hive_api::db::assert_fts5(&pool).await?;
 
     let store = hive_api::store::Store::new(pool);
     // Fold any legacy people.bio/role into the canonical profile card (idempotent).

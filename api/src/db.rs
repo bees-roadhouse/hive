@@ -1,38 +1,32 @@
-// SQLite is the whole datastore — parity port of packages/api/src/db.ts.
-// Schema statements mirror the Node API byte-for-byte (CREATE TABLE IF NOT
-// EXISTS + idempotent column adds) so this binary boots cleanly on a database
-// the Node API created, and vice versa. The only addition is the `identities`
-// table (cross-platform identity mapping, a Rust-branch feature).
+// PostgreSQL is the datastore. The api and worker both connect to the same
+// Postgres (via DATABASE_URL), which is what lets them share state without the
+// single-writer / file-ownership friction of the old shared-SQLite-file setup.
+//
+// Schema is created idempotently at boot (CREATE TABLE IF NOT EXISTS + ADD
+// COLUMN IF NOT EXISTS), so both binaries can race the migrate path safely.
+// Full-text search uses a generated `tsvector` column + GIN index in place of
+// SQLite's FTS5 virtual table. Existing SQLite data migrates in via the import
+// endpoint (api/src/legacy_import.rs reads the uploaded .db; this store writes
+// it through the normal insert path).
 
 use anyhow::Result;
 use hive_shared::APP_VERSION;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::PgPool;
 
 use crate::auth::now_iso;
 
-/// Resolve the database path: $HIVE_DB or ./data/hive.db next to the workspace.
-pub fn db_path() -> String {
-    std::env::var("HIVE_DB").unwrap_or_else(|_| "data/hive.db".to_string())
+/// Resolve the Postgres connection string from `DATABASE_URL`. Falls back to a
+/// local dev instance so tests + local runs work without extra config.
+pub fn database_url() -> String {
+    std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://hive:hive@localhost:5432/hive".to_string())
 }
 
-pub async fn open(path: &str) -> Result<SqlitePool> {
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    let opts = SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
-        .foreign_keys(true)
-        .busy_timeout(std::time::Duration::from_secs(30));
-    // better-sqlite3 is single-connection; SQLite WAL handles one writer at a
-    // time. A small pool keeps reads concurrent without writer contention.
-    let pool = SqlitePoolOptions::new()
-        .max_connections(8)
-        .connect_with(opts)
+pub async fn open(url: &str) -> Result<PgPool> {
+    let pool = PgPoolOptions::new()
+        .max_connections(16)
+        .connect(url)
         .await?;
     Ok(pool)
 }
@@ -52,8 +46,8 @@ const SCHEMA: &str = r#"
     CREATE TABLE IF NOT EXISTS anchors (
       id         TEXT PRIMARY KEY,
       entry_id   TEXT NOT NULL,
-      start      INTEGER NOT NULL,
-      "end"      INTEGER NOT NULL,
+      start      BIGINT NOT NULL,
+      "end"      BIGINT NOT NULL,
       text       TEXT NOT NULL,
       kind       TEXT NOT NULL,
       ref_id     TEXT NOT NULL,
@@ -80,7 +74,7 @@ const SCHEMA: &str = r#"
       id         TEXT PRIMARY KEY,
       project    TEXT NOT NULL,
       name       TEXT NOT NULL,
-      position   INTEGER NOT NULL DEFAULT 0,
+      position   BIGINT NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS phases_project ON phases (project);
@@ -170,9 +164,9 @@ const SCHEMA: &str = r#"
       kind          TEXT NOT NULL DEFAULT 'rss',
       category      TEXT,
       severity      TEXT NOT NULL DEFAULT 'info',
-      interval_secs INTEGER NOT NULL DEFAULT 900,
+      interval_secs BIGINT NOT NULL DEFAULT 900,
       notify        TEXT,
-      enabled       INTEGER NOT NULL DEFAULT 1,
+      enabled       BOOLEAN NOT NULL DEFAULT TRUE,
       owner         TEXT,
       last_polled_at TEXT,
       last_status   TEXT,
@@ -185,7 +179,7 @@ const SCHEMA: &str = r#"
       kind         TEXT NOT NULL,
       payload      TEXT NOT NULL DEFAULT '{}',
       status       TEXT NOT NULL DEFAULT 'pending',
-      attempts     INTEGER NOT NULL DEFAULT 0,
+      attempts     BIGINT NOT NULL DEFAULT 0,
       last_error   TEXT,
       run_after    TEXT NOT NULL,
       created_at   TEXT NOT NULL,
@@ -193,13 +187,13 @@ const SCHEMA: &str = r#"
     );
     CREATE INDEX IF NOT EXISTS outbox_pending ON outbox (status, run_after);
 
-    -- Local embeddings for semantic search (vec = packed little-endian f32 BLOB).
+    -- Local embeddings for semantic search (vec = packed little-endian f32 bytes).
     CREATE TABLE IF NOT EXISTS embeddings (
       ref_kind   TEXT NOT NULL,
       ref_id     TEXT NOT NULL,
       model      TEXT NOT NULL,
-      dim        INTEGER NOT NULL,
-      vec        BLOB NOT NULL,
+      dim        BIGINT NOT NULL,
+      vec        BYTEA NOT NULL,
       hash       TEXT NOT NULL,
       created_at TEXT NOT NULL,
       PRIMARY KEY (ref_kind, ref_id)
@@ -207,7 +201,7 @@ const SCHEMA: &str = r#"
 
     -- Single-row worker heartbeat / last-run stats, surfaced in the GUI.
     CREATE TABLE IF NOT EXISTS worker_status (
-      id         INTEGER PRIMARY KEY CHECK (id = 1),
+      id         BIGINT PRIMARY KEY CHECK (id = 1),
       heartbeat  TEXT,
       last_run   TEXT
     );
@@ -273,7 +267,12 @@ const SCHEMA: &str = r#"
       label        TEXT NOT NULL,
       created_by   TEXT NOT NULL,
       created_at   TEXT NOT NULL,
-      last_used_at TEXT
+      last_used_at TEXT,
+      kind         TEXT,
+      client_id    TEXT,
+      granted_by   TEXT,
+      expires_at   TEXT,
+      scope        TEXT
     );
 
     -- OAuth 2.1 dynamic client registration (RFC 7591).
@@ -311,8 +310,8 @@ const SCHEMA: &str = r#"
       updated_at   TEXT NOT NULL
     );
 
-    -- Cross-platform identity mapping (Rust-branch addition): Discord/Telegram/
-    -- Slack user ids → a people.slug.
+    -- Cross-platform identity mapping: Discord/Telegram/Slack user ids →
+    -- a people.slug.
     CREATE TABLE IF NOT EXISTS identities (
       id          TEXT PRIMARY KEY,
       platform    TEXT NOT NULL,
@@ -323,118 +322,61 @@ const SCHEMA: &str = r#"
     );
 "#;
 
-/// Unified full-text index — created separately because sqlx's prepared-statement
-/// path can't batch a CREATE VIRTUAL TABLE with other statements.
-const SCHEMA_FTS: &str = r#"
-    CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(
-      kind UNINDEXED,
-      ref_id UNINDEXED,
-      title,
-      body,
-      tokenize = 'porter unicode61'
+/// Unified full-text index. Postgres equivalent of the old FTS5 virtual table:
+/// a regular table with a generated `tsvector` column (title + body, english
+/// config) and a GIN index. Maintained by the same DELETE+INSERT path as before.
+const SCHEMA_SEARCH: &str = r#"
+    CREATE TABLE IF NOT EXISTS search (
+      kind   TEXT NOT NULL,
+      ref_id TEXT NOT NULL,
+      title  TEXT NOT NULL DEFAULT '',
+      body   TEXT NOT NULL DEFAULT '',
+      tsv    tsvector GENERATED ALWAYS AS (
+               to_tsvector('english', coalesce(title, '') || ' ' || coalesce(body, ''))
+             ) STORED,
+      PRIMARY KEY (kind, ref_id)
     );
+    CREATE INDEX IF NOT EXISTS search_tsv ON search USING GIN (tsv);
 "#;
 
-pub async fn migrate(pool: &SqlitePool) -> Result<()> {
+pub async fn migrate(pool: &PgPool) -> Result<()> {
     // Was this a brand-new database? `journal` is the oldest core table, so its
     // absence before this migrate run means a genuinely fresh install (→ run
-    // onboarding). A DB that predates v0.1.1 already has it (→ skip onboarding).
-    let fresh = sqlx::query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='journal'")
-        .fetch_optional(pool)
-        .await?
-        .is_none();
-
-    // Storage-format migration: embeddings.vec moved from JSON-text to packed
-    // little-endian f32 BLOB. Drop a stale TEXT-format table so the worker
-    // re-backfills it in the new format.
-    let vec_col: Option<String> =
-        sqlx::query_scalar("SELECT type FROM pragma_table_info('embeddings') WHERE name = 'vec'")
-            .fetch_optional(pool)
-            .await?;
-    if let Some(t) = vec_col {
-        if t.to_uppercase() != "BLOB" {
-            sqlx::raw_sql("DROP TABLE embeddings").execute(pool).await?;
-        }
-    }
+    // onboarding); a DB that already has it is treated as already set up.
+    let fresh = sqlx::query_scalar::<_, i32>(
+        "SELECT 1 FROM information_schema.tables \
+         WHERE table_schema = current_schema() AND table_name = 'journal'",
+    )
+    .fetch_optional(pool)
+    .await?
+    .is_none();
 
     sqlx::raw_sql(SCHEMA).execute(pool).await?;
-    sqlx::raw_sql(SCHEMA_FTS).execute(pool).await?;
+    sqlx::raw_sql(SCHEMA_SEARCH).execute(pool).await?;
 
     // Idempotent column additions for DBs created before these columns existed.
-    add_column_if_missing(
-        pool,
-        "sources",
-        "owner",
-        "ALTER TABLE sources ADD COLUMN owner TEXT",
-    )
-    .await?;
-    add_column_if_missing(
-        pool,
-        "tasks",
-        "phase",
-        "ALTER TABLE tasks ADD COLUMN phase TEXT",
-    )
-    .await?;
-    add_column_if_missing(
-        pool,
-        "tasks",
-        "due",
-        "ALTER TABLE tasks ADD COLUMN due TEXT",
-    )
-    .await?;
-    add_column_if_missing(
-        pool,
-        "projects",
-        "slug",
-        "ALTER TABLE projects ADD COLUMN slug TEXT NOT NULL DEFAULT ''",
-    )
-    .await?;
-    add_column_if_missing(
-        pool,
-        "people",
-        "owner",
-        "ALTER TABLE people ADD COLUMN owner TEXT",
-    )
-    .await?;
-    add_column_if_missing(
-        pool,
-        "people",
-        "bio",
-        "ALTER TABLE people ADD COLUMN bio TEXT",
-    )
-    .await?;
-    add_column_if_missing(
-        pool,
-        "people",
-        "role",
-        "ALTER TABLE people ADD COLUMN role TEXT",
-    )
-    .await?;
-    // v0.1.2: OAuth tokens share the api_tokens table; existing PATs read as
-    // kind NULL (treated as 'pat') with no expiry.
-    for (col, ddl) in [
-        ("kind", "ALTER TABLE api_tokens ADD COLUMN kind TEXT"),
-        (
-            "client_id",
-            "ALTER TABLE api_tokens ADD COLUMN client_id TEXT",
-        ),
-        (
-            "granted_by",
-            "ALTER TABLE api_tokens ADD COLUMN granted_by TEXT",
-        ),
-        (
-            "expires_at",
-            "ALTER TABLE api_tokens ADD COLUMN expires_at TEXT",
-        ),
-        ("scope", "ALTER TABLE api_tokens ADD COLUMN scope TEXT"),
+    // Postgres has ADD COLUMN IF NOT EXISTS, so no existence probe is needed.
+    for ddl in [
+        "ALTER TABLE sources    ADD COLUMN IF NOT EXISTS owner      TEXT",
+        "ALTER TABLE tasks      ADD COLUMN IF NOT EXISTS phase      TEXT",
+        "ALTER TABLE tasks      ADD COLUMN IF NOT EXISTS due        TEXT",
+        "ALTER TABLE projects   ADD COLUMN IF NOT EXISTS slug       TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE people     ADD COLUMN IF NOT EXISTS owner      TEXT",
+        "ALTER TABLE people     ADD COLUMN IF NOT EXISTS bio        TEXT",
+        "ALTER TABLE people     ADD COLUMN IF NOT EXISTS role       TEXT",
+        "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS kind       TEXT",
+        "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS client_id  TEXT",
+        "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS granted_by TEXT",
+        "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS expires_at TEXT",
+        "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS scope      TEXT",
     ] {
-        add_column_if_missing(pool, "api_tokens", col, ddl).await?;
+        sqlx::raw_sql(ddl).execute(pool).await?;
     }
 
     // Onboarding gate: stamp the app version once; a fresh DB needs the wizard,
-    // a DB that predates v0.1.1 is treated as already set up.
+    // an existing DB is treated as already set up.
     let has_version: Option<String> =
-        sqlx::query_scalar("SELECT value FROM config WHERE key = 'app.version'")
+        crate::pgq::query_scalar::<String>("SELECT value FROM config WHERE key = 'app.version'")
             .fetch_optional(pool)
             .await?;
     if has_version.is_none() {
@@ -450,20 +392,8 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
-async fn add_column_if_missing(pool: &SqlitePool, table: &str, col: &str, ddl: &str) -> Result<()> {
-    let has = sqlx::query("SELECT 1 FROM pragma_table_info(?) WHERE name = ?")
-        .bind(table)
-        .bind(col)
-        .fetch_optional(pool)
-        .await?;
-    if has.is_none() {
-        sqlx::raw_sql(ddl).execute(pool).await?;
-    }
-    Ok(())
-}
-
-async fn set_config(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
-    sqlx::query(
+async fn set_config(pool: &PgPool, key: &str, value: &str) -> Result<()> {
+    crate::pgq::query(
         "INSERT INTO config (key, value, updated_at) VALUES (?, ?, ?) \
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
     )
@@ -475,20 +405,42 @@ async fn set_config(pool: &SqlitePool, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Open + migrate in one call (the boot path for both api and tests).
-pub async fn init() -> Result<SqlitePool> {
-    let path = db_path();
-    let pool = open(&path).await?;
+/// Open + migrate in one call (the boot path for both api and worker).
+pub async fn init() -> Result<PgPool> {
+    let url = database_url();
+    let pool = open(&url).await?;
     migrate(&pool).await?;
     Ok(pool)
 }
 
-/// Verify the FTS5 module is actually available in the bundled SQLite.
-pub async fn assert_fts5(pool: &SqlitePool) -> Result<()> {
-    let n: i64 = sqlx::query("SELECT count(*) AS n FROM pragma_module_list WHERE name = 'fts5'")
-        .fetch_one(pool)
-        .await?
-        .try_get("n")?;
-    anyhow::ensure!(n > 0, "bundled SQLite lacks FTS5 — search cannot work");
-    Ok(())
+/// Test helper: a pool pinned to a fresh, uniquely-named schema, migrated and
+/// ready. Each test gets full isolation against one shared Postgres (DATABASE_URL
+/// or the local dev default). Public (not cfg(test)) so integration tests can
+/// use it; never called from the running binaries.
+pub async fn test_pool() -> PgPool {
+    let url = database_url();
+    let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
+
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect admin");
+    sqlx::raw_sql(&format!("CREATE SCHEMA \"{schema}\""))
+        .execute(&admin)
+        .await
+        .expect("create schema");
+    admin.close().await;
+
+    // Pin every connection in the pool to the test schema via the libpq
+    // `options` startup parameter — cleaner than an after_connect hook.
+    let opts: PgConnectOptions = url.parse().expect("parse DATABASE_URL");
+    let opts = opts.options([("search_path", schema.as_str())]);
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect_with(opts)
+        .await
+        .expect("connect pool");
+    migrate(&pool).await.expect("migrate");
+    pool
 }

@@ -3,7 +3,7 @@
 // owned by the search parity workstream.
 
 use anyhow::Result;
-use sqlx::SqliteConnection;
+use sqlx::PgConnection;
 
 use super::Store;
 
@@ -25,19 +25,19 @@ impl Store {
 /// Connection-level variant so indexing can run inside a transaction
 /// (`&mut *tx`) as the Node code does.
 pub async fn index_entity_conn(
-    conn: &mut SqliteConnection,
+    conn: &mut PgConnection,
     kind: &str,
     ref_id: &str,
     title: &str,
     body: &str,
     tags: &[String],
 ) -> Result<()> {
-    sqlx::query("DELETE FROM search WHERE kind = ? AND ref_id = ?")
+    crate::pgq::query("DELETE FROM search WHERE kind = ? AND ref_id = ?")
         .bind(kind)
         .bind(ref_id)
         .execute(&mut *conn)
         .await?;
-    sqlx::query("INSERT INTO search (kind, ref_id, title, body) VALUES (?, ?, ?, ?)")
+    crate::pgq::query("INSERT INTO search (kind, ref_id, title, body) VALUES (?, ?, ?, ?)")
         .bind(kind)
         .bind(ref_id)
         .bind(title)

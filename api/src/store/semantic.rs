@@ -66,17 +66,22 @@ fn split_key(k: &str) -> (&str, &str) {
     }
 }
 
-/// store.ts `toMatchQuery`: per-term strip non-alphanumerics, append `*`,
-/// drop empty stems, join with spaces (FTS5 implicit AND).
+/// store.ts `toMatchQuery`, Postgres tsquery form: per-term strip
+/// non-alphanumerics + lowercase, append `:*` (prefix match), drop empty/1-char
+/// stems, join with ` & ` (AND). Feeds `to_tsquery('english', …)`.
 fn to_match_query(q: &str) -> String {
     q.split_whitespace()
         .map(|term| {
-            let stem: String = term.chars().filter(|c| c.is_alphanumeric()).collect();
-            format!("{stem}*")
+            let stem: String = term
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .flat_map(|c| c.to_lowercase())
+                .collect();
+            format!("{stem}:*")
         })
-        .filter(|t| t.encode_utf16().count() > 1)
+        .filter(|t| t.encode_utf16().count() > 2) // drop empty stems (":*"), keep 1-char+
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" & ")
 }
 
 /// Per-candidate blend components (store.ts `Score`).
@@ -157,11 +162,12 @@ impl Store {
             let Some(table) = origin_table(h.kind.as_str()) else {
                 continue;
             };
-            let origin: Option<Option<String>> =
-                sqlx::query_scalar(&format!("SELECT origin_entry_id FROM {table} WHERE id = ?"))
-                    .bind(&h.id)
-                    .fetch_optional(self.db())
-                    .await?;
+            let origin: Option<Option<String>> = crate::pgq::query_scalar(&format!(
+                "SELECT origin_entry_id FROM {table} WHERE id = ?"
+            ))
+            .bind(&h.id)
+            .fetch_optional(self.db())
+            .await?;
             if matches!(origin, Some(Some(ref o)) if visible.contains(o)) {
                 out.push(h);
             }
@@ -179,26 +185,38 @@ impl Store {
         if query.trim().is_empty() {
             return Ok(vec![]);
         }
+        let match_q = to_match_query(query);
+        if match_q.is_empty() {
+            return Ok(vec![]);
+        }
         // Over-fetch when scoping so permission filtering doesn't starve the result.
         let fetch = if viewer.is_some() { limit * 5 } else { limit };
-        let rows = sqlx::query(
-            "SELECT kind, ref_id, title, snippet(search, 3, '[', ']', '…', 12) AS snip, bm25(search) AS rank \
-             FROM search WHERE search MATCH ? ORDER BY rank LIMIT ?",
+        // Postgres FTS: tsvector @@ tsquery, ts_rank for ranking (higher = better,
+        // so DESC), ts_headline for the snippet. Replaces FTS5 MATCH/bm25/snippet.
+        let rows = crate::pgq::query(
+            "SELECT kind, ref_id, title, \
+                    ts_headline('english', body, to_tsquery('english', ?), \
+                      'StartSel=[, StopSel=], MaxFragments=2, MaxWords=14, MinWords=4, ShortWord=0') AS snip, \
+                    ts_rank(tsv, to_tsquery('english', ?)) AS rank \
+             FROM search WHERE tsv @@ to_tsquery('english', ?) ORDER BY rank DESC LIMIT ?",
         )
-        .bind(to_match_query(query))
+        .bind(&match_q)
+        .bind(&match_q)
+        .bind(&match_q)
         .bind(fetch as i64)
         .fetch_all(self.db())
         .await?;
         let hits: Vec<SearchHit> = rows
             .iter()
             .map(|r| -> Result<SearchHit> {
-                let rank: f64 = r.try_get("rank")?;
+                // ts_rank is f32 and higher = better; clamp to a 0..1 score.
+                let rank: f32 = r.try_get("rank")?;
                 Ok(SearchHit {
                     kind: EntityKind::from_str_lossy(r.try_get::<String, _>("kind")?.as_str()),
                     id: r.try_get("ref_id")?,
                     title: r.try_get("title")?,
                     snippet: r.try_get("snip")?,
-                    score: ((1.0 / (1.0 + rank.abs())) * 1000.0).round() / 1000.0,
+                    score: ((rank.clamp(0.0, 1.0) as f64) * 1000.0).round() / 1000.0,
                 })
             })
             .collect::<Result<_>>()?;
@@ -227,10 +245,11 @@ impl Store {
             });
         };
 
-        let journal =
-            sqlx::query("SELECT id, author, body FROM journal ORDER BY created_at DESC LIMIT 1000")
-                .fetch_all(self.db())
-                .await?;
+        let journal = crate::pgq::query(
+            "SELECT id, author, body FROM journal ORDER BY created_at DESC LIMIT 1000",
+        )
+        .fetch_all(self.db())
+        .await?;
         for r in &journal {
             let id: String = r.try_get("id")?;
             let author: String = r.try_get("author")?;
@@ -243,7 +262,7 @@ impl Store {
             );
         }
 
-        let tasks = sqlx::query(
+        let tasks = crate::pgq::query(
             "SELECT id, title, body FROM tasks ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC",
         )
         .fetch_all(self.db())
@@ -256,7 +275,7 @@ impl Store {
             push("task", id, title, text);
         }
 
-        let decisions = sqlx::query(
+        let decisions = crate::pgq::query(
             "SELECT id, title, context, decision, consequences FROM decisions ORDER BY created_at DESC",
         )
         .fetch_all(self.db())
@@ -271,7 +290,7 @@ impl Store {
             push("decision", id, title, text);
         }
 
-        let events = sqlx::query(
+        let events = crate::pgq::query(
             "SELECT id, title, body FROM events ORDER BY COALESCE(at, created_at) DESC",
         )
         .fetch_all(self.db())
@@ -290,7 +309,7 @@ impl Store {
     /// Admin view of the embedding corpus (store.ts `embeddingStats`).
     pub async fn embedding_stats(&self) -> Result<EmbeddingStats> {
         let items = self.embeddable_items().await?;
-        let stored_rows = sqlx::query("SELECT ref_kind, ref_id, hash FROM embeddings")
+        let stored_rows = crate::pgq::query("SELECT ref_kind, ref_id, hash FROM embeddings")
             .fetch_all(self.db())
             .await?;
         let mut stored: HashMap<String, String> = HashMap::new();
@@ -308,10 +327,10 @@ impl Store {
             .filter(|it| stored.get(&ref_key(&it.kind, &it.id)) != Some(&it.hash))
             .count();
 
-        let total: i64 = sqlx::query_scalar("SELECT count(*) FROM embeddings")
+        let total: i64 = crate::pgq::query_scalar("SELECT count(*) FROM embeddings")
             .fetch_one(self.db())
             .await?;
-        let by_kind = sqlx::query(
+        let by_kind = crate::pgq::query(
             "SELECT ref_kind AS kind, count(*) AS count FROM embeddings GROUP BY ref_kind ORDER BY count DESC",
         )
         .fetch_all(self.db())
@@ -324,7 +343,7 @@ impl Store {
             })
         })
         .collect::<Result<_>>()?;
-        let by_model = sqlx::query(
+        let by_model = crate::pgq::query(
             "SELECT model, dim, count(*) AS count FROM embeddings GROUP BY model, dim ORDER BY count DESC",
         )
         .fetch_all(self.db())
@@ -353,7 +372,7 @@ impl Store {
     /// author + mentions; task/decision/event → assignees.
     async fn hit_actors(&self, kind: &str, ref_id: &str) -> Result<Vec<String>> {
         if kind == "journal" {
-            let row = sqlx::query("SELECT author, mentions FROM journal WHERE id = ?")
+            let row = crate::pgq::query("SELECT author, mentions FROM journal WHERE id = ?")
                 .bind(ref_id)
                 .fetch_optional(self.db())
                 .await?;
@@ -366,7 +385,7 @@ impl Store {
             return Ok(vec![]);
         };
         let assignees: Option<String> =
-            sqlx::query_scalar(&format!("SELECT assignees FROM {table} WHERE id = ?"))
+            crate::pgq::query_scalar(&format!("SELECT assignees FROM {table} WHERE id = ?"))
                 .bind(ref_id)
                 .fetch_optional(self.db())
                 .await?;
@@ -376,7 +395,7 @@ impl Store {
     /// Neighbors of an entity in the links graph, either direction (store.ts
     /// `blanketNeighbors` — the Markov blanket).
     async fn blanket_neighbors(&self, kind: &str, id: &str) -> Result<Vec<String>> {
-        let rows = sqlx::query(
+        let rows = crate::pgq::query(
             "SELECT target_kind AS k, target_id AS i FROM links WHERE source_kind = ? AND source_id = ? \
              UNION \
              SELECT source_kind AS k, source_id AS i FROM links WHERE target_kind = ? AND target_id = ?",
@@ -444,12 +463,13 @@ impl Store {
         // filter so a partial backfill never compares across dimensions).
         let owned_query = query.to_string();
         let q = tokio::task::spawn_blocking(move || hive_embed::embed_query(&owned_query)).await?;
-        let rows =
-            sqlx::query("SELECT ref_kind, ref_id, vec FROM embeddings WHERE model = ? AND dim = ?")
-                .bind(hive_embed::embed_model())
-                .bind(q.len() as i64)
-                .fetch_all(self.db())
-                .await?;
+        let rows = crate::pgq::query(
+            "SELECT ref_kind, ref_id, vec FROM embeddings WHERE model = ? AND dim = ?",
+        )
+        .bind(hive_embed::embed_model())
+        .bind(q.len() as i64)
+        .fetch_all(self.db())
+        .await?;
         let mut scored_all: Vec<(String, f64)> = rows
             .iter()
             .map(|r| -> Result<(String, f64)> {
@@ -619,11 +639,11 @@ mod tests {
 
     #[test]
     fn match_query_strips_and_stars() {
-        assert_eq!(to_match_query("hello world"), "hello* world*");
-        assert_eq!(to_match_query("c++ rocks!"), "c* rocks*");
+        assert_eq!(to_match_query("hello world"), "hello:* & world:*");
+        assert_eq!(to_match_query("c++ rocks!"), "c:* & rocks:*");
         assert_eq!(to_match_query("!!! ..."), "");
-        // Single-char stems survive (Node keeps `a*` — length 2 with the star).
-        assert_eq!(to_match_query("a bee"), "a* bee*");
+        // Single-char stems survive as `a:*` (prefix match, AND-joined).
+        assert_eq!(to_match_query("a bee"), "a:* & bee:*");
     }
 
     #[test]

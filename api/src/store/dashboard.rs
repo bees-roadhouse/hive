@@ -18,10 +18,12 @@ use super::{json_vec, Store};
 impl Store {
     pub async fn dashboard(&self) -> Result<DashboardStats> {
         let count = |sql: &'static str| async move {
-            sqlx::query_scalar::<_, i64>(sql).fetch_one(self.db()).await
+            crate::pgq::query_scalar::<i64>(sql)
+                .fetch_one(self.db())
+                .await
         };
         let count_by = |sql: &'static str, arg: String| async move {
-            sqlx::query_scalar::<_, i64>(sql)
+            crate::pgq::query_scalar::<i64>(sql)
                 .bind(arg)
                 .fetch_one(self.db())
                 .await
@@ -62,7 +64,7 @@ impl Store {
             .await?,
         };
 
-        let by_author = sqlx::query(
+        let by_author = crate::pgq::query(
             "SELECT author, count(*) AS entries FROM journal GROUP BY author ORDER BY entries DESC",
         )
         .fetch_all(self.db())
@@ -95,7 +97,7 @@ impl Store {
         }
 
         // Open tasks with a due date (for calendar overlay).
-        let tasks_with_due = sqlx::query(
+        let tasks_with_due = crate::pgq::query(
             "SELECT id, title, due, status, assignees FROM tasks WHERE due IS NOT NULL AND status != 'done' ORDER BY due ASC",
         )
         .fetch_all(self.db())
@@ -113,12 +115,18 @@ impl Store {
         .collect::<Result<_>>()?;
 
         // Entry counts per day for last 30 days (substr gives YYYY-MM-DD).
-        let entries_by_day = sqlx::query(
+        // created_at is an ISO-8601 TEXT column, so compare against a
+        // Rust-computed cutoff string (lexicographic order matches chronological).
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(30))
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        let entries_by_day = crate::pgq::query(
             "SELECT substr(created_at, 1, 10) AS day, count(*) AS count \
              FROM journal \
-             WHERE created_at >= datetime('now', '-30 days') \
+             WHERE created_at >= ? \
              GROUP BY day ORDER BY day ASC",
         )
+        .bind(&cutoff)
         .fetch_all(self.db())
         .await?
         .iter()
@@ -130,7 +138,7 @@ impl Store {
         })
         .collect::<Result<_>>()?;
 
-        let entries_by_author = sqlx::query(
+        let entries_by_author = crate::pgq::query(
             "SELECT author, count(*) AS count FROM journal GROUP BY author ORDER BY count DESC",
         )
         .fetch_all(self.db())
@@ -145,7 +153,7 @@ impl Store {
         .collect::<Result<_>>()?;
 
         // Callouts: how often each person is referenced via links.
-        let callout_rows = sqlx::query(
+        let callout_rows = crate::pgq::query(
             "SELECT target_id, count(*) AS count FROM links WHERE target_kind = 'person' \
              GROUP BY target_id ORDER BY count DESC",
         )
@@ -190,7 +198,7 @@ impl Store {
         for p in self.people_list().await? {
             title_of.insert(format!("person:{}", p.id), p.name);
         }
-        let topics = sqlx::query("SELECT id, name FROM topics ORDER BY name")
+        let topics = crate::pgq::query("SELECT id, name FROM topics ORDER BY name")
             .fetch_all(self.db())
             .await?;
         for r in &topics {
@@ -202,7 +210,7 @@ impl Store {
         for p in self.projects_list().await? {
             title_of.insert(format!("project:{}", p.id), p.name);
         }
-        let phases = sqlx::query(
+        let phases = crate::pgq::query(
             "SELECT id, project, name FROM phases ORDER BY project, position, created_at",
         )
         .fetch_all(self.db())
@@ -230,7 +238,7 @@ impl Store {
             }
         };
 
-        let link_rows = sqlx::query(
+        let link_rows = crate::pgq::query(
             "SELECT source_kind, source_id, target_kind, target_id, rel FROM links ORDER BY created_at",
         )
         .fetch_all(self.db())
@@ -252,7 +260,7 @@ impl Store {
 
         // Derived: per-author journal chain edges.
         let journal_rows =
-            sqlx::query("SELECT id, author FROM journal ORDER BY author, created_at ASC")
+            crate::pgq::query("SELECT id, author FROM journal ORDER BY author, created_at ASC")
                 .fetch_all(self.db())
                 .await?;
         let mut prev_author: Option<String> = None;
@@ -277,7 +285,7 @@ impl Store {
         }
 
         // Derived: project→task and project→phase edges from column values.
-        let task_rows = sqlx::query(
+        let task_rows = crate::pgq::query(
             "SELECT id, project, phase FROM tasks ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC",
         )
         .fetch_all(self.db())
@@ -360,7 +368,7 @@ impl Store {
             }
         }
         if wants("topic") {
-            let rows = sqlx::query("SELECT id, name, slug FROM topics ORDER BY name")
+            let rows = crate::pgq::query("SELECT id, name, slug FROM topics ORDER BY name")
                 .fetch_all(self.db())
                 .await?;
             for r in &rows {
@@ -376,10 +384,11 @@ impl Store {
             }
         }
         if wants("phase") {
-            let rows =
-                sqlx::query("SELECT id, name FROM phases ORDER BY project, position, created_at")
-                    .fetch_all(self.db())
-                    .await?;
+            let rows = crate::pgq::query(
+                "SELECT id, name FROM phases ORDER BY project, position, created_at",
+            )
+            .fetch_all(self.db())
+            .await?;
             for r in &rows {
                 let name: String = r.try_get("name")?;
                 if name.to_lowercase().contains(&lower) {
@@ -395,7 +404,7 @@ impl Store {
         if wants("task") {
             // Node: tasks.list({status:'todo'}).concat(tasks.list({status:'doing'})).
             for status in ["todo", "doing"] {
-                let rows = sqlx::query(
+                let rows = crate::pgq::query(
                     "SELECT id, title FROM tasks WHERE status = ? ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC",
                 )
                 .bind(status)

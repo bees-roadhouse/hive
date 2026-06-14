@@ -8,14 +8,14 @@ use super::{new_id, now_iso, Store};
 
 impl Store {
     pub async fn projects_list(&self) -> Result<Vec<Project>> {
-        let rows = sqlx::query("SELECT * FROM projects ORDER BY name")
+        let rows = crate::pgq::query("SELECT * FROM projects ORDER BY name")
             .fetch_all(self.db())
             .await?;
         rows.iter().map(row_to_project).collect()
     }
 
     pub async fn projects_get(&self, project_id: &str) -> Result<Option<Project>> {
-        let row = sqlx::query("SELECT * FROM projects WHERE id = ?")
+        let row = crate::pgq::query("SELECT * FROM projects WHERE id = ?")
             .bind(project_id)
             .fetch_optional(self.db())
             .await?;
@@ -23,7 +23,7 @@ impl Store {
     }
 
     pub async fn projects_by_slug(&self, slug: &str) -> Result<Option<Project>> {
-        let row = sqlx::query("SELECT * FROM projects WHERE slug = ?")
+        let row = crate::pgq::query("SELECT * FROM projects WHERE slug = ?")
             .bind(slug)
             .fetch_optional(self.db())
             .await?;
@@ -41,7 +41,7 @@ impl Store {
             slug,
             created_at: now_iso(),
         };
-        sqlx::query("INSERT INTO projects (id, name, slug, created_at) VALUES (?, ?, ?, ?)")
+        crate::pgq::query("INSERT INTO projects (id, name, slug, created_at) VALUES (?, ?, ?, ?)")
             .bind(&p.id)
             .bind(&p.name)
             .bind(&p.slug)
@@ -52,7 +52,7 @@ impl Store {
     }
 }
 
-pub(crate) fn row_to_project(r: &sqlx::sqlite::SqliteRow) -> Result<Project> {
+pub(crate) fn row_to_project(r: &sqlx::postgres::PgRow) -> Result<Project> {
     Ok(Project {
         id: r.try_get("id")?,
         name: r.try_get("name")?,

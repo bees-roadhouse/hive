@@ -40,6 +40,24 @@ jobs:
 
   rust:
     runs-on: ubuntu-latest
+    # The store layer is Postgres now; the test suite runs each test in an
+    # isolated schema against this service (DATABASE_URL below).
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: hive
+          POSTGRES_PASSWORD: hive
+          POSTGRES_DB: hive
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hive -d hive"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://hive:hive@localhost:5432/hive
     steps:
       - uses: actions/checkout@v4
 

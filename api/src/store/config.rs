@@ -6,14 +6,16 @@ use super::{now_iso, Store};
 
 impl Store {
     pub async fn config_get(&self, key: &str) -> Result<Option<String>> {
-        Ok(sqlx::query_scalar("SELECT value FROM config WHERE key = ?")
-            .bind(key)
-            .fetch_optional(self.db())
-            .await?)
+        Ok(
+            crate::pgq::query_scalar("SELECT value FROM config WHERE key = ?")
+                .bind(key)
+                .fetch_optional(self.db())
+                .await?,
+        )
     }
 
     pub async fn config_set(&self, key: &str, value: &str) -> Result<()> {
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO config (key, value, updated_at) VALUES (?, ?, ?) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         )

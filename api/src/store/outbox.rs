@@ -27,7 +27,7 @@ impl Store {
             created_at: now_iso(),
             completed_at: None,
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO outbox (id, kind, payload, status, attempts, last_error, run_after, created_at, completed_at) \
              VALUES (?, ?, ?, ?, ?, NULL, ?, ?, NULL)",
         )
@@ -50,7 +50,7 @@ impl Store {
     }
 
     pub async fn outbox_list(&self, limit: i64) -> Result<Vec<OutboxJob>> {
-        let rows = sqlx::query("SELECT * FROM outbox ORDER BY created_at DESC LIMIT ?")
+        let rows = crate::pgq::query("SELECT * FROM outbox ORDER BY created_at DESC LIMIT ?")
             .bind(limit)
             .fetch_all(self.db())
             .await?;
@@ -59,7 +59,7 @@ impl Store {
 
     /// Pending jobs whose run_after has elapsed, oldest first.
     pub async fn outbox_claim(&self, limit: i64) -> Result<Vec<OutboxJob>> {
-        let rows = sqlx::query(
+        let rows = crate::pgq::query(
             "SELECT * FROM outbox WHERE status = 'pending' AND run_after <= ? ORDER BY run_after LIMIT ?",
         )
         .bind(now_iso())
@@ -70,7 +70,7 @@ impl Store {
     }
 
     pub async fn outbox_complete(&self, job_id: &str) -> Result<()> {
-        sqlx::query("UPDATE outbox SET status='done', completed_at=? WHERE id=?")
+        crate::pgq::query("UPDATE outbox SET status='done', completed_at=? WHERE id=?")
             .bind(now_iso())
             .bind(job_id)
             .execute(self.db())
@@ -89,20 +89,22 @@ impl Store {
         } else {
             OutboxStatus::Pending
         };
-        sqlx::query("UPDATE outbox SET status=?, attempts=?, last_error=?, run_after=? WHERE id=?")
-            .bind(status.as_str())
-            .bind(attempts)
-            .bind(error)
-            .bind(&run_after)
-            .bind(job_id)
-            .execute(self.db())
-            .await?;
+        crate::pgq::query(
+            "UPDATE outbox SET status=?, attempts=?, last_error=?, run_after=? WHERE id=?",
+        )
+        .bind(status.as_str())
+        .bind(attempts)
+        .bind(error)
+        .bind(&run_after)
+        .bind(job_id)
+        .execute(self.db())
+        .await?;
         Ok(())
     }
 
     pub async fn outbox_counts(&self) -> Result<WorkerOutboxCounts> {
         let count = |status: &'static str| async move {
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM outbox WHERE status = ?")
+            crate::pgq::query_scalar::<i64>("SELECT count(*) FROM outbox WHERE status = ?")
                 .bind(status)
                 .fetch_one(self.db())
                 .await
@@ -169,7 +171,7 @@ fn backoff_secs(attempts: i64) -> i64 {
     exp.saturating_mul(30).min(3600)
 }
 
-fn row_to_job(r: &sqlx::sqlite::SqliteRow) -> Result<OutboxJob> {
+fn row_to_job(r: &sqlx::postgres::PgRow) -> Result<OutboxJob> {
     Ok(OutboxJob {
         id: r.try_get("id")?,
         kind: r.try_get("kind")?,

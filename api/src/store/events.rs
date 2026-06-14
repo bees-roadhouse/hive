@@ -21,14 +21,14 @@ pub struct EventCreate {
 
 impl Store {
     pub async fn events_list(&self) -> Result<Vec<EventItem>> {
-        let rows = sqlx::query("SELECT * FROM events ORDER BY COALESCE(at, created_at) DESC")
+        let rows = crate::pgq::query("SELECT * FROM events ORDER BY COALESCE(at, created_at) DESC")
             .fetch_all(self.db())
             .await?;
         rows.iter().map(row_to_event).collect()
     }
 
     pub async fn events_get(&self, event_id: &str) -> Result<Option<EventItem>> {
-        let row = sqlx::query("SELECT * FROM events WHERE id = ?")
+        let row = crate::pgq::query("SELECT * FROM events WHERE id = ?")
             .bind(event_id)
             .fetch_optional(self.db())
             .await?;
@@ -47,7 +47,7 @@ impl Store {
             anchor_text: input.anchor_text,
             created_at: now_iso(),
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO events (id, title, body, at, tags, assignees, origin_entry_id, anchor_text, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
@@ -74,7 +74,7 @@ impl Store {
     }
 }
 
-pub(crate) fn row_to_event(r: &sqlx::sqlite::SqliteRow) -> Result<EventItem> {
+pub(crate) fn row_to_event(r: &sqlx::postgres::PgRow) -> Result<EventItem> {
     Ok(EventItem {
         id: r.try_get("id")?,
         title: r.try_get("title")?,

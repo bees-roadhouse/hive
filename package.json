@@ -1,8 +1,8 @@
 {
   "name": "hive-node",
   "private": true,
-  "version": "0.2.0",
-  "description": "A fun Node.js + Solid.js rewrite of hive — the shared state (tasks, journal, notes, search) for the Bee's Roadhouse AI configs.",
+  "version": "0.3.0",
+  "description": "A fun Node.js + Solid.js rewrite of hive \u00e2\u20ac\u201d the shared state (tasks, journal, notes, search) for the Bee's Roadhouse AI configs.",
   "type": "module",
   "engines": {
     "node": ">=20"

@@ -30,8 +30,8 @@ impl Store {
         let mut tx = self.db().begin().await?;
 
         for p in payload.projects.as_deref().unwrap_or_default() {
-            let r = sqlx::query(
-                "INSERT OR IGNORE INTO projects (id, name, slug, created_at) VALUES (?, ?, ?, ?)",
+            let r = crate::pgq::query(
+                "INSERT INTO projects (id, name, slug, created_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
             )
             .bind(&p.id)
             .bind(&p.name)
@@ -47,9 +47,9 @@ impl Store {
         }
 
         for e in payload.journal.as_deref().unwrap_or_default() {
-            let r = sqlx::query(
-                "INSERT OR IGNORE INTO journal (id, author, body, tags, mentions, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
+            let r = crate::pgq::query(
+                "INSERT INTO journal (id, author, body, tags, mentions, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
             )
             .bind(&e.id)
             .bind(&e.author)
@@ -79,9 +79,9 @@ impl Store {
             } else {
                 t.priority.as_str()
             };
-            let r = sqlx::query(
-                "INSERT OR IGNORE INTO tasks (id, project, title, body, status, priority, tags, assignees, due, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            let r = crate::pgq::query(
+                "INSERT INTO tasks (id, project, title, body, status, priority, tags, assignees, due, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
             )
             .bind(&t.id)
             .bind(&t.project)
@@ -105,9 +105,9 @@ impl Store {
         }
 
         for l in payload.links.as_deref().unwrap_or_default() {
-            let r = sqlx::query(
-                "INSERT OR IGNORE INTO links (id, source_kind, source_id, target_kind, target_id, rel, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+            let r = crate::pgq::query(
+                "INSERT INTO links (id, source_kind, source_id, target_kind, target_id, rel, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
             )
             .bind(&l.id)
             .bind(&l.source_kind)
