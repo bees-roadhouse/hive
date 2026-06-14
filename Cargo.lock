@@ -964,7 +964,7 @@ dependencies = [
 
 [[package]]
 name = "hive-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1000,7 +1000,7 @@ dependencies = [
 
 [[package]]
 name = "hive-embed"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "hex",
@@ -1015,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "hive-shared"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1023,7 +1023,7 @@ dependencies = [
 
 [[package]]
 name = "hive-worker"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
