@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1
+
+# hive (rust) — one image, two binaries. hive-api (axum) serves BOTH the API
+# and the Solid SPA (no nginx web container in this deployment path: the vite
+# dist is baked at /app/web and routes/spa.rs serves it with an index.html
+# fallback). hive-worker runs from the same image with `command: /app/hive-worker`.
+#
+# Build from the repo root:
+#   docker build -f docker/Dockerfile.rust -t beesroadhouse/hive-rust:latest .
+
+# ----- web: vite build of the Solid SPA → packages/web/dist -----
+FROM node:22-alpine AS web
+RUN corepack enable
+WORKDIR /app
+# Flat node_modules, same as the Node-stack images.
+RUN printf 'node-linker=hoisted\n' > .npmrc
+# Manifests first for a cacheable install layer.
+COPY pnpm-workspace.yaml pnpm-lock.yaml package.json ./
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/api/package.json ./packages/api/
+COPY packages/cli/package.json ./packages/cli/
+COPY packages/web/package.json ./packages/web/
+COPY packages/worker/package.json ./packages/worker/
+RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
+    pnpm install --frozen-lockfile
+# Only the packages the web build needs (@hive/web depends on @hive/shared).
+COPY packages/shared ./packages/shared
+COPY packages/web ./packages/web
+RUN pnpm --filter @hive/shared build \
+ && pnpm --filter @hive/web build
+
+# ----- rust: release build of hive-api + hive-worker -----
+# rust-toolchain.toml pins 1.94.1; rustup in the base image installs the pinned
+# toolchain on first cargo invocation if the image's minor differs.
+# Trixie, not bookworm: ort's prebuilt onnxruntime static libs are compiled
+# against glibc >= 2.38 (__isoc23_strtol*); bookworm's 2.36 fails to link.
+FROM rust:1.94-trixie AS build
+WORKDIR /src
+COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
+COPY shared ./shared
+COPY embed ./embed
+COPY api ./api
+COPY worker ./worker
+# Cache mounts keep the registry + incremental artifacts across builds; the
+# binaries are copied out because the target dir vanishes with the mount.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p hive-api -p hive-worker \
+ && mkdir -p /out \
+ && cp target/release/hive-api target/release/hive-worker /out/
+
+# ----- runtime: slim debian, both binaries + the web dist -----
+# trixie-slim to match the build stage's glibc (the binaries link 2.38+ symbols).
+FROM debian:trixie-slim AS runtime
+# ca-certificates for outbound TLS (reqwest/rustls feed polling); curl for the
+# compose healthcheck.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl \
+  && rm -rf /var/lib/apt/lists/* \
+  && useradd --system --uid 10001 --create-home hive
+# Data + model cache live on the mounted /data volume (shared with the worker).
+ENV HIVE_DB=/data/hive.db
+ENV HIVE_MODEL_CACHE=/data/models
+ENV HIVE_WEB_DIST=/app/web
+ENV PORT=7878
+WORKDIR /app
+COPY --from=build /out/hive-api /out/hive-worker /app/
+COPY --from=web /app/packages/web/dist /app/web
+RUN mkdir -p /data && chown -R hive /data
+USER hive
+VOLUME /data
+EXPOSE 7878
+# Default is the API; the worker service overrides with ["/app/hive-worker"].
+CMD ["/app/hive-api"]
