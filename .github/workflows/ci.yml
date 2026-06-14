@@ -5,6 +5,9 @@ on:
     branches: [development, release]
   push:
     branches: [development, release]
+  # Manual escape hatch: lets CI run when GitHub webhook delivery drops the
+  # pull_request/push event (dispatches go straight to Actions, not via hooks).
+  workflow_dispatch:
 
 jobs:
   check:
