@@ -84,8 +84,7 @@ async fn entry(
     // handleMcp; OPTIONS is short-circuited by the middleware): 401 + RFC 9728
     // resource-metadata pointer.
     if store.onboarding_required().await? || ctx.actor.is_none() {
-        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
-        let issuer = issuer_for(&store, host).await;
+        let issuer = issuer_for(&store, &headers).await;
         let mut res = http_rpc_error(
             StatusCode::UNAUTHORIZED,
             -32001,
