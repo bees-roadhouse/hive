@@ -8,7 +8,7 @@ use anyhow::Result;
 use hive_api::store::Store;
 use hive_shared::WorkerLastRun;
 use serde_json::json;
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -23,13 +23,13 @@ fn now_iso() -> String {
 }
 
 impl Worker {
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: PgPool) -> Self {
         Self {
             store: Store::new(db),
         }
     }
 
-    fn db(&self) -> &SqlitePool {
+    fn db(&self) -> &PgPool {
         self.store.db()
     }
 
@@ -132,18 +132,19 @@ impl Worker {
         hash: String,
     ) -> Result<bool> {
         let model = hive_embed::embed_model();
-        let existing: Option<(String, String)> =
-            sqlx::query_as("SELECT hash, model FROM embeddings WHERE ref_kind = ? AND ref_id = ?")
-                .bind(ref_kind)
-                .bind(ref_id)
-                .fetch_optional(self.db())
-                .await?;
+        let existing: Option<(String, String)> = hive_api::pgq::query_as(
+            "SELECT hash, model FROM embeddings WHERE ref_kind = ? AND ref_id = ?",
+        )
+        .bind(ref_kind)
+        .bind(ref_id)
+        .fetch_optional(self.db())
+        .await?;
         if matches!(&existing, Some((h, m)) if *h == hash && m == model) {
             return Ok(false);
         }
         // embed() is sync + potentially slow (ONNX) — keep it off the async runtime.
         let vec = tokio::task::spawn_blocking(move || hive_embed::embed(&embed_text)).await?;
-        sqlx::query(
+        hive_api::pgq::query(
             "INSERT INTO embeddings (ref_kind, ref_id, model, dim, vec, hash, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(ref_kind, ref_id) DO UPDATE SET model=excluded.model, dim=excluded.dim, vec=excluded.vec, hash=excluded.hash, created_at=excluded.created_at",
@@ -160,21 +161,14 @@ impl Worker {
         Ok(true)
     }
 
-    /// Node worker `maintain()`: WAL checkpoint (TRUNCATE), FTS optimize, wire
-    /// prune keeping the newest 2000, VACUUM on the first cycle then every
-    /// 20th (Node's counter starts at 0, so `--once` always vacuums).
-    async fn maintain(&self, cycle_n: u64) -> Result<Vec<String>> {
+    /// Worker `maintain()`: prune the wire log to the newest 2000 rows. On
+    /// Postgres the SQLite-era housekeeping is handled by the server — WAL
+    /// checkpointing is automatic, the GIN full-text index self-maintains (no
+    /// FTS5 `optimize`), and autovacuum reclaims space (no manual `VACUUM`).
+    async fn maintain(&self, _cycle_n: u64) -> Result<Vec<String>> {
         let db = self.db();
         let mut did: Vec<String> = Vec::new();
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(db)
-            .await?;
-        did.push("wal-checkpoint".to_string());
-        sqlx::query("INSERT INTO search(search) VALUES('optimize')")
-            .execute(db)
-            .await?;
-        did.push("fts-optimize".to_string());
-        let pruned = sqlx::query(
+        let pruned = hive_api::pgq::query(
             "DELETE FROM wire WHERE id NOT IN (SELECT id FROM wire ORDER BY created_at DESC LIMIT 2000)",
         )
         .execute(db)
@@ -182,10 +176,6 @@ impl Worker {
         .rows_affected();
         if pruned > 0 {
             did.push(format!("pruned-wire({pruned})"));
-        }
-        if cycle_n.saturating_sub(1) % 20 == 0 {
-            sqlx::query("VACUUM").execute(db).await?;
-            did.push("vacuum".to_string());
         }
         Ok(did)
     }

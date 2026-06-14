@@ -10,7 +10,7 @@
 use anyhow::Result;
 use hive_shared::{ActorDeleteResult, ActorMergeResult};
 use serde_json::json;
-use sqlx::{Row, SqliteConnection};
+use sqlx::{PgConnection, Row};
 
 use super::Store;
 
@@ -105,8 +105,8 @@ fn replace_slug(json_arr: &str, from: &str, to: &str) -> Option<String> {
     Some(serde_json::to_string(&next).unwrap_or_else(|_| "[]".to_string()))
 }
 
-async fn exec_count(conn: &mut SqliteConnection, sql: &str, binds: &[&str]) -> Result<i64> {
-    let mut q = sqlx::query(sql);
+async fn exec_count(conn: &mut PgConnection, sql: &str, binds: &[&str]) -> Result<i64> {
+    let mut q = crate::pgq::query(sql);
     for b in binds {
         q = q.bind(*b);
     }
@@ -116,7 +116,7 @@ async fn exec_count(conn: &mut SqliteConnection, sql: &str, binds: &[&str]) -> R
 /// Strip the search-index + embeddings + link rows pointing at a structured
 /// entity or journal entry. Shared by entity and entry deletes.
 async fn purge_entity_indexes(
-    conn: &mut SqliteConnection,
+    conn: &mut PgConnection,
     kind: &str,
     ref_id: &str,
 ) -> Result<(i64, i64, i64)> {
@@ -146,7 +146,7 @@ async fn purge_entity_indexes(
 /// at it: its anchors row, inbox items, search/embeddings/links, and any
 /// decision that supersedes it (the supersedes pointer is cleared).
 async fn delete_entity(
-    conn: &mut SqliteConnection,
+    conn: &mut PgConnection,
     kind: &str,
     table: &str,
     ref_id: &str,
@@ -189,13 +189,13 @@ async fn delete_entity(
 /// Delete a journal entry and cascade everything that emerged from it.
 /// Must run inside the caller's transaction.
 async fn delete_journal_entry(
-    conn: &mut SqliteConnection,
+    conn: &mut PgConnection,
     entry_id: &str,
     acc: &mut ActorDeleteResult,
 ) -> Result<()> {
     // Entities anchored to spans of this entry — the cascade's core rule.
     let anchored: Vec<(String, String)> =
-        sqlx::query_as("SELECT DISTINCT kind, ref_id FROM anchors WHERE entry_id = ?")
+        crate::pgq::query_as("SELECT DISTINCT kind, ref_id FROM anchors WHERE entry_id = ?")
             .bind(entry_id)
             .fetch_all(&mut *conn)
             .await?;
@@ -209,7 +209,7 @@ async fn delete_journal_entry(
     // belt-and-suspenders so nothing emerged from this entry is left orphaned).
     for (kind, table) in EMERGED {
         let ids: Vec<(String,)> =
-            sqlx::query_as(&format!("SELECT id FROM {table} WHERE origin_entry_id = ?"))
+            crate::pgq::query_as(&format!("SELECT id FROM {table} WHERE origin_entry_id = ?"))
                 .bind(entry_id)
                 .fetch_all(&mut *conn)
                 .await?;
@@ -240,7 +240,7 @@ async fn delete_journal_entry(
 }
 
 /// The mutating body of actors.remove, run inside the caller's transaction.
-async fn remove_in_tx(conn: &mut SqliteConnection, slug: &str) -> Result<ActorDeleteResult> {
+async fn remove_in_tx(conn: &mut PgConnection, slug: &str) -> Result<ActorDeleteResult> {
     let mut acc = ActorDeleteResult {
         actor: slug.to_string(),
         ..Default::default()
@@ -248,7 +248,7 @@ async fn remove_in_tx(conn: &mut SqliteConnection, slug: &str) -> Result<ActorDe
 
     // 1. Every journal entry the actor authored — cascade each (this folds in the
     //    anchored tasks/decisions/events + their indexes).
-    let entries: Vec<(String,)> = sqlx::query_as("SELECT id FROM journal WHERE author = ?")
+    let entries: Vec<(String,)> = crate::pgq::query_as("SELECT id FROM journal WHERE author = ?")
         .bind(slug)
         .fetch_all(&mut *conn)
         .await?;
@@ -260,7 +260,7 @@ async fn remove_in_tx(conn: &mut SqliteConnection, slug: &str) -> Result<ActorDe
     //    tasks/decisions/events assignee arrays so nothing assigns to a ghost.
     let like = format!("%\"{slug}\"%");
     for (_, table) in EMERGED {
-        let rows: Vec<(String, String)> = sqlx::query_as(&format!(
+        let rows: Vec<(String, String)> = crate::pgq::query_as(&format!(
             "SELECT id, assignees FROM {table} WHERE assignees LIKE ?"
         ))
         .bind(&like)
@@ -268,7 +268,7 @@ async fn remove_in_tx(conn: &mut SqliteConnection, slug: &str) -> Result<ActorDe
         .await?;
         for (id, assignees) in &rows {
             if let Some(next) = without_slug(assignees, slug) {
-                sqlx::query(&format!("UPDATE {table} SET assignees = ? WHERE id = ?"))
+                crate::pgq::query(&format!("UPDATE {table} SET assignees = ? WHERE id = ?"))
                     .bind(&next)
                     .bind(id)
                     .execute(&mut *conn)
@@ -279,13 +279,13 @@ async fn remove_in_tx(conn: &mut SqliteConnection, slug: &str) -> Result<ActorDe
 
     // 3. journal.mentions scrub on surviving entries (other authors who @mentioned slug).
     let mention_rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT id, mentions FROM journal WHERE mentions LIKE ?")
+        crate::pgq::query_as("SELECT id, mentions FROM journal WHERE mentions LIKE ?")
             .bind(&like)
             .fetch_all(&mut *conn)
             .await?;
     for (id, mentions) in &mention_rows {
         if let Some(next) = without_slug(mentions, slug) {
-            sqlx::query("UPDATE journal SET mentions = ? WHERE id = ?")
+            crate::pgq::query("UPDATE journal SET mentions = ? WHERE id = ?")
                 .bind(&next)
                 .bind(id)
                 .execute(&mut *conn)
@@ -314,7 +314,7 @@ async fn remove_in_tx(conn: &mut SqliteConnection, slug: &str) -> Result<ActorDe
 
     // 7. Login + credentials. Sessions hang off the user row (user_id), so reap
     //    them first, then the user, then any bearer tokens for this actor.
-    let usr_rows: Vec<(String,)> = sqlx::query_as("SELECT id FROM users WHERE actor = ?")
+    let usr_rows: Vec<(String,)> = crate::pgq::query_as("SELECT id FROM users WHERE actor = ?")
         .bind(slug)
         .fetch_all(&mut *conn)
         .await?;
@@ -361,11 +361,7 @@ async fn remove_in_tx(conn: &mut SqliteConnection, slug: &str) -> Result<ActorDe
 }
 
 /// The mutating body of actors.merge, run inside the caller's transaction.
-async fn merge_in_tx(
-    conn: &mut SqliteConnection,
-    from: &str,
-    to: &str,
-) -> Result<ActorMergeResult> {
+async fn merge_in_tx(conn: &mut PgConnection, from: &str, to: &str) -> Result<ActorMergeResult> {
     if from == to {
         anyhow::bail!("cannot merge an actor into itself");
     }
@@ -386,13 +382,13 @@ async fn merge_in_tx(
     // journal.mentions: rewrite from→to (dedupe) on every entry that mentioned from.
     let like = format!("%\"{from}\"%");
     let mention_rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT id, mentions FROM journal WHERE mentions LIKE ?")
+        crate::pgq::query_as("SELECT id, mentions FROM journal WHERE mentions LIKE ?")
             .bind(&like)
             .fetch_all(&mut *conn)
             .await?;
     for (id, mentions) in &mention_rows {
         if let Some(next) = replace_slug(mentions, from, to) {
-            sqlx::query("UPDATE journal SET mentions = ? WHERE id = ?")
+            crate::pgq::query("UPDATE journal SET mentions = ? WHERE id = ?")
                 .bind(&next)
                 .bind(id)
                 .execute(&mut *conn)
@@ -402,7 +398,7 @@ async fn merge_in_tx(
 
     // Assignees on tasks/decisions/events: from→to (dedupe).
     for (kind, table) in EMERGED {
-        let rows: Vec<(String, String)> = sqlx::query_as(&format!(
+        let rows: Vec<(String, String)> = crate::pgq::query_as(&format!(
             "SELECT id, assignees FROM {table} WHERE assignees LIKE ?"
         ))
         .bind(&like)
@@ -410,7 +406,7 @@ async fn merge_in_tx(
         .await?;
         for (id, assignees) in &rows {
             if let Some(next) = replace_slug(assignees, from, to) {
-                sqlx::query(&format!("UPDATE {table} SET assignees = ? WHERE id = ?"))
+                crate::pgq::query(&format!("UPDATE {table} SET assignees = ? WHERE id = ?"))
                     .bind(&next)
                     .bind(id)
                     .execute(&mut *conn)
@@ -447,7 +443,7 @@ async fn merge_in_tx(
         ("viewer", "viewer = ?"),
         ("ref", "scope = 'journal' AND ref = ?"),
     ] {
-        let rows = sqlx::query(&format!(
+        let rows = crate::pgq::query(&format!(
             "SELECT id, scope, ref, viewer FROM shares WHERE {where_sql}"
         ))
         .bind(from)
@@ -460,7 +456,7 @@ async fn merge_in_tx(
             let viewer: String = r.try_get("viewer")?;
             let next_ref = if col == "ref" { to } else { s_ref.as_str() };
             let next_viewer = if col == "viewer" { to } else { viewer.as_str() };
-            let twin = sqlx::query(
+            let twin = crate::pgq::query(
                 "SELECT 1 FROM shares WHERE scope = ? AND ref = ? AND viewer = ? AND id != ?",
             )
             .bind(&scope)
@@ -547,7 +543,7 @@ async fn merge_in_tx(
 
     // Profile/identity + login: the `to` card/account wins. Move the `from` card
     // only if `to` has none, else drop the `from` card; same for the user account.
-    let to_has_profile = sqlx::query("SELECT 1 FROM profile WHERE actor = ?")
+    let to_has_profile = crate::pgq::query("SELECT 1 FROM profile WHERE actor = ?")
         .bind(to)
         .fetch_optional(&mut *conn)
         .await?
@@ -562,14 +558,14 @@ async fn merge_in_tx(
         )
         .await?;
     }
-    let to_has_user = sqlx::query("SELECT 1 FROM users WHERE actor = ?")
+    let to_has_user = crate::pgq::query("SELECT 1 FROM users WHERE actor = ?")
         .bind(to)
         .fetch_optional(&mut *conn)
         .await?
         .is_some();
     if to_has_user {
         // `to` already logs in; drop the `from` account + its sessions.
-        let usr_rows: Vec<(String,)> = sqlx::query_as("SELECT id FROM users WHERE actor = ?")
+        let usr_rows: Vec<(String,)> = crate::pgq::query_as("SELECT id FROM users WHERE actor = ?")
             .bind(from)
             .fetch_all(&mut *conn)
             .await?;

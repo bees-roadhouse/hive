@@ -40,7 +40,7 @@ impl Store {
             grant_types: vec!["authorization_code".to_string()],
             created_at: now_iso(),
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO oauth_clients (client_id, client_name, redirect_uris, grant_types, created_at) \
              VALUES (?, ?, ?, ?, ?)",
         )
@@ -55,7 +55,7 @@ impl Store {
     }
 
     pub async fn oauth_clients_get(&self, client_id: &str) -> Result<Option<OAuthClient>> {
-        let row = sqlx::query("SELECT * FROM oauth_clients WHERE client_id = ?")
+        let row = crate::pgq::query("SELECT * FROM oauth_clients WHERE client_id = ?")
             .bind(client_id)
             .fetch_optional(self.db())
             .await?;
@@ -74,15 +74,17 @@ impl Store {
     }
 
     pub async fn oauth_clients_count(&self) -> Result<i64> {
-        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM oauth_clients")
-            .fetch_one(self.db())
-            .await?)
+        Ok(
+            crate::pgq::query_scalar("SELECT COUNT(*) FROM oauth_clients")
+                .fetch_one(self.db())
+                .await?,
+        )
     }
 
     /// Issue a single-use auth code (60s TTL); returns the plaintext code.
     pub async fn oauth_codes_create(&self, grant: &AuthCodeGrant) -> Result<String> {
         let code = generate_token(AUTH_CODE_PREFIX);
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO oauth_auth_codes (code_hash, client_id, redirect_uri, code_challenge, ai_actor, granted_by, scope, created_at, expires_at, used_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
         )
@@ -103,13 +105,13 @@ impl Store {
     /// Single-use redemption under a transaction. Marks the code used on success.
     pub async fn oauth_codes_redeem(&self, code: &str) -> Result<RedeemOutcome> {
         // Opportunistic sweep of expired codes.
-        sqlx::query("DELETE FROM oauth_auth_codes WHERE expires_at < ?")
+        crate::pgq::query("DELETE FROM oauth_auth_codes WHERE expires_at < ?")
             .bind(now_iso())
             .execute(self.db())
             .await?;
 
         let mut tx = self.db().begin().await?;
-        let row = sqlx::query("SELECT * FROM oauth_auth_codes WHERE code_hash = ?")
+        let row = crate::pgq::query("SELECT * FROM oauth_auth_codes WHERE code_hash = ?")
             .bind(token_hash(code))
             .fetch_optional(&mut *tx)
             .await?;
@@ -127,7 +129,7 @@ impl Store {
         if expired {
             return Ok(RedeemOutcome::Expired);
         }
-        sqlx::query("UPDATE oauth_auth_codes SET used_at = ? WHERE code_hash = ?")
+        crate::pgq::query("UPDATE oauth_auth_codes SET used_at = ? WHERE code_hash = ?")
             .bind(now_iso())
             .bind(token_hash(code))
             .execute(&mut *tx)

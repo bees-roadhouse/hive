@@ -10,14 +10,14 @@ use super::{new_id, now_iso, Store};
 
 impl Store {
     pub async fn identities_list(&self) -> Result<Vec<Identity>> {
-        let rows = sqlx::query("SELECT * FROM identities ORDER BY platform, platform_id")
+        let rows = crate::pgq::query("SELECT * FROM identities ORDER BY platform, platform_id")
             .fetch_all(self.db())
             .await?;
         rows.iter().map(row_to_identity).collect()
     }
 
     pub async fn identities_get(&self, id: &str) -> Result<Option<Identity>> {
-        let row = sqlx::query("SELECT * FROM identities WHERE id = ?")
+        let row = crate::pgq::query("SELECT * FROM identities WHERE id = ?")
             .bind(id)
             .fetch_optional(self.db())
             .await?;
@@ -29,7 +29,7 @@ impl Store {
         platform: &str,
         platform_id: &str,
     ) -> Result<Option<String>> {
-        Ok(sqlx::query_scalar(
+        Ok(crate::pgq::query_scalar(
             "SELECT actor FROM identities WHERE platform = ? AND platform_id = ?",
         )
         .bind(platform)
@@ -39,7 +39,7 @@ impl Store {
     }
 
     pub async fn identities_for_actor(&self, actor: &str) -> Result<Vec<Identity>> {
-        let rows = sqlx::query("SELECT * FROM identities WHERE actor = ? ORDER BY platform")
+        let rows = crate::pgq::query("SELECT * FROM identities WHERE actor = ? ORDER BY platform")
             .bind(actor)
             .fetch_all(self.db())
             .await?;
@@ -67,7 +67,7 @@ impl Store {
             actor: input.actor,
             created_at: now_iso(),
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO identities (id, platform, platform_id, actor, created_at) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&item.id)
@@ -128,7 +128,7 @@ impl Store {
             return Ok(None);
         };
         let actor = patch.actor.unwrap_or_else(|| cur.actor.clone());
-        sqlx::query("UPDATE identities SET actor = ? WHERE id = ?")
+        crate::pgq::query("UPDATE identities SET actor = ? WHERE id = ?")
             .bind(&actor)
             .bind(id)
             .execute(self.db())
@@ -142,7 +142,7 @@ impl Store {
         let Some(cur) = self.identities_get(id).await? else {
             return Ok(false);
         };
-        sqlx::query("DELETE FROM identities WHERE id = ?")
+        crate::pgq::query("DELETE FROM identities WHERE id = ?")
             .bind(id)
             .execute(self.db())
             .await?;
@@ -156,7 +156,7 @@ impl Store {
     }
 }
 
-fn row_to_identity(r: &sqlx::sqlite::SqliteRow) -> Result<Identity> {
+fn row_to_identity(r: &sqlx::postgres::PgRow) -> Result<Identity> {
     Ok(Identity {
         id: r.try_get("id")?,
         platform: r.try_get("platform")?,

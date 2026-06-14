@@ -327,18 +327,15 @@ fn v4_issue(expected: &str, path: &[&str], received: Option<&Value>) -> String {
 mod tests {
     use super::*;
 
-    async fn test_store() -> (Store, tempfile::TempDir) {
+    async fn test_store() -> (Store, ()) {
         std::env::set_var("HIVE_EMBED", "hash");
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("hive.db");
-        let pool = crate::db::open(path.to_str().unwrap()).await.expect("open");
-        crate::db::migrate(&pool).await.expect("migrate");
+        let pool = crate::db::test_pool().await;
         let store = Store::new(pool);
         store
             .onboarding_complete("test", "nate", "nate@example.com", "Password123!")
             .await
             .expect("onboarding");
-        (store, dir)
+        (store, ())
     }
 
     fn req(method: &str, params: Value, id: i64) -> Value {

@@ -4,5 +4,6 @@ pub mod error;
 pub mod legacy_import;
 pub mod mcp;
 pub mod middleware;
+pub mod pgq;
 pub mod routes;
 pub mod store;

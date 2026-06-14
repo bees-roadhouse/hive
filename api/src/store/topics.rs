@@ -8,14 +8,14 @@ use super::{new_id, now_iso, Store};
 
 impl Store {
     pub async fn topics_list(&self) -> Result<Vec<Topic>> {
-        let rows = sqlx::query("SELECT * FROM topics ORDER BY name")
+        let rows = crate::pgq::query("SELECT * FROM topics ORDER BY name")
             .fetch_all(self.db())
             .await?;
         rows.iter().map(row_to_topic).collect()
     }
 
     pub async fn topics_get(&self, topic_id: &str) -> Result<Option<Topic>> {
-        let row = sqlx::query("SELECT * FROM topics WHERE id = ?")
+        let row = crate::pgq::query("SELECT * FROM topics WHERE id = ?")
             .bind(topic_id)
             .fetch_optional(self.db())
             .await?;
@@ -23,7 +23,7 @@ impl Store {
     }
 
     pub async fn topics_by_slug(&self, slug: &str) -> Result<Option<Topic>> {
-        let row = sqlx::query("SELECT * FROM topics WHERE slug = ?")
+        let row = crate::pgq::query("SELECT * FROM topics WHERE slug = ?")
             .bind(slug)
             .fetch_optional(self.db())
             .await?;
@@ -41,7 +41,7 @@ impl Store {
             slug,
             created_at: now_iso(),
         };
-        sqlx::query("INSERT INTO topics (id, name, slug, created_at) VALUES (?, ?, ?, ?)")
+        crate::pgq::query("INSERT INTO topics (id, name, slug, created_at) VALUES (?, ?, ?, ?)")
             .bind(&t.id)
             .bind(&t.name)
             .bind(&t.slug)
@@ -52,7 +52,7 @@ impl Store {
     }
 }
 
-pub(crate) fn row_to_topic(r: &sqlx::sqlite::SqliteRow) -> Result<Topic> {
+pub(crate) fn row_to_topic(r: &sqlx::postgres::PgRow) -> Result<Topic> {
     Ok(Topic {
         id: r.try_get("id")?,
         name: r.try_get("name")?,
