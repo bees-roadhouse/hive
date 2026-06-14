@@ -39,6 +39,10 @@ const SCHEMA: &str = r#"
       body       TEXT NOT NULL,
       tags       TEXT NOT NULL DEFAULT '[]',
       mentions   TEXT NOT NULL DEFAULT '[]',
+      -- Namespace owner: the human user this entry belongs to. NULL = global /
+      -- "continuous" history visible to everyone. Non-NULL = visible only to
+      -- that user (+ admins). See the Visibility model in middleware.rs.
+      user_scope TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -357,6 +361,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
     // Idempotent column additions for DBs created before these columns existed.
     // Postgres has ADD COLUMN IF NOT EXISTS, so no existence probe is needed.
     for ddl in [
+        "ALTER TABLE journal    ADD COLUMN IF NOT EXISTS user_scope TEXT",
         "ALTER TABLE sources    ADD COLUMN IF NOT EXISTS owner      TEXT",
         "ALTER TABLE tasks      ADD COLUMN IF NOT EXISTS phase      TEXT",
         "ALTER TABLE tasks      ADD COLUMN IF NOT EXISTS due        TEXT",

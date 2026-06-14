@@ -133,17 +133,25 @@ impl Store {
 
     /// Resolve a bearer token to its actor (and stamp last_used), honoring
     /// expiry (NULL = legacy non-expiring; past expiry → reject + reap).
-    pub async fn tokens_resolve(&self, token: &str) -> Result<Option<String>> {
-        let row =
-            crate::pgq::query("SELECT id, actor, expires_at FROM api_tokens WHERE token_hash = ?")
-                .bind(token_hash(token))
-                .fetch_optional(self.db())
-                .await?;
+    /// Resolve a bearer token to `(actor, namespace_user)`. The namespace user is
+    /// the human the token acts for — `granted_by` for OAuth tokens, else
+    /// `created_by` — which keys per-user memory visibility (an AI sees the
+    /// namespace of whoever granted its token).
+    pub async fn tokens_resolve(&self, token: &str) -> Result<Option<(String, String)>> {
+        let row = crate::pgq::query(
+            "SELECT id, actor, granted_by, created_by, expires_at FROM api_tokens WHERE token_hash = ?",
+        )
+        .bind(token_hash(token))
+        .fetch_optional(self.db())
+        .await?;
         let Some(row) = row else {
             return Ok(None);
         };
         let id: String = row.try_get("id")?;
         let actor: String = row.try_get("actor")?;
+        let granted_by: Option<String> = row.try_get("granted_by")?;
+        let created_by: String = row.try_get("created_by")?;
+        let namespace_user = granted_by.unwrap_or(created_by);
         let expires_at: Option<String> = row.try_get("expires_at")?;
         if let Some(exp) = expires_at {
             let expired = chrono::DateTime::parse_from_rfc3339(&exp)
@@ -162,7 +170,7 @@ impl Store {
             .bind(&id)
             .execute(self.db())
             .await?;
-        Ok(Some(actor))
+        Ok(Some((actor, namespace_user)))
     }
 
     pub async fn tokens_remove(&self, token_id: &str) -> Result<bool> {

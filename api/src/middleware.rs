@@ -21,6 +21,11 @@ pub struct AuthCtx {
     /// "session" | "token"
     pub principal: Option<&'static str>,
     pub role: Option<UserRole>,
+    /// The human user whose namespace this principal reads/writes in: the
+    /// logged-in user for a session, or the token's granter for a Bearer token
+    /// (so an AI sees the memory namespace of whoever it acts for). `role` is
+    /// resolved from THIS user, so admin-bypass follows the granting human.
+    pub namespace_user: Option<String>,
     /// The raw session cookie value (the OAuth CSRF token derives from it).
     pub session_cookie: Option<String>,
 }
@@ -31,10 +36,34 @@ impl AuthCtx {
         self.actor.as_deref().unwrap_or("anon")
     }
 
+    /// The human user whose namespace governs visibility (falls back to the
+    /// acting identity when no distinct granter is known).
+    pub fn namespace_user(&self) -> &str {
+        self.namespace_user.as_deref().unwrap_or_else(|| self.actor())
+    }
+
     /// Session-principal admin (Node `requireAdmin`).
     pub fn is_admin(&self) -> bool {
         self.role == Some(UserRole::Admin)
     }
+
+    /// What this principal may see across the per-user memory namespaces.
+    pub fn visibility(&self) -> Visibility {
+        if self.is_admin() {
+            Visibility::All
+        } else {
+            Visibility::Namespace(self.namespace_user().to_string())
+        }
+    }
+}
+
+/// Per-user namespace visibility: admins see everything; everyone else sees
+/// global (NULL-scoped) entries plus their own namespace (plus explicit
+/// shares/@mentions, applied separately).
+#[derive(Clone, Debug)]
+pub enum Visibility {
+    All,
+    Namespace(String),
 }
 
 const PUBLIC_PATHS: &[&str] = &[
@@ -88,9 +117,14 @@ pub async fn resolve_auth(store: &Store, headers: &axum::http::HeaderMap) -> Aut
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim)
     {
-        if let Ok(Some(actor)) = store.tokens_resolve(bearer).await {
+        if let Ok(Some((actor, namespace_user))) = store.tokens_resolve(bearer).await {
             ctx.actor = Some(actor);
             ctx.principal = Some("token");
+            // Admin-bypass and namespace follow the granting human user.
+            if let Ok(Some(u)) = store.users_by_actor(&namespace_user).await {
+                ctx.role = Some(u.role);
+            }
+            ctx.namespace_user = Some(namespace_user);
         }
     }
 
@@ -98,9 +132,10 @@ pub async fn resolve_auth(store: &Store, headers: &axum::http::HeaderMap) -> Aut
     if ctx.actor.is_none() {
         if let Some(value) = &cookie {
             if let Ok(Some(user)) = store.sessions_resolve(value).await {
-                ctx.actor = Some(user.actor);
+                ctx.actor = Some(user.actor.clone());
                 ctx.principal = Some("session");
                 ctx.role = Some(user.role);
+                ctx.namespace_user = Some(user.actor);
             }
         }
     }
