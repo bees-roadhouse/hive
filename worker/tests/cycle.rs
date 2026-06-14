@@ -4,17 +4,13 @@
 
 use hive_api::store::Store;
 
-async fn test_pool() -> (sqlx::SqlitePool, tempfile::TempDir) {
+async fn test_pool() -> (sqlx::PgPool, ()) {
     // Hash embedder: deterministic + offline (set before any embed call; the
     // provider choice is latched once per process).
     std::env::set_var("HIVE_EMBED", "hash");
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("hive.db");
-    let pool = hive_api::db::open(path.to_str().unwrap())
-        .await
-        .expect("open db");
-    hive_api::db::migrate(&pool).await.expect("migrate");
-    (pool, dir)
+    // Isolated Postgres schema per test (uses DATABASE_URL / local dev default).
+    let pool = hive_api::db::test_pool().await;
+    (pool, ())
 }
 
 #[tokio::test]
@@ -23,7 +19,8 @@ async fn cycle_writes_status_and_node_maintenance_labels() {
     let store = Store::new(pool.clone());
     let worker = hive_worker::Worker::new(pool);
 
-    // First cycle: vacuum fires (Node's counter starts at 0 → 0 % 20 === 0).
+    // Postgres handles WAL/GIN/autovacuum itself, so the worker's only
+    // maintenance is pruning the wire log — and only when there's surplus.
     worker.cycle(1).await.expect("cycle 1");
     let status = store.worker_status().await.expect("status");
     assert!(status.heartbeat.is_some(), "heartbeat stamped");
@@ -31,20 +28,11 @@ async fn cycle_writes_status_and_node_maintenance_labels() {
     assert_eq!(run.polled, 0);
     assert_eq!(run.ingested, 0);
     assert_eq!(run.outbox, 0);
-    assert_eq!(
-        run.maintenance,
-        ["wal-checkpoint", "fts-optimize", "vacuum"]
+    assert!(
+        run.maintenance.is_empty(),
+        "wire is empty → nothing pruned: {:?}",
+        run.maintenance
     );
-
-    // Steady-state cycle: no vacuum, no prune (wire is tiny).
-    worker.cycle(2).await.expect("cycle 2");
-    let run = store.worker_status().await.unwrap().last_run.unwrap();
-    assert_eq!(run.maintenance, ["wal-checkpoint", "fts-optimize"]);
-
-    // Every 20th: cycle 21 is Node's cycles === 20.
-    worker.cycle(21).await.expect("cycle 21");
-    let run = store.worker_status().await.unwrap().last_run.unwrap();
-    assert!(run.maintenance.contains(&"vacuum".to_string()));
 }
 
 #[tokio::test]

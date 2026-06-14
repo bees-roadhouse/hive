@@ -14,7 +14,7 @@ impl Store {
     pub async fn sessions_create(&self, user_id: &str) -> Result<String> {
         let token = generate_token(SESSION_PREFIX);
         let ts = now_iso();
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO sessions (id, token_hash, user_id, created_at, expires_at, last_seen) \
              VALUES (?, ?, ?, ?, ?, ?)",
         )
@@ -31,10 +31,11 @@ impl Store {
 
     /// Resolve a session cookie to its user, or None if missing/expired.
     pub async fn sessions_resolve(&self, token: &str) -> Result<Option<User>> {
-        let row = sqlx::query("SELECT id, user_id, expires_at FROM sessions WHERE token_hash = ?")
-            .bind(token_hash(token))
-            .fetch_optional(self.db())
-            .await?;
+        let row =
+            crate::pgq::query("SELECT id, user_id, expires_at FROM sessions WHERE token_hash = ?")
+                .bind(token_hash(token))
+                .fetch_optional(self.db())
+                .await?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -45,13 +46,13 @@ impl Store {
             .map(|t| t.with_timezone(&Utc) < Utc::now())
             .unwrap_or(true);
         if expired {
-            sqlx::query("DELETE FROM sessions WHERE id = ?")
+            crate::pgq::query("DELETE FROM sessions WHERE id = ?")
                 .bind(&session_id)
                 .execute(self.db())
                 .await?;
             return Ok(None);
         }
-        sqlx::query("UPDATE sessions SET last_seen = ? WHERE id = ?")
+        crate::pgq::query("UPDATE sessions SET last_seen = ? WHERE id = ?")
             .bind(now_iso())
             .bind(&session_id)
             .execute(self.db())
@@ -60,7 +61,7 @@ impl Store {
     }
 
     pub async fn sessions_destroy(&self, token: &str) -> Result<()> {
-        sqlx::query("DELETE FROM sessions WHERE token_hash = ?")
+        crate::pgq::query("DELETE FROM sessions WHERE token_hash = ?")
             .bind(token_hash(token))
             .execute(self.db())
             .await?;

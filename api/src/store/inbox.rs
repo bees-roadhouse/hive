@@ -34,7 +34,7 @@ impl Store {
             created_at: now_iso(),
             read_at: None,
         };
-        sqlx::query(
+        crate::pgq::query(
             r#"INSERT INTO inbox (id, recipient, "from", reason, ref_kind, ref_id, entry_id, snippet, created_at, read_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"#,
         )
@@ -66,7 +66,7 @@ impl Store {
             r#"SELECT id, recipient, "from", reason, ref_kind, ref_id, entry_id, snippet, created_at, read_at
                FROM inbox WHERE recipient = ? ORDER BY created_at DESC"#
         };
-        let rows = sqlx::query(sql)
+        let rows = crate::pgq::query(sql)
             .bind(recipient)
             .fetch_all(self.db())
             .await?;
@@ -74,37 +74,37 @@ impl Store {
     }
 
     pub async fn inbox_mark_read(&self, item_id: &str) -> Result<u64> {
-        let res = sqlx::query("UPDATE inbox SET read_at = ? WHERE id = ? AND read_at IS NULL")
-            .bind(now_iso())
-            .bind(item_id)
-            .execute(self.db())
-            .await?;
-        Ok(res.rows_affected())
-    }
-
-    pub async fn inbox_mark_all_read(&self, recipient: &str) -> Result<u64> {
         let res =
-            sqlx::query("UPDATE inbox SET read_at = ? WHERE recipient = ? AND read_at IS NULL")
+            crate::pgq::query("UPDATE inbox SET read_at = ? WHERE id = ? AND read_at IS NULL")
                 .bind(now_iso())
-                .bind(recipient)
+                .bind(item_id)
                 .execute(self.db())
                 .await?;
         Ok(res.rows_affected())
     }
 
-    pub async fn inbox_unread_count(&self, recipient: &str) -> Result<i64> {
-        Ok(
-            sqlx::query_scalar(
-                "SELECT count(*) FROM inbox WHERE recipient = ? AND read_at IS NULL",
-            )
-            .bind(recipient)
-            .fetch_one(self.db())
-            .await?,
+    pub async fn inbox_mark_all_read(&self, recipient: &str) -> Result<u64> {
+        let res = crate::pgq::query(
+            "UPDATE inbox SET read_at = ? WHERE recipient = ? AND read_at IS NULL",
         )
+        .bind(now_iso())
+        .bind(recipient)
+        .execute(self.db())
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    pub async fn inbox_unread_count(&self, recipient: &str) -> Result<i64> {
+        Ok(crate::pgq::query_scalar(
+            "SELECT count(*) FROM inbox WHERE recipient = ? AND read_at IS NULL",
+        )
+        .bind(recipient)
+        .fetch_one(self.db())
+        .await?)
     }
 }
 
-pub(crate) fn row_to_inbox(r: &sqlx::sqlite::SqliteRow) -> Result<InboxItem> {
+pub(crate) fn row_to_inbox(r: &sqlx::postgres::PgRow) -> Result<InboxItem> {
     Ok(InboxItem {
         id: r.try_get("id")?,
         recipient: r.try_get("recipient")?,

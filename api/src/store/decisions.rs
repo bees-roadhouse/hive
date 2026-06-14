@@ -25,7 +25,7 @@ pub struct DecisionCreate {
 
 impl Store {
     pub async fn decisions_list(&self, status: Option<&str>) -> Result<Vec<Decision>> {
-        let rows = sqlx::query("SELECT * FROM decisions ORDER BY created_at DESC")
+        let rows = crate::pgq::query("SELECT * FROM decisions ORDER BY created_at DESC")
             .fetch_all(self.db())
             .await?;
         let decisions: Vec<Decision> = rows
@@ -39,7 +39,7 @@ impl Store {
     }
 
     pub async fn decisions_get(&self, decision_id: &str) -> Result<Option<Decision>> {
-        let row = sqlx::query("SELECT * FROM decisions WHERE id = ?")
+        let row = crate::pgq::query("SELECT * FROM decisions WHERE id = ?")
             .bind(decision_id)
             .fetch_optional(self.db())
             .await?;
@@ -69,7 +69,7 @@ impl Store {
             created_at: ts.clone(),
             updated_at: ts,
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO decisions (id, title, context, decision, consequences, status, tags, assignees, \
              project, supersedes, origin_entry_id, anchor_text, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -100,11 +100,13 @@ impl Store {
         .await?;
         if let Some(supersedes) = &d.supersedes {
             if let Some(prior) = self.decisions_get(supersedes).await? {
-                sqlx::query("UPDATE decisions SET status='superseded', updated_at=? WHERE id=?")
-                    .bind(now_iso())
-                    .bind(&prior.id)
-                    .execute(self.db())
-                    .await?;
+                crate::pgq::query(
+                    "UPDATE decisions SET status='superseded', updated_at=? WHERE id=?",
+                )
+                .bind(now_iso())
+                .bind(&prior.id)
+                .execute(self.db())
+                .await?;
                 self.links_create(
                     EntityKind::Decision,
                     &d.id,
@@ -144,7 +146,7 @@ impl Store {
             updated_at: now_iso(),
             ..current
         };
-        sqlx::query(
+        crate::pgq::query(
             "UPDATE decisions SET title=?, context=?, decision=?, consequences=?, status=?, tags=?, assignees=?, updated_at=? WHERE id=?",
         )
         .bind(&next.title)
@@ -176,7 +178,7 @@ impl Store {
     }
 }
 
-pub(crate) fn row_to_decision(r: &sqlx::sqlite::SqliteRow) -> Result<Decision> {
+pub(crate) fn row_to_decision(r: &sqlx::postgres::PgRow) -> Result<Decision> {
     Ok(Decision {
         id: r.try_get("id")?,
         title: r.try_get("title")?,

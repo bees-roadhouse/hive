@@ -9,14 +9,14 @@ use super::{new_id, now_iso, Store};
 
 impl Store {
     pub async fn people_list(&self) -> Result<Vec<Person>> {
-        let rows = sqlx::query("SELECT * FROM people ORDER BY kind, slug")
+        let rows = crate::pgq::query("SELECT * FROM people ORDER BY kind, slug")
             .fetch_all(self.db())
             .await?;
         rows.iter().map(row_to_person).collect()
     }
 
     pub async fn people_get(&self, id_or_slug: &str) -> Result<Option<Person>> {
-        let row = sqlx::query("SELECT * FROM people WHERE slug = ? OR id = ?")
+        let row = crate::pgq::query("SELECT * FROM people WHERE slug = ? OR id = ?")
             .bind(id_or_slug)
             .bind(id_or_slug)
             .fetch_optional(self.db())
@@ -25,7 +25,7 @@ impl Store {
     }
 
     pub async fn people_by_slug(&self, slug: &str) -> Result<Option<Person>> {
-        let row = sqlx::query("SELECT * FROM people WHERE slug = ?")
+        let row = crate::pgq::query("SELECT * FROM people WHERE slug = ?")
             .bind(slug)
             .fetch_optional(self.db())
             .await?;
@@ -35,7 +35,7 @@ impl Store {
     /// AI identities a given human owns — the grantable set for OAuth consent.
     pub async fn people_ais_owned_by(&self, owner_slug: &str) -> Result<Vec<Person>> {
         let rows =
-            sqlx::query("SELECT * FROM people WHERE kind = 'ai' AND owner = ? ORDER BY slug")
+            crate::pgq::query("SELECT * FROM people WHERE kind = 'ai' AND owner = ? ORDER BY slug")
                 .bind(owner_slug)
                 .fetch_all(self.db())
                 .await?;
@@ -57,7 +57,7 @@ impl Store {
             role: None,
             created_at: now_iso(),
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO people (id, name, slug, kind, owner, bio, role, created_at) \
              VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?)",
         )
@@ -92,7 +92,7 @@ impl Store {
             role: None,
             created_at: now_iso(),
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO people (id, slug, name, kind, owner, bio, role, created_at) \
              VALUES (?, ?, ?, ?, ?, NULL, NULL, ?)",
         )
@@ -147,7 +147,7 @@ impl Store {
             cur.slug.clone()
         };
 
-        sqlx::query("UPDATE people SET name = ?, slug = ?, kind = ?, owner = ?, bio = ?, role = ? WHERE id = ?")
+        crate::pgq::query("UPDATE people SET name = ?, slug = ?, kind = ?, owner = ?, bio = ?, role = ? WHERE id = ?")
             .bind(&name)
             .bind(&slug)
             .bind(kind.as_str())
@@ -199,7 +199,7 @@ impl Store {
     }
 }
 
-pub(crate) fn row_to_person(r: &sqlx::sqlite::SqliteRow) -> Result<Person> {
+pub(crate) fn row_to_person(r: &sqlx::postgres::PgRow) -> Result<Person> {
     Ok(Person {
         id: r.try_get("id")?,
         slug: r.try_get("slug")?,

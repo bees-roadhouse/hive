@@ -8,19 +8,14 @@ use axum::Router;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-async fn test_app() -> (Router, tempfile::TempDir) {
+async fn test_app() -> (Router, ()) {
     // Hash embedder: deterministic + offline (set before any embed call; the
     // provider choice is latched once per process).
     std::env::set_var("HIVE_EMBED", "hash");
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("hive.db");
-    let pool = hive_api::db::open(path.to_str().unwrap())
-        .await
-        .expect("open db");
-    hive_api::db::migrate(&pool).await.expect("migrate");
-    hive_api::db::assert_fts5(&pool).await.expect("fts5");
+    // Isolated Postgres schema per test (uses DATABASE_URL / local dev default).
+    let pool = hive_api::db::test_pool().await;
     let store = hive_api::store::Store::new(pool);
-    (hive_api::routes::router(store), dir)
+    (hive_api::routes::router(store), ())
 }
 
 async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Value, axum::http::HeaderMap) {

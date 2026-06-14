@@ -139,10 +139,11 @@ impl Store {
             .into_iter()
             .filter(|h| h.kind == hive_shared::EntityKind::Journal)
         {
-            let row = sqlx::query("SELECT author, body, created_at FROM journal WHERE id = ?")
-                .bind(&h.id)
-                .fetch_optional(self.db())
-                .await?;
+            let row =
+                crate::pgq::query("SELECT author, body, created_at FROM journal WHERE id = ?")
+                    .bind(&h.id)
+                    .fetch_optional(self.db())
+                    .await?;
             let Some(r) = row else { continue };
             let body: String = r.try_get("body")?;
             journal_hits.push(RecallJournalHit {
@@ -266,7 +267,7 @@ impl Store {
     /// Node: `tasks.list({ assignee: identity }).filter(t => t.status !== "done")`
     /// — priority order (urgent→low), then created_at DESC.
     async fn recall_open_tasks(&self, assignee: &str) -> Result<Vec<Task>> {
-        let rows = sqlx::query(
+        let rows = crate::pgq::query(
             "SELECT * FROM tasks ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC",
         )
         .fetch_all(self.db())
@@ -298,11 +299,12 @@ impl Store {
 
     /// Node: `events.list().slice(0, 5)` — COALESCE(at, created_at) DESC.
     async fn recall_recent_events(&self, limit: i64) -> Result<Vec<EventItem>> {
-        let rows =
-            sqlx::query("SELECT * FROM events ORDER BY COALESCE(at, created_at) DESC LIMIT ?")
-                .bind(limit)
-                .fetch_all(self.db())
-                .await?;
+        let rows = crate::pgq::query(
+            "SELECT * FROM events ORDER BY COALESCE(at, created_at) DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(self.db())
+        .await?;
         rows.iter()
             .map(|r| -> Result<EventItem> {
                 Ok(EventItem {

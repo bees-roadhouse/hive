@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use hive_shared::WireEvent;
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use tokio::sync::broadcast;
 
 pub mod actors;
@@ -40,17 +40,17 @@ pub use crate::auth::now_iso;
 
 #[derive(Clone)]
 pub struct Store {
-    db: SqlitePool,
+    db: PgPool,
     bus: broadcast::Sender<WireEvent>,
 }
 
 impl Store {
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(db: PgPool) -> Self {
         let (bus, _) = broadcast::channel(1024);
         Self { db, bus }
     }
 
-    pub fn db(&self) -> &SqlitePool {
+    pub fn db(&self) -> &PgPool {
         &self.db
     }
 
@@ -73,7 +73,7 @@ impl Store {
             payload,
             created_at: now_iso(),
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO wire (id, kind, actor, payload, created_at) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&ev.id)
@@ -90,7 +90,7 @@ impl Store {
 
     /// The wire log, newest first.
     pub async fn wire_log(&self, limit: i64) -> Result<Vec<WireEvent>> {
-        let rows = sqlx::query_as::<_, WireRow>(
+        let rows = crate::pgq::query_as::<WireRow>(
             "SELECT id, kind, actor, payload, created_at FROM wire ORDER BY created_at DESC LIMIT ?",
         )
         .bind(limit)

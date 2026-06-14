@@ -35,7 +35,7 @@ impl Store {
     /// List sources. With an owner, returns global (owner=null) + that actor's;
     /// `None` returns all (the worker path).
     pub async fn sources_list(&self, owner: Option<&str>) -> Result<Vec<Source>> {
-        let rows = sqlx::query("SELECT * FROM sources ORDER BY created_at")
+        let rows = crate::pgq::query("SELECT * FROM sources ORDER BY created_at")
             .fetch_all(self.db())
             .await?;
         let all = rows.iter().map(row_to_source).collect::<Result<Vec<_>>>()?;
@@ -49,7 +49,7 @@ impl Store {
     }
 
     pub async fn sources_get(&self, source_id: &str) -> Result<Option<Source>> {
-        let row = sqlx::query("SELECT * FROM sources WHERE id = ?")
+        let row = crate::pgq::query("SELECT * FROM sources WHERE id = ?")
             .bind(source_id)
             .fetch_optional(self.db())
             .await?;
@@ -72,7 +72,7 @@ impl Store {
             last_status: None,
             created_at: now_iso(),
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO sources (id, name, url, kind, category, severity, interval_secs, notify, enabled, owner, last_polled_at, last_status, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
         )
@@ -84,7 +84,7 @@ impl Store {
         .bind(s.severity.as_str())
         .bind(s.interval_secs)
         .bind(&s.notify)
-        .bind(if s.enabled { 1 } else { 0 })
+        .bind(s.enabled)
         .bind(&s.owner)
         .bind(&s.created_at)
         .execute(self.db())
@@ -123,7 +123,7 @@ impl Store {
             last_status: cur.last_status,
             created_at: cur.created_at,
         };
-        sqlx::query(
+        crate::pgq::query(
             "UPDATE sources SET name=?, url=?, kind=?, category=?, severity=?, interval_secs=?, notify=?, enabled=?, owner=? WHERE id=?",
         )
         .bind(&next.name)
@@ -133,7 +133,7 @@ impl Store {
         .bind(next.severity.as_str())
         .bind(next.interval_secs)
         .bind(&next.notify)
-        .bind(if next.enabled { 1 } else { 0 })
+        .bind(next.enabled)
         .bind(&next.owner)
         .bind(&next.id)
         .execute(self.db())
@@ -144,7 +144,7 @@ impl Store {
     }
 
     pub async fn sources_remove(&self, source_id: &str, actor: &str) -> Result<bool> {
-        let ok = sqlx::query("DELETE FROM sources WHERE id = ?")
+        let ok = crate::pgq::query("DELETE FROM sources WHERE id = ?")
             .bind(source_id)
             .execute(self.db())
             .await?
@@ -176,7 +176,7 @@ impl Store {
     }
 
     pub async fn sources_mark_polled(&self, source_id: &str, status: &str) -> Result<()> {
-        sqlx::query("UPDATE sources SET last_polled_at = ?, last_status = ? WHERE id = ?")
+        crate::pgq::query("UPDATE sources SET last_polled_at = ?, last_status = ? WHERE id = ?")
             .bind(now_iso())
             .bind(status)
             .bind(source_id)
@@ -319,7 +319,7 @@ impl Store {
         let escaped = serde_json::to_string(guid)?;
         let pattern = format!("%{}%", &escaped[1..escaped.len() - 1]);
         Ok(
-            sqlx::query("SELECT 1 FROM wire WHERE kind = ? AND payload LIKE ? LIMIT 1")
+            crate::pgq::query("SELECT 1 FROM wire WHERE kind = ? AND payload LIKE ? LIMIT 1")
                 .bind(kind)
                 .bind(pattern)
                 .fetch_optional(self.db())
@@ -329,7 +329,7 @@ impl Store {
     }
 }
 
-fn row_to_source(r: &sqlx::sqlite::SqliteRow) -> Result<Source> {
+fn row_to_source(r: &sqlx::postgres::PgRow) -> Result<Source> {
     Ok(Source {
         id: r.try_get("id")?,
         name: r.try_get("name")?,
@@ -339,7 +339,7 @@ fn row_to_source(r: &sqlx::sqlite::SqliteRow) -> Result<Source> {
         severity: Severity::from_str_lossy(r.try_get::<String, _>("severity")?.as_str()),
         interval_secs: r.try_get("interval_secs")?,
         notify: r.try_get("notify")?,
-        enabled: r.try_get::<i64, _>("enabled")? != 0,
+        enabled: r.try_get::<bool, _>("enabled")?,
         owner: r.try_get("owner")?,
         last_polled_at: r.try_get("last_polled_at")?,
         last_status: r.try_get("last_status")?,

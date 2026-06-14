@@ -1,12 +1,31 @@
 # Hive v0.2.0 — all-Rust deployment (additive path; the Node compose files
 # still work). One image, two services: hive-api serves the API AND the Solid
 # SPA itself (no nginx web container), hive-worker is the out-of-band loop.
-# Both open the SAME hive.db + model cache via the shared /data volume.
+# Both connect to the same Postgres (DATABASE_URL); the model cache is shared
+# on the hive-models volume.
 #
 # Run from the repo root:
 #   docker compose -f docker/docker-compose.rust.yml up --build
 
 services:
+  postgres:
+    image: postgres:17
+    environment:
+      - POSTGRES_USER=hive
+      - POSTGRES_PASSWORD=hive
+      - POSTGRES_DB=hive
+    volumes:
+      - hive-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive -d hive"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - hive
+
   hive-api:
     build:
       context: ..
@@ -15,10 +34,10 @@ services:
     ports:
       - "7878:7878"
     volumes:
-      - hive-data:/data
+      - hive-models:/models
     environment:
-      - HIVE_DB=/data/hive.db
-      - HIVE_MODEL_CACHE=/data/models
+      - DATABASE_URL=postgres://hive:hive@postgres:5432/hive
+      - HIVE_MODEL_CACHE=/models
       - HIVE_WEB_DIST=/app/web
       - PORT=7878
       - RUST_LOG=hive_api=info,tower_http=info
@@ -31,6 +50,9 @@ services:
     restart: unless-stopped
     networks:
       - hive
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   hive-worker:
     build:
@@ -39,20 +61,24 @@ services:
     image: beesroadhouse/hive-rust:latest
     command: ["/app/hive-worker"]
     volumes:
-      - hive-data:/data
+      - hive-models:/models
     environment:
-      - HIVE_DB=/data/hive.db
-      - HIVE_MODEL_CACHE=/data/models
+      - DATABASE_URL=postgres://hive:hive@postgres:5432/hive
+      - HIVE_MODEL_CACHE=/models
       - HIVE_WORKER_TICK=30
       - RUST_LOG=hive_worker=info
     restart: unless-stopped
     networks:
       - hive
     depends_on:
-      - hive-api
+      postgres:
+        condition: service_healthy
+      hive-api:
+        condition: service_healthy
 
 volumes:
-  hive-data:
+  hive-pgdata:
+  hive-models:
 
 networks:
   hive:

@@ -8,7 +8,7 @@ use super::{now_iso, Store};
 
 impl Store {
     pub async fn worker_set_heartbeat(&self) -> Result<()> {
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO worker_status (id, heartbeat) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET heartbeat = excluded.heartbeat",
         )
         .bind(now_iso())
@@ -18,7 +18,7 @@ impl Store {
     }
 
     pub async fn worker_set_last_run(&self, stats: &WorkerLastRun) -> Result<()> {
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO worker_status (id, last_run) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET last_run = excluded.last_run",
         )
         .bind(serde_json::to_string(stats)?)
@@ -29,13 +29,13 @@ impl Store {
 
     pub async fn worker_status(&self) -> Result<WorkerStatus> {
         let row: Option<(Option<String>, Option<String>)> =
-            sqlx::query_as("SELECT heartbeat, last_run FROM worker_status WHERE id = 1")
+            crate::pgq::query_as("SELECT heartbeat, last_run FROM worker_status WHERE id = 1")
                 .fetch_optional(self.db())
                 .await?;
         let (heartbeat, last_run_raw) = row.unwrap_or((None, None));
         let all = self.sources_list(None).await?;
         let outbox = self.outbox_counts().await?;
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM embeddings")
+        let count: i64 = crate::pgq::query_scalar("SELECT count(*) FROM embeddings")
             .fetch_one(self.db())
             .await?;
         Ok(WorkerStatus {

@@ -10,13 +10,15 @@ impl Store {
     pub async fn phases_list(&self, project_id: Option<&str>) -> Result<Vec<Phase>> {
         let rows = match project_id {
             Some(project) => {
-                sqlx::query("SELECT * FROM phases WHERE project = ? ORDER BY position, created_at")
-                    .bind(project)
-                    .fetch_all(self.db())
-                    .await?
+                crate::pgq::query(
+                    "SELECT * FROM phases WHERE project = ? ORDER BY position, created_at",
+                )
+                .bind(project)
+                .fetch_all(self.db())
+                .await?
             }
             None => {
-                sqlx::query("SELECT * FROM phases ORDER BY project, position, created_at")
+                crate::pgq::query("SELECT * FROM phases ORDER BY project, position, created_at")
                     .fetch_all(self.db())
                     .await?
             }
@@ -25,7 +27,7 @@ impl Store {
     }
 
     pub async fn phases_get(&self, phase_id: &str) -> Result<Option<Phase>> {
-        let row = sqlx::query("SELECT * FROM phases WHERE id = ?")
+        let row = crate::pgq::query("SELECT * FROM phases WHERE id = ?")
             .bind(phase_id)
             .fetch_optional(self.db())
             .await?;
@@ -34,7 +36,7 @@ impl Store {
 
     pub async fn phases_ensure(&self, project_id: &str, name: &str) -> Result<Phase> {
         let existing =
-            sqlx::query("SELECT * FROM phases WHERE project = ? AND LOWER(name) = LOWER(?)")
+            crate::pgq::query("SELECT * FROM phases WHERE project = ? AND LOWER(name) = LOWER(?)")
                 .bind(project_id)
                 .bind(name)
                 .fetch_optional(self.db())
@@ -42,11 +44,12 @@ impl Store {
         if let Some(row) = existing {
             return row_to_phase(&row);
         }
-        let pos: i64 =
-            sqlx::query_scalar("SELECT COALESCE(MAX(position)+1, 0) FROM phases WHERE project = ?")
-                .bind(project_id)
-                .fetch_one(self.db())
-                .await?;
+        let pos: i64 = crate::pgq::query_scalar(
+            "SELECT COALESCE(MAX(position)+1, 0) FROM phases WHERE project = ?",
+        )
+        .bind(project_id)
+        .fetch_one(self.db())
+        .await?;
         let ph = Phase {
             id: new_id("ph"),
             project: project_id.to_string(),
@@ -54,7 +57,7 @@ impl Store {
             position: pos,
             created_at: now_iso(),
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO phases (id, project, name, position, created_at) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&ph.id)
@@ -68,7 +71,7 @@ impl Store {
     }
 }
 
-pub(crate) fn row_to_phase(r: &sqlx::sqlite::SqliteRow) -> Result<Phase> {
+pub(crate) fn row_to_phase(r: &sqlx::postgres::PgRow) -> Result<Phase> {
     Ok(Phase {
         id: r.try_get("id")?,
         project: r.try_get("project")?,

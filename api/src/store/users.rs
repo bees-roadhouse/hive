@@ -22,14 +22,14 @@ pub struct NewUser {
 
 impl Store {
     pub async fn users_count(&self) -> Result<i64> {
-        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM users")
+        Ok(crate::pgq::query_scalar("SELECT COUNT(*) FROM users")
             .fetch_one(self.db())
             .await?)
     }
 
     pub async fn users_list(&self) -> Result<Vec<SafeUser>> {
         let rows =
-            sqlx::query("SELECT id, actor, email, name, role FROM users ORDER BY created_at")
+            crate::pgq::query("SELECT id, actor, email, name, role FROM users ORDER BY created_at")
                 .fetch_all(self.db())
                 .await?;
         rows.iter()
@@ -46,7 +46,7 @@ impl Store {
     }
 
     pub async fn users_by_email(&self, email: &str) -> Result<Option<(User, String)>> {
-        let row = sqlx::query("SELECT * FROM users WHERE email = ?")
+        let row = crate::pgq::query("SELECT * FROM users WHERE email = ?")
             .bind(email.trim().to_lowercase())
             .fetch_optional(self.db())
             .await?;
@@ -54,7 +54,7 @@ impl Store {
     }
 
     pub async fn users_by_id(&self, uid: &str) -> Result<Option<User>> {
-        let row = sqlx::query("SELECT * FROM users WHERE id = ?")
+        let row = crate::pgq::query("SELECT * FROM users WHERE id = ?")
             .bind(uid)
             .fetch_optional(self.db())
             .await?;
@@ -64,7 +64,7 @@ impl Store {
     }
 
     pub async fn users_by_actor(&self, actor: &str) -> Result<Option<User>> {
-        let row = sqlx::query("SELECT * FROM users WHERE actor = ?")
+        let row = crate::pgq::query("SELECT * FROM users WHERE actor = ?")
             .bind(actor)
             .fetch_optional(self.db())
             .await?;
@@ -91,7 +91,7 @@ impl Store {
             last_login_at: None,
         };
         let password_hash = hash_password(&input.password);
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO users (id, actor, email, name, role, password_hash, created_at, last_login_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
         )
@@ -127,7 +127,7 @@ impl Store {
         if !verify_password(password, &hash) {
             return Ok(None);
         }
-        sqlx::query("UPDATE users SET last_login_at = ? WHERE id = ?")
+        crate::pgq::query("UPDATE users SET last_login_at = ? WHERE id = ?")
             .bind(now_iso())
             .bind(&user.id)
             .execute(self.db())
@@ -191,7 +191,7 @@ impl Store {
     }
 }
 
-fn row_to_user_with_hash(r: &sqlx::sqlite::SqliteRow) -> Result<(User, String)> {
+fn row_to_user_with_hash(r: &sqlx::postgres::PgRow) -> Result<(User, String)> {
     Ok((
         User {
             id: r.try_get("id")?,

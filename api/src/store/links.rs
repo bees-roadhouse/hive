@@ -25,7 +25,7 @@ impl Store {
             rel: rel.to_string(),
             created_at: now_iso(),
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO links (id, source_kind, source_id, target_kind, target_id, rel, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
@@ -42,7 +42,7 @@ impl Store {
     }
 
     pub async fn links_for_entity(&self, ref_id: &str) -> Result<Vec<Link>> {
-        let rows = sqlx::query(
+        let rows = crate::pgq::query(
             "SELECT * FROM links WHERE source_id = ? OR target_id = ? ORDER BY created_at DESC",
         )
         .bind(ref_id)
@@ -53,7 +53,7 @@ impl Store {
     }
 }
 
-pub(crate) fn row_to_link(r: &sqlx::sqlite::SqliteRow) -> Result<Link> {
+pub(crate) fn row_to_link(r: &sqlx::postgres::PgRow) -> Result<Link> {
     Ok(Link {
         id: r.try_get("id")?,
         source_kind: EntityKind::from_str_lossy(r.try_get::<String, _>("source_kind")?.as_str()),

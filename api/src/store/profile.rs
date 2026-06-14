@@ -9,7 +9,7 @@ use super::{now_iso, Store};
 
 impl Store {
     pub async fn profile_get(&self, actor: &str) -> Result<Option<Profile>> {
-        let row = sqlx::query("SELECT * FROM profile WHERE actor = ?")
+        let row = crate::pgq::query("SELECT * FROM profile WHERE actor = ?")
             .bind(actor)
             .fetch_optional(self.db())
             .await?;
@@ -51,7 +51,7 @@ impl Store {
             derived_at: cur.as_ref().and_then(|p| p.derived_at.clone()),
             updated_at: now_iso(),
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO profile (actor, kind, display_name, body, source, derived_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(actor) DO UPDATE SET kind=excluded.kind, display_name=excluded.display_name, \
@@ -79,7 +79,7 @@ impl Store {
     /// canonical profile card as sections.bio/sections.role. Idempotent — only
     /// fills a section that's missing/blank. Safe to run on every boot.
     pub async fn backfill_identity_cards(&self) -> Result<i64> {
-        let rows = sqlx::query(
+        let rows = crate::pgq::query(
             "SELECT slug, name, kind, bio, role FROM people WHERE bio IS NOT NULL OR role IS NOT NULL",
         )
         .fetch_all(self.db())
@@ -139,7 +139,7 @@ impl Store {
     }
 }
 
-fn row_to_profile(r: &sqlx::sqlite::SqliteRow) -> Result<Profile> {
+fn row_to_profile(r: &sqlx::postgres::PgRow) -> Result<Profile> {
     let body: String = r.try_get("body")?;
     let parsed: ProfileBody = serde_json::from_str(&body).unwrap_or_default();
     Ok(Profile {

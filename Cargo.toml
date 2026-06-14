@@ -28,7 +28,9 @@ hyper = { version = "1.5", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 
 # --- Database ---
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono", "uuid"] }
+# postgres is the datastore; sqlite stays only so the import path can READ an
+# uploaded legacy hive.db file (api/src/legacy_import.rs) when migrating data in.
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "sqlite", "migrate", "chrono", "uuid"] }
 
 # --- Auth / Crypto ---
 jsonwebtoken = "9.3"

@@ -19,7 +19,7 @@ const TOKEN_COLS: &str =
 
 impl Store {
     pub async fn tokens_list(&self) -> Result<Vec<ApiToken>> {
-        let rows = sqlx::query(&format!(
+        let rows = crate::pgq::query(&format!(
             "SELECT {TOKEN_COLS} FROM api_tokens ORDER BY created_at DESC"
         ))
         .fetch_all(self.db())
@@ -62,7 +62,7 @@ impl Store {
             expires_at: Some(iso_in_days(days)),
             scope: None,
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO api_tokens (id, token_hash, actor, label, created_by, created_at, last_used_at, kind, expires_at) \
              VALUES (?, ?, ?, ?, ?, ?, NULL, 'pat', ?)",
         )
@@ -106,7 +106,7 @@ impl Store {
             expires_at: Some(iso_in_secs(OAUTH_TOKEN_TTL_SECS)),
             scope: Some(scope.to_string()),
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO api_tokens (id, token_hash, actor, label, created_by, created_at, last_used_at, kind, client_id, granted_by, expires_at, scope) \
              VALUES (?, ?, ?, ?, ?, ?, NULL, 'oauth', ?, ?, ?, ?)",
         )
@@ -134,10 +134,11 @@ impl Store {
     /// Resolve a bearer token to its actor (and stamp last_used), honoring
     /// expiry (NULL = legacy non-expiring; past expiry → reject + reap).
     pub async fn tokens_resolve(&self, token: &str) -> Result<Option<String>> {
-        let row = sqlx::query("SELECT id, actor, expires_at FROM api_tokens WHERE token_hash = ?")
-            .bind(token_hash(token))
-            .fetch_optional(self.db())
-            .await?;
+        let row =
+            crate::pgq::query("SELECT id, actor, expires_at FROM api_tokens WHERE token_hash = ?")
+                .bind(token_hash(token))
+                .fetch_optional(self.db())
+                .await?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -149,14 +150,14 @@ impl Store {
                 .map(|t| t.with_timezone(&Utc) < Utc::now())
                 .unwrap_or(true);
             if expired {
-                sqlx::query("DELETE FROM api_tokens WHERE id = ?")
+                crate::pgq::query("DELETE FROM api_tokens WHERE id = ?")
                     .bind(&id)
                     .execute(self.db())
                     .await?;
                 return Ok(None);
             }
         }
-        sqlx::query("UPDATE api_tokens SET last_used_at = ? WHERE id = ?")
+        crate::pgq::query("UPDATE api_tokens SET last_used_at = ? WHERE id = ?")
             .bind(now_iso())
             .bind(&id)
             .execute(self.db())
@@ -165,7 +166,7 @@ impl Store {
     }
 
     pub async fn tokens_remove(&self, token_id: &str) -> Result<bool> {
-        let res = sqlx::query("DELETE FROM api_tokens WHERE id = ?")
+        let res = crate::pgq::query("DELETE FROM api_tokens WHERE id = ?")
             .bind(token_id)
             .execute(self.db())
             .await?;
@@ -174,7 +175,7 @@ impl Store {
 
     /// Revoke every token minted by a given OAuth client_id (used on code replay).
     pub async fn tokens_revoke_by_client(&self, client_id: &str) -> Result<u64> {
-        let res = sqlx::query("DELETE FROM api_tokens WHERE client_id = ?")
+        let res = crate::pgq::query("DELETE FROM api_tokens WHERE client_id = ?")
             .bind(client_id)
             .execute(self.db())
             .await?;
@@ -182,7 +183,7 @@ impl Store {
     }
 }
 
-fn row_to_token(r: &sqlx::sqlite::SqliteRow) -> Result<ApiToken> {
+fn row_to_token(r: &sqlx::postgres::PgRow) -> Result<ApiToken> {
     Ok(ApiToken {
         id: r.try_get("id")?,
         actor: r.try_get("actor")?,

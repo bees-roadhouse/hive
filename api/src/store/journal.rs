@@ -20,11 +20,12 @@ use super::{json_vec, new_id, now_iso, to_json, Store};
 
 impl Store {
     pub async fn journal_list(&self, limit: i64, offset: i64) -> Result<Vec<JournalEntryView>> {
-        let rows = sqlx::query("SELECT * FROM journal ORDER BY created_at DESC LIMIT ? OFFSET ?")
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(self.db())
-            .await?;
+        let rows =
+            crate::pgq::query("SELECT * FROM journal ORDER BY created_at DESC LIMIT ? OFFSET ?")
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(self.db())
+                .await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             let entry = row_to_entry(row)?;
@@ -34,7 +35,7 @@ impl Store {
     }
 
     pub async fn journal_get(&self, entry_id: &str) -> Result<Option<JournalEntryView>> {
-        let row = sqlx::query("SELECT * FROM journal WHERE id = ?")
+        let row = crate::pgq::query("SELECT * FROM journal WHERE id = ?")
             .bind(entry_id)
             .fetch_optional(self.db())
             .await?;
@@ -70,7 +71,7 @@ impl Store {
             mentions: mentions.clone(),
             created_at: now_iso(),
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO journal (id, author, body, tags, mentions, created_at) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&entry.id)
@@ -249,7 +250,7 @@ impl Store {
             }
         };
 
-        sqlx::query(
+        crate::pgq::query(
             r#"INSERT INTO anchors (id, entry_id, start, "end", text, kind, ref_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(new_id("anc"))
@@ -434,7 +435,7 @@ impl Store {
 
     /// Anchors for an entry, each with its resolved entity (Node `anchorsFor`).
     pub async fn anchors_for(&self, entry_id: &str) -> Result<Vec<ResolvedAnchor>> {
-        let rows = sqlx::query(
+        let rows = crate::pgq::query(
             r#"SELECT id, entry_id, start, "end", text, kind, ref_id, created_at FROM anchors WHERE entry_id = ? ORDER BY start"#,
         )
         .bind(entry_id)
@@ -507,11 +508,12 @@ impl Store {
                     .map(|x| (x.id, x.slug, x.name)),
                 "phase" => {
                     // phase resolution without a project context: find by name across all phases
-                    let row =
-                        sqlx::query("SELECT * FROM phases WHERE LOWER(name) = LOWER(?) LIMIT 1")
-                            .bind(&t.name)
-                            .fetch_optional(self.db())
-                            .await?;
+                    let row = crate::pgq::query(
+                        "SELECT * FROM phases WHERE LOWER(name) = LOWER(?) LIMIT 1",
+                    )
+                    .bind(&t.name)
+                    .fetch_optional(self.db())
+                    .await?;
                     match row {
                         Some(r) => {
                             let name: String = r.try_get("name")?;
@@ -522,7 +524,7 @@ impl Store {
                 }
                 // task — find the most recent task with matching title
                 _ => {
-                    let row = sqlx::query(
+                    let row = crate::pgq::query(
                         "SELECT id, title FROM tasks WHERE LOWER(title) = LOWER(?) ORDER BY created_at DESC LIMIT 1",
                     )
                     .bind(&t.name)
@@ -572,14 +574,14 @@ impl Store {
         };
 
         let owned: Vec<String> =
-            sqlx::query_scalar("SELECT slug FROM people WHERE kind='ai' AND owner=?")
+            crate::pgq::query_scalar("SELECT slug FROM people WHERE kind='ai' AND owner=?")
                 .bind(viewer)
                 .fetch_all(self.db())
                 .await?;
         push(owned, &mut authors);
 
         // AI authors that referenced viewer via links (target_kind='person', target_id=viewer).
-        let linked: Vec<String> = sqlx::query_scalar(
+        let linked: Vec<String> = crate::pgq::query_scalar(
             "SELECT DISTINCT j.author FROM journal j \
              JOIN links l ON l.source_kind='journal' AND l.source_id=j.id \
              WHERE l.target_kind='person' AND l.target_id=? \
@@ -591,7 +593,7 @@ impl Store {
         push(linked, &mut authors);
 
         // AI authors that @mentioned viewer in any entry.
-        let mentioned: Vec<String> = sqlx::query_scalar(
+        let mentioned: Vec<String> = crate::pgq::query_scalar(
             "SELECT DISTINCT j.author FROM journal j \
              WHERE j.mentions LIKE ? \
                AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')",
@@ -616,14 +618,14 @@ impl Store {
 
         // Entry-level shares (scope='entry') for this viewer.
         let shared_entry_ids: Vec<String> =
-            sqlx::query_scalar("SELECT ref FROM shares WHERE scope='entry' AND viewer=?")
+            crate::pgq::query_scalar("SELECT ref FROM shares WHERE scope='entry' AND viewer=?")
                 .bind(viewer)
                 .fetch_all(self.db())
                 .await?;
 
         // Journal-level shares (scope='journal') give visibility into entire author streams.
         let journal_shared: Vec<String> =
-            sqlx::query_scalar("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
+            crate::pgq::query_scalar("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
                 .bind(viewer)
                 .fetch_all(self.db())
                 .await?;
@@ -635,7 +637,7 @@ impl Store {
 
         // Entries where viewer is @mentioned.
         let mentioned_ids: Vec<String> =
-            sqlx::query_scalar("SELECT id FROM journal WHERE mentions LIKE ?")
+            crate::pgq::query_scalar("SELECT id FROM journal WHERE mentions LIKE ?")
                 .bind(mention_like(viewer))
                 .fetch_all(self.db())
                 .await?;
@@ -667,7 +669,7 @@ impl Store {
              WHERE (j.author IN ({author_ph}) OR (j.id IN ({extra_ph}) {writers_filter})) \
              ORDER BY j.created_at DESC LIMIT ? OFFSET ?"
         );
-        let mut q = sqlx::query(&sql);
+        let mut q = crate::pgq::query(&sql);
         for a in &authors {
             q = q.bind(a);
         }
@@ -701,7 +703,7 @@ impl Store {
     pub async fn journal_writers(&self, viewer: &str) -> Result<Vec<JournalWriter>> {
         let mut slugs = self.viewer_base_authors(viewer).await?;
         let journal_shared: Vec<String> =
-            sqlx::query_scalar("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
+            crate::pgq::query_scalar("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
                 .bind(viewer)
                 .fetch_all(self.db())
                 .await?;
@@ -738,7 +740,7 @@ impl Store {
     pub async fn visible_entry_ids(&self, viewer: &str) -> Result<HashSet<String>> {
         let mut authors = self.viewer_base_authors(viewer).await?;
         let journal_shared: Vec<String> =
-            sqlx::query_scalar("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
+            crate::pgq::query_scalar("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
                 .bind(viewer)
                 .fetch_all(self.db())
                 .await?;
@@ -750,13 +752,13 @@ impl Store {
 
         let mut ids: HashSet<String> = HashSet::new();
         let shared: Vec<String> =
-            sqlx::query_scalar("SELECT ref FROM shares WHERE scope='entry' AND viewer=?")
+            crate::pgq::query_scalar("SELECT ref FROM shares WHERE scope='entry' AND viewer=?")
                 .bind(viewer)
                 .fetch_all(self.db())
                 .await?;
         ids.extend(shared);
         let mentioned: Vec<String> =
-            sqlx::query_scalar("SELECT id FROM journal WHERE mentions LIKE ?")
+            crate::pgq::query_scalar("SELECT id FROM journal WHERE mentions LIKE ?")
                 .bind(mention_like(viewer))
                 .fetch_all(self.db())
                 .await?;
@@ -767,7 +769,7 @@ impl Store {
                 "SELECT id FROM journal WHERE author IN ({})",
                 placeholders_or_never(authors.len())
             );
-            let mut q = sqlx::query_scalar::<_, String>(&sql);
+            let mut q = crate::pgq::query_scalar::<String>(&sql);
             for a in &authors {
                 q = q.bind(a);
             }
@@ -777,7 +779,7 @@ impl Store {
     }
 }
 
-fn row_to_entry(r: &sqlx::sqlite::SqliteRow) -> Result<JournalEntry> {
+fn row_to_entry(r: &sqlx::postgres::PgRow) -> Result<JournalEntry> {
     Ok(JournalEntry {
         id: r.try_get("id")?,
         author: r.try_get("author")?,

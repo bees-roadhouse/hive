@@ -10,12 +10,13 @@ use super::{new_id, now_iso, Store};
 impl Store {
     /// Idempotent — returns the existing row if the (scope, ref, viewer) triple exists.
     pub async fn shares_create(&self, input: NewShare) -> Result<Share> {
-        let existing = sqlx::query("SELECT * FROM shares WHERE scope=? AND ref=? AND viewer=?")
-            .bind(input.scope.as_str())
-            .bind(&input.ref_)
-            .bind(&input.viewer)
-            .fetch_optional(self.db())
-            .await?;
+        let existing =
+            crate::pgq::query("SELECT * FROM shares WHERE scope=? AND ref=? AND viewer=?")
+                .bind(input.scope.as_str())
+                .bind(&input.ref_)
+                .bind(&input.viewer)
+                .fetch_optional(self.db())
+                .await?;
         if let Some(row) = existing {
             return row_to_share(&row);
         }
@@ -26,7 +27,7 @@ impl Store {
             viewer: input.viewer,
             created_at: now_iso(),
         };
-        sqlx::query(
+        crate::pgq::query(
             "INSERT INTO shares (id, scope, ref, viewer, created_at) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(&s.id)
@@ -46,15 +47,16 @@ impl Store {
     }
 
     pub async fn shares_for_viewer(&self, viewer: &str) -> Result<Vec<Share>> {
-        let rows = sqlx::query("SELECT * FROM shares WHERE viewer=? ORDER BY created_at DESC")
-            .bind(viewer)
-            .fetch_all(self.db())
-            .await?;
+        let rows =
+            crate::pgq::query("SELECT * FROM shares WHERE viewer=? ORDER BY created_at DESC")
+                .bind(viewer)
+                .fetch_all(self.db())
+                .await?;
         rows.iter().map(row_to_share).collect()
     }
 }
 
-pub(crate) fn row_to_share(r: &sqlx::sqlite::SqliteRow) -> Result<Share> {
+pub(crate) fn row_to_share(r: &sqlx::postgres::PgRow) -> Result<Share> {
     Ok(Share {
         id: r.try_get("id")?,
         scope: ShareScope::from_str_lossy(r.try_get::<String, _>("scope")?.as_str()),
