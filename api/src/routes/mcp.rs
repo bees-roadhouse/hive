@@ -500,6 +500,8 @@ mod tests {
                 "identity_resolve",
                 "identity_list",
                 "identity_unlink",
+                "artifacts_list",
+                "artifacts_get",
             ]
         );
         // Spot-check a schema verbatim against the captured Node output.

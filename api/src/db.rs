@@ -326,6 +326,26 @@ const SCHEMA: &str = r#"
       created_at  TEXT NOT NULL,
       UNIQUE (platform, platform_id)
     );
+
+    -- Claude Code artifacts (skills / agents / slash-commands) stored per AI
+    -- identity. The plugin pulls THIS actor's enabled artifacts via the sync
+    -- endpoint, authenticated by the AI-identity token. Keyed on the AI actor
+    -- (people.slug), NOT the per-user memory namespace.
+    -- Skills are modeled as a single SKILL.md `content` for v1 — multi-file
+    -- skills (scripts, references) are out of scope for now.
+    CREATE TABLE IF NOT EXISTS identity_artifacts (
+      id          TEXT PRIMARY KEY,
+      actor       TEXT NOT NULL,
+      kind        TEXT NOT NULL,
+      name        TEXT NOT NULL,
+      content     TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      enabled     BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at  TEXT NOT NULL,
+      updated_at  TEXT NOT NULL,
+      UNIQUE (actor, kind, name)
+    );
+    CREATE INDEX IF NOT EXISTS identity_artifacts_actor ON identity_artifacts (actor);
 "#;
 
 /// Unified full-text index. Postgres equivalent of the old FTS5 virtual table:
