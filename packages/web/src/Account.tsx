@@ -16,6 +16,7 @@ export const Account: Component = () => {
   const me = getCurrentUser();
   const [users, { refetch: refetchUsers }] = createResource(() => api.users());
   const [tokens, { refetch: refetchTokens }] = createResource(() => api.apiTokens());
+  const [apps, { refetch: refetchApps }] = createResource(() => api.oauthClients());
 
   // new user form
   const [uName, setUName] = createSignal("");
@@ -55,6 +56,45 @@ export const Account: Component = () => {
   const revoke = async (id: string) => {
     await api.deleteToken(id);
     refetchTokens();
+  };
+
+  // connected apps: revoke every token a client holds (disconnects it).
+  const revokeApp = async (id: string, name: string) => {
+    if (!confirm(`Disconnect "${name}"? This revokes all of its tokens.`)) return;
+    await api.revokeOAuthClient(id);
+    refetchApps();
+    refetchTokens();
+  };
+
+  // memory-namespace bulk reassignment (admin-only, bulk → confirm first)
+  const [rUnscoped, setRUnscoped] = createSignal(false);
+  const [rFromUser, setRFromUser] = createSignal("");
+  const [rAuthor, setRAuthor] = createSignal("");
+  const [rTo, setRTo] = createSignal("");
+  const [rResult, setRResult] = createSignal<string | null>(null);
+  const [rErr, setRErr] = createSignal<string | null>(null);
+
+  const reassignScope = async (e: Event) => {
+    e.preventDefault();
+    setRResult(null);
+    setRErr(null);
+    const from = rFromUser().trim();
+    const author = rAuthor().trim();
+    const to = rTo().trim();
+    const target = to ? `user "${to}"` : "global (no owner)";
+    if (!confirm(`Bulk-reassign matching journal entries to ${target}? This can't be undone in one click.`))
+      return;
+    try {
+      const { changed } = await api.reassignJournalScope({
+        match_unscoped: rUnscoped(),
+        from_user: from || undefined,
+        author: author || undefined,
+        to: to ? to : null,
+      });
+      setRResult(`${changed} entries reassigned.`);
+    } catch (err) {
+      setRErr(String(err instanceof Error ? err.message : err));
+    }
   };
 
   // legacy import (upload an old hive.db)
@@ -160,6 +200,51 @@ export const Account: Component = () => {
           </select>
           <button type="submit">Mint token</button>
         </form>
+      </section>
+
+      <section>
+        <h3>Connected apps</h3>
+        <p class="dim">OAuth clients that have been granted access via the consent flow. Revoking disconnects the app by deleting all of its tokens.</p>
+        <table class="data-table">
+          <thead>
+            <tr><th>App</th><th>Connected</th><th>Active tokens</th><th>Last used</th><th></th></tr>
+          </thead>
+          <tbody>
+            <For each={apps() ?? []}>
+              {(c) => (
+                <tr>
+                  <td>{c.client_name}</td>
+                  <td>{c.created_at.slice(0, 10)}</td>
+                  <td>{c.active_tokens}</td>
+                  <td>{c.last_used_at ? c.last_used_at.slice(0, 10) : "—"}</td>
+                  <td><button class="danger" onClick={() => revokeApp(c.client_id, c.client_name)}>Revoke app</button></td>
+                </tr>
+              )}
+            </For>
+          </tbody>
+        </table>
+        <Show when={(apps() ?? []).length === 0}><p class="dim">No apps connected.</p></Show>
+      </section>
+
+      <section>
+        <h3>Memory namespaces</h3>
+        <p class="dim">
+          Admin tool: bulk-reassign journal ownership across per-user memory namespaces. Filters are
+          ANDed; an empty "to user" makes matched entries global (visible to everyone). This is a bulk
+          mutation — you'll be asked to confirm.
+        </p>
+        <form class="inline-form" onSubmit={reassignScope}>
+          <label class="checkbox-label">
+            <input type="checkbox" checked={rUnscoped()} onChange={(e) => setRUnscoped(e.currentTarget.checked)} />
+            match unscoped (global) entries
+          </label>
+          <input placeholder="from user (optional)" value={rFromUser()} onInput={(e) => setRFromUser(e.currentTarget.value)} />
+          <input placeholder="author (optional)" value={rAuthor()} onInput={(e) => setRAuthor(e.currentTarget.value)} />
+          <input placeholder="to user (blank = global)" value={rTo()} onInput={(e) => setRTo(e.currentTarget.value)} />
+          <button type="submit" class="danger">Reassign</button>
+        </form>
+        <Show when={rResult()}><p class="dim">{rResult()}</p></Show>
+        <Show when={rErr()}><p class="auth-error">{rErr()}</p></Show>
       </section>
 
       <section>

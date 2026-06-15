@@ -39,6 +39,10 @@ const SCHEMA: &str = r#"
       body       TEXT NOT NULL,
       tags       TEXT NOT NULL DEFAULT '[]',
       mentions   TEXT NOT NULL DEFAULT '[]',
+      -- Namespace owner: the human user this entry belongs to. NULL = global /
+      -- "continuous" history visible to everyone. Non-NULL = visible only to
+      -- that user (+ admins). See the Visibility model in middleware.rs.
+      user_scope TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -295,7 +299,9 @@ const SCHEMA: &str = r#"
       scope          TEXT NOT NULL,
       created_at     TEXT NOT NULL,
       expires_at     TEXT NOT NULL,
-      used_at        TEXT
+      used_at        TEXT,
+      -- Requested access-token lifetime (seconds) carried from consent; NULL = default.
+      token_ttl_secs BIGINT
     );
     CREATE INDEX IF NOT EXISTS oauth_codes_expiry ON oauth_auth_codes (expires_at);
 
@@ -357,6 +363,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
     // Idempotent column additions for DBs created before these columns existed.
     // Postgres has ADD COLUMN IF NOT EXISTS, so no existence probe is needed.
     for ddl in [
+        "ALTER TABLE journal    ADD COLUMN IF NOT EXISTS user_scope TEXT",
         "ALTER TABLE sources    ADD COLUMN IF NOT EXISTS owner      TEXT",
         "ALTER TABLE tasks      ADD COLUMN IF NOT EXISTS phase      TEXT",
         "ALTER TABLE tasks      ADD COLUMN IF NOT EXISTS due        TEXT",
@@ -369,6 +376,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS granted_by TEXT",
         "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS expires_at TEXT",
         "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS scope      TEXT",
+        "ALTER TABLE oauth_auth_codes ADD COLUMN IF NOT EXISTS token_ttl_secs BIGINT",
     ] {
         sqlx::raw_sql(ddl).execute(pool).await?;
     }

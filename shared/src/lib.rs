@@ -225,6 +225,19 @@ pub struct OAuthClient {
     pub created_at: String,
 }
 
+/// A registered OAuth client plus live token stats, for the admin
+/// connected-apps view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthClientStatus {
+    pub client_id: String,
+    pub client_name: String,
+    pub created_at: String,
+    /// Count of this client's currently-active (non-expired) oauth tokens.
+    pub active_tokens: i64,
+    /// Most-recent `last_used_at` across this client's tokens (null = never used).
+    pub last_used_at: Option<String>,
+}
+
 /// An AI identity a signed-in human owns and may grant via the consent flow.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiIdentity {

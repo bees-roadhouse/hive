@@ -27,9 +27,9 @@ pub fn router() -> Router<Store> {
 }
 
 /// GET /api/search — ?mode=semantic|standard|precision routes to the semantic
-/// engine (flags: hybrid/rerank/blanket/threshold/identity/peer/viewer);
-/// anything else is FTS keyword search. Results are scoped to the acting
-/// user's visible entries; ?viewer= overrides.
+/// engine (flags: hybrid/rerank/blanket/threshold/identity/peer); anything else
+/// is FTS keyword search. Results are scoped to the AUTHENTICATED principal's
+/// namespace (admins search unscoped); the client cannot widen this.
 async fn search(
     State(s): State<Store>,
     Extension(ctx): Extension<AuthCtx>,
@@ -37,10 +37,12 @@ async fn search(
 ) -> ApiResult {
     let query = q.get("q").cloned().unwrap_or_default();
     let limit: usize = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(25);
-    let viewer = q
-        .get("viewer")
-        .cloned()
-        .unwrap_or_else(|| ctx.actor().to_string());
+    // Admins search everything (viewer=None); everyone else is namespace-scoped.
+    let viewer: Option<String> = if ctx.is_admin() {
+        None
+    } else {
+        Some(ctx.namespace_user().to_string())
+    };
 
     let mode = q.get("mode").map(String::as_str);
     if matches!(
@@ -60,13 +62,13 @@ async fn search(
             rerank: Some(flag("rerank")),
             blanket: if off("blanket") { Some(false) } else { None },
             threshold: q.get("threshold").and_then(|t| t.parse().ok()),
-            viewer: Some(viewer),
+            viewer: viewer.clone(),
             identity: q.get("identity").filter(|v| !v.is_empty()).cloned(),
             peer: q.get("peer").filter(|v| !v.is_empty()).cloned(),
         };
         return Ok(Json(s.semantic_search(&query, opts).await?).into_response());
     }
-    Ok(Json(s.search(&query, limit, Some(&viewer)).await?).into_response())
+    Ok(Json(s.search(&query, limit, viewer.as_deref()).await?).into_response())
 }
 
 #[derive(Deserialize, Default)]
@@ -87,6 +89,11 @@ async fn recall(
     if identity.is_empty() {
         return Ok(err(StatusCode::BAD_REQUEST, "identity required"));
     }
+    let viewer = if ctx.is_admin() {
+        None
+    } else {
+        Some(ctx.namespace_user().to_string())
+    };
     let result = s
         .recall(
             &identity,
@@ -94,17 +101,27 @@ async fn recall(
                 peer: body.peer,
                 query: body.query,
                 budget: body.budget,
+                viewer,
             },
         )
         .await?;
     Ok(Json(result).into_response())
 }
 
-async fn dashboard(State(s): State<Store>) -> ApiResult {
+// dashboard / graph / autocomplete are cross-namespace aggregate views (counts,
+// the full knowledge graph, global typeahead). Until they're per-namespace they
+// are admin-only so they can't leak other users' entries.
+async fn dashboard(State(s): State<Store>, Extension(ctx): Extension<AuthCtx>) -> ApiResult {
+    if !ctx.is_admin() {
+        return Ok(err(StatusCode::FORBIDDEN, "admin only"));
+    }
     Ok(Json(s.dashboard().await?).into_response())
 }
 
-async fn graph(State(s): State<Store>) -> ApiResult {
+async fn graph(State(s): State<Store>, Extension(ctx): Extension<AuthCtx>) -> ApiResult {
+    if !ctx.is_admin() {
+        return Ok(err(StatusCode::FORBIDDEN, "admin only"));
+    }
     Ok(Json(s.graph().await?).into_response())
 }
 
@@ -116,8 +133,12 @@ struct AutocompleteQuery {
 
 async fn autocomplete(
     State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
     Query(params): Query<AutocompleteQuery>,
 ) -> ApiResult {
+    if !ctx.is_admin() {
+        return Ok(err(StatusCode::FORBIDDEN, "admin only"));
+    }
     let q = params.q.unwrap_or_default();
     let kinds = params
         .kinds

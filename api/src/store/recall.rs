@@ -82,6 +82,8 @@ pub struct RecallOptions {
     pub peer: Option<String>,
     pub query: Option<String>,
     pub budget: Option<usize>,
+    /// Namespace user to scope the journal recall to (None = admin/unscoped).
+    pub viewer: Option<String>,
 }
 
 impl Store {
@@ -129,6 +131,7 @@ impl Store {
                     identity: Some(identity.to_string()),
                     peer: peer.map(String::from),
                     mode: Some("precision".to_string()),
+                    viewer: opts.viewer.clone(),
                     ..Default::default()
                 },
             )

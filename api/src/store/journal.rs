@@ -13,6 +13,8 @@ use hive_shared::{
 use serde_json::json;
 use sqlx::Row;
 
+use crate::middleware::Visibility;
+
 use super::decisions::DecisionCreate;
 use super::events::EventCreate;
 use super::tasks::TaskCreate;
@@ -34,15 +36,69 @@ impl Store {
         Ok(out)
     }
 
-    pub async fn journal_get(&self, entry_id: &str) -> Result<Option<JournalEntryView>> {
+    pub async fn journal_get(
+        &self,
+        entry_id: &str,
+        vis: &Visibility,
+    ) -> Result<Option<JournalEntryView>> {
         let row = crate::pgq::query("SELECT * FROM journal WHERE id = ?")
             .bind(entry_id)
             .fetch_optional(self.db())
             .await?;
-        match row {
-            Some(row) => Ok(Some(self.entry_view(row_to_entry(&row)?).await?)),
-            None => Ok(None),
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        // Namespace gate: non-admins get an entry only if it's global, in their
+        // own namespace, or explicitly shared/@mentioned to them. Hidden as 404.
+        if let Visibility::Namespace(u) = vis {
+            let scope: Option<String> = row.try_get("user_scope")?;
+            let own_or_global = scope.as_deref().map(|s| s == u).unwrap_or(true);
+            if !own_or_global {
+                let visible = self.visible_entry_ids(vis).await?.unwrap_or_default();
+                if !visible.contains(entry_id) {
+                    return Ok(None);
+                }
+            }
         }
+        Ok(Some(self.entry_view(row_to_entry(&row)?).await?))
+    }
+
+    /// Admin bulk-reassignment of journal namespace ownership. Filters (ANDed,
+    /// all optional) pick the entries: `match_unscoped` = currently global,
+    /// `from_user` = currently owned by that user, `author` = written by that
+    /// actor. `to` is the new owner (None = make global). Returns rows changed.
+    /// With no filters it reassigns every entry (admin-only, deliberate).
+    pub async fn journal_reassign_scope(
+        &self,
+        match_unscoped: bool,
+        from_user: Option<&str>,
+        author: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<u64> {
+        let mut clauses: Vec<String> = Vec::new();
+        if match_unscoped {
+            clauses.push("user_scope IS NULL".to_string());
+        }
+        if from_user.is_some() {
+            clauses.push("user_scope = ?".to_string());
+        }
+        if author.is_some() {
+            clauses.push("author = ?".to_string());
+        }
+        let where_ = if clauses.is_empty() {
+            "TRUE".to_string()
+        } else {
+            clauses.join(" AND ")
+        };
+        let sql = format!("UPDATE journal SET user_scope = ? WHERE {where_}");
+        let mut q = crate::pgq::query(&sql).bind(to);
+        if let Some(u) = from_user {
+            q = q.bind(u);
+        }
+        if let Some(a) = author {
+            q = q.bind(a);
+        }
+        Ok(q.execute(self.db()).await?.rows_affected())
     }
 
     /// The one write path. Persist immutable prose, then materialise each anchored
@@ -57,6 +113,7 @@ impl Store {
         &self,
         input: NewJournalEntry,
         actor_override: Option<&str>,
+        user_scope: Option<&str>,
     ) -> Result<JournalEntryView> {
         let author = actor_override
             .map(String::from)
@@ -71,14 +128,18 @@ impl Store {
             mentions: mentions.clone(),
             created_at: now_iso(),
         };
+        // Namespace owner: the human the writing principal acts for (None = a
+        // system/worker write → global/continuous history).
         crate::pgq::query(
-            "INSERT INTO journal (id, author, body, tags, mentions, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO journal (id, author, body, tags, mentions, user_scope, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&entry.id)
         .bind(&entry.author)
         .bind(&entry.body)
         .bind(to_json(&entry.tags))
         .bind(to_json(&entry.mentions))
+        .bind(user_scope)
         .bind(&entry.created_at)
         .execute(self.db())
         .await?;
@@ -605,44 +666,42 @@ impl Store {
         Ok(authors)
     }
 
-    /// Journal entries visible to a viewer, optionally filtered to specific writers
-    /// (Node `visibleJournal`).
+    /// Journal entries visible to a principal, optionally filtered to specific
+    /// writers (Node `visibleJournal`, now per-user-namespace). Admins see every
+    /// entry; everyone else sees global + own-namespace entries surfaced by the
+    /// author/share/mention ACL.
     pub async fn visible_journal(
         &self,
-        viewer: &str,
+        vis: &Visibility,
         writers: Option<&[String]>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<JournalEntryView>> {
-        let mut authors = self.viewer_base_authors(viewer).await?;
-
-        // Entry-level shares (scope='entry') for this viewer.
+        let viewer = match vis {
+            Visibility::All => return self.journal_all(writers, limit, offset).await,
+            Visibility::Namespace(u) => u.clone(),
+        };
+        let viewer = viewer.as_str();
+        // Base authors (self + owned/related AIs) are NAMESPACE-GATED.
+        let mut base_authors = self.viewer_base_authors(viewer).await?;
+        // Journal-scope shares grant a whole author stream and PIERCE the
+        // namespace (explicit "open my journal to you").
+        let mut shared_authors: Vec<String> =
+            crate::pgq::query_scalar("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
+                .bind(viewer)
+                .fetch_all(self.db())
+                .await?;
+        // Entry shares + @mentions are explicit per-entry grants that PIERCE.
         let shared_entry_ids: Vec<String> =
             crate::pgq::query_scalar("SELECT ref FROM shares WHERE scope='entry' AND viewer=?")
                 .bind(viewer)
                 .fetch_all(self.db())
                 .await?;
-
-        // Journal-level shares (scope='journal') give visibility into entire author streams.
-        let journal_shared: Vec<String> =
-            crate::pgq::query_scalar("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
-                .bind(viewer)
-                .fetch_all(self.db())
-                .await?;
-        for a in journal_shared {
-            if !authors.contains(&a) {
-                authors.push(a);
-            }
-        }
-
-        // Entries where viewer is @mentioned.
         let mentioned_ids: Vec<String> =
             crate::pgq::query_scalar("SELECT id FROM journal WHERE mentions LIKE ?")
                 .bind(mention_like(viewer))
                 .fetch_all(self.db())
                 .await?;
-
-        // Union the visible entry id set (from shares + mentions).
         let mut extra_ids: Vec<String> = Vec::new();
         for id in shared_entry_ids.into_iter().chain(mentioned_ids) {
             if !extra_ids.contains(&id) {
@@ -650,27 +709,35 @@ impl Store {
             }
         }
 
-        // Optional writers filter: intersect with the visible authors.
+        // Optional writers filter: intersect with both author lists.
         let writers = writers.filter(|w| !w.is_empty());
         if let Some(w) = writers {
-            authors.retain(|a| w.contains(a));
+            base_authors.retain(|a| w.contains(a));
+            shared_authors.retain(|a| w.contains(a));
         }
 
-        let author_ph = placeholders_or_never(authors.len());
+        let base_ph = placeholders_or_never(base_authors.len());
+        let shared_ph = placeholders_or_never(shared_authors.len());
         let extra_ph = placeholders_or_never(extra_ids.len());
-        // writers filter on the extra-id path: only include extra entries whose
-        // author is in the writers filter.
         let writers_filter = match writers {
             Some(w) => format!("AND j.author IN ({})", placeholders_or_never(w.len())),
             None => String::new(),
         };
+        // Namespace gate applies to the base-author branch ONLY; shared streams,
+        // entry shares, and @mentions pierce it.
         let sql = format!(
-            "SELECT j.* FROM journal j \
-             WHERE (j.author IN ({author_ph}) OR (j.id IN ({extra_ph}) {writers_filter})) \
+            "SELECT j.* FROM journal j WHERE \
+               (j.author IN ({base_ph}) AND (j.user_scope IS NULL OR j.user_scope = ?)) \
+               OR j.author IN ({shared_ph}) \
+               OR (j.id IN ({extra_ph}) {writers_filter}) \
              ORDER BY j.created_at DESC LIMIT ? OFFSET ?"
         );
         let mut q = crate::pgq::query(&sql);
-        for a in &authors {
+        for a in &base_authors {
+            q = q.bind(a);
+        }
+        q = q.bind(viewer);
+        for a in &shared_authors {
             q = q.bind(a);
         }
         for id in &extra_ids {
@@ -682,9 +749,43 @@ impl Store {
             }
         }
         let rows = q.bind(limit).bind(offset).fetch_all(self.db()).await?;
+        self.hydrate_entries(&rows).await
+    }
 
+    /// Admin path: every entry, optionally filtered to writers, no namespace gate.
+    async fn journal_all(
+        &self,
+        writers: Option<&[String]>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<JournalEntryView>> {
+        let writers = writers.filter(|w| !w.is_empty());
+        let sql = match writers {
+            Some(w) => format!(
+                "SELECT j.* FROM journal j WHERE j.author IN ({}) \
+                 ORDER BY j.created_at DESC LIMIT ? OFFSET ?",
+                placeholders_or_never(w.len())
+            ),
+            None => {
+                "SELECT j.* FROM journal j ORDER BY j.created_at DESC LIMIT ? OFFSET ?".to_string()
+            }
+        };
+        let mut q = crate::pgq::query(&sql);
+        if let Some(w) = writers {
+            for x in w {
+                q = q.bind(x);
+            }
+        }
+        let rows = q.bind(limit).bind(offset).fetch_all(self.db()).await?;
+        self.hydrate_entries(&rows).await
+    }
+
+    async fn hydrate_entries(
+        &self,
+        rows: &[sqlx::postgres::PgRow],
+    ) -> Result<Vec<JournalEntryView>> {
         let mut out = Vec::with_capacity(rows.len());
-        for row in &rows {
+        for row in rows {
             let entry = row_to_entry(row)?;
             // Parity with Node: visibleJournal calls refsFor(r.id) — the entry ID,
             // not the body — so refs always resolve empty on this path.
@@ -698,9 +799,16 @@ impl Store {
         Ok(out)
     }
 
-    /// Writers visible to a viewer: themselves + their AIs + related AIs
-    /// (Node `journalWriters`).
-    pub async fn journal_writers(&self, viewer: &str) -> Result<Vec<JournalWriter>> {
+    /// Writers visible to a principal: their own + related AIs (Node
+    /// `journalWriters`). Admins get every author.
+    pub async fn journal_writers(&self, vis: &Visibility) -> Result<Vec<JournalWriter>> {
+        let viewer = match vis {
+            Visibility::All => {
+                return self.all_writers().await;
+            }
+            Visibility::Namespace(u) => u.clone(),
+        };
+        let viewer = viewer.as_str();
         let mut slugs = self.viewer_base_authors(viewer).await?;
         let journal_shared: Vec<String> =
             crate::pgq::query_scalar("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
@@ -735,22 +843,53 @@ impl Store {
         Ok(result)
     }
 
-    /// Journal entry ids visible to a viewer — the permission boundary every read
-    /// (feed, search, entity reads) filters through (Node `visibleEntryIds`).
-    pub async fn visible_entry_ids(&self, viewer: &str) -> Result<HashSet<String>> {
-        let mut authors = self.viewer_base_authors(viewer).await?;
-        let journal_shared: Vec<String> =
+    /// Admin path: every journal author as a writer.
+    async fn all_writers(&self) -> Result<Vec<JournalWriter>> {
+        let slugs: Vec<String> = crate::pgq::query_scalar("SELECT DISTINCT author FROM journal")
+            .fetch_all(self.db())
+            .await?;
+        let mut result = Vec::with_capacity(slugs.len());
+        for slug in &slugs {
+            match self.people_get(slug).await? {
+                Some(p) => result.push(JournalWriter {
+                    slug: p.slug,
+                    name: p.name,
+                    kind: p.kind,
+                    owner: p.owner,
+                }),
+                None => result.push(JournalWriter {
+                    slug: slug.clone(),
+                    name: slug.clone(),
+                    kind: ActorKind::Human,
+                    owner: None,
+                }),
+            }
+        }
+        result.sort_by(|a, b| a.slug.cmp(&b.slug));
+        Ok(result)
+    }
+
+    /// Journal entry ids visible to a principal — the permission boundary every
+    /// read (feed, search, entity reads) filters through (Node `visibleEntryIds`,
+    /// now per-user-namespace). Returns `None` for an admin (sees everything — no
+    /// id filter). For a non-admin the candidate set (author streams + shares +
+    /// @mentions) is hard-gated to the principal's namespace: only entries that
+    /// are global (`user_scope IS NULL`) or owned by their namespace user.
+    pub async fn visible_entry_ids(&self, vis: &Visibility) -> Result<Option<HashSet<String>>> {
+        let Visibility::Namespace(viewer) = vis else {
+            return Ok(None);
+        };
+        let viewer = viewer.as_str();
+        let base_authors = self.viewer_base_authors(viewer).await?;
+        let shared_authors: Vec<String> =
             crate::pgq::query_scalar("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
                 .bind(viewer)
                 .fetch_all(self.db())
                 .await?;
-        for a in journal_shared {
-            if !authors.contains(&a) {
-                authors.push(a);
-            }
-        }
 
         let mut ids: HashSet<String> = HashSet::new();
+        // Explicit entry shares + @mentions pierce the namespace (a deliberate
+        // "relates to you" signal across users).
         let shared: Vec<String> =
             crate::pgq::query_scalar("SELECT ref FROM shares WHERE scope='entry' AND viewer=?")
                 .bind(viewer)
@@ -764,18 +903,35 @@ impl Store {
                 .await?;
         ids.extend(mentioned);
 
-        if !authors.is_empty() {
+        // Base author streams are namespace-gated: global or own-namespace only.
+        if !base_authors.is_empty() {
             let sql = format!(
-                "SELECT id FROM journal WHERE author IN ({})",
-                placeholders_or_never(authors.len())
+                "SELECT id FROM journal WHERE author IN ({}) \
+                 AND (user_scope IS NULL OR user_scope = ?)",
+                placeholders_or_never(base_authors.len())
             );
             let mut q = crate::pgq::query_scalar::<String>(&sql);
-            for a in &authors {
+            for a in &base_authors {
+                q = q.bind(a);
+            }
+            q = q.bind(viewer);
+            ids.extend(q.fetch_all(self.db()).await?);
+        }
+
+        // Journal-scope-shared author streams pierce the namespace.
+        if !shared_authors.is_empty() {
+            let sql = format!(
+                "SELECT id FROM journal WHERE author IN ({})",
+                placeholders_or_never(shared_authors.len())
+            );
+            let mut q = crate::pgq::query_scalar::<String>(&sql);
+            for a in &shared_authors {
                 q = q.bind(a);
             }
             ids.extend(q.fetch_all(self.db()).await?);
         }
-        Ok(ids)
+
+        Ok(Some(ids))
     }
 }
 

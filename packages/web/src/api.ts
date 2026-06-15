@@ -33,6 +33,7 @@ import type {
   AuthConfig,
   AuthMe,
   OAuthConsentContext,
+  OAuthClientStatus,
   OnboardingPayload,
   OnboardingStatus,
   SafeUser,
@@ -199,6 +200,7 @@ export const api = {
     scope: string;
     ai_actor: string;
     csrf: string;
+    token_ttl_secs?: number;
   }) =>
     fetch("/oauth/authorize/grant", {
       method: "POST",
@@ -221,6 +223,25 @@ export const api = {
       body: JSON.stringify({ actor, label, expiresInDays }),
     }),
   deleteToken: (id: string) => req<void>(`/tokens/${id}`, { method: "DELETE" }),
+
+  // admin: connected OAuth apps — list clients with live token stats, revoke all
+  // of a client's tokens (disconnects the app).
+  oauthClients: () => req<OAuthClientStatus[]>("/oauth/clients"),
+  revokeOAuthClient: (id: string) =>
+    req<{ revoked: number }>(`/oauth/clients/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  // admin: bulk-reassign journal namespace ownership. Filters are ANDed; `to`
+  // omitted/null makes matched entries global.
+  reassignJournalScope: (body: {
+    match_unscoped?: boolean;
+    from_user?: string;
+    author?: string;
+    to?: string | null;
+  }) =>
+    req<{ changed: number }>("/journal/reassign-scope", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 
   // admin: bulk import from a legacy hive.db (SQLite). Multipart upload — we let the
   // browser set the content-type/boundary, so this bypasses the JSON `req` helper.
