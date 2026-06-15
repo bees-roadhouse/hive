@@ -126,6 +126,7 @@ impl Store {
             body: input.body.clone(),
             tags: input.tags.clone().unwrap_or_default(),
             mentions: mentions.clone(),
+            user_scope: user_scope.map(String::from),
             created_at: now_iso(),
         };
         // Namespace owner: the human the writing principal acts for (None = a
@@ -674,11 +675,12 @@ impl Store {
         &self,
         vis: &Visibility,
         writers: Option<&[String]>,
+        scope: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<JournalEntryView>> {
         let viewer = match vis {
-            Visibility::All => return self.journal_all(writers, limit, offset).await,
+            Visibility::All => return self.journal_all(writers, scope, limit, offset).await,
             Visibility::Namespace(u) => u.clone(),
         };
         let viewer = viewer.as_str();
@@ -724,12 +726,16 @@ impl Store {
             None => String::new(),
         };
         // Namespace gate applies to the base-author branch ONLY; shared streams,
-        // entry shares, and @mentions pierce it.
+        // entry shares, and @mentions pierce it. The optional `scope` filter only
+        // NARROWS this already-permitted set (it never widens visibility): it is
+        // ANDed onto the whole WHERE.
+        let scope_filter = scope_clause(scope);
         let sql = format!(
-            "SELECT j.* FROM journal j WHERE \
+            "SELECT j.* FROM journal j WHERE (\
                (j.author IN ({base_ph}) AND (j.user_scope IS NULL OR j.user_scope = ?)) \
                OR j.author IN ({shared_ph}) \
-               OR (j.id IN ({extra_ph}) {writers_filter}) \
+               OR (j.id IN ({extra_ph}) {writers_filter})\
+             ){scope_filter} \
              ORDER BY j.created_at DESC LIMIT ? OFFSET ?"
         );
         let mut q = crate::pgq::query(&sql);
@@ -748,27 +754,33 @@ impl Store {
                 q = q.bind(x);
             }
         }
+        q = bind_scope(q, scope);
         let rows = q.bind(limit).bind(offset).fetch_all(self.db()).await?;
         self.hydrate_entries(&rows).await
     }
 
     /// Admin path: every entry, optionally filtered to writers, no namespace gate.
+    /// The optional `scope` filter lets an admin pivot the feed to a single
+    /// namespace (or the global/continuous stream).
     async fn journal_all(
         &self,
         writers: Option<&[String]>,
+        scope: Option<&str>,
         limit: i64,
         offset: i64,
     ) -> Result<Vec<JournalEntryView>> {
         let writers = writers.filter(|w| !w.is_empty());
+        let scope_filter = scope_clause(scope);
         let sql = match writers {
             Some(w) => format!(
-                "SELECT j.* FROM journal j WHERE j.author IN ({}) \
+                "SELECT j.* FROM journal j WHERE j.author IN ({}){scope_filter} \
                  ORDER BY j.created_at DESC LIMIT ? OFFSET ?",
                 placeholders_or_never(w.len())
             ),
-            None => {
-                "SELECT j.* FROM journal j ORDER BY j.created_at DESC LIMIT ? OFFSET ?".to_string()
-            }
+            None => format!(
+                "SELECT j.* FROM journal j WHERE TRUE{scope_filter} \
+                 ORDER BY j.created_at DESC LIMIT ? OFFSET ?"
+            ),
         };
         let mut q = crate::pgq::query(&sql);
         if let Some(w) = writers {
@@ -776,6 +788,7 @@ impl Store {
                 q = q.bind(x);
             }
         }
+        q = bind_scope(q, scope);
         let rows = q.bind(limit).bind(offset).fetch_all(self.db()).await?;
         self.hydrate_entries(&rows).await
     }
@@ -942,6 +955,7 @@ fn row_to_entry(r: &sqlx::postgres::PgRow) -> Result<JournalEntry> {
         body: r.try_get("body")?,
         tags: json_vec(r.try_get::<String, _>("tags")?.as_str()),
         mentions: json_vec(r.try_get::<String, _>("mentions")?.as_str()),
+        user_scope: r.try_get("user_scope")?,
         created_at: r.try_get("created_at")?,
     })
 }
@@ -949,6 +963,34 @@ fn row_to_entry(r: &sqlx::postgres::PgRow) -> Result<JournalEntry> {
 /// `%"viewer"%` — Node's LIKE probe into the mentions JSON column.
 fn mention_like(viewer: &str) -> String {
     format!("%\"{viewer}\"%")
+}
+
+/// Sentinel scope value meaning "the global / continuous (un-owned) stream"
+/// — i.e. `user_scope IS NULL`. Any other `Some(slug)` matches that exact owner.
+pub const GLOBAL_SCOPE: &str = "__global__";
+
+/// SQL fragment ANDed onto the feed query for the optional namespace filter.
+/// `None` → no extra clause; `Some(GLOBAL_SCOPE)` → only un-owned (global)
+/// entries; `Some(slug)` → only entries owned by `slug`. This only ever NARROWS
+/// the already-permitted set.
+fn scope_clause(scope: Option<&str>) -> &'static str {
+    match scope {
+        None => "",
+        Some(GLOBAL_SCOPE) => " AND j.user_scope IS NULL",
+        Some(_) => " AND j.user_scope = ?",
+    }
+}
+
+/// Bind the placeholder used by `scope_clause` (a no-op unless `scope` is a
+/// concrete owner slug).
+fn bind_scope<'q>(
+    q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    scope: Option<&'q str>,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    match scope {
+        Some(s) if s != GLOBAL_SCOPE => q.bind(s),
+        _ => q,
+    }
 }
 
 /// `?,?,?` for n binds, or the never-matching literal Node uses when a set is empty.

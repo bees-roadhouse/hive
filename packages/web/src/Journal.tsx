@@ -26,6 +26,7 @@ import type {
   AnchorKind,
   AutocompleteItem,
   JournalEntryView,
+  JournalWriter,
   NewAnchor,
   Priority,
   ResolvedAnchor,
@@ -50,6 +51,10 @@ interface Pending {
 }
 
 const PAGE = 20;
+
+// Namespace-filter sentinel: the active scope is either a user slug, this token
+// for the global/continuous (un-owned) stream, or null for "all namespaces".
+const GLOBAL_SCOPE = "global";
 
 // Autocomplete trigger scheme:
 //   @  → person
@@ -178,6 +183,24 @@ export const Journal: Component = () => {
   const [fetchDone, setFetchDone] = createSignal(false);
   const [visibleDays, setVisibleDays] = createSignal(1);
 
+  // ---- namespace (memory-scope) filter ----
+  // null = all namespaces; GLOBAL_SCOPE = continuous/un-owned; else a user slug.
+  const [activeScope, setActiveScope] = createSignal<string | null>(null);
+  // slug → friendly name, from the writers the viewer already sees.
+  const [writers, setWriters] = createSignal<JournalWriter[]>([]);
+  const scopeName = (slug: string): string =>
+    writers().find((w) => w.slug === slug)?.name ?? slug;
+  // Friendly label for an entry's namespace chip.
+  const chipLabel = (scope: string | null | undefined): string =>
+    scope ? scopeName(scope) : "Continuous";
+  // The token a chip filters by (its entry's scope, or GLOBAL_SCOPE when null).
+  const chipScope = (scope: string | null | undefined): string => scope ?? GLOBAL_SCOPE;
+  const activeScopeLabel = createMemo(() => {
+    const s = activeScope();
+    if (s === null) return "";
+    return s === GLOBAL_SCOPE ? "Continuous" : scopeName(s);
+  });
+
   const allDayGroups = createMemo(() => groupByDay(buffer()));
   const days = createMemo(() => allDayGroups().slice(0, visibleDays()));
   const hasBufferedDays = createMemo(() => allDayGroups().length > visibleDays());
@@ -235,7 +258,7 @@ export const Journal: Component = () => {
     setFetching(true);
     try {
       while (true) {
-        const batch = await api.journal(PAGE, buffer().length);
+        const batch = await api.journal(PAGE, buffer().length, activeScope());
         if (batch.length === 0) { setFetchDone(true); return false; }
         setBuffer((prev) => [...prev, ...batch]);
         if (batch.length < PAGE) setFetchDone(true);
@@ -259,12 +282,19 @@ export const Journal: Component = () => {
     setVisibleDays(1);
     setFetching(true);
     try {
-      const batch = await api.journal(PAGE, 0);
+      const batch = await api.journal(PAGE, 0, activeScope());
       setBuffer(batch);
       if (batch.length < PAGE) setFetchDone(true);
     } finally {
       setFetching(false);
     }
+  };
+
+  // Apply (or clear) the namespace filter, then reload the feed from the top.
+  const setScope = (scope: string | null) => {
+    if (activeScope() === scope) return;
+    setActiveScope(scope);
+    void reload();
   };
 
   createEffect(on(liveRev, () => { void reload(); }, { defer: true }));
@@ -274,6 +304,8 @@ export const Journal: Component = () => {
 
   onMount(() => {
     void reload();
+    // Resolve namespace slugs → friendly names for the chips (best-effort).
+    void api.journalWriters(getActor()).then(setWriters).catch(() => {});
 
     const scrollObs = new IntersectionObserver(
       (ents) => { if (ents.some((x) => x.isIntersecting)) void revealNextDay(); },
@@ -639,6 +671,15 @@ export const Journal: Component = () => {
         <button class="primary journal-new-btn" onClick={openOverlay}>
           + new entry
         </button>
+        <Show when={activeScope() !== null}>
+          <div class="ns-filter-bar">
+            <span class="dim sm">namespace</span>
+            <span class="ns-chip ns-chip-active">◆ {activeScopeLabel()}</span>
+            <button class="ns-clear" onClick={() => setScope(null)} title="Show all namespaces">
+              ✕ all namespaces
+            </button>
+          </div>
+        </Show>
       </div>
 
       {/* ---- feed + anchored-entities rail ---- */}
@@ -659,6 +700,15 @@ export const Journal: Component = () => {
                   <article class="entry entry-fade" id={`entry-${e.id}`} data-entry-id={e.id}>
                     <header>
                       <span class="actor-chip">{e.author}</span>
+                      <button
+                        type="button"
+                        class="ns-chip"
+                        classList={{ "ns-chip-global": !e.user_scope }}
+                        title={`Filter to ${chipLabel(e.user_scope)}`}
+                        onClick={() => setScope(chipScope(e.user_scope))}
+                      >
+                        ◆ {chipLabel(e.user_scope)}
+                      </button>
                       <time>{relTime(e.created_at)}</time>
                       <Show when={e.anchors.length}>
                         <span class="dim">

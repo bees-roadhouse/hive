@@ -563,14 +563,50 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 /* Header row above the feed: "new entry" button aligned right */
 .journal-header {
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
   align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
   margin-bottom: 1.1rem;
 }
 .journal-new-btn {
   font-size: 0.88rem;
   padding: 0.4rem 0.9rem;
+  margin-left: auto;
 }
+
+/* ---- namespace (memory-scope) chips + filter bar ---- */
+.ns-chip {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  border-radius: 999px;
+  padding: 0.08rem 0.5rem;
+  font-size: 0.74rem;
+  line-height: 1.4;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ns-chip:hover { background: color-mix(in srgb, var(--accent) 16%, transparent); }
+/* Continuous (global / un-owned) namespace reads quieter than an owned one. */
+.ns-chip-global { border-color: var(--dim); color: var(--dim); }
+.ns-chip-global:hover { background: color-mix(in srgb, var(--dim) 16%, transparent); }
+.ns-chip-active { cursor: default; }
+.ns-filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.ns-clear {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--dim);
+  border-radius: 999px;
+  padding: 0.08rem 0.5rem;
+  font-size: 0.74rem;
+  cursor: pointer;
+}
+.ns-clear:hover { color: var(--accent); border-color: var(--accent); }
 
 /* Floating action button — bottom-right corner of the viewport */
 .journal-fab {

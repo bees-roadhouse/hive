@@ -317,6 +317,11 @@ export interface JournalEntry {
   tags: string[];
   /** actors @mentioned in the body. */
   mentions: string[];
+  /**
+   * Memory namespace owner (the human the writing principal acts for).
+   * null/absent = global/continuous history.
+   */
+  user_scope?: string | null;
   created_at: string;
 }
 
