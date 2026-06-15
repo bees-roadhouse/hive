@@ -145,6 +145,27 @@ export interface ApiToken {
 export const API_TOKEN_MAX_EXPIRY_DAYS = 365;
 export const API_TOKEN_DEFAULT_EXPIRY_DAYS = 90;
 
+/** A Claude Code artifact (skill, agent, or slash-command) stored per AI identity.
+ *  The plugin pulls an identity's ENABLED artifacts via the sync endpoint, keyed
+ *  on the AI actor (not the per-user memory namespace). Skills are a single
+ *  SKILL.md `content` for v1 (multi-file is out of scope). */
+export interface IdentityArtifact {
+  id: string;
+  /** The AI identity (people.slug) this artifact belongs to. */
+  actor: string;
+  /** 'skill' | 'agent' | 'command'. */
+  kind: "skill" | "agent" | "command";
+  /** Artifact name (directory / file basename). */
+  name: string;
+  /** The markdown body (frontmatter + content): SKILL.md / agent .md / command .md. */
+  content: string;
+  /** Short description (from frontmatter), for listings. */
+  description: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
 /** A dynamically-registered OAuth client (RFC 7591). */
 export interface OAuthClient {
   client_id: string;

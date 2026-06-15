@@ -688,6 +688,25 @@ fn build_tools() -> Value {
             }
         }
     ));
+    // ---- Rust-branch additions (identity artifacts: per-identity skills/agents) ----
+    tools.push(json!(
+        {
+            "name":"artifacts_list",
+            "description": "List your Claude Code artifacts (skills, agents, slash-commands) — scoped to the authenticated identity",
+            "inputSchema": {"type": "object", "properties": {}}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"artifacts_get",
+            "description": "Get one Claude Code artifact by id",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"]
+            }
+        }
+    ));
     Value::Array(tools)
 }
 
@@ -1506,6 +1525,25 @@ async fn dispatch(
             a.finish()?;
             let removed = store.identities_remove(id.unwrap(), actor).await?;
             Ok(ok_content(&json!({"removed": removed})))
+        }
+        // Claude Code artifacts for the authenticated identity (its own skills /
+        // agents / commands) — same keying as the REST sync endpoint.
+        "artifacts_list" => {
+            let a = Args::new("artifacts_list", args);
+            a.finish()?;
+            let items = store.artifacts_list(actor).await?;
+            Ok(ok_content(
+                &json!({"count": items.len(), "artifacts": items}),
+            ))
+        }
+        "artifacts_get" => {
+            let mut a = Args::new("artifacts_get", args);
+            let id = a.req_str("id");
+            a.finish()?;
+            match store.artifacts_get(id.unwrap()).await? {
+                Some(art) => Ok(ok_content(&art)),
+                None => Ok(ok_content(&json!({"error": "not found"}))),
+            }
         }
         _ => Ok(tool_error(&format!(
             "MCP error -32602: Tool {name} not found"

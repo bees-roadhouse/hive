@@ -9,6 +9,7 @@ use sqlx::PgPool;
 use tokio::sync::broadcast;
 
 pub mod actors;
+pub mod artifacts;
 pub mod config;
 pub mod conversations;
 pub mod dashboard;

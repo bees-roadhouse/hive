@@ -505,6 +505,8 @@ mod tests {
                 "conversation_get",
                 "conversations_pending",
                 "conversation_reflected",
+                "artifacts_list",
+                "artifacts_get",
             ]
         );
         // Spot-check a schema verbatim against the captured Node output.
