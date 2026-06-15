@@ -591,6 +591,60 @@ export interface JournalEntryView extends JournalEntry {
   refs: JournalRef[];
 }
 
+// ---- conversations (full-transcript session logs ingested by an external app) ----
+
+/**
+ * A logged session from an external app (claude-code / claude-desktop /
+ * openclaude). Namespace-aware exactly like the journal: user_scope is the
+ * owning user (null/absent = global). Reflection maintains the rolling summary
+ * and stamps reflected_at (null = pending the reflection queue).
+ */
+export interface Conversation {
+  id: string;
+  /** 'claude-code' | 'claude-desktop' | 'openclaude' | … */
+  app: string;
+  /** host/runtime id. */
+  instance: string | null;
+  /** friendly, human-editable name. */
+  name: string;
+  /** the AI identity it ran as. */
+  actor: string;
+  /** the app's own session id — drives idempotent ingest via (app, external_id). */
+  external_id: string | null;
+  /** 'open' | 'closed'. */
+  status: string;
+  /** rolling summary maintained by reflection. */
+  summary: string;
+  /**
+   * Memory namespace owner (the human the writing principal acts for).
+   * null/absent = global/continuous history.
+   */
+  user_scope?: string | null;
+  /** null = pending reflection. */
+  reflected_at: string | null;
+  started_at: string;
+  last_message_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One turn within a conversation transcript. */
+export interface ConversationMessage {
+  id: string;
+  conversation_id: string;
+  /** ordering within the conversation. */
+  seq: number;
+  /** 'user' | 'assistant' | 'tool' | 'system'. */
+  role: string;
+  content: string;
+  created_at: string;
+}
+
+/** A conversation plus its full transcript (the get/transcript view). */
+export interface ConversationView extends Conversation {
+  messages: ConversationMessage[];
+}
+
 export interface DashboardStats {
   entries: number;
   events: number;

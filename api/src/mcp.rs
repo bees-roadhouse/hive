@@ -599,6 +599,95 @@ fn build_tools() -> Value {
             }
         }
     ));
+    // ---- Rust-branch additions (conversations: full-transcript session logs) ----
+    // Not in the Node toolset; namespace-aware exactly like the journal.
+    let conversation_message_schema = json!({
+        "type": "object",
+        "properties": {
+            "role": {"type": "string", "enum": ["user", "assistant", "tool", "system"]},
+            "content": {"type": "string"}
+        },
+        "required": ["role", "content"],
+        "additionalProperties": false
+    });
+    tools.push(json!(
+        {
+            "name":"conversation_log",
+            "title": "Log a conversation transcript",
+            "description": "Ingest a session transcript from an external app (claude-code / claude-desktop / openclaude) (Rust-branch addition; not in the Node toolset). Upserts the conversation by (app, external_id) — idempotent re-ingest — and appends the supplied message turns in seq order. Authorship + namespace come from your token; `actor` defaults to your authenticated identity. Returns the conversation id and the number of turns appended.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "app": {"type": "string", "description": "'claude-code' | 'claude-desktop' | 'openclaude' | …"},
+                    "external_id": {"type": "string", "description": "the app's own session id (idempotent ingest key)"},
+                    "instance": {"type": "string", "description": "host/runtime id"},
+                    "name": {"type": "string", "description": "friendly, human-editable name"},
+                    "actor": {"type": "string", "description": "the AI identity it ran as (defaults to your token's actor)"},
+                    "messages": {"type": "array", "items": conversation_message_schema}
+                },
+                "required": ["app"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            }
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"conversations_list",
+            "title": "List conversations",
+            "description": "Recent conversations (newest by last message), namespace-scoped to what you can see (Rust-branch addition; not in the Node toolset).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 200}},
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            }
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"conversation_get",
+            "title": "Get a conversation transcript",
+            "description": "A conversation plus its full message transcript, namespace-checked (Rust-branch addition; not in the Node toolset).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            }
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"conversations_pending",
+            "title": "List conversations pending reflection",
+            "description": "The reflection queue: conversations not yet reflected (reflected_at IS NULL), namespace-scoped, oldest-first (Rust-branch addition; not in the Node toolset).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 200}},
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            }
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"conversation_reflected",
+            "title": "Mark a conversation reflected",
+            "description": "Stamp a conversation reflected and store its rolling summary, draining it from the reflection queue (Rust-branch addition; not in the Node toolset).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "summary": {"type": "string", "description": "the rolling summary reflection produced"}
+                },
+                "required": ["id"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            }
+        }
+    ));
     Value::Array(tools)
 }
 
@@ -985,6 +1074,52 @@ async fn dispatch(
             a.finish()?;
             match store.journal_get(id.unwrap(), &ctx.visibility()).await? {
                 Some(e) => Ok(ok_content(&e)),
+                None => Ok(ok_content(&json!({"error": "not found"}))),
+            }
+        }
+        "conversation_log" => conversation_log(store, ctx, args).await,
+        "conversations_list" => {
+            let mut a = Args::new("conversations_list", args);
+            let limit = a.opt_int("limit", Some(1), Some(200));
+            a.finish()?;
+            Ok(ok_content(
+                &store
+                    .conversations_list(&ctx.visibility(), limit.unwrap_or(50), 0)
+                    .await?,
+            ))
+        }
+        "conversation_get" => {
+            let mut a = Args::new("conversation_get", args);
+            let id = a.req_str("id");
+            a.finish()?;
+            match store
+                .conversation_get(id.unwrap(), &ctx.visibility())
+                .await?
+            {
+                Some(v) => Ok(ok_content(&v)),
+                None => Ok(ok_content(&json!({"error": "not found"}))),
+            }
+        }
+        "conversations_pending" => {
+            let mut a = Args::new("conversations_pending", args);
+            let limit = a.opt_int("limit", Some(1), Some(200));
+            a.finish()?;
+            Ok(ok_content(
+                &store
+                    .conversations_pending(&ctx.visibility(), limit.unwrap_or(50))
+                    .await?,
+            ))
+        }
+        "conversation_reflected" => {
+            let mut a = Args::new("conversation_reflected", args);
+            let id = a.req_str("id").map(String::from);
+            let summary = a.opt_str("summary").map(String::from);
+            a.finish()?;
+            match store
+                .conversation_mark_reflected(&id.unwrap(), &summary.unwrap_or_default())
+                .await?
+            {
+                Some(c) => Ok(ok_content(&c)),
                 None => Ok(ok_content(&json!({"error": "not found"}))),
             }
         }
@@ -1395,6 +1530,39 @@ async fn journal_append(store: &Store, ctx: &AuthCtx, args: &Map<String, Value>)
             .journal_append(input, Some(&actor), ctx.namespace_owner())
             .await?,
     ))
+}
+
+/// conversation_log: upsert a conversation (by app/external_id) and append its
+/// message turns in one call. Authorship + namespace come from the token's ctx;
+/// `actor` defaults to the authenticated identity.
+async fn conversation_log(store: &Store, ctx: &AuthCtx, args: &Map<String, Value>) -> ToolResult {
+    let mut a = Args::new("conversation_log", args);
+    let app = a.req_str("app").map(String::from);
+    let external_id = a.opt_str("external_id").map(String::from);
+    let instance = a.opt_str("instance").map(String::from);
+    let name = a.opt_str("name").map(String::from);
+    let actor_arg = a.opt_str("actor").map(String::from);
+    a.finish()?;
+    // messages: [{role, content}] via serde — nested failures report the serde
+    // message inside the SDK's "Input validation error" wrapper.
+    let messages: Vec<hive_shared::NewConversationMessage> = match args.get("messages") {
+        None => Vec::new(),
+        Some(v) => serde_json::from_value(v.clone())
+            .map_err(|e| invalid_args("conversation_log", &e.to_string()))?,
+    };
+    let actor = actor_arg.unwrap_or_else(|| ctx.actor().to_string());
+    let input = crate::store::conversations::ConversationUpsert {
+        app: app.unwrap(),
+        instance,
+        name,
+        actor,
+        external_id,
+    };
+    let id = store
+        .conversations_upsert(input, ctx.namespace_owner())
+        .await?;
+    let appended = store.conversation_append_messages(&id, &messages).await?;
+    Ok(ok_content(&json!({"id": id, "appended": appended})))
 }
 
 /// mcp.ts isAdmin(): the token's actor maps to a user with role 'admin'.

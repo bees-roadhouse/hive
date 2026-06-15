@@ -451,6 +451,234 @@ async fn viewer_acl_scopes_journal() {
 }
 
 #[tokio::test]
+async fn conversations_upsert_append_scope_and_reflection() {
+    use hive_api::middleware::Visibility;
+    use hive_api::store::conversations::ConversationUpsert;
+    use hive_api::store::Store;
+    use hive_shared::NewConversationMessage;
+
+    std::env::set_var("HIVE_EMBED", "hash");
+    let pool = hive_api::db::test_pool().await;
+    let store = Store::new(pool);
+
+    let upsert = |actor: &str, ext: &str| ConversationUpsert {
+        app: "claude-code".into(),
+        instance: Some("roadhouse".into()),
+        name: Some("kickoff".into()),
+        actor: actor.into(),
+        external_id: Some(ext.into()),
+    };
+
+    // Upsert idempotency by (app, external_id): same key returns the same id.
+    let id1 = store
+        .conversations_upsert(upsert("pia", "sess-1"), Some("nate"))
+        .await
+        .unwrap();
+    let id2 = store
+        .conversations_upsert(upsert("pia", "sess-1"), Some("nate"))
+        .await
+        .unwrap();
+    assert_eq!(id1, id2, "same (app, external_id) must upsert to one row");
+
+    // Message append ordering: seq continues monotonically across calls.
+    let appended = store
+        .conversation_append_messages(
+            &id1,
+            &[
+                NewConversationMessage {
+                    role: "user".into(),
+                    content: "hello".into(),
+                },
+                NewConversationMessage {
+                    role: "assistant".into(),
+                    content: "hi".into(),
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(appended, 2);
+    store
+        .conversation_append_messages(
+            &id1,
+            &[NewConversationMessage {
+                role: "user".into(),
+                content: "again".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    let view = store
+        .conversation_get(&id1, &Visibility::All)
+        .await
+        .unwrap()
+        .expect("conversation present");
+    let seqs: Vec<i64> = view.messages.iter().map(|m| m.seq).collect();
+    assert_eq!(seqs, vec![0, 1, 2], "seq is monotonic across append calls");
+    assert_eq!(view.messages[2].content, "again");
+    assert!(view.conversation.last_message_at.is_some());
+
+    // A second conversation owned by maggie's namespace, plus a global one.
+    let id_maggie = store
+        .conversations_upsert(upsert("apis", "sess-2"), Some("maggie"))
+        .await
+        .unwrap();
+    let id_global = store
+        .conversations_upsert(upsert("system", "sess-3"), None)
+        .await
+        .unwrap();
+
+    // Namespace scoping: nate sees his own + global, not maggie's.
+    let nate_vis = Visibility::Namespace("nate".into());
+    let nate_list = store.conversations_list(&nate_vis, 50, 0).await.unwrap();
+    let nate_ids: Vec<&str> = nate_list.iter().map(|c| c.id.as_str()).collect();
+    assert!(nate_ids.contains(&id1.as_str()), "nate sees own");
+    assert!(nate_ids.contains(&id_global.as_str()), "nate sees global");
+    assert!(
+        !nate_ids.contains(&id_maggie.as_str()),
+        "nate must not see maggie's namespace"
+    );
+    // get() hides maggie's conversation from nate as a 404 (None).
+    assert!(store
+        .conversation_get(&id_maggie, &nate_vis)
+        .await
+        .unwrap()
+        .is_none());
+    // Admin (All) sees every conversation.
+    let all = store
+        .conversations_list(&Visibility::All, 50, 0)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 3, "admin sees all three");
+
+    // pending → reflected transition, namespace-scoped.
+    let pending = store.conversations_pending(&nate_vis, 50).await.unwrap();
+    let pending_ids: Vec<&str> = pending.iter().map(|c| c.id.as_str()).collect();
+    assert!(pending_ids.contains(&id1.as_str()), "id1 starts pending");
+    assert!(
+        !pending_ids.contains(&id_maggie.as_str()),
+        "pending is namespace-scoped"
+    );
+    let reflected = store
+        .conversation_mark_reflected(&id1, "rolling summary")
+        .await
+        .unwrap()
+        .expect("marked");
+    assert!(reflected.reflected_at.is_some());
+    assert_eq!(reflected.summary, "rolling summary");
+    let pending_after = store.conversations_pending(&nate_vis, 50).await.unwrap();
+    assert!(
+        !pending_after.iter().any(|c| c.id == id1),
+        "reflected conversation leaves the pending queue"
+    );
+
+    // Rename updates the friendly name.
+    let renamed = store
+        .conversation_rename(&id1, "renamed session")
+        .await
+        .unwrap()
+        .expect("renamed");
+    assert_eq!(renamed.name, "renamed session");
+}
+
+#[tokio::test]
+async fn conversations_route_flow() {
+    let (app, _dir) = test_app().await;
+    let cookie = onboard(&app).await;
+
+    // Upsert via the REST route returns an id.
+    let (status, body, _) = send(
+        &app,
+        post_json(
+            "/api/conversations",
+            json!({"app": "claude-code", "external_id": "route-sess-1", "name": "rust work"}),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "upsert: {body}");
+    let id = body["id"].as_str().expect("conversation id").to_string();
+
+    // Idempotent re-upsert hits the same row.
+    let (_, body2, _) = send(
+        &app,
+        post_json(
+            "/api/conversations",
+            json!({"app": "claude-code", "external_id": "route-sess-1"}),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(body2["id"], id, "same external_id is idempotent");
+
+    // Append turns.
+    let (status, appended, _) = send(
+        &app,
+        post_json(
+            &format!("/api/conversations/{id}/messages"),
+            json!({"messages": [
+                {"role": "user", "content": "kick it off"},
+                {"role": "assistant", "content": "on it"}
+            ]}),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "append: {appended}");
+    assert_eq!(appended["appended"], 2);
+
+    // Transcript get returns the conversation + ordered messages.
+    let (status, view, _) = send(
+        &app,
+        get(&format!("/api/conversations/{id}"), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(view["messages"].as_array().map(Vec::len), Some(2));
+    assert_eq!(view["messages"][0]["seq"], 0);
+
+    // pending lists it (admin sees all).
+    let (status, pending, _) = send(&app, get("/api/conversations/pending", Some(&cookie))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(pending
+        .as_array()
+        .map(|a| a.iter().any(|c| c["id"] == id))
+        .unwrap_or(false));
+
+    // Mark reflected, then it drops out of pending.
+    let (status, reflected, _) = send(
+        &app,
+        post_json(
+            &format!("/api/conversations/{id}/reflected"),
+            json!({"summary": "did the rust work"}),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(reflected["summary"], "did the rust work");
+    assert!(reflected["reflected_at"].is_string());
+    let (_, pending2, _) = send(&app, get("/api/conversations/pending", Some(&cookie))).await;
+    assert!(!pending2
+        .as_array()
+        .map(|a| a.iter().any(|c| c["id"] == id))
+        .unwrap_or(false));
+
+    // Rename via PATCH.
+    let (status, renamed, _) = send(
+        &app,
+        patch_json(
+            &format!("/api/conversations/{id}"),
+            json!({"name": "renamed"}),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(renamed["name"], "renamed");
+}
+
+#[tokio::test]
 async fn spa_paths_are_not_gated() {
     let (app, _dir) = test_app().await;
     // Without onboarding, non-API paths must not 401/403 (the SPA has to load

@@ -10,6 +10,7 @@ use tokio::sync::broadcast;
 
 pub mod actors;
 pub mod config;
+pub mod conversations;
 pub mod dashboard;
 pub mod decisions;
 pub mod events;

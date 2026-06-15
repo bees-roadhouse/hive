@@ -326,6 +326,40 @@ const SCHEMA: &str = r#"
       created_at  TEXT NOT NULL,
       UNIQUE (platform, platform_id)
     );
+
+    -- Full-transcript session logs ingested by an external app (Claude Code /
+    -- claude-desktop / openclaude). Namespace-aware exactly like the journal:
+    -- user_scope is the owner (NULL = global), gated by the Visibility model.
+    -- Reflection (rolling summary) drains the reflected_at IS NULL queue.
+    CREATE TABLE IF NOT EXISTS conversations (
+      id              TEXT PRIMARY KEY,
+      app             TEXT NOT NULL,
+      instance        TEXT,
+      name            TEXT NOT NULL DEFAULT '',
+      actor           TEXT NOT NULL,
+      external_id     TEXT,
+      status          TEXT NOT NULL DEFAULT 'open',
+      summary         TEXT NOT NULL DEFAULT '',
+      user_scope      TEXT,
+      reflected_at    TEXT,
+      started_at      TEXT NOT NULL,
+      last_message_at TEXT,
+      created_at      TEXT NOT NULL,
+      updated_at      TEXT NOT NULL,
+      UNIQUE (app, external_id)
+    );
+    CREATE INDEX IF NOT EXISTS conversations_reflected ON conversations (reflected_at);
+    CREATE INDEX IF NOT EXISTS conversations_actor ON conversations (actor);
+
+    CREATE TABLE IF NOT EXISTS conversation_messages (
+      id              TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      seq             BIGINT NOT NULL,
+      role            TEXT NOT NULL,
+      content         TEXT NOT NULL,
+      created_at      TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS conversation_messages_conv ON conversation_messages (conversation_id, seq);
 "#;
 
 /// Unified full-text index. Postgres equivalent of the old FTS5 virtual table:
@@ -377,6 +411,14 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS expires_at TEXT",
         "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS scope      TEXT",
         "ALTER TABLE oauth_auth_codes ADD COLUMN IF NOT EXISTS token_ttl_secs BIGINT",
+        // Conversation columns that may post-date a first release.
+        "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS name            TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS summary         TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS user_scope      TEXT",
+        "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS reflected_at    TEXT",
+        "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS instance        TEXT",
+        "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS external_id     TEXT",
+        "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS last_message_at TEXT",
     ] {
         sqlx::raw_sql(ddl).execute(pool).await?;
     }

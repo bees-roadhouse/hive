@@ -500,6 +500,11 @@ mod tests {
                 "identity_resolve",
                 "identity_list",
                 "identity_unlink",
+                "conversation_log",
+                "conversations_list",
+                "conversation_get",
+                "conversations_pending",
+                "conversation_reflected",
             ]
         );
         // Spot-check a schema verbatim against the captured Node output.

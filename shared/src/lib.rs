@@ -1071,6 +1071,69 @@ pub struct JournalEntryView {
     pub refs: Vec<JournalRef>,
 }
 
+// ---- conversations (full-transcript session logs ingested by an external app) ----
+
+/// A logged session from an external app (claude-code / claude-desktop /
+/// openclaude). Namespace-aware exactly like the journal: `user_scope` is the
+/// owning user (None = global). Reflection maintains the rolling `summary` and
+/// stamps `reflected_at` (None = pending the reflection queue).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Conversation {
+    pub id: String,
+    /// 'claude-code' | 'claude-desktop' | 'openclaude' | …
+    pub app: String,
+    /// host/runtime id.
+    pub instance: Option<String>,
+    /// friendly, human-editable name.
+    pub name: String,
+    /// the AI identity it ran as.
+    pub actor: String,
+    /// the app's own session id — drives idempotent ingest via (app, external_id).
+    pub external_id: Option<String>,
+    /// 'open' | 'closed'.
+    pub status: String,
+    /// rolling summary maintained by reflection.
+    pub summary: String,
+    /// Memory namespace owner (the human the writing principal acts for). `None`
+    /// = global/continuous history.
+    #[serde(default)]
+    pub user_scope: Option<String>,
+    /// None = pending reflection.
+    pub reflected_at: Option<String>,
+    pub started_at: String,
+    pub last_message_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One turn within a conversation transcript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationMessage {
+    pub id: String,
+    pub conversation_id: String,
+    /// ordering within the conversation.
+    pub seq: i64,
+    /// 'user' | 'assistant' | 'tool' | 'system'.
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+/// A new message turn to append (role + content; seq/id/timestamps assigned server-side).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewConversationMessage {
+    pub role: String,
+    pub content: String,
+}
+
+/// A conversation plus its full transcript (the get/transcript view).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationView {
+    #[serde(flatten)]
+    pub conversation: Conversation,
+    pub messages: Vec<ConversationMessage>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskCounts {
     pub total: i64,
