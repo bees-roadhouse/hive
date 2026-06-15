@@ -33,6 +33,20 @@ struct ListQuery {
     limit: Option<i64>,
     offset: Option<i64>,
     writers: Option<String>,
+    /// Optional namespace filter: a user slug, or `global`/`continuous` for the
+    /// un-owned stream. Only NARROWS the principal's already-permitted feed.
+    scope: Option<String>,
+}
+
+/// Map the `?scope=` query value to the store's filter sentinel. `global` /
+/// `continuous` (case-insensitive) mean the un-owned stream; any other
+/// non-empty value is a literal owner slug; empty/absent means no filter.
+fn parse_scope(raw: Option<&str>) -> Option<&str> {
+    let v = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    match v.to_ascii_lowercase().as_str() {
+        "global" | "continuous" => Some(crate::store::journal::GLOBAL_SCOPE),
+        _ => Some(v),
+    }
 }
 
 async fn list(
@@ -49,9 +63,11 @@ async fn list(
             .map(String::from)
             .collect()
     });
-    // Visibility is the authenticated principal's, not a client param.
+    let scope = parse_scope(q.scope.as_deref());
+    // Visibility is the authenticated principal's, not a client param. The scope
+    // filter only narrows within what visibility already permits.
     let entries = s
-        .visible_journal(&ctx.visibility(), writers.as_deref(), limit, offset)
+        .visible_journal(&ctx.visibility(), writers.as_deref(), scope, limit, offset)
         .await?;
     Ok(Json(entries).into_response())
 }
