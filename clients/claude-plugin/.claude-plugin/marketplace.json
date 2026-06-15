@@ -1,0 +1,14 @@
+{
+  "name": "bees-roadhouse",
+  "owner": {
+    "name": "Bee's Roadhouse",
+    "url": "https://github.com/bees-roadhouse"
+  },
+  "plugins": [
+    {
+      "name": "hive",
+      "source": "./",
+      "description": "Boot a Claude Code session as a known hive AI identity: recall brief + profile injection, identity skills/agents sync, hive MCP tools, and transcript capture for reflection."
+    }
+  ]
+}

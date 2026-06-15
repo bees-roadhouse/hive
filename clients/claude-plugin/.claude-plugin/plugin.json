@@ -1,0 +1,16 @@
+{
+  "name": "hive",
+  "displayName": "Hive Memory",
+  "version": "0.1.0",
+  "description": "Boots a Claude Code session as a known hive AI identity: injects your profile + a semantic recall brief at session start, syncs your identity's skills/agents/commands, exposes hive tools over MCP, and captures the transcript back to hive for reflection.",
+  "author": {
+    "name": "Bee's Roadhouse",
+    "url": "https://github.com/bees-roadhouse/hive"
+  },
+  "homepage": "https://github.com/bees-roadhouse/hive",
+  "repository": "https://github.com/bees-roadhouse/hive",
+  "license": "MIT",
+  "keywords": ["hive", "memory", "recall", "identity", "mcp"],
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json"
+}
