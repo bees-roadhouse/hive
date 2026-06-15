@@ -602,6 +602,10 @@ pub struct JournalEntry {
     pub tags: Vec<String>,
     /// actors @mentioned in the body.
     pub mentions: Vec<String>,
+    /// Memory namespace owner (the human the writing principal acts for). `None`
+    /// = global/continuous history (a system/worker write).
+    #[serde(default)]
+    pub user_scope: Option<String>,
     pub created_at: String,
 }
 

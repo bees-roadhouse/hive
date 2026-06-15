@@ -975,7 +975,7 @@ async fn dispatch(
             a.finish()?;
             Ok(ok_content(
                 &store
-                    .visible_journal(&ctx.visibility(), None, limit.unwrap_or(30), 0)
+                    .visible_journal(&ctx.visibility(), None, None, limit.unwrap_or(30), 0)
                     .await?,
             ))
         }

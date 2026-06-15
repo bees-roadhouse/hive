@@ -83,8 +83,13 @@ async function req<T>(path: string, init?: RequestInit, timeoutMs = 15000): Prom
 }
 
 export const api = {
-  journal: (limit = 50, offset = 0) =>
-    req<JournalEntryView[]>(`/journal?limit=${limit}&offset=${offset}`),
+  // `scope` narrows the feed to one memory namespace: a user slug, or "global"
+  // for the continuous (un-owned) stream. Omitted = no namespace filter.
+  journal: (limit = 50, offset = 0, scope?: string | null) => {
+    const p = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (scope) p.set("scope", scope);
+    return req<JournalEntryView[]>(`/journal?${p}`);
+  },
   journalScoped: (viewer: string, writers?: string[], limit = 50, offset = 0) => {
     const p = new URLSearchParams({ viewer, limit: String(limit), offset: String(offset) });
     if (writers && writers.length > 0) p.set("writers", writers.join(","));
