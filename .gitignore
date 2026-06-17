@@ -3,10 +3,6 @@
 *.swp
 .DS_Store
 
-# Rust
-target/
-**/target/
-
 # Node / Solid app
 node_modules/
 **/node_modules/

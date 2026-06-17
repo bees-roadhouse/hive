@@ -18,8 +18,7 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  # ===== build: Node images (PR open/synchronize/reopen) =====
-  # JS isn't compiled, so multi-arch via QEMU is effectively free here.
+  # ===== build (PR open/synchronize/reopen) =====
   build:
     if: github.event_name == 'pull_request' && github.event.action != 'closed'
     runs-on: ubuntu-latest
@@ -57,93 +56,6 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
 
-  # ===== build: hive-rust (all-in-one Axum image) =====
-  # Rust + onnxruntime is a real compile, so QEMU arm64 emulation is
-  # pathological (multi-hour). Build each arch on its OWN native runner
-  # (free for public repos), push by digest, then assemble the multi-arch
-  # manifest in build-rust-manifest. The Node images keep publishing — the
-  # Rust stack is additive until it's proven in prod.
-  build-rust:
-    if: github.event_name == 'pull_request' && github.event.action != 'closed'
-    runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build + push by digest (${{ matrix.arch }})
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile.rust
-          platforms: linux/${{ matrix.arch }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ github.repository_owner }}/hive-rust,push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=rust-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=rust-${{ matrix.arch }}
-
-      - name: Export digest
-        run: |
-          mkdir -p /tmp/digests
-          echo "${{ steps.build.outputs.digest }}" > "/tmp/digests/${{ matrix.arch }}"
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rust-digest-${{ matrix.arch }}
-          path: /tmp/digests/*
-          retention-days: 1
-
-  # Assemble the per-arch digests into one sha-<sha> manifest list.
-  build-rust-manifest:
-    if: github.event_name == 'pull_request' && github.event.action != 'closed'
-    needs: build-rust
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: /tmp/digests
-          pattern: rust-digest-*
-          merge-multiple: true
-
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create multi-arch manifest
-        run: |
-          IMG="${{ env.REGISTRY }}/${{ github.repository_owner }}/hive-rust"
-          TAG="${IMG}:sha-${{ github.event.pull_request.head.sha }}"
-          docker buildx imagetools create --tag "$TAG" \
-            $(for d in /tmp/digests/*; do echo "${IMG}@$(cat "$d")"; done)
-          docker buildx imagetools inspect "$TAG"
-
   # ===== promote (PR closed && merged) =====
   # Retags the existing sha-{full-sha} manifest as the stream tag. No rebuild.
   promote:
@@ -154,7 +66,7 @@ jobs:
       packages: write
     strategy:
       matrix:
-        image: [api, web, worker, rust]
+        image: [api, web, worker]
     steps:
       - uses: actions/checkout@v4
 
@@ -235,10 +147,6 @@ jobs:
             ## Container images
 
             ```
-            # All-in-one Rust stack (API + SPA + worker from one image):
-            podman pull ghcr.io/${{ github.repository_owner }}/hive-rust:${{ steps.vars.outputs.version }}
-
-            # Node stack (api + web + worker):
             podman pull ghcr.io/${{ github.repository_owner }}/hive-api:${{ steps.vars.outputs.version }}
             podman pull ghcr.io/${{ github.repository_owner }}/hive-web:${{ steps.vars.outputs.version }}
             podman pull ghcr.io/${{ github.repository_owner }}/hive-worker:${{ steps.vars.outputs.version }}
