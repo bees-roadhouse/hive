@@ -642,6 +642,18 @@ impl Store {
                 .await?;
         push(owned, &mut authors);
 
+        // AI authors that have written inside this user's namespace belong to
+        // this user's memory view even if the AI person row predates ownership.
+        let namespace_ai_authors: Vec<String> = crate::pgq::query_scalar(
+            "SELECT DISTINCT j.author FROM journal j \
+             WHERE j.user_scope = ? \
+               AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')",
+        )
+        .bind(viewer)
+        .fetch_all(self.db())
+        .await?;
+        push(namespace_ai_authors, &mut authors);
+
         // AI authors that referenced viewer via links (target_kind='person', target_id=viewer).
         let linked: Vec<String> = crate::pgq::query_scalar(
             "SELECT DISTINCT j.author FROM journal j \

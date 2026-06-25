@@ -13,8 +13,8 @@ export const OAuthConsent: Component = () => {
   const state = params.get("state") ?? "";
   const scope = params.get("scope") ?? "mcp";
 
-  // Token-lifetime presets (seconds). The server clamps to [1h, 1 year].
-  const LIFETIMES = [
+  // Token-lifetime presets (seconds). 0 is the server's "never expires" sentinel.
+  const BASE_LIFETIMES = [
     { label: "7 days", secs: 7 * 24 * 60 * 60 },
     { label: "30 days", secs: 30 * 24 * 60 * 60 },
     { label: "90 days", secs: 90 * 24 * 60 * 60 },
@@ -27,7 +27,9 @@ export const OAuthConsent: Component = () => {
   const [error, setError] = createSignal<string | null>(null);
   const [busy, setBusy] = createSignal(false);
 
-  const ttlLabel = () => LIFETIMES.find((l) => l.secs === ttl())?.label ?? "1 year";
+  const lifetimes = () =>
+    ctx()?.allow_never_expires ? [...BASE_LIFETIMES, { label: "Never", secs: 0 }] : BASE_LIFETIMES;
+  const ttlLabel = () => lifetimes().find((l) => l.secs === ttl())?.label ?? "1 year";
 
   const approve = async () => {
     const ident = chosen() || ctx()?.identities[0]?.slug;
@@ -78,10 +80,10 @@ export const OAuthConsent: Component = () => {
             <label>
               Access lasts
               <select value={ttl()} onChange={(e) => setTtl(Number(e.currentTarget.value))}>
-                <For each={LIFETIMES}>{(l) => <option value={l.secs}>{l.label}</option>}</For>
+                <For each={lifetimes()}>{(l) => <option value={l.secs}>{l.label}</option>}</For>
               </select>
             </label>
-            <p class="dim">This issues a token valid for {ttlLabel()} that identifies every MCP action as that AI. You can revoke it anytime from the Account tab.</p>
+            <p class="dim">This issues a {ttl() === 0 ? "non-expiring token" : `token that lasts ${ttlLabel()}`} and identifies every MCP action as that AI. You can revoke it anytime from the Account tab.</p>
             <Show when={error()}><p class="auth-error">{error()}</p></Show>
             <div class="consent-actions">
               <button class="logout" onClick={deny} disabled={busy()}>Deny</button>

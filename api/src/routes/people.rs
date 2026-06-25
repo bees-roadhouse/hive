@@ -109,7 +109,23 @@ async fn profile_update(
     Path(actor): Path<String>,
     Json(patch): Json<ProfilePatch>,
 ) -> ApiResult {
+    if !can_edit_actor_profile(&s, &ctx, &actor).await? {
+        return Ok(forbidden());
+    }
     Ok(Json(s.profile_update(&actor, patch, ctx.actor()).await?).into_response())
+}
+
+async fn can_edit_actor_profile(s: &Store, ctx: &AuthCtx, actor: &str) -> anyhow::Result<bool> {
+    if ctx.is_admin() || actor == ctx.actor() {
+        return Ok(true);
+    }
+    if ctx.principal == Some("session") {
+        let Some(target) = s.people_get(actor).await? else {
+            return Ok(false);
+        };
+        return Ok(target.owner.as_deref() == Some(ctx.actor()));
+    }
+    Ok(false)
 }
 
 // ---- inbox ----

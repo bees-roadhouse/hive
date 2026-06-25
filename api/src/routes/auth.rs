@@ -9,7 +9,9 @@ use hive_shared::{ActorKind, AuthMe, OnboardingPayload, UserRole};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::auth::{SESSION_COOKIE, SESSION_TTL_SECS};
+use crate::auth::{
+    local_auth_enabled, oauth_never_expires_enabled, oidc_enabled, SESSION_COOKIE, SESSION_TTL_SECS,
+};
 use crate::error::{err, forbidden, not_found, ApiResult};
 use crate::middleware::AuthCtx;
 use crate::store::users::NewUser;
@@ -88,6 +90,9 @@ struct LoginBody {
 }
 
 async fn login(State(s): State<Store>, Json(body): Json<LoginBody>) -> ApiResult {
+    if !local_auth_enabled() {
+        return Ok(err(StatusCode::NOT_FOUND, "local_auth_disabled"));
+    }
     let (Some(email), Some(password)) = (body.email, body.password) else {
         return Ok(err(StatusCode::BAD_REQUEST, "email and password required"));
     };
@@ -131,12 +136,21 @@ async fn me(State(s): State<Store>, Extension(ctx): Extension<AuthCtx>) -> ApiRe
 }
 
 async fn auth_config(State(s): State<Store>) -> ApiResult {
-    // OIDC is live only when the issuer env is configured (oidc.ts oidcConfig()).
-    let oidc = std::env::var("OIDC_ISSUER")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
+    // OIDC is live only when enabled and minimally configured.
+    let oidc = oidc_enabled()
+        && std::env::var("OIDC_ISSUER")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        && std::env::var("OIDC_CLIENT_ID")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+        && std::env::var("OIDC_REDIRECT_URI")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
     Ok(Json(hive_shared::AuthConfig {
         oidc,
+        local_auth: local_auth_enabled(),
+        oauth_never_expires: oauth_never_expires_enabled(),
         instance_name: s.config_get("instance.name").await?,
     })
     .into_response())
@@ -217,6 +231,8 @@ struct TokenCreateBody {
     label: Option<String>,
     #[serde(rename = "expiresInDays")]
     expires_in_days: Option<i64>,
+    #[serde(rename = "neverExpires")]
+    never_expires: Option<bool>,
 }
 
 async fn tokens_create(
@@ -235,7 +251,13 @@ async fn tokens_create(
     }
     // The plaintext token is returned ONCE here and never again.
     let (token, record) = s
-        .tokens_create(&actor, &label, body.expires_in_days, ctx.actor())
+        .tokens_create(
+            &actor,
+            &label,
+            body.expires_in_days,
+            body.never_expires.unwrap_or(false),
+            ctx.actor(),
+        )
         .await?;
     Ok((
         StatusCode::CREATED,

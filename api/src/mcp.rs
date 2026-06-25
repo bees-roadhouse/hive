@@ -354,7 +354,8 @@ fn build_tools() -> Value {
                     "identity": {"type": "string", "description": "the AI/actor recalling (whose tasks/inbox to pull)"},
                     "peer": {"type": "string", "description": "optional focus actor, e.g. the human in the session"},
                     "query": {"type": "string", "description": "optional topic; defaults to recent + open threads"},
-                    "budget": {"type": "integer", "description": "approx token budget for the brief"}
+                    "budget": {"type": "integer", "description": "approx token budget for the brief"},
+                    "threshold": {"type": "number", "description": "optional minimum semantic score for journal hits"}
                 },
                 "required": ["identity"],
                 "additionalProperties": false,
@@ -1162,9 +1163,13 @@ async fn dispatch(
                 kind,
                 sections,
             };
+            let target = target.unwrap();
+            if !can_edit_actor_profile(store, ctx, &target).await? {
+                return Ok(tool_error("forbidden"));
+            }
             // Node passes "mcp" as the acting principal here (not the token actor).
             Ok(ok_content(
-                &store.profile_update(&target.unwrap(), patch, "mcp").await?,
+                &store.profile_update(&target, patch, "mcp").await?,
             ))
         }
         "recall" => {
@@ -1173,14 +1178,20 @@ async fn dispatch(
             let peer = a.opt_str("peer").map(String::from);
             let query = a.opt_str("query").map(String::from);
             let budget = a.opt_int("budget", None, None);
+            let threshold = a.opt_f64("threshold");
             a.finish()?;
+            let identity = identity.unwrap();
+            if !can_recall_identity(store, ctx, &identity).await? {
+                return Ok(tool_error("not_your_identity"));
+            }
             let opts = RecallOptions {
                 peer,
                 query,
                 budget: budget.map(|b| b.max(0) as usize),
+                threshold,
                 viewer: viewer.clone(),
             };
-            Ok(ok_content(&store.recall(&identity.unwrap(), opts).await?))
+            Ok(ok_content(&store.recall(&identity, opts).await?))
         }
         "sources_list" => Ok(ok_content(&store.sources_list(None).await?)),
         "sources_add" => {
@@ -1395,6 +1406,42 @@ async fn journal_append(store: &Store, ctx: &AuthCtx, args: &Map<String, Value>)
             .journal_append(input, Some(&actor), ctx.namespace_owner())
             .await?,
     ))
+}
+
+async fn can_recall_identity(
+    store: &Store,
+    ctx: &AuthCtx,
+    identity: &str,
+) -> Result<bool, ToolFailure> {
+    if ctx.is_admin() || identity == ctx.actor() {
+        return Ok(true);
+    }
+    if ctx.principal == Some("session") {
+        let owner = ctx.namespace_user();
+        return Ok(store
+            .people_ais_owned_by(owner)
+            .await?
+            .iter()
+            .any(|p| p.slug == identity));
+    }
+    Ok(false)
+}
+
+async fn can_edit_actor_profile(
+    store: &Store,
+    ctx: &AuthCtx,
+    actor: &str,
+) -> Result<bool, ToolFailure> {
+    if ctx.is_admin() || actor == ctx.actor() {
+        return Ok(true);
+    }
+    if ctx.principal == Some("session") {
+        let Some(target) = store.people_get(actor).await? else {
+            return Ok(false);
+        };
+        return Ok(target.owner.as_deref() == Some(ctx.actor()));
+    }
+    Ok(false)
 }
 
 /// mcp.ts isAdmin(): the token's actor maps to a user with role 'admin'.

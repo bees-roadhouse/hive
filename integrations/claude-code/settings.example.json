@@ -1,0 +1,15 @@
+{
+  "_comment": "Development-only hook equivalent. Prefer plugins/claude-code-hive-memory for normal installs.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pnpm --dir /path/to/hive --filter @hive/agent start -- session-start"
+          }
+        ]
+      }
+    ]
+  }
+}

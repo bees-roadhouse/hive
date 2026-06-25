@@ -222,10 +222,10 @@ export const api = {
   addUser: (u: { name: string; email: string; password: string; role?: UserRole; kind?: "human" | "ai" }) =>
     req<SafeUser>("/users", { method: "POST", body: JSON.stringify(u) }),
   apiTokens: () => req<ApiToken[]>("/tokens"),
-  createToken: (actor: string, label: string, expiresInDays?: number) =>
+  createToken: (actor: string, label: string, expiresInDays?: number, neverExpires = false) =>
     req<{ token: string; record: ApiToken }>("/tokens", {
       method: "POST",
-      body: JSON.stringify({ actor, label, expiresInDays }),
+      body: JSON.stringify({ actor, label, expiresInDays, neverExpires }),
     }),
   deleteToken: (id: string) => req<void>(`/tokens/${id}`, { method: "DELETE" }),
 

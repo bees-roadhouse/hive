@@ -50,9 +50,13 @@ impl AuthCtx {
         self.namespace_user.as_deref()
     }
 
-    /// Session-principal admin (Node `requireAdmin`).
+    /// Admin authority belongs to an admin session, or to a token acting as the
+    /// same admin human. Delegated/AI tokens keep the grantor's namespace but do
+    /// not inherit admin-wide visibility.
     pub fn is_admin(&self) -> bool {
         self.role == Some(UserRole::Admin)
+            && (self.principal == Some("session")
+                || self.actor.as_deref() == self.namespace_user.as_deref())
     }
 
     /// What this principal may see across the per-user memory namespaces.

@@ -1437,6 +1437,7 @@ export const journal = {
   append(input: NewJournalEntry, actorOverride?: string): JournalEntryView {
     return tx(() => {
       const author = actorOverride ?? input.author;
+      if (!author) throw new Error("author required");
       const mentions = parseMentions(input.body);
       const entry: JournalEntry = {
         id: id("jrnl"),
@@ -2637,7 +2638,7 @@ export async function recall(opts: {
       // Title is derived from the body (no title column); adapters fold a
       // heading into the prose, so prefer the first Markdown `#` heading.
       return e
-        ? { ...h, title: deriveJournalTitle(e.body), author: e.author, created_at: e.created_at }
+        ? { hit: { ...h, title: deriveJournalTitle(e.body) }, author: e.author, created_at: e.created_at }
         : undefined;
     })
     .filter((h): h is RecallJournalHit => h !== undefined);
@@ -2676,7 +2677,7 @@ export async function recall(opts: {
   if (journalHits.length)
     sections.push(
       `## Recent relevant journal\n` +
-        journalHits.map((h) => `- ${h.author}: ${h.title}`).join("\n"),
+        journalHits.map((h) => `- ${h.author}: ${h.hit.title}`).join("\n"),
     );
   if (recentEvents.length)
     sections.push(
