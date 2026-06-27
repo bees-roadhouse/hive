@@ -8,6 +8,7 @@ export const Login: Component<{ instanceName: string | null; onLogin: () => void
   const [error, setError] = createSignal<string | null>(null);
   const [busy, setBusy] = createSignal(false);
   const [cfg] = createResource(() => api.authConfig());
+  const localAuth = () => cfg()?.localAuth ?? true;
 
   const ssoLogin = () => {
     const returnTo = window.location.pathname + window.location.search;
@@ -16,6 +17,7 @@ export const Login: Component<{ instanceName: string | null; onLogin: () => void
 
   const submit = async (e: Event) => {
     e.preventDefault();
+    if (!localAuth()) return;
     setError(null);
     setBusy(true);
     try {
@@ -37,22 +39,29 @@ export const Login: Component<{ instanceName: string | null; onLogin: () => void
           <span class="brand-name">{props.instanceName ?? "hive"}</span>
         </div>
         <h1>Sign in</h1>
-        <label>
-          Email
-          <input type="email" value={email()} onInput={(e) => setEmail(e.currentTarget.value)} required />
-        </label>
-        <label>
-          Password
-          <input type="password" value={password()} onInput={(e) => setPassword(e.currentTarget.value)} required />
-        </label>
-        <Show when={error()}>
-          <p class="auth-error">{error()}</p>
+        <Show when={localAuth()}>
+          <>
+          <label>
+            Email
+            <input type="email" value={email()} onInput={(e) => setEmail(e.currentTarget.value)} required />
+          </label>
+          <label>
+            Password
+            <input type="password" value={password()} onInput={(e) => setPassword(e.currentTarget.value)} required />
+          </label>
+          <Show when={error()}>
+            <p class="auth-error">{error()}</p>
+          </Show>
+          <button type="submit" disabled={busy()}>
+            {busy() ? "Signing in…" : "Sign in"}
+          </button>
+          </>
         </Show>
-        <button type="submit" disabled={busy()}>
-          {busy() ? "Signing in…" : "Sign in"}
-        </button>
         <Show when={cfg()?.oidc}>
           <button type="button" class="logout" onClick={ssoLogin}>Sign in with SSO</button>
+        </Show>
+        <Show when={cfg() && !localAuth() && !cfg()?.oidc}>
+          <p class="auth-error">No sign-in method is enabled.</p>
         </Show>
       </form>
     </div>

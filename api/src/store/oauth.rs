@@ -24,7 +24,7 @@ pub struct AuthCodeGrant {
 
 pub enum RedeemOutcome {
     Ok(AuthCodeGrant),
-    Replay,
+    Replay { client_id: String },
     Expired,
     Unknown,
 }
@@ -153,7 +153,9 @@ impl Store {
         };
         let used_at: Option<String> = row.try_get("used_at")?;
         if used_at.is_some() {
-            return Ok(RedeemOutcome::Replay);
+            return Ok(RedeemOutcome::Replay {
+                client_id: row.try_get("client_id")?,
+            });
         }
         let expires_at: String = row.try_get("expires_at")?;
         let expired = chrono::DateTime::parse_from_rfc3339(&expires_at)

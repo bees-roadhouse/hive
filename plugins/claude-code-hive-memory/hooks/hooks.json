@@ -1,0 +1,15 @@
+{
+  "description": "Inject Hive session memory at Claude Code startup.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks-handlers/session-start.mjs\""
+          }
+        ]
+      }
+    ]
+  }
+}

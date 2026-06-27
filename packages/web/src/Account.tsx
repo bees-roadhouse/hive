@@ -2,12 +2,13 @@ import { createResource, createSignal, For, Show, type Component } from "solid-j
 import { ACTORS, API_TOKEN_DEFAULT_EXPIRY_DAYS, type ImportResult, type UserRole } from "@hive/shared";
 import { api, getCurrentUser } from "./api.ts";
 
-// Token expiry presets (days). The server hard-caps at API_TOKEN_MAX_EXPIRY_DAYS (365).
+// Token expiry presets (days). 0 asks the server for a non-expiring token.
 const EXPIRY_OPTIONS = [
   { label: "30 days", days: 30 },
   { label: "90 days", days: 90 },
   { label: "180 days", days: 180 },
   { label: "1 year", days: 365 },
+  { label: "Never", days: 0 },
 ];
 
 // Admin panel (v0.1.1): manage login users and programmatic API tokens.
@@ -47,7 +48,13 @@ export const Account: Component = () => {
 
   const mintToken = async (e: Event) => {
     e.preventDefault();
-    const { token } = await api.createToken(tActor().trim(), tLabel().trim() || `${tActor()} token`, tExpiry());
+    const neverExpires = tExpiry() === 0;
+    const { token } = await api.createToken(
+      tActor().trim(),
+      tLabel().trim() || `${tActor()} token`,
+      neverExpires ? undefined : tExpiry(),
+      neverExpires,
+    );
     setFreshToken(token); // shown once
     setTLabel("");
     refetchTokens();
@@ -195,7 +202,7 @@ export const Account: Component = () => {
             <For each={ACTORS}>{(a) => <option value={a.name}>{a.name} ({a.kind})</option>}</For>
           </select>
           <input placeholder="label (e.g. pia laptop)" value={tLabel()} onInput={(e) => setTLabel(e.currentTarget.value)} />
-          <select value={tExpiry()} onChange={(e) => setTExpiry(Number(e.currentTarget.value))} title="Token expiry (max 1 year)">
+          <select value={tExpiry()} onChange={(e) => setTExpiry(Number(e.currentTarget.value))} title="Token expiry">
             <For each={EXPIRY_OPTIONS}>{(o) => <option value={o.days}>{o.label}</option>}</For>
           </select>
           <button type="submit">Mint token</button>

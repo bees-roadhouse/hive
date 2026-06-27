@@ -10,7 +10,8 @@ use sqlx::Row;
 
 use crate::auth::{
     generate_token, iso_in_days, iso_in_secs, token_hash, API_TOKEN_PREFIX,
-    OAUTH_TOKEN_TTL_MAX_SECS, OAUTH_TOKEN_TTL_MIN_SECS, OAUTH_TOKEN_TTL_SECS,
+    OAUTH_TOKEN_TTL_MAX_SECS, OAUTH_TOKEN_TTL_MIN_SECS, OAUTH_TOKEN_TTL_NEVER,
+    OAUTH_TOKEN_TTL_SECS,
 };
 
 use super::{new_id, now_iso, Store};
@@ -29,12 +30,14 @@ impl Store {
     }
 
     /// Mint a bearer token. `expires_in_days` is clamped to [1, MAX]; omitted →
-    /// DEFAULT. The plaintext is returned once and never stored.
+    /// DEFAULT unless `never_expires` is true. The plaintext is returned once
+    /// and never stored.
     pub async fn tokens_create(
         &self,
         actor: &str,
         label: &str,
         expires_in_days: Option<i64>,
+        never_expires: bool,
         by: &str,
     ) -> Result<(String, ApiToken)> {
         let person = self
@@ -48,8 +51,13 @@ impl Store {
             )
             .await?;
         let token = generate_token(API_TOKEN_PREFIX);
-        let requested = expires_in_days.unwrap_or(API_TOKEN_DEFAULT_EXPIRY_DAYS);
-        let days = requested.clamp(1, API_TOKEN_MAX_EXPIRY_DAYS);
+        let expires_at = if never_expires {
+            None
+        } else {
+            let requested = expires_in_days.unwrap_or(API_TOKEN_DEFAULT_EXPIRY_DAYS);
+            let days = requested.clamp(1, API_TOKEN_MAX_EXPIRY_DAYS);
+            Some(iso_in_days(days))
+        };
         let record = ApiToken {
             id: new_id("tok"),
             actor: person.slug,
@@ -60,7 +68,7 @@ impl Store {
             kind: Some("pat".to_string()),
             client_id: None,
             granted_by: None,
-            expires_at: Some(iso_in_days(days)),
+            expires_at,
             scope: None,
         };
         crate::pgq::query(
@@ -86,7 +94,8 @@ impl Store {
     }
 
     /// Mint a long-lived OAuth access token (consent flow). Plaintext returned
-    /// once. `expires_in_secs` is clamped to [MIN, MAX]; omitted → DEFAULT.
+    /// once. `expires_in_secs=Some(0)` means never expires; any positive value
+    /// is clamped to [MIN, MAX]; omitted → DEFAULT.
     pub async fn tokens_create_oauth(
         &self,
         actor: &str,
@@ -96,9 +105,13 @@ impl Store {
         expires_in_secs: Option<i64>,
     ) -> Result<(String, ApiToken)> {
         let token = generate_token(API_TOKEN_PREFIX);
-        let ttl_secs = expires_in_secs
-            .unwrap_or(OAUTH_TOKEN_TTL_SECS)
-            .clamp(OAUTH_TOKEN_TTL_MIN_SECS, OAUTH_TOKEN_TTL_MAX_SECS);
+        let expires_at = match expires_in_secs {
+            Some(OAUTH_TOKEN_TTL_NEVER) => None,
+            Some(secs) => Some(iso_in_secs(
+                secs.clamp(OAUTH_TOKEN_TTL_MIN_SECS, OAUTH_TOKEN_TTL_MAX_SECS),
+            )),
+            None => Some(iso_in_secs(OAUTH_TOKEN_TTL_SECS)),
+        };
         let record = ApiToken {
             id: new_id("tok"),
             actor: actor.to_string(),
@@ -109,7 +122,7 @@ impl Store {
             kind: Some("oauth".to_string()),
             client_id: Some(client_id.to_string()),
             granted_by: Some(granted_by.to_string()),
-            expires_at: Some(iso_in_secs(ttl_secs)),
+            expires_at,
             scope: Some(scope.to_string()),
         };
         crate::pgq::query(

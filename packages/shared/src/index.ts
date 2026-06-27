@@ -122,8 +122,9 @@ export interface SafeUser {
 
 /** A bearer token for programmatic clients (CLI, MCP, AI agents). The plaintext
  *  is shown once at creation; only its hash is stored. `kind='oauth'` tokens were
- *  minted via the OAuth consent flow and carry a client + expiry; `kind='pat'`
- *  (or null) are admin-minted personal tokens with no expiry. */
+ *  minted via the OAuth consent flow and carry a client + granting human;
+ *  `kind='pat'` are admin-minted personal tokens. `expires_at=null` means
+ *  non-expiring for either kind. */
 export interface ApiToken {
   id: string;
   actor: string;
@@ -176,11 +177,14 @@ export interface OAuthConsentContext {
   client_name: string;
   identities: AiIdentity[];
   csrf: string;
+  allow_never_expires: boolean;
 }
 
 /** Public auth capabilities the SPA reads before login. */
 export interface AuthConfig {
   oidc: boolean;
+  localAuth: boolean;
+  oauthNeverExpires: boolean;
   instanceName: string | null;
 }
 
@@ -637,8 +641,9 @@ export interface ProfilePatch {
 
 // ---- recall (the read/inject composition) ----
 
-/** A journal hit returned by recall — a search hit plus the author + snippet. */
-export interface RecallJournalHit extends SearchHit {
+/** A journal hit returned by recall — a search hit plus the author + timestamp. */
+export interface RecallJournalHit {
+  hit: SearchHit;
   author: string;
   created_at: string;
 }
@@ -696,7 +701,8 @@ export interface NewAnchor {
 }
 
 export interface NewJournalEntry {
-  author: string;
+  /** Optional legacy/client hint. The server overwrites authorship from auth. */
+  author?: string;
   body: string;
   tags?: string[];
   anchors?: NewAnchor[];

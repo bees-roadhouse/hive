@@ -251,12 +251,17 @@ pub struct OAuthConsentContext {
     pub client_name: String,
     pub identities: Vec<AiIdentity>,
     pub csrf: String,
+    pub allow_never_expires: bool,
 }
 
 /// Public auth capabilities the SPA reads before login.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthConfig {
     pub oidc: bool,
+    #[serde(rename = "localAuth")]
+    pub local_auth: bool,
+    #[serde(rename = "oauthNeverExpires")]
+    pub oauth_never_expires: bool,
     #[serde(rename = "instanceName")]
     pub instance_name: Option<String>,
 }
@@ -1211,7 +1216,6 @@ pub struct ProfilePatch {
 /// A journal hit returned by recall — a search hit plus the author + timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecallJournalHit {
-    #[serde(flatten)]
     pub hit: SearchHit,
     pub author: String,
     pub created_at: String,

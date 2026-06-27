@@ -30,10 +30,16 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
   display: flex; flex-direction: column; gap: 0.5rem;
   background: var(--panel); border-right: 1px solid var(--line);
   padding: 1rem 0.7rem;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
 }
+.sidebar::-webkit-scrollbar { width: 8px; }
+.sidebar::-webkit-scrollbar-track { background: transparent; }
+.sidebar::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; }
 .brand { display: flex; align-items: center; gap: 0.5rem; padding: 0.25rem 0.5rem 0.75rem; }
 .brand .logo { font-size: 1.5rem; }
-.brand-name { font-size: 1.3rem; font-weight: 700; }
+.brand-name { font-size: 1.08rem; line-height: 1.15; font-weight: 700; }
 
 .sidebar nav { display: flex; flex-direction: column; gap: 0.15rem; flex: 1; }
 .sidebar nav button,
@@ -73,10 +79,44 @@ main {
 
 @media (max-width: 720px) {
   .app { flex-direction: column; }
-  .sidebar { position: static; width: 100%; min-width: 0; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; }
-  .sidebar nav { flex-direction: row; flex-wrap: wrap; }
-  .sidebar nav button { width: auto; }
-  .sidebar-foot { border-top: none; padding-top: 0; flex-direction: row; align-items: center; margin-left: auto; }
+  .sidebar {
+    position: static; width: 100%; min-width: 0; height: auto;
+    display: grid; grid-template-columns: 1fr; align-items: stretch;
+    border-right: none; border-bottom: 1px solid var(--line);
+    padding: 0.75rem; overflow: visible;
+  }
+  .brand { padding: 0; }
+  .brand-name { font-size: 1.12rem; }
+  .sidebar nav {
+    flex-direction: row; flex-wrap: nowrap; overflow-x: auto;
+    padding-bottom: 0.2rem; scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+  .sidebar nav::-webkit-scrollbar {
+    display: none;
+  }
+  .sidebar nav button,
+  .sidebar nav a {
+    flex: 0 0 auto; width: auto; white-space: nowrap;
+    padding: 0.42rem 0.6rem;
+  }
+  .sidebar-foot {
+    border-top: 1px solid var(--line); padding-top: 0.55rem;
+    display: grid; grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center; gap: 0.75rem; margin-left: 0;
+  }
+  .sidebar-foot .signed-in {
+    min-width: 0; margin-bottom: 0;
+    display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.15rem 0.45rem;
+    align-items: baseline; line-height: 1.25;
+  }
+  .sidebar-foot .signed-in strong {
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .sidebar-foot .signed-in span:last-child {
+    grid-column: 2; font-size: 0.78rem;
+  }
+  .logout { width: auto; margin-bottom: 0; white-space: nowrap; padding-inline: 1rem; }
   .foot-note { display: none; }
   /* Sidebar is stacked on top now, so the content pane scrolls with the page
      rather than owning its own viewport-height scroll region. */
@@ -894,7 +934,7 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 
 /* ---- account (admin: users + tokens) ---- */
 .account { display: flex; flex-direction: column; gap: 2rem; max-width: 52rem; }
-.account section { display: flex; flex-direction: column; gap: 0.75rem; }
+.account section { display: flex; flex-direction: column; gap: 0.75rem; min-width: 0; overflow-x: auto; }
 .data-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
 .data-table th, .data-table td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--line, #2a3038); }
 .data-table th { color: var(--dim, #8a93a0); font-weight: 500; }

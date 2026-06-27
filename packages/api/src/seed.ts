@@ -30,7 +30,7 @@ import type { AnchorKind, AnchorFields } from "@hive/shared";
 migrate();
 seedActors();
 
-const BASE = process.env.HIVE_API_URL ?? "http://localhost:8787";
+const BASE = process.env.HIVE_API_URL ?? "http://localhost:7878";
 
 /** Anchor the (first) occurrence of `span` within `body`. */
 function at(body: string, span: string, kind: AnchorKind, fields?: AnchorFields) {
@@ -291,7 +291,7 @@ if (r.data.journal.length === 0)
 // must surface its Markdown `#` heading as the hit title — never the synthetic
 // "author: slice" form.
 const planned = await recall({ identity: "pia", query: "Solid UI rewrite plan milestones" });
-const headingHit = planned.data.journal.find((h) => h.title === "Solid UI rewrite plan");
+const headingHit = planned.data.journal.find((h) => h.hit.title === "Solid UI rewrite plan");
 if (!headingHit) throw new Error("seed: recall did not derive the journal title from the body heading");
 
 // ---- identity reconciliation smoke (#31 bio/role → #37 card, canonical) ----
