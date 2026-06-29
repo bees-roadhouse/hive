@@ -600,6 +600,42 @@ fn build_tools() -> Value {
             }
         }
     ));
+    tools.push(json!(
+        {
+            "name": "workspace_list",
+            "description": "List hosted Claude Code workspaces (sessions) visible to you. Each is a sandboxed Claude Code session hive runs; use workspace_transcript to read one's full chat history.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 500}}
+            }
+        }
+    ));
+    tools.push(json!(
+        {
+            "name": "workspace_get",
+            "description": "Get one hosted Claude Code workspace by id (status, owner, sandbox dir, claude_session_id).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"]
+            }
+        }
+    ));
+    tools.push(json!(
+        {
+            "name": "workspace_transcript",
+            "description": "Read the complete transcript (chat history) of a hosted Claude Code workspace — every message and tool call. Use this to dream over a session and append/enrich journal memory based on what happened.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "after": {"type": "integer", "minimum": 0, "description": "only messages with seq greater than this"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 5000}
+                },
+                "required": ["id"]
+            }
+        }
+    ));
     Value::Array(tools)
 }
 
@@ -969,6 +1005,41 @@ async fn dispatch(
         Some(ctx.namespace_user().to_string())
     };
     match name {
+        "workspace_list" => {
+            let mut a = Args::new("workspace_list", args);
+            let limit = a.opt_int("limit", Some(1), Some(500));
+            a.finish()?;
+            Ok(ok_content(
+                &store
+                    .workspace_list(&ctx.visibility(), limit.unwrap_or(50))
+                    .await?,
+            ))
+        }
+        "workspace_get" => {
+            let mut a = Args::new("workspace_get", args);
+            let id = a.req_str("id");
+            a.finish()?;
+            match store.workspace_get(&ctx.visibility(), id.unwrap()).await? {
+                Some(ws) => Ok(ok_content(&ws)),
+                None => Ok(ok_content(&json!({"error": "not found"}))),
+            }
+        }
+        "workspace_transcript" => {
+            let mut a = Args::new("workspace_transcript", args);
+            let id = a.req_str("id");
+            let after = a.opt_int("after", Some(0), None);
+            let limit = a.opt_int("limit", Some(1), Some(5000));
+            a.finish()?;
+            let id = id.unwrap();
+            if store.workspace_get(&ctx.visibility(), id).await?.is_none() {
+                return Ok(ok_content(&json!({"error": "not found"})));
+            }
+            Ok(ok_content(
+                &store
+                    .workspace_transcript(id, after.unwrap_or(0), limit.unwrap_or(2000))
+                    .await?,
+            ))
+        }
         "journal_append" => journal_append(store, ctx, args).await,
         "journal_list" => {
             let mut a = Args::new("journal_list", args);

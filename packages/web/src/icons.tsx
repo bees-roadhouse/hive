@@ -90,6 +90,13 @@ function paths(name: string): JSX.Element {
           <path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1" />
         </>
       );
+    case "workspaces": // terminal window — a hosted Claude Code session
+      return (
+        <>
+          <rect x="3" y="4" width="18" height="16" rx="2" />
+          <path d="M7 9l3 3-3 3M13 15h4" />
+        </>
+      );
     case "hex": // honeycomb cell — the day-page marker
       return <path d="M12 2.5l8.2 4.75v9.5L12 21.5l-8.2-4.75v-9.5z" />;
     case "person": // user outline — head + shoulders

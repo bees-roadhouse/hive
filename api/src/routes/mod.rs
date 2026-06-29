@@ -21,6 +21,7 @@ pub mod people;
 pub mod search;
 pub mod spa;
 pub mod stream;
+pub mod workspaces;
 
 pub fn router(store: Store) -> Router {
     Router::new()
@@ -34,6 +35,7 @@ pub fn router(store: Store) -> Router {
         .merge(search::router())
         .merge(oauth::router())
         .merge(admin::router())
+        .merge(workspaces::router())
         .merge(mcp::router())
         .merge(stream::router())
         .merge(spa::router())

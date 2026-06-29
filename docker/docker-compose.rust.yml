@@ -9,7 +9,8 @@
 
 services:
   postgres:
-    image: postgres:17
+    # Mirror of Docker Hub's official image — avoids the anonymous pull rate limit.
+    image: mirror.gcr.io/library/postgres:17
     environment:
       - POSTGRES_USER=hive
       - POSTGRES_PASSWORD=hive

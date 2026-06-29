@@ -257,4 +257,64 @@ export const api = {
     if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
     return res.json() as Promise<ImportResult & { warnings: string[] }>;
   },
+
+  // ---- hosted Claude Code workspaces (hive → Claude Code) ----
+  workspaces: (limit = 50) => req<CcSession[]>(`/workspaces?limit=${limit}`),
+  workspace: (id: string) => req<CcSession>(`/workspaces/${id}`),
+  createWorkspace: (input: { title?: string; model?: string; prompt?: string }) =>
+    req<CcSession>("/workspaces", { method: "POST", body: JSON.stringify(input) }),
+  transcript: (id: string, after = 0, limit = 2000) =>
+    req<CcMessage[]>(`/workspaces/${id}/messages?after=${after}&limit=${limit}`),
+  sendInput: (id: string, text: string) =>
+    req<CcMessage>(`/workspaces/${id}/input`, { method: "POST", body: JSON.stringify({ text }) }),
+  archiveWorkspace: (id: string) =>
+    req<{ ok: boolean }>(`/workspaces/${id}/archive`, { method: "POST" }),
+
+  // per-user Claude Code credentials (secret never returned)
+  ccCredentials: () => req<CcCredentialView[]>("/cc-credentials"),
+  saveCcCredential: (input: { kind: string; label?: string; secret: string }) =>
+    req<CcCredentialView>("/cc-credentials", { method: "POST", body: JSON.stringify(input) }),
+  deleteCcCredential: (id: string) => req<void>(`/cc-credentials/${id}`, { method: "DELETE" }),
 };
+
+// ---- hosted Claude Code workspace types (kept local; mirror api/src/store) ----
+export interface CcSession {
+  id: string;
+  owner: string;
+  created_by: string;
+  title: string;
+  workdir: string;
+  claude_session_id: string | null;
+  status: string;
+  model: string | null;
+  usage: unknown;
+  meta: unknown;
+  repo_url: string | null;
+  repo_ref: string | null;
+  created_at: string;
+  updated_at: string;
+  last_activity_at: string | null;
+}
+
+export interface CcMessage {
+  id: string;
+  session_id: string;
+  seq: number;
+  role: string;
+  kind: string;
+  content: { text?: string; [k: string]: unknown };
+  raw: unknown;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  created_at: string;
+}
+
+export interface CcCredentialView {
+  id: string;
+  owner: string;
+  kind: string;
+  label: string;
+  tail: string;
+  created_at: string;
+  last_used_at: string | null;
+}

@@ -326,6 +326,59 @@ const SCHEMA: &str = r#"
       created_at  TEXT NOT NULL,
       UNIQUE (platform, platform_id)
     );
+
+    -- ===== Hosted Claude Code workspaces (hive → Claude Code) =====
+    -- One row per session hive spins up and drives in an isolated sandbox.
+    -- Separate from the journal; scoped per owner (see Visibility in middleware.rs).
+    CREATE TABLE IF NOT EXISTS cc_sessions (
+      id                TEXT PRIMARY KEY,
+      owner             TEXT NOT NULL,
+      created_by        TEXT NOT NULL,
+      title             TEXT NOT NULL DEFAULT '',
+      workdir           TEXT NOT NULL DEFAULT '',
+      claude_session_id TEXT,
+      status            TEXT NOT NULL DEFAULT 'provisioning',
+      model             TEXT,
+      usage             TEXT NOT NULL DEFAULT '{}',
+      meta              TEXT NOT NULL DEFAULT '{}',
+      repo_url          TEXT,
+      repo_ref          TEXT,
+      created_at        TEXT NOT NULL,
+      updated_at        TEXT NOT NULL,
+      last_activity_at  TEXT
+    );
+    CREATE INDEX IF NOT EXISTS cc_sessions_owner ON cc_sessions (owner);
+
+    -- Complete chat history per session: every Agent-SDK message, lossless.
+    CREATE TABLE IF NOT EXISTS cc_messages (
+      id          TEXT PRIMARY KEY,
+      session_id  TEXT NOT NULL,
+      seq         BIGINT NOT NULL,
+      role        TEXT NOT NULL,
+      kind        TEXT NOT NULL,
+      content     TEXT NOT NULL DEFAULT '{}',
+      raw         TEXT NOT NULL DEFAULT '{}',
+      tokens_in   BIGINT,
+      tokens_out  BIGINT,
+      created_at  TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS cc_messages_session ON cc_messages (session_id, seq);
+
+    -- Per-user Claude Code credentials, encrypted at rest (AES-256-GCM via
+    -- HIVE_CRED_KEY). Reversible (unlike PAT/password hashes): the runner must
+    -- hand the real token to Claude Code. Plaintext never leaves the server.
+    CREATE TABLE IF NOT EXISTS cc_credentials (
+      id           TEXT PRIMARY KEY,
+      owner        TEXT NOT NULL,
+      kind         TEXT NOT NULL,
+      label        TEXT NOT NULL DEFAULT '',
+      ciphertext   TEXT NOT NULL,
+      nonce        TEXT NOT NULL,
+      tail         TEXT NOT NULL DEFAULT '',
+      created_at   TEXT NOT NULL,
+      last_used_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS cc_credentials_owner ON cc_credentials (owner);
 "#;
 
 /// Unified full-text index. Postgres equivalent of the old FTS5 virtual table:

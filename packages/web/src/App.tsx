@@ -9,6 +9,7 @@ import { Settings } from "./Settings.tsx";
 import { Admin } from "./Admin.tsx";
 import { Account } from "./Account.tsx";
 import { Graph } from "./Graph.tsx";
+import { Workspaces } from "./Workspaces.tsx";
 import { Onboarding } from "./Onboarding.tsx";
 import { Login } from "./Login.tsx";
 import { OAuthConsent } from "./OAuthConsent.tsx";
@@ -19,6 +20,7 @@ const TABS = [
   { id: "journal" },
   { id: "inbox" },
   { id: "dashboard" },
+  { id: "workspaces" },
   { id: "tasks" },
   { id: "decisions" },
   { id: "events" },
@@ -40,6 +42,7 @@ const PAGES: Record<Tab, Component> = {
   journal: Journal,
   inbox: Inbox,
   dashboard: Dashboard,
+  workspaces: Workspaces,
   tasks: Tasks,
   decisions: Decisions,
   events: Events,

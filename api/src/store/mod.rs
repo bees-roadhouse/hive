@@ -9,6 +9,7 @@ use sqlx::PgPool;
 use tokio::sync::broadcast;
 
 pub mod actors;
+pub mod cc_credentials;
 pub mod config;
 pub mod dashboard;
 pub mod decisions;
@@ -35,6 +36,7 @@ pub mod tokens;
 pub mod topics;
 pub mod users;
 pub mod workerstatus;
+pub mod workspaces;
 
 pub use crate::auth::now_iso;
 
