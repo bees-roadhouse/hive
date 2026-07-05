@@ -70,7 +70,9 @@ async fn search(
         };
         return Ok(Json(s.semantic_search(&query, opts).await?).into_response());
     }
-    let mail_hits = s.mail_search(&query, viewer.as_deref(), limit as i64).await?;
+    let mail_hits = s
+        .mail_search(&query, viewer.as_deref(), limit as i64)
+        .await?;
     let mut hits: Vec<SearchHit> = mail_hits
         .into_iter()
         .map(|m| SearchHit {

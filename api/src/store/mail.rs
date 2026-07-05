@@ -111,19 +111,23 @@ fn json_string_array(raw: &str) -> Vec<String> {
 impl Store {
     pub async fn mail_accounts_list(&self, viewer: Option<&str>) -> Result<Vec<MailAccount>> {
         let rows = match viewer {
-            Some(viewer) => crate::pgq::query_as::<MailAccount>(
-                "SELECT id, address AS label, address, 'jmap' AS provider, last_synced_at \
+            Some(viewer) => {
+                crate::pgq::query_as::<MailAccount>(
+                    "SELECT id, address AS label, address, 'jmap' AS provider, last_synced_at \
                  FROM mail_accounts WHERE owner = ? ORDER BY address ASC",
-            )
-            .bind(viewer)
-            .fetch_all(self.db())
-            .await?,
-            None => crate::pgq::query_as::<MailAccount>(
-                "SELECT id, address AS label, address, 'jmap' AS provider, last_synced_at \
+                )
+                .bind(viewer)
+                .fetch_all(self.db())
+                .await?
+            }
+            None => {
+                crate::pgq::query_as::<MailAccount>(
+                    "SELECT id, address AS label, address, 'jmap' AS provider, last_synced_at \
                  FROM mail_accounts ORDER BY owner ASC, address ASC",
-            )
-            .fetch_all(self.db())
-            .await?,
+                )
+                .fetch_all(self.db())
+                .await?
+            }
         };
         Ok(rows)
     }
@@ -160,25 +164,24 @@ impl Store {
         thread_id: &str,
         viewer: Option<&str>,
     ) -> Result<MailThread> {
-        let rows = match viewer {
-            Some(viewer) => {
-                crate::pgq::query_as::<MailMessageRow>(&mail_message_select(
+        let rows =
+            match viewer {
+                Some(viewer) => crate::pgq::query_as::<MailMessageRow>(&mail_message_select(
                     "WHERE m.user_scope = ? AND m.jmap_thread_id = ? ORDER BY m.received_at ASC",
                 ))
                 .bind(viewer)
                 .bind(thread_id)
                 .fetch_all(self.db())
-                .await?
-            }
-            None => {
-                crate::pgq::query_as::<MailMessageRow>(&mail_message_select(
-                    "WHERE m.jmap_thread_id = ? ORDER BY m.received_at ASC",
-                ))
-                .bind(thread_id)
-                .fetch_all(self.db())
-                .await?
-            }
-        };
+                .await?,
+                None => {
+                    crate::pgq::query_as::<MailMessageRow>(&mail_message_select(
+                        "WHERE m.jmap_thread_id = ? ORDER BY m.received_at ASC",
+                    ))
+                    .bind(thread_id)
+                    .fetch_all(self.db())
+                    .await?
+                }
+            };
         let messages: Vec<MailThreadMessage> =
             rows.into_iter().map(MailThreadMessage::from).collect();
         let subject = messages

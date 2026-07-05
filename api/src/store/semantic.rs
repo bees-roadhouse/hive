@@ -203,10 +203,9 @@ impl Store {
             if kinds.is_some_and(|ks| !ks.iter().any(|k| k.as_str() == *kind)) {
                 continue;
             }
-            let rows =
-                crate::pgq::query(&format!("SELECT id, origin_entry_id FROM {table}"))
-                    .fetch_all(self.db())
-                    .await?;
+            let rows = crate::pgq::query(&format!("SELECT id, origin_entry_id FROM {table}"))
+                .fetch_all(self.db())
+                .await?;
             for r in &rows {
                 origin_of.insert(
                     ref_key(kind, r.try_get::<String, _>("id")?.as_str()),

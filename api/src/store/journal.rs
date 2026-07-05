@@ -325,8 +325,14 @@ impl Store {
         .bind(now_iso())
         .execute(self.db())
         .await?;
-        self.links_create(EntityKind::Journal.as_str(), &entry.id, ref_kind.as_str(), &ref_id, "anchors")
-            .await?;
+        self.links_create(
+            EntityKind::Journal.as_str(),
+            &entry.id,
+            ref_kind.as_str(),
+            &ref_id,
+            "anchors",
+        )
+        .await?;
 
         // For inbox delivery use the full assignee list (including author when auto-assigned).
         let recipients = if a.kind == AnchorKind::Task {
@@ -1008,7 +1014,6 @@ fn bind_scope<'q>(
         _ => q,
     }
 }
-
 
 fn capitalize(s: &str) -> String {
     let mut chars = s.chars();

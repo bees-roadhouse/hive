@@ -210,7 +210,10 @@ pub fn validate_fields(
                 _ => issues.push(FieldIssue::new(
                     &spec.slug,
                     "bad_date",
-                    format!("'{}' must be YYYY-MM-DD or an ISO-8601 UTC timestamp", spec.slug),
+                    format!(
+                        "'{}' must be YYYY-MM-DD or an ISO-8601 UTC timestamp",
+                        spec.slug
+                    ),
                 )),
             },
             FieldType::Choice => match v.as_str() {
@@ -218,7 +221,11 @@ pub fn validate_fields(
                 _ => issues.push(FieldIssue::new(
                     &spec.slug,
                     "bad_choice",
-                    format!("'{}' must be one of: {}", spec.slug, spec.options.join(", ")),
+                    format!(
+                        "'{}' must be one of: {}",
+                        spec.slug,
+                        spec.options.join(", ")
+                    ),
                 )),
             },
             FieldType::Ref => match (v.as_str(), spec.ref_kind.as_deref()) {

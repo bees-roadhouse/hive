@@ -73,10 +73,7 @@ struct TypesListQuery {
     include_archived: Option<String>,
 }
 
-async fn types_list(
-    State(s): State<Store>,
-    Query(q): Query<TypesListQuery>,
-) -> ApiResult {
+async fn types_list(State(s): State<Store>, Query(q): Query<TypesListQuery>) -> ApiResult {
     let include = matches!(q.include_archived.as_deref(), Some("1") | Some("true"));
     Ok(Json(s.entity_types_list(include).await?).into_response())
 }
@@ -204,7 +201,13 @@ async fn entities_update(
     Json(patch): Json<CustomEntityPatch>,
 ) -> ApiResult {
     match s
-        .custom_entities_update(&id, patch, ctx.actor(), &ctx.visibility(), ctx.namespace_owner())
+        .custom_entities_update(
+            &id,
+            patch,
+            ctx.actor(),
+            &ctx.visibility(),
+            ctx.namespace_owner(),
+        )
         .await
     {
         Ok(Some(e)) => Ok(Json(e).into_response()),

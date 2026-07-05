@@ -113,7 +113,9 @@ impl Worker {
         // tag — pausing beats poisoning the corpus with vectors that never get
         // re-embedded. The latch clears on restart; retry next cycle.
         if hive_embed::transformers_latched() {
-            warn!("embedding backfill paused: transformers model unavailable (hash fallback latched)");
+            warn!(
+                "embedding backfill paused: transformers model unavailable (hash fallback latched)"
+            );
             return Ok(0);
         }
         let mut n = 0;
