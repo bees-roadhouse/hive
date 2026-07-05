@@ -45,6 +45,7 @@ const COMMANDS: Cmd[] = [
   { id: "journal", label: "Today", hint: "journal feed", icon: "journal", section: "Go to", keywords: "journal home", run: (nav) => nav("/journal") },
   { id: "inbox", label: "Inbox", hint: "mentions + assignments", icon: "inbox", section: "Go to", run: (nav) => nav("/inbox") },
   { id: "search", label: "Search", hint: "keyword + semantic", icon: "search", section: "Go to", run: (nav) => nav("/search") },
+  { id: "mail", label: "Mail", hint: "read-only archive", icon: "mail", section: "Go to", keywords: "email messages mailbox", run: (nav) => nav("/mail") },
   { id: "workspaces", label: "Chats", hint: "Claude Code sessions", icon: "chats", section: "Go to", keywords: "claude code terminal workspaces sessions", run: (nav) => nav("/workspaces") },
   { id: "tasks", label: "Tasks", hint: "board", icon: "tasks", section: "Boards", run: (nav) => nav("/tasks") },
   { id: "decisions", label: "Decisions", hint: "log", icon: "decisions", section: "Boards", run: (nav) => nav("/decisions") },

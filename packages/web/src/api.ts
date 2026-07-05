@@ -11,6 +11,9 @@ import type {
   InboxItem,
   JournalEntryView,
   JournalWriter,
+  MailAccount,
+  MailMessageSummary,
+  MailThread,
   NewJournalEntry,
   NewShare,
   NewSource,
@@ -124,6 +127,14 @@ export const api = {
 
   search: (query: string, mode: "keyword" | "semantic" | "precision" = "keyword") =>
     req<SearchHit[]>(`/search?q=${encodeURIComponent(query)}&mode=${mode}`),
+  mailAccounts: () => req<MailAccount[]>("/mail/accounts"),
+  mailMessages: (q: { query?: string; account_id?: string } = {}) => {
+    const p = new URLSearchParams();
+    if (q.query) p.set("query", q.query);
+    if (q.account_id) p.set("account_id", q.account_id);
+    return req<MailMessageSummary[]>(`/mail/messages?${p}`);
+  },
+  mailThread: (threadId: string) => req<MailThread>(`/mail/thread/${encodeURIComponent(threadId)}`),
   wire: () => req<WireEvent[]>("/wire"),
   // Trigger an immediate source poll (worker normally polls on a schedule).
   // The backend endpoint may not exist yet — callers should catch and fall

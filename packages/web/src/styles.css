@@ -337,6 +337,10 @@ table.mini .num { text-align: right; }
 /* ---- search / wire ---- */
 .hit { display: flex; gap: 0.6rem; align-items: baseline; padding: 0.5rem 0; border-bottom: 1px solid var(--line); }
 .snippet { color: var(--dim); font-size: var(--fs-sm); }
+.hit-title { color: var(--ink); text-decoration: none; }
+.hit-title:hover { color: var(--honey); }
+.kind-chip { display: inline-flex; align-items: center; gap: 0.3rem; background: var(--line); color: var(--accent); border-radius: var(--r-pill); padding: 0.1rem 0.55rem; font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: 0.03em; white-space: nowrap; }
+.mail-chip { background: color-mix(in srgb, var(--honey) 16%, transparent); color: var(--honey); border: 1px solid color-mix(in srgb, var(--honey) 35%, transparent); }
 /* highlightSnippet (lib.tsx) escapes body text and emits <mark> for ts_headline matches */
 .snippet mark {
   background: color-mix(in srgb, var(--honey) 20%, transparent);
@@ -1425,6 +1429,43 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
   .write-bar { left: 0; }
   .cmdk-backdrop { padding-top: 8vh; }
 }
+
+/* ---- mail: read-only plaintext archive ---- */
+.mail {
+  display: grid; grid-template-columns: 310px minmax(0, 1fr); gap: 1.2rem;
+  height: calc(100dvh - 3.75rem);
+}
+.mail-rail {
+  display: flex; flex-direction: column; gap: 0.7rem; min-height: 0;
+  border-right: 1px solid var(--line); padding-right: 1.2rem;
+}
+.mail-tools { display: flex; flex-direction: column; gap: 0.55rem; }
+.mail-tools select { width: 100%; }
+.mail-search { display: flex; gap: 0.4rem; }
+.mail-search input { min-width: 0; flex: 1; }
+.mail-rows { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.18rem; scrollbar-width: thin; scrollbar-color: var(--line) transparent; }
+.mail-row {
+  width: 100%; display: flex; flex-direction: column; gap: 0.18rem;
+  background: transparent; border: 1px solid transparent; border-radius: var(--r-md);
+  padding: 0.52rem 0.6rem; text-align: left; color: var(--dim); font: inherit; cursor: pointer;
+}
+.mail-row:hover, .mail-row.selected { background: var(--panel2); color: var(--ink); }
+.mail-row-top { display: flex; justify-content: space-between; gap: 0.6rem; align-items: baseline; }
+.mail-row-top strong { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--ink); }
+.mail-row-top time { flex: none; font-size: var(--fs-2xs); color: var(--dim); font-variant-numeric: tabular-nums; }
+.mail-row-from, .mail-row-snippet { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: var(--fs-xs); }
+.mail-row-meta { display: flex; justify-content: space-between; gap: 0.5rem; color: var(--dim); font-size: var(--fs-2xs); text-transform: uppercase; letter-spacing: 0.03em; }
+.mail-main { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.mail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; padding-bottom: 0.7rem; border-bottom: 1px solid var(--line); }
+.mail-head h3 { margin: 0; font-family: var(--display); font-size: var(--fs-lg); }
+.mail-head p { margin: 0.2rem 0 0; }
+.mail-thread { flex: 1; overflow-y: auto; min-height: 0; display: flex; flex-direction: column; gap: 0.9rem; padding: 1rem 0.15rem; }
+.mail-msg { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 0.8rem 0.9rem; }
+.mail-msg-head { display: flex; justify-content: space-between; gap: 1rem; padding-bottom: 0.55rem; border-bottom: 1px solid var(--line); }
+.mail-recipients { margin-top: 0.1rem; }
+.mail-plain { white-space: pre-wrap; word-break: break-word; margin: 0.75rem 0 0; color: var(--ink); font: 0.92rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: transparent; }
+.mail-empty { margin: auto; text-align: center; color: var(--dim); }
+.mail-empty svg { color: var(--honey); }
 
 /* ---- chats: hosted Claude Code sessions as conversations ---- */
 /* Claude-desktop shape inside the hive shell: recents rail, turns in the

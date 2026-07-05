@@ -496,6 +496,43 @@ export interface SearchHit {
   score: number;
 }
 
+// ---- mail archive (read-only) ----
+
+/** A configured mailbox/account visible to the signed-in viewer. */
+export interface MailAccount {
+  id: string;
+  label: string;
+  address: string;
+  provider?: string | null;
+  last_synced_at?: string | null;
+}
+
+/** Dense row returned by /api/mail/messages for the archive rail. */
+export interface MailMessageSummary {
+  id: string;
+  thread_id: string;
+  account_id: string;
+  mailbox?: string | null;
+  from: string;
+  to?: string[];
+  cc?: string[];
+  subject: string;
+  snippet?: string | null;
+  received_at: string;
+  has_attachments?: boolean;
+}
+
+/** Plaintext message body returned in a thread. HTML is intentionally absent. */
+export interface MailThreadMessage extends MailMessageSummary {
+  body_text: string;
+}
+
+export interface MailThread {
+  thread_id: string;
+  subject: string;
+  messages: MailThreadMessage[];
+}
+
 // ---- knowledge graph ----
 
 /** A node in the knowledge graph; `id` is the `kind:ref_id` composite key. */
