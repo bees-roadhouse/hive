@@ -110,9 +110,14 @@ export const Mail: Component = () => {
                 </span>
                 <span class="mail-row-from">{m.from}</span>
                 <span class="mail-row-snippet">{oneLine(m.snippet)}</span>
+                <span class="mail-row-labels">
+                  <For each={m.labels?.filter((label) => label !== "seen").slice(0, 4) ?? []}>
+                    {(label) => <span class="mail-label">{label}</span>}
+                  </For>
+                  <Show when={m.has_attachments}><span class="mail-label">paperclip</span></Show>
+                </span>
                 <span class="mail-row-meta">
                   <AccountLabel id={m.account_id} accounts={accts()} />
-                  <Show when={m.has_attachments}><span>paperclip</span></Show>
                 </span>
               </button>
             )}

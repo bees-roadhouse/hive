@@ -560,7 +560,8 @@ export interface MailMessageSummary {
   id: string;
   thread_id: string;
   account_id: string;
-  mailbox?: string | null;
+  /** JMAP keywords rendered as system-wide tags. Folders/mailboxes stay internal to ingest. */
+  labels: string[];
   from: string;
   to?: string[];
   cc?: string[];

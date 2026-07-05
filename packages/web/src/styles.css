@@ -1455,6 +1455,8 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
 .mail-row-top time { flex: none; font-size: var(--fs-2xs); color: var(--dim); font-variant-numeric: tabular-nums; }
 .mail-row-from, .mail-row-snippet { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: var(--fs-xs); }
 .mail-row-meta { display: flex; justify-content: space-between; gap: 0.5rem; color: var(--dim); font-size: var(--fs-2xs); text-transform: uppercase; letter-spacing: 0.03em; }
+.mail-row-labels { display: flex; gap: 0.28rem; flex-wrap: wrap; min-height: 1.15rem; }
+.mail-label { display: inline-flex; align-items: center; border-radius: 999px; padding: 0.08rem 0.42rem; background: color-mix(in srgb, var(--honey) 9%, transparent); border: 1px solid color-mix(in srgb, var(--honey) 24%, transparent); color: color-mix(in srgb, var(--honey) 92%, var(--ink)); font-size: var(--fs-2xs); line-height: 1.35; text-transform: none; letter-spacing: 0; }
 .mail-main { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 .mail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; padding-bottom: 0.7rem; border-bottom: 1px solid var(--line); }
 .mail-head h3 { margin: 0; font-family: var(--display); font-size: var(--fs-lg); }

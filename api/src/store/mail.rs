@@ -16,8 +16,8 @@ pub struct MailAccount {
 struct MailMessageRow {
     pub id: String,
     pub account_id: String,
-    pub mailbox: Option<String>,
     pub thread_id: String,
+    pub labels_json: String,
     pub subject: String,
     pub from_name: Option<String>,
     pub from_email: String,
@@ -34,7 +34,7 @@ pub struct MailMessageSummary {
     pub id: String,
     pub thread_id: String,
     pub account_id: String,
-    pub mailbox: Option<String>,
+    pub labels: Vec<String>,
     pub from: String,
     pub to: Vec<String>,
     pub cc: Vec<String>,
@@ -69,7 +69,7 @@ impl From<MailMessageRow> for MailThreadMessage {
             id: row.id,
             thread_id: row.thread_id,
             account_id: row.account_id,
-            mailbox: row.mailbox,
+            labels: mail_labels(&row.labels_json),
             from,
             to: json_string_array(&row.to_json),
             cc: json_string_array(&row.cc_json),
@@ -86,6 +86,53 @@ impl From<MailMessageRow> for MailThreadMessage {
             summary,
             body_text: row.body_text,
         }
+    }
+}
+
+fn mail_labels(raw: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let mut labels: Vec<String> = match value {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|v| v.as_str().map(label_display))
+            .collect(),
+        serde_json::Value::Object(map) => map
+            .into_iter()
+            .filter_map(|(k, v)| {
+                if v.as_bool().unwrap_or(!v.is_null()) {
+                    Some(label_display(&k))
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    labels.sort_by_key(|label| (label_rank(label), label.to_lowercase()));
+    labels.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    labels
+}
+
+fn label_display(raw: &str) -> String {
+    match raw.trim() {
+        "$seen" | "seen" => "seen".to_string(),
+        "$draft" | "draft" => "draft".to_string(),
+        "$flagged" | "flagged" => "flagged".to_string(),
+        "$answered" | "answered" => "answered".to_string(),
+        "$forwarded" | "forwarded" => "forwarded".to_string(),
+        other => other.trim_start_matches('$').replace(['_', '-'], " "),
+    }
+}
+
+fn label_rank(label: &str) -> u8 {
+    match label {
+        "flagged" => 0,
+        "draft" => 1,
+        "answered" | "forwarded" => 2,
+        "seen" => 9,
+        _ => 4,
     }
 }
 
@@ -212,7 +259,7 @@ impl Store {
         }
         let trimmed = query.map(str::trim).filter(|q| !q.is_empty());
         if trimmed.is_some() {
-            clauses.push("(m.subject ILIKE ? OR m.from_addr ILIKE ? OR COALESCE(m.from_name, '') ILIKE ? OR m.snippet ILIKE ? OR m.body_text ILIKE ?)");
+            clauses.push("(m.subject ILIKE ? OR m.from_addr ILIKE ? OR COALESCE(m.from_name, '') ILIKE ? OR m.snippet ILIKE ? OR m.body_text ILIKE ? OR m.keywords_json::text ILIKE ?)");
         }
         let where_sql = if clauses.is_empty() {
             String::new()
@@ -241,6 +288,7 @@ impl Store {
                 .bind(needle.clone())
                 .bind(needle.clone())
                 .bind(needle.clone())
+                .bind(needle.clone())
                 .bind(needle);
         }
         Ok(q.bind(limit).fetch_all(self.db()).await?)
@@ -249,7 +297,7 @@ impl Store {
 
 fn mail_message_select(suffix: &str) -> String {
     format!(
-        "SELECT m.id, m.account_id, NULL::TEXT AS mailbox, m.jmap_thread_id AS thread_id, \
+        "SELECT m.id, m.account_id, m.jmap_thread_id AS thread_id, m.keywords_json AS labels_json, \
          m.subject, m.from_name, m.from_addr AS from_email, m.to_json, m.cc_json, \
          m.received_at, m.snippet, m.body_text, m.has_attachments \
          FROM mail_messages m \
@@ -302,7 +350,7 @@ mod tests {
         .await
         .unwrap();
         crate::pgq::query(
-            "INSERT INTO mail_messages (id, account_id, user_scope, jmap_thread_id, jmap_id, message_id_hdr, subject, from_name, from_addr, to_json, cc_json, received_at, snippet, body_text, has_attachments, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO mail_messages (id, account_id, user_scope, jmap_thread_id, jmap_id, message_id_hdr, subject, from_name, from_addr, to_json, cc_json, received_at, keywords_json, snippet, body_text, has_attachments, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind("msg-alice-1")
         .bind("acct-alice")
@@ -316,6 +364,7 @@ mod tests {
         .bind(r#"[{"email":"alice@example.test"}]"#)
         .bind("[]")
         .bind("2026-07-04T12:00:00Z")
+        .bind(r##"{"$flagged":true,"Bee Roadhouse":true,"$seen":true}"##)
         .bind("nectar budget")
         .bind("The nectar budget has fictional hive details.")
         .bind(false)
@@ -365,6 +414,14 @@ mod tests {
             .unwrap();
         assert_eq!(alice_messages.len(), 1);
         assert_eq!(alice_messages[0].id, "msg-alice-1");
+        assert_eq!(
+            alice_messages[0].labels,
+            vec![
+                "flagged".to_string(),
+                "Bee Roadhouse".to_string(),
+                "seen".to_string(),
+            ]
+        );
 
         let hits = store
             .mail_search("budget", Some("alice"), 20)
