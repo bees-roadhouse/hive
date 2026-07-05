@@ -31,12 +31,16 @@ const MODEL = process.env.HIVE_RUNNER_MODEL || undefined;
 const DRY_RUN = process.env.HIVE_RUNNER_DRY_RUN === "1";
 const SESSION_ISOLATION = (process.env.HIVE_SESSION_ISOLATION ?? "container") !== "host";
 const ENGINE_PREF = process.env.HIVE_CONTAINER_ENGINE ?? "auto";
-const SESSION_IMAGE = process.env.HIVE_SESSION_IMAGE ?? process.env.HIVE_RUNNER_IMAGE ?? "beesroadhouse/hive-runner:latest";
+const SESSION_IMAGE = process.env.HIVE_SESSION_IMAGE ?? process.env.HIVE_RUNNER_IMAGE ?? "beesroadhouse/hive-session-dev:latest";
 const USER_VOLUME_PREFIX = process.env.HIVE_USER_VOLUME_PREFIX ?? "hive-user";
 const SESSION_CONTAINER_PREFIX = process.env.HIVE_SESSION_CONTAINER_PREFIX ?? "hive-session";
 const SESSION_NETWORK = process.env.HIVE_SESSION_NETWORK ?? "";
 const ENGINE_SOCKET_TARGET = process.env.HIVE_CONTAINER_SOCKET_TARGET ?? (ENGINE_PREF === "docker" ? "/var/run/docker.sock" : "/run/podman/podman.sock");
 const PROPAGATE_SOCKET = process.env.HIVE_PROPAGATE_ENGINE_SOCKET === "1";
+const SESSION_GUI = process.env.HIVE_SESSION_GUI ?? "1";
+const SESSION_VNC = process.env.HIVE_SESSION_VNC ?? "0";
+const SESSION_VNC_PORT = process.env.HIVE_SESSION_VNC_PORT ?? "5900";
+const SESSION_NOVNC_PORT = process.env.HIVE_SESSION_NOVNC_PORT ?? "6080";
 
 if (!TOKEN) {
   console.error("hive-runner: HIVE_API_TOKEN (an admin/service PAT) is required.");
@@ -210,6 +214,10 @@ function ensureSessionContainer(ws: Workspace, auth: RuntimeAuth | null): Sessio
       "--env", `HIVE_RUNTIME=${runtimeOf(ws)}`,
       "--env", `HIVE_RUNTIME_PROVIDER=${auth?.provider ?? ""}`,
       "--env", `HIVE_RUNTIME_MODEL=${auth?.model ?? ws.model ?? MODEL ?? ""}`,
+      "--env", `HIVE_GUI=${SESSION_GUI}`,
+      "--env", `HIVE_VNC=${SESSION_VNC}`,
+      "--env", `HIVE_VNC_PORT=${SESSION_VNC_PORT}`,
+      "--env", `HIVE_NOVNC_PORT=${SESSION_NOVNC_PORT}`,
       SESSION_IMAGE,
       "sh", "-lc", `mkdir -p ${workspaceDir} && tail -f /dev/null`,
     ];
