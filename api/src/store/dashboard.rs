@@ -224,12 +224,12 @@ impl Store {
 
         let mut nodes: Vec<GraphNode> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        let mut add_node = |nodes: &mut Vec<GraphNode>, kind: &str, ref_id: &str| {
-            let key = format!("{kind}:{ref_id}");
+        let mut add_node = |nodes: &mut Vec<GraphNode>, kind: EntityKind, ref_id: &str| {
+            let key = format!("{}:{ref_id}", kind.as_str());
             if seen.insert(key.clone()) {
                 nodes.push(GraphNode {
                     id: key.clone(),
-                    kind: kind.to_string(),
+                    kind: kind.as_str().to_string(),
                     title: title_of
                         .get(&key)
                         .cloned()
@@ -249,11 +249,16 @@ impl Store {
             let si: String = r.try_get("source_id")?;
             let tk: String = r.try_get("target_kind")?;
             let ti: String = r.try_get("target_id")?;
-            add_node(&mut nodes, &sk, &si);
-            add_node(&mut nodes, &tk, &ti);
+            // Fail closed: skip links whose endpoint kinds this build doesn't
+            // know rather than graphing them under a wrong kind.
+            let (Some(sk), Some(tk)) = (EntityKind::parse(&sk), EntityKind::parse(&tk)) else {
+                continue;
+            };
+            add_node(&mut nodes, sk, &si);
+            add_node(&mut nodes, tk, &ti);
             edges.push(GraphEdge {
-                source: format!("{sk}:{si}"),
-                target: format!("{tk}:{ti}"),
+                source: format!("{}:{si}", sk.as_str()),
+                target: format!("{}:{ti}", tk.as_str()),
                 rel: r.try_get("rel")?,
             });
         }
@@ -270,8 +275,8 @@ impl Store {
             let author: String = r.try_get("author")?;
             if prev_author.as_deref() == Some(author.as_str()) {
                 if let Some(prev) = &prev_id {
-                    add_node(&mut nodes, "journal", prev);
-                    add_node(&mut nodes, "journal", &id);
+                    add_node(&mut nodes, EntityKind::Journal, prev);
+                    add_node(&mut nodes, EntityKind::Journal, &id);
                     edges.push(GraphEdge {
                         source: format!("journal:{prev}"),
                         target: format!("journal:{id}"),
@@ -293,8 +298,8 @@ impl Store {
         for r in &task_rows {
             let id: String = r.try_get("id")?;
             if let Some(project) = r.try_get::<Option<String>, _>("project")? {
-                add_node(&mut nodes, "project", &project);
-                add_node(&mut nodes, "task", &id);
+                add_node(&mut nodes, EntityKind::Project, &project);
+                add_node(&mut nodes, EntityKind::Task, &id);
                 edges.push(GraphEdge {
                     source: format!("project:{project}"),
                     target: format!("task:{id}"),
@@ -302,8 +307,8 @@ impl Store {
                 });
             }
             if let Some(phase) = r.try_get::<Option<String>, _>("phase")? {
-                add_node(&mut nodes, "phase", &phase);
-                add_node(&mut nodes, "task", &id);
+                add_node(&mut nodes, EntityKind::Phase, &phase);
+                add_node(&mut nodes, EntityKind::Task, &id);
                 edges.push(GraphEdge {
                     source: format!("phase:{phase}"),
                     target: format!("task:{id}"),
@@ -314,8 +319,8 @@ impl Store {
         for r in &phases {
             let id: String = r.try_get("id")?;
             let project: String = r.try_get("project")?;
-            add_node(&mut nodes, "project", &project);
-            add_node(&mut nodes, "phase", &id);
+            add_node(&mut nodes, EntityKind::Project, &project);
+            add_node(&mut nodes, EntityKind::Phase, &id);
             edges.push(GraphEdge {
                 source: format!("project:{project}"),
                 target: format!("phase:{id}"),

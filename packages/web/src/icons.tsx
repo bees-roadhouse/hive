@@ -169,6 +169,13 @@ function paths(name: string): JSX.Element {
       return <path d="M14.5 5.5 8 12l6.5 6.5" />;
     case "chev-r": // chevron right
       return <path d="M9.5 5.5 16 12l-6.5 6.5" />;
+    case "mail": // envelope — the ingested-mail entity (distinct from the inbox tray)
+      return (
+        <>
+          <rect x="2.5" y="5" width="19" height="14" rx="2" />
+          <path d="m3 6.5 9 7 9-7" />
+        </>
+      );
     default:
       return <circle cx="12" cy="12" r="9" />;
   }

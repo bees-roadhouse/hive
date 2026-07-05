@@ -131,6 +131,15 @@ pub fn new_id(prefix: &str) -> String {
     format!("{prefix}_{}", nanoid::nanoid!(12))
 }
 
+/// `?,?,?` for n binds, or the never-matching literal Node uses when a set is empty.
+pub(crate) fn placeholders_or_never(n: usize) -> String {
+    if n == 0 {
+        "'__never__'".to_string()
+    } else {
+        vec!["?"; n].join(",")
+    }
+}
+
 /// Truncate to 140 chars with `…` (the Node snip default).
 pub fn snip140(s: &str) -> String {
     hive_shared::snip(s, 140)

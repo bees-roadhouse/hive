@@ -18,7 +18,7 @@ use crate::middleware::Visibility;
 use super::decisions::DecisionCreate;
 use super::events::EventCreate;
 use super::tasks::TaskCreate;
-use super::{json_vec, new_id, now_iso, to_json, Store};
+use super::{json_vec, new_id, now_iso, placeholders_or_never, to_json, Store};
 
 impl Store {
     pub async fn journal_list(&self, limit: i64, offset: i64) -> Result<Vec<JournalEntryView>> {
@@ -602,14 +602,18 @@ impl Store {
                 }
             };
             if let Some((id, slug, name)) = resolved {
-                refs.push(JournalRef {
-                    kind: EntityKind::parse(t.kind).expect("TOKEN_KINDS entries always parse"),
-                    id,
-                    slug,
-                    name,
-                    start,
-                    end,
-                });
+                // TOKEN_KINDS is a subset of EntityKind strings, so this never
+                // skips today; parse keeps it fail-closed if they ever drift.
+                if let Some(kind) = EntityKind::parse(t.kind) {
+                    refs.push(JournalRef {
+                        kind,
+                        id,
+                        slug,
+                        name,
+                        start,
+                        end,
+                    });
+                }
             }
         }
         Ok(refs)
@@ -1005,14 +1009,6 @@ fn bind_scope<'q>(
     }
 }
 
-/// `?,?,?` for n binds, or the never-matching literal Node uses when a set is empty.
-fn placeholders_or_never(n: usize) -> String {
-    if n == 0 {
-        "'__never__'".to_string()
-    } else {
-        vec!["?"; n].join(",")
-    }
-}
 
 fn capitalize(s: &str) -> String {
     let mut chars = s.chars();

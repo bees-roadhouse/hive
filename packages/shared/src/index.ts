@@ -300,7 +300,14 @@ export type DecisionStatus = "proposed" | "accepted" | "rejected" | "superseded"
 /** The structured kinds that can be anchored into a journal entry. */
 export type AnchorKind = "task" | "decision" | "event";
 /** Everything addressable in search / inbox / links. */
-export type EntityKind = AnchorKind | "journal" | "person" | "topic" | "project" | "phase";
+export type EntityKind =
+  | AnchorKind
+  | "journal"
+  | "person"
+  | "topic"
+  | "project"
+  | "phase"
+  | "mail";
 
 export const TASK_STATUSES: TaskStatus[] = ["todo", "doing", "blocked", "done"];
 export const PRIORITIES: Priority[] = ["low", "normal", "high", "urgent"];

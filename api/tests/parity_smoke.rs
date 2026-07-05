@@ -641,6 +641,168 @@ async fn onboarding_gate_then_full_flow() {
     );
 }
 
+/// REST twin of the MCP `inbox_tools_are_viewer_gated` test: the inbox routes
+/// answer only for yourself, AIs you own (sessions), or anyone if admin.
+#[tokio::test]
+async fn rest_inbox_routes_are_viewer_gated() {
+    let _guard = env_guard().await;
+    reset_auth_env();
+    let (app, store) = test_app().await;
+    let admin = onboard(&app).await; // nate, admin
+
+    // A member with a login (maggie) and an AI she owns (pia).
+    let (status, body, _) = send(
+        &app,
+        post_json(
+            "/api/users",
+            json!({"name": "Maggie", "email": "maggie@example.com", "password": "hunter22-strong", "role": "member"}),
+            Some(&admin),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "member create: {body}");
+    assert_eq!(body["actor"], "maggie");
+    let (status, body, headers) = send(
+        &app,
+        post_json(
+            "/api/auth/login",
+            json!({"email": "maggie@example.com", "password": "hunter22-strong"}),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "member login: {body}");
+    let maggie = headers
+        .get(header::SET_COOKIE)
+        .expect("member session cookie")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let (status, _, _) = send(
+        &app,
+        post_json(
+            "/api/people",
+            json!({"name": "pia", "kind": "ai"}),
+            Some(&admin),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body, _) = send(
+        &app,
+        patch_json("/api/people/pia", json!({"owner": "maggie"}), Some(&admin)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "grant pia to maggie: {body}");
+
+    // One notification per recipient.
+    let mut items = std::collections::HashMap::new();
+    for (to, from) in [("nate", "maggie"), ("maggie", "nate"), ("pia", "nate")] {
+        let item = store
+            .inbox_add(
+                to,
+                from,
+                hive_shared::InboxReason::Mention,
+                hive_shared::EntityKind::Journal.as_str(),
+                "jrnl_secret",
+                None,
+                &format!("private snippet only {to} may see"),
+            )
+            .await
+            .expect("inbox add")
+            .expect("delivered");
+        items.insert(to, item);
+    }
+
+    // A member can no longer read another human's inbox, nor mark it read.
+    // Slug routes 403 (slugs are public); mark-by-id answers the same soft
+    // {"marked": false} as a missing id so it doesn't oracle foreign ids.
+    let (status, body, _) = send(&app, get("/api/inbox/nate", Some(&maggie))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "cross-actor list: {body}");
+    assert_eq!(body["error"], "forbidden");
+    let (status, _, _) = send(
+        &app,
+        post_json("/api/inbox/nate/read", json!({}), Some(&maggie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body, _) = send(
+        &app,
+        post_json(
+            &format!("/api/inbox/item/{}/read", items["nate"].id),
+            json!({}),
+            Some(&maggie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"marked": false}), "foreign id soft no-op");
+    assert_eq!(store.inbox_unread_count("nate").await.unwrap(), 1);
+
+    // Self and owned-AI inboxes still answer; admins may peek anyone's.
+    let (status, body, _) = send(&app, get("/api/inbox/maggie", Some(&maggie))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().map(Vec::len), Some(1), "own inbox: {body}");
+    let (status, body, _) = send(&app, get("/api/inbox/pia", Some(&maggie))).await;
+    assert_eq!(status, StatusCode::OK, "owned-AI inbox: {body}");
+    assert_eq!(body.as_array().map(Vec::len), Some(1));
+    let (status, _, _) = send(&app, get("/api/inbox/maggie", Some(&admin))).await;
+    assert_eq!(status, StatusCode::OK, "admin peeks any inbox");
+
+    // Own mark-read works, both shapes.
+    let (status, body, _) = send(
+        &app,
+        post_json(
+            &format!("/api/inbox/item/{}/read", items["maggie"].id),
+            json!({}),
+            Some(&maggie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"marked": true}));
+    let (status, body, _) = send(
+        &app,
+        post_json("/api/inbox/pia/read", json!({}), Some(&maggie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"marked": 1}));
+
+    // An AI's bearer token reads its own inbox and nobody else's — not even
+    // its owner's or its granter's.
+    let (status, minted, _) = send(
+        &app,
+        post_json(
+            "/api/tokens",
+            json!({"actor": "pia", "label": "test", "expiresInDays": 30}),
+            Some(&admin),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "token mint: {minted}");
+    let token = minted["token"].as_str().unwrap();
+    let (status, body, _) = send(&app, bearer("/api/inbox/pia?unread=0", token)).await;
+    assert_eq!(status, StatusCode::OK, "AI token, own inbox: {body}");
+    assert_eq!(body.as_array().map(Vec::len), Some(1));
+    let (status, _, _) = send(&app, bearer("/api/inbox/maggie", token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "AI token, owner's inbox");
+    let (status, _, _) = send(&app, bearer("/api/inbox/nate", token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "AI token, granter's inbox");
+
+    // Unknown ids answer exactly like foreign ones — no existence probe.
+    let (status, body, _) = send(
+        &app,
+        post_json("/api/inbox/item/inb_missing/read", json!({}), Some(&maggie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"marked": false}));
+}
+
 #[tokio::test]
 async fn oidc_callback_provisions_allowed_user_and_sets_session() {
     let _guard = env_guard().await;
@@ -1001,6 +1163,165 @@ async fn viewer_acl_scopes_journal() {
     assert!(
         bodies.iter().any(|b| b.contains("private nate-only")),
         "shared journal visible: {bodies:?}"
+    );
+}
+
+#[tokio::test]
+async fn semantic_scope_runs_before_truncation_and_recall_filters_kinds_in_search() {
+    let _guard = env_guard().await;
+    reset_auth_env();
+    let (app, store) = test_app().await;
+    let cookie = onboard(&app).await;
+
+    // maggie: a second, non-admin login.
+    let (status, _, _) = send(
+        &app,
+        post_json(
+            "/api/users",
+            json!({"name": "Maggie", "email": "maggie@example.com", "password": "maggie-secret-1"}),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, _, headers) = send(
+        &app,
+        post_json(
+            "/api/auth/login",
+            json!({"email": "maggie@example.com", "password": "maggie-secret-1"}),
+            None,
+        ),
+    )
+    .await;
+    let maggie_cookie = headers
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // maggie's own note, then nate floods the vector space with three private
+    // entries that match the query exactly (strictly higher cosine than hers).
+    let (status, _, _) = send(
+        &app,
+        post_json(
+            "/api/journal",
+            json!({"body": "alpha hive inspection notes from the west garden"}),
+            Some(&maggie_cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    for _ in 0..3 {
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/journal",
+                json!({"body": "alpha hive inspection notes"}),
+                Some(&cookie),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    backfill_embeddings(&store).await;
+
+    // limit=2: before the fix the two top slots were nate's private entries,
+    // scoped away only AFTER the cut — maggie got an empty result back.
+    let (status, hits, _) = send(
+        &app,
+        get(
+            "/api/search?q=alpha%20hive%20inspection%20notes&mode=semantic&limit=2",
+            Some(&maggie_cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let titles: Vec<String> = hits
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["title"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        titles.iter().any(|t| t.starts_with("maggie:")),
+        "viewer-visible hit starved out of the pool: {titles:?}"
+    );
+    assert!(
+        !titles.iter().any(|t| t.starts_with("nate:")),
+        "cross-namespace leak: {titles:?}"
+    );
+
+    // Ten tasks that outscore every journal entry for this query used to fill
+    // semantic_search's 8-hit pool before recall's journal post-filter ran,
+    // emptying the brief (DIRECTION.md D9). The kinds filter now runs inside
+    // the search, so the pool is journal-only from the start.
+    for _ in 0..10 {
+        store
+            .tasks_create(
+                hive_api::store::tasks::TaskCreate {
+                    title: "queen brood frame audit notes".to_string(),
+                    body: "queen brood frame audit notes".to_string(),
+                    assignees: vec!["nate".to_string()],
+                    ..Default::default()
+                },
+                "nate",
+            )
+            .await
+            .expect("task create");
+    }
+    backfill_embeddings(&store).await;
+    let recall = store
+        .recall(
+            "nate",
+            hive_api::store::recall::RecallOptions {
+                query: Some("queen brood frame audit notes".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("recall");
+    assert!(
+        !recall.data.journal.is_empty(),
+        "task noise crowded journal out of the recall brief"
+    );
+    assert!(recall
+        .data
+        .journal
+        .iter()
+        .all(|h| h.hit.kind == "journal"));
+
+    // A top-scoring embeddings row of a kind this build doesn't know (written
+    // by a newer binary) must not hold result slots on the UNSCOPED path
+    // either: admission drops it before the cut, so the admin still gets the
+    // best parseable hit instead of an empty result.
+    let alien = hive_embed::embed_query("alpha hive inspection notes");
+    hive_api::pgq::query(
+        "INSERT INTO embeddings (ref_kind, ref_id, model, dim, vec, hash, created_at) \
+         VALUES ('document', 'doc_alien', ?, ?, ?, 'alien', ?)",
+    )
+    .bind(hive_embed::embed_model())
+    .bind(alien.len() as i64)
+    .bind(hive_embed::to_blob(&alien))
+    .bind(hive_api::store::now_iso())
+    .execute(store.db())
+    .await
+    .expect("alien embedding row");
+    let (status, hits, _) = send(
+        &app,
+        get(
+            "/api/search?q=alpha%20hive%20inspection%20notes&mode=semantic&limit=1",
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !hits.as_array().unwrap().is_empty(),
+        "unknown-kind row starved the unscoped result: {hits}"
     );
 }
 

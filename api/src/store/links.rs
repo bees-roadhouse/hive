@@ -53,6 +53,9 @@ impl Store {
     }
 }
 
+/// Kinds pass through as strings: with user-defined entity types an
+/// enum-unknown kind is a VALID row (a custom slug), not a hazard — nothing
+/// mislabels now that the lossy default is gone.
 pub(crate) fn row_to_link(r: &sqlx::postgres::PgRow) -> Result<Link> {
     Ok(Link {
         id: r.try_get("id")?,

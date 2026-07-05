@@ -570,6 +570,7 @@ pub enum EntityKind {
     Topic,
     Project,
     Phase,
+    Mail,
 }
 
 impl EntityKind {
@@ -583,12 +584,15 @@ impl EntityKind {
             EntityKind::Topic => "topic",
             EntityKind::Project => "project",
             EntityKind::Phase => "phase",
+            EntityKind::Mail => "mail",
         }
     }
-    /// Fail-closed parse: unknown kind strings are None, never silently Task.
-    /// Seam rows (search/links/inbox/graph) carry kind as a plain String so
-    /// user-defined entity type slugs can flow through them; this parse exists
-    /// for the genuinely closed domains (bracket tokens, autocomplete).
+    /// Fail-closed parse: an unknown kind is `None`, never a default — rows
+    /// written by a newer binary must be dropped by callers, not mislabeled
+    /// (DIRECTION.md Phase 0). Seam rows (search/links/inbox/graph) carry kind
+    /// as a plain String so custom entity type slugs flow through them; this
+    /// parse exists for the genuinely closed domains (bracket tokens,
+    /// autocomplete, mail).
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "task" => Some(EntityKind::Task),
@@ -599,6 +603,7 @@ impl EntityKind {
             "topic" => Some(EntityKind::Topic),
             "project" => Some(EntityKind::Project),
             "phase" => Some(EntityKind::Phase),
+            "mail" => Some(EntityKind::Mail),
             _ => None,
         }
     }
@@ -1658,6 +1663,20 @@ mod tests {
     fn slugify_matches_node() {
         assert_eq!(slugify("Bee's Roadhouse"), "bees-roadhouse");
         assert_eq!(slugify("MiXeD 123"), "mixed-123");
+    }
+
+    #[test]
+    fn entity_kind_parses_fail_closed() {
+        assert_eq!(EntityKind::parse("mail"), Some(EntityKind::Mail));
+        assert_eq!(EntityKind::parse("task"), Some(EntityKind::Task));
+        // Unknown kinds must never default to Task.
+        assert_eq!(EntityKind::parse("document"), None);
+        assert_eq!(EntityKind::parse(""), None);
+        // serde round-trip stays lowercase.
+        assert_eq!(
+            serde_json::to_string(&EntityKind::Mail).unwrap(),
+            "\"mail\""
+        );
     }
 
     #[test]
