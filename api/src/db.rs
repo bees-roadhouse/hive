@@ -396,6 +396,70 @@ const SCHEMA_SEARCH: &str = r#"
       PRIMARY KEY (kind, ref_id)
     );
     CREATE INDEX IF NOT EXISTS search_tsv ON search USING GIN (tsv);
+
+    -- ===== User-defined custom entity types =====
+    -- Registry (entity_types + entity_fields) + validated JSONB instances
+    -- (entities). fields is REAL JSONB — a deliberate departure from the
+    -- TEXT-JSON habit: server-side operators/indexes for user-shaped data.
+    -- Rust binds it as TEXT with ?::jsonb casts and reads fields::text
+    -- (workspace sqlx has no 'json' feature; SELECT * would fail to decode),
+    -- so row_to_entity in store/custom_entities.rs is the only read path.
+    -- Kind at the seams (search.kind, links.*_kind) is entity_types.slug;
+    -- instance ids are uniformly 'ent_'.
+    CREATE TABLE IF NOT EXISTS entity_types (
+      id          TEXT PRIMARY KEY,
+      slug        TEXT NOT NULL UNIQUE,
+      name        TEXT NOT NULL,
+      name_plural TEXT NOT NULL DEFAULT '',
+      description TEXT NOT NULL DEFAULT '',
+      icon        TEXT NOT NULL DEFAULT '',
+      color       TEXT NOT NULL DEFAULT '',
+      -- slug of a choice field the generic board groups by; NULL = flat list.
+      board_field TEXT,
+      archived    BOOLEAN NOT NULL DEFAULT FALSE,
+      created_by  TEXT NOT NULL,
+      created_at  TEXT NOT NULL,
+      updated_at  TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS entity_fields (
+      id         TEXT PRIMARY KEY,
+      type_id    TEXT NOT NULL,
+      slug       TEXT NOT NULL,
+      label      TEXT NOT NULL,
+      -- text | number | bool | date | choice | ref (validated in Rust only,
+      -- same enforcement level as tasks.status).
+      field_type TEXT NOT NULL,
+      required   BOOLEAN NOT NULL DEFAULT FALSE,
+      position   BIGINT NOT NULL DEFAULT 0,
+      options    TEXT NOT NULL DEFAULT '[]',
+      -- ref fields: target kind — person|topic|project|task or a custom slug.
+      ref_kind   TEXT,
+      archived   BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE (type_id, slug)
+    );
+    CREATE INDEX IF NOT EXISTS entity_fields_type ON entity_fields (type_id, position);
+
+    CREATE TABLE IF NOT EXISTS entities (
+      id              TEXT PRIMARY KEY,
+      type_id         TEXT NOT NULL,
+      title           TEXT NOT NULL,
+      fields          JSONB NOT NULL DEFAULT '{}'::jsonb,
+      -- Visibility: same model as journal.user_scope (NULL = global).
+      user_scope      TEXT,
+      -- v2 journal-emergence provenance; carried now so nothing blocks it.
+      origin_entry_id TEXT,
+      created_by      TEXT NOT NULL,
+      created_at      TEXT NOT NULL,
+      updated_at      TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS entities_type  ON entities (type_id, created_at);
+    CREATE INDEX IF NOT EXISTS entities_scope ON entities (user_scope);
+    -- Dormant in v1 (filters run in Rust at household scale); enables ad-hoc
+    -- psql @> queries and server-side filtering later without a migration.
+    CREATE INDEX IF NOT EXISTS entities_fields_gin ON entities USING GIN (fields jsonb_path_ops);
 "#;
 
 pub async fn migrate(pool: &PgPool) -> Result<()> {

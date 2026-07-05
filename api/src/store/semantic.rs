@@ -159,10 +159,31 @@ impl Store {
             ))
             .await?
             .unwrap_or_default();
+        // Registered custom type slugs get their own visibility arm (scope is
+        // on the row itself, not an origin entry). Fetched once per call.
+        let custom_slugs: std::collections::HashSet<String> =
+            crate::pgq::query_scalar::<String>("SELECT slug FROM entity_types")
+                .fetch_all(self.db())
+                .await?
+                .into_iter()
+                .collect();
         let mut out = Vec::with_capacity(hits.len());
         for h in hits {
             if h.kind == "journal" {
                 if visible.contains(&h.id) {
+                    out.push(h);
+                }
+                continue;
+            }
+            if custom_slugs.contains(&h.kind) {
+                let seen: Option<i32> = crate::pgq::query_scalar(
+                    "SELECT 1 FROM entities WHERE id = ? AND (user_scope IS NULL OR user_scope = ?)",
+                )
+                .bind(&h.id)
+                .bind(viewer)
+                .fetch_optional(self.db())
+                .await?;
+                if seen.is_some() {
                     out.push(h);
                 }
                 continue;
