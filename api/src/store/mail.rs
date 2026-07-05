@@ -112,15 +112,15 @@ impl Store {
     pub async fn mail_accounts_list(&self, viewer: Option<&str>) -> Result<Vec<MailAccount>> {
         let rows = match viewer {
             Some(viewer) => crate::pgq::query_as::<MailAccount>(
-                "SELECT id, COALESCE(display_name, email) AS label, email AS address, provider, updated_at AS last_synced_at \
-                 FROM mail_accounts WHERE user_scope = ? ORDER BY email ASC",
+                "SELECT id, address AS label, address, 'jmap' AS provider, last_synced_at \
+                 FROM mail_accounts WHERE owner = ? ORDER BY address ASC",
             )
             .bind(viewer)
             .fetch_all(self.db())
             .await?,
             None => crate::pgq::query_as::<MailAccount>(
-                "SELECT id, COALESCE(display_name, email) AS label, email AS address, provider, updated_at AS last_synced_at \
-                 FROM mail_accounts ORDER BY user_scope ASC, email ASC",
+                "SELECT id, address AS label, address, 'jmap' AS provider, last_synced_at \
+                 FROM mail_accounts ORDER BY owner ASC, address ASC",
             )
             .fetch_all(self.db())
             .await?,
@@ -163,7 +163,7 @@ impl Store {
         let rows = match viewer {
             Some(viewer) => {
                 crate::pgq::query_as::<MailMessageRow>(&mail_message_select(
-                    "WHERE m.user_scope = ? AND m.thread_id = ? ORDER BY m.received_at ASC",
+                    "WHERE m.user_scope = ? AND m.jmap_thread_id = ? ORDER BY m.received_at ASC",
                 ))
                 .bind(viewer)
                 .bind(thread_id)
@@ -172,7 +172,7 @@ impl Store {
             }
             None => {
                 crate::pgq::query_as::<MailMessageRow>(&mail_message_select(
-                    "WHERE m.thread_id = ? ORDER BY m.received_at ASC",
+                    "WHERE m.jmap_thread_id = ? ORDER BY m.received_at ASC",
                 ))
                 .bind(thread_id)
                 .fetch_all(self.db())
@@ -209,14 +209,21 @@ impl Store {
         }
         let trimmed = query.map(str::trim).filter(|q| !q.is_empty());
         if trimmed.is_some() {
-            clauses.push("(m.subject ILIKE ? OR m.from_email ILIKE ? OR COALESCE(m.from_name, '') ILIKE ? OR m.snippet ILIKE ? OR m.body_text ILIKE ?)");
+            clauses.push("(m.subject ILIKE ? OR m.from_addr ILIKE ? OR COALESCE(m.from_name, '') ILIKE ? OR m.snippet ILIKE ? OR m.body_text ILIKE ?)");
         }
         let where_sql = if clauses.is_empty() {
             String::new()
         } else {
             format!("WHERE {} ", clauses.join(" AND "))
         };
-        let sql = mail_message_select(&format!("{where_sql}ORDER BY m.received_at DESC LIMIT ?"));
+        let deleted_filter = if where_sql.is_empty() {
+            "WHERE m.deleted_at IS NULL "
+        } else {
+            "AND m.deleted_at IS NULL "
+        };
+        let sql = mail_message_select(&format!(
+            "{where_sql}{deleted_filter}ORDER BY m.received_at DESC LIMIT ?"
+        ));
         let mut q = crate::pgq::query_as::<MailMessageRow>(&sql);
         if let Some(viewer) = viewer {
             q = q.bind(viewer);
@@ -239,11 +246,11 @@ impl Store {
 
 fn mail_message_select(suffix: &str) -> String {
     format!(
-        "SELECT m.id, m.account_id, mb.name AS mailbox, m.thread_id, m.subject, m.from_name, \
-         m.from_email, m.to_json, m.cc_json, m.received_at, m.snippet, m.body_text, m.has_attachments \
+        "SELECT m.id, m.account_id, NULL::TEXT AS mailbox, m.jmap_thread_id AS thread_id, \
+         m.subject, m.from_name, m.from_addr AS from_email, m.to_json, m.cc_json, \
+         m.received_at, m.snippet, m.body_text, m.has_attachments \
          FROM mail_messages m \
-         JOIN mail_accounts a ON a.id = m.account_id \
-         LEFT JOIN mail_mailboxes mb ON mb.id = m.mailbox_id {suffix}"
+         JOIN mail_accounts a ON a.id = m.account_id {suffix}"
     )
 }
 
@@ -258,33 +265,29 @@ mod tests {
         let now = "2026-07-05T00:00:00Z";
 
         crate::pgq::query(
-            "INSERT INTO mail_accounts (id, user_scope, provider, email, display_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO mail_accounts (id, owner, address, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
         )
         .bind("acct-alice")
         .bind("alice")
-        .bind("jmap")
         .bind("alice@example.test")
-        .bind("Alice Test")
         .bind(now)
         .bind(now)
         .execute(store.db())
         .await
         .unwrap();
         crate::pgq::query(
-            "INSERT INTO mail_accounts (id, user_scope, provider, email, display_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO mail_accounts (id, owner, address, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
         )
         .bind("acct-bob")
         .bind("bob")
-        .bind("jmap")
         .bind("bob@example.test")
-        .bind("Bob Test")
         .bind(now)
         .bind(now)
         .execute(store.db())
         .await
         .unwrap();
         crate::pgq::query(
-            "INSERT INTO mail_mailboxes (id, account_id, mailbox_id, name, role, sort_order) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO mail_mailboxes (id, account_id, jmap_id, name, role, sort_order) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind("mbox-alice-inbox")
         .bind("acct-alice")
@@ -296,12 +299,11 @@ mod tests {
         .await
         .unwrap();
         crate::pgq::query(
-            "INSERT INTO mail_messages (id, account_id, user_scope, mailbox_id, thread_id, jmap_id, message_id, subject, from_name, from_email, to_json, cc_json, received_at, snippet, body_text, has_attachments, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO mail_messages (id, account_id, user_scope, jmap_thread_id, jmap_id, message_id_hdr, subject, from_name, from_addr, to_json, cc_json, received_at, snippet, body_text, has_attachments, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind("msg-alice-1")
         .bind("acct-alice")
         .bind("alice")
-        .bind("mbox-alice-inbox")
         .bind("thread-shared")
         .bind("jmap-alice-1")
         .bind("<alice-1@example.test>")
@@ -320,12 +322,11 @@ mod tests {
         .await
         .unwrap();
         crate::pgq::query(
-            "INSERT INTO mail_messages (id, account_id, user_scope, mailbox_id, thread_id, jmap_id, message_id, subject, from_name, from_email, to_json, cc_json, received_at, snippet, body_text, has_attachments, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO mail_messages (id, account_id, user_scope, jmap_thread_id, jmap_id, message_id_hdr, subject, from_name, from_addr, to_json, cc_json, received_at, snippet, body_text, has_attachments, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind("msg-bob-1")
         .bind("acct-bob")
         .bind("bob")
-        .bind(Option::<String>::None)
         .bind("thread-shared")
         .bind("jmap-bob-1")
         .bind("<bob-1@example.test>")

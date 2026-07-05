@@ -70,18 +70,21 @@ async fn search(
         };
         return Ok(Json(s.semantic_search(&query, opts).await?).into_response());
     }
-    let mut hits = s.search(&query, limit, viewer.as_deref()).await?;
-    let remaining = limit.saturating_sub(hits.len()).max(1);
-    let mail_hits = s
-        .mail_search(&query, viewer.as_deref(), remaining as i64)
-        .await?;
-    hits.extend(mail_hits.into_iter().map(|m| SearchHit {
-        kind: "mail".to_string(),
-        id: m.id,
-        title: m.subject,
-        snippet: m.snippet.unwrap_or_default(),
-        score: 0.5,
-    }));
+    let mail_hits = s.mail_search(&query, viewer.as_deref(), limit as i64).await?;
+    let mut hits: Vec<SearchHit> = mail_hits
+        .into_iter()
+        .map(|m| SearchHit {
+            kind: "mail".to_string(),
+            id: m.thread_id,
+            title: m.subject,
+            snippet: m.snippet.unwrap_or_default(),
+            score: 0.5,
+        })
+        .collect();
+    let remaining = limit.saturating_sub(hits.len());
+    if remaining > 0 {
+        hits.extend(s.search(&query, remaining, viewer.as_deref()).await?);
+    }
     hits.truncate(limit);
     Ok(Json(hits).into_response())
 }
