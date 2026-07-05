@@ -281,7 +281,7 @@ export const Account: Component = () => {
               </p>
               <Show when={r().warnings.length}>
                 <ul class="dim sm">
-                  <For each={r().warnings}>{(w) => <li>⚠ {w}</li>}</For>
+                  <For each={r().warnings}>{(w) => <li>warning: {w}</li>}</For>
                 </ul>
               </Show>
             </div>

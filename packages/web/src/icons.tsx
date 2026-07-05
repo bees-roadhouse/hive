@@ -3,7 +3,7 @@ import type { JSX } from "solid-js";
 // One cohesive line-icon family (currentColor, consistent stroke) so the whole
 // shell reads as a single system instead of a mix of emoji and glyphs. The nav
 // tasks/decisions/events marks deliberately echo their inline anchor glyphs
-// (square / diamond / clock). The bee 🐝 stays as the brand mark.
+// (square / diamond / clock). The hex cell carries the brand mark.
 
 // Fresh nodes per call (a DOM node can't live in two places) — so this is a
 // function, not a lookup table of pre-built JSX.
@@ -151,6 +151,24 @@ function paths(name: string): JSX.Element {
           <path d="M6 4h11l-3 4 3 4H6" />
         </>
       );
+    case "link": // chain links
+      return (
+        <>
+          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+        </>
+      );
+    case "quote": // quotation mark — blockquote
+      return (
+        <>
+          <path d="M9.5 6.5c-3 1-4.5 3.2-4.5 6.5v4.5h5.5v-5.5H8c0-2 .8-3.3 2.5-4z" />
+          <path d="M20 6.5c-3 1-4.5 3.2-4.5 6.5v4.5H21v-5.5h-2.5c0-2 .8-3.3 2.5-4z" />
+        </>
+      );
+    case "chev-l": // chevron left
+      return <path d="M14.5 5.5 8 12l6.5 6.5" />;
+    case "chev-r": // chevron right
+      return <path d="M9.5 5.5 16 12l-6.5 6.5" />;
     default:
       return <circle cx="12" cy="12" r="9" />;
   }

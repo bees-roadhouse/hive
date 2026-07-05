@@ -1425,13 +1425,9 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
 .chat-row-meta { display: flex; align-items: center; gap: 0.4rem; font-size: var(--fs-xs); color: var(--dim); }
 
 /* Status is a dot, not a rainbow: honey while Claude works or waits on you,
-   neutral at rest, danger only for genuine failure. */
-.chat-dot { width: 7px; height: 7px; border-radius: var(--r-pill); background: var(--line); flex: none; }
-.chat-dot.st-provisioning, .chat-dot.st-running { background: var(--honey); animation: chat-pulse 1.6s ease-in-out infinite; }
-.chat-dot.st-waiting_input { background: var(--accent); }
-.chat-dot.st-idle { background: var(--dim); }
-.chat-dot.st-failed { background: var(--danger); }
-@keyframes chat-pulse { 50% { opacity: 0.3; } }
+   neutral at rest, danger only for genuine failure. The .chat-dot.st-*
+   selectors are aliased into the shared dot family (see "shared primitives"
+   near the end of this file) so there is exactly one source for dot color. */
 
 .chat-main { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 .chat-head {
@@ -1515,6 +1511,40 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
   .chat-scroll { max-height: 58vh; }
 }
 
+/* ============================================================
+   shared primitives — EmptyState / SectionHead / StatusDot
+   (src/primitives.tsx). One voice for "nothing here yet", one
+   section-header shape, one dot family for every status light.
+   ============================================================ */
+
+/* EmptyState — a centered, quiet column: dim icon, ink title, dim hint. */
+.empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: var(--sp-2); padding: var(--sp-6); text-align: center;
+}
+.empty-icon { color: var(--dim); display: flex; }
+.empty-title { margin: 0; font-size: var(--fs-base); color: var(--ink); }
+.empty-hint { margin: 0; font-size: var(--fs-sm); color: var(--dim); line-height: 1.5; max-width: 38ch; }
+.empty-action { margin-top: var(--sp-2); }
+
+/* SectionHead — h3-level header row: icon, title (takes the room), count
+   badge, then whatever controls the caller slots on the right. */
+.sec-head { display: flex; align-items: center; gap: var(--sp-2); margin: 0 0 var(--sp-3); }
+.sec-head h3 { margin: 0; flex: 1; font-size: var(--fs-md); font-weight: 600; }
+.sec-head-icon { color: var(--dim); display: inline-flex; align-items: center; }
+
+/* StatusDot — the one dot family. .chat-dot (Workspaces markup) aliases the
+   same declarations so the chats rail and every other status light share a
+   single source: honey live (pulse while working), accent waiting on you,
+   danger for genuine failure, dim at rest. */
+.dot, .chat-dot { width: 7px; height: 7px; border-radius: var(--r-pill); background: var(--line); flex: none; display: inline-block; }
+.dot-rest, .chat-dot.st-idle { background: var(--dim); }
+.dot-live, .chat-dot.st-provisioning, .chat-dot.st-running { background: var(--honey); }
+.dot-waiting, .chat-dot.st-waiting_input { background: var(--accent); }
+.dot-danger, .chat-dot.st-failed { background: var(--danger); }
+.dot-pulse, .chat-dot.st-provisioning, .chat-dot.st-running { animation: dot-pulse 1.6s ease-in-out infinite; }
+@keyframes dot-pulse { 50% { opacity: 0.3; } }
+
 /* ---- reduced motion: one master switch ----
    Everything stops except meaning-bearing progress (spinner) — status-dot
    pulses go static at full opacity. */
@@ -1525,7 +1555,7 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
     transition-duration: 0.01ms !important;
   }
   .spinner { animation-duration: 0.7s !important; animation-iteration-count: infinite !important; }
-  .live-dot, .chat-dot, .ws-dot { animation: none !important; opacity: 1 !important; }
+  .live-dot, .dot, .chat-dot, .ws-dot { animation: none !important; opacity: 1 !important; }
   /* Folded from the old per-feature blocks: scroll-fade journal entries must
      never sit hidden waiting for an entrance transition that no longer runs. */
   .entry-fade { opacity: 1; transform: none; }

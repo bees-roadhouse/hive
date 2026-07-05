@@ -3,6 +3,7 @@ import { ACTOR_NAMES, SEVERITIES, type Severity, type SourceKind } from "@hive/s
 import { api, getActor } from "./api.ts";
 import { relTime } from "./lib.tsx";
 import { liveRev } from "./live.ts";
+import { EmptyState } from "./primitives.tsx";
 
 /** Worker configuration: ingest sources (GUI ⇄ MCP), status, outbound queue,
  * and the Claude Code credentials that power hosted chats. */
@@ -113,7 +114,10 @@ export const Settings: Component = () => {
         <button class="primary" type="submit">add source</button>
       </form>
 
-      <For each={sources()} fallback={<p class="dim sm pad">no sources yet — add one above.</p>}>
+      <For
+        each={sources()}
+        fallback={<EmptyState icon="wire" title="No sources yet." hint="Add one above to feed the wire." />}
+      >
         {(s) => (
           <div class="source-row" classList={{ off: !s.enabled }}>
             <label class="sw">
@@ -139,7 +143,10 @@ export const Settings: Component = () => {
       </For>
 
       <h3 class="sec">Outbound queue</h3>
-      <Show when={outbox()?.length} fallback={<p class="dim sm">no outbound jobs.</p>}>
+      <Show
+        when={outbox()?.length}
+        fallback={<EmptyState icon="inbox" title="No outbound jobs." hint="Deliveries queue here on their way out." />}
+      >
         <For each={outbox()}>
           {(j) => (
             <div class="wire-row">
@@ -165,7 +172,10 @@ export const Settings: Component = () => {
         <button class="primary" type="submit">save credential</button>
       </form>
 
-      <For each={creds()} fallback={<p class="dim sm pad">no credentials yet — chats can't start without one.</p>}>
+      <For
+        each={creds()}
+        fallback={<EmptyState icon="chats" title="No credentials yet." hint="Chats can't start without one — add a token above." />}
+      >
         {(c) => (
           <div class="wire-row">
             <span class="badge">{c.kind}</span>

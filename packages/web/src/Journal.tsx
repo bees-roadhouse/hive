@@ -72,7 +72,7 @@ const TRIGGERS: Record<string, string[]> = {
 };
 
 const KIND_GLYPH: Record<string, string> = {
-  person: "👤",
+  person: "@",
   topic: "#",
   project: "◈",
   phase: "◷",
@@ -871,9 +871,9 @@ export const Journal: Component = () => {
                 <button title="inline code"   onClick={toolCode}>   {"</>"}     </button>
                 <button title="heading"       onClick={toolHeading}>H            </button>
                 <button title="bullet list"   onClick={toolBullet}> •            </button>
-                <button title="checkbox task" onClick={toolCheckbox}>☑           </button>
-                <button title="blockquote"    onClick={toolQuote}>  ❝            </button>
-                <button title="link"          onClick={toolLink}>   🔗           </button>
+                <button title="checkbox task" onClick={toolCheckbox}><Icon name="tasks" size={14} /></button>
+                <button title="blockquote"    onClick={toolQuote}><Icon name="quote" size={14} /></button>
+                <button title="link"          onClick={toolLink}><Icon name="link" size={14} /></button>
               </div>
 
               {/* TipTap mount point + autocomplete dropdown */}

@@ -9,6 +9,7 @@ import { createEffect, createResource, createSignal, For, on, Show, type Compone
 import { api, type CcMessage, type CcSession } from "./api.ts";
 import { Icon } from "./icons.tsx";
 import { liveRev } from "./live.ts";
+import { EmptyState } from "./primitives.tsx";
 
 function rel(iso: string | null | undefined): string {
   if (!iso) return "";
@@ -162,7 +163,10 @@ export const Workspaces: Component = () => {
           <Icon name="chats" size={15} /> New chat
         </button>
         <div class="chat-rows">
-          <For each={rail()} fallback={<p class="dim sm">No chats yet.</p>}>
+          <For
+            each={rail()}
+            fallback={<EmptyState icon="chats" title="No chats yet." hint="Start one by describing a task." />}
+          >
             {(s) => (
               <button class="chat-row" classList={{ selected: selected() === s.id }} onClick={() => setSelected(s.id)}>
                 <span class="chat-row-title">{s.title || "Untitled chat"}</span>

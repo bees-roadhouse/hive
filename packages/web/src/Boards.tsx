@@ -30,6 +30,7 @@ import { liveRev } from "./live.ts";
 import { Icon } from "./icons.tsx";
 import { DECISION_GLYPH, highlightSnippet, relTime, SkeletonList, TASK_GLYPH } from "./lib.tsx";
 import { Markdown } from "./markdown.tsx";
+import { EmptyState } from "./primitives.tsx";
 
 // ---- due-date helpers ----
 
@@ -373,7 +374,16 @@ export const Decisions: Component = () => {
   const [decisions] = createResource(() => ({ _r: liveRev() }), () => api.decisions());
   return (
     <section>
-      <For each={decisions()} fallback={<p class="dim sm pad">no decisions yet — a decision emerges when you anchor one in a journal entry.</p>}>
+      <For
+        each={decisions()}
+        fallback={
+          <EmptyState
+            icon="decisions"
+            title="No decisions yet."
+            hint="Anchor one in a journal entry to start the log."
+          />
+        }
+      >
         {(d) => (
           <article class={`decision status-${d.status}`}>
             <header>
@@ -413,7 +423,16 @@ export const Events: Component = () => {
   const [events] = createResource(() => ({ _r: liveRev() }), () => api.events());
   return (
     <section>
-      <For each={events()} fallback={<p class="dim sm pad">no events yet — an event emerges when you anchor one in a journal entry.</p>}>
+      <For
+        each={events()}
+        fallback={
+          <EmptyState
+            icon="events"
+            title="No events yet."
+            hint="Anchor one in a journal entry to put it on the record."
+          />
+        }
+      >
         {(e) => (
           <article class="entry">
             <h3>◷ {e.title}</h3>
@@ -445,7 +464,11 @@ const SearchResults: Component<{ query: string; mode: "keyword" | "semantic" }> 
   return (
     <For
       each={hits()}
-      fallback={<Show when={props.query.trim()}><p class="dim sm pad">no matches.</p></Show>}
+      fallback={
+        <Show when={props.query.trim()}>
+          <EmptyState icon="search" title="No matches." hint="Try different words, or switch modes." />
+        </Show>
+      }
     >
       {(h) => (
         <div class="hit">
@@ -508,7 +531,7 @@ export const SearchPane: Component = () => {
         </div>
       </div>
       <p class="dim sm pad">
-        {mode() === "semantic" ? "vector similarity via the local embedder" : "FTS5 keyword match"}
+        {mode() === "semantic" ? "vector similarity via the local embedder" : "full-text keyword match"}
       </p>
       <Suspense fallback={<p class="dim sm pad">searching…</p>}>
         <SearchResults query={query()} mode={mode()} />
@@ -632,12 +655,30 @@ export const Wire: Component = () => {
       </div>
 
       <Show when={filter() === "news"}>
-        <For each={shown()} fallback={<p class="dim sm pad">no news yet — add an RSS or scrape source in Settings; items land here as the worker polls them.</p>}>
+        <For
+          each={shown()}
+          fallback={
+            <EmptyState
+              icon="wire"
+              title="No news yet."
+              hint="Add an RSS or scrape source in Settings; items land here as the worker polls."
+            />
+          }
+        >
           {(e) => <NewsCard e={e} fresh={isFresh(e)} />}
         </For>
       </Show>
       <Show when={filter() !== "news"}>
-        <For each={shown()} fallback={<p class="dim sm pad">no activity yet — the wire shows live events as you and the agents work.</p>}>
+        <For
+          each={shown()}
+          fallback={
+            <EmptyState
+              icon="wire"
+              title="No activity yet."
+              hint="Live events appear here as you and the agents work."
+            />
+          }
+        >
           {(e) => (
             <div class="wire-row" classList={{ "just-landed": isFresh(e) }}>
               <time>{relTime(e.created_at)}</time>
@@ -672,7 +713,16 @@ export const PeopleView: Component = () => {
     <section>
       <p class="dim pad">Identities known to hive — humans and AIs. Click one to edit its profile (bio + role). AIs can also keep their own profile updated via MCP.</p>
       <Show when={people()} fallback={<SkeletonList rows={6} />}>
-        <For each={people() as Person[]} fallback={<p class="dim sm">no people yet — reference someone in a journal entry.</p>}>
+        <For
+          each={people() as Person[]}
+          fallback={
+            <EmptyState
+              icon="people"
+              title="No people yet."
+              hint="Mention someone in a journal entry to introduce them."
+            />
+          }
+        >
           {(p) => (
             <div class="person-card">
               <div class="entity-row person-head" onClick={() => (editing() === p.slug ? setEditing(null) : open(p))}>
@@ -711,7 +761,16 @@ export const TopicsView: Component = () => {
     <section>
       <p class="dim pad">Topics extracted from <code>[topic:…]</code> references in journal entries.</p>
       <Show when={topics()} fallback={<SkeletonList rows={6} />}>
-        <For each={topics() as Topic[]} fallback={<p class="dim sm">no topics yet — reference a topic in a journal entry.</p>}>
+        <For
+          each={topics() as Topic[]}
+          fallback={
+            <EmptyState
+              icon="topics"
+              title="No topics yet."
+              hint="Tag #topic in a journal entry to open one."
+            />
+          }
+        >
           {(t) => (
             <div class="entity-row">
               <span class="entity-icon"><Icon name="topic" size={16} /></span>
@@ -775,7 +834,16 @@ export const ProjectsView: Component = () => {
     <section>
       <p class="dim pad">Projects with their phases and task counts. Projects are created automatically when a task references one.</p>
       <Show when={projects()} fallback={<SkeletonList rows={4} />}>
-        <For each={projects() as Project[]} fallback={<p class="dim sm">no projects yet — assign a task a project in a journal entry.</p>}>
+        <For
+          each={projects() as Project[]}
+          fallback={
+            <EmptyState
+              icon="projects"
+              title="No projects yet."
+              hint="Give a task a +project in a journal entry to start one."
+            />
+          }
+        >
           {(p) => <ProjectCard p={p} />}
         </For>
       </Show>
