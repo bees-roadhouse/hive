@@ -1,4 +1,4 @@
-// Chats — terminal-native agent sessions. The UI keeps a Codex/OpenCode-like
+// Conversations: terminal-native agent sessions. The UI keeps a Codex/OpenCode-like
 // split: recents/runtime rail on the left, transcript/tool stream in the main
 // terminal pane, and a composer asking what the agent should do.
 import { createEffect, createMemo, createResource, createSignal, For, on, Show, type Component } from "solid-js";
@@ -42,6 +42,32 @@ const runtimeOf = (s: CcSession | undefined): RuntimeId => {
 };
 const runtimeInfo = (id: RuntimeId) => RUNTIMES.find((r) => r.id === id) ?? RUNTIMES[1];
 
+type GroupMode = "recent" | "project" | "tag";
+const tagsOf = (s: CcSession): string[] => {
+  const tags = metaOf(s).tags;
+  return Array.isArray(tags) ? tags.filter((t): t is string => typeof t === "string" && t.trim().length > 0) : [];
+};
+const projectOf = (s: CcSession): string => {
+  const p = metaOf(s).project;
+  return typeof p === "string" && p.trim() ? p.trim() : "unfiled";
+};
+const parseTags = (s: string): string[] => Array.from(new Set(s.split(/[\s,]+/).map((t) => t.trim().replace(/^#/, "").toLowerCase()).filter(Boolean)));
+const parseLinkedEntities = (s: string): Array<{ kind: string; id: string; rel?: string }> => {
+  const seen = new Set<string>();
+  return s
+    .split(/[\s,]+/)
+    .map((token) => token.trim().replace(/^\[/, "").replace(/\]$/, ""))
+    .map((token) => token.match(/^([a-z][a-z0-9_-]*):(.+)$/i))
+    .filter((m): m is RegExpMatchArray => !!m)
+    .map((m) => ({ kind: m[1].toLowerCase(), id: m[2].trim(), rel: "related" }))
+    .filter((e) => {
+      const key = `${e.kind}:${e.id}`;
+      if (!e.id || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+};
+
 const StatusDot: Component<{ status: string }> = (p) => (
   <span class={`chat-dot st-${p.status}`} title={p.status.replace("_", " ")} />
 );
@@ -77,6 +103,10 @@ export const Workspaces: Component = () => {
   const [draft, setDraft] = createSignal("");
   const [runtime, setRuntime] = createSignal<RuntimeId>("codex");
   const [model, setModel] = createSignal("");
+  const [groupMode, setGroupMode] = createSignal<GroupMode>("recent");
+  const [tagDraft, setTagDraft] = createSignal("");
+  const [projectDraft, setProjectDraft] = createSignal("");
+  const [entityDraft, setEntityDraft] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const [err, setErr] = createSignal<string | null>(null);
   let scrollEl: HTMLDivElement | undefined;
@@ -99,6 +129,16 @@ export const Workspaces: Component = () => {
     return !!s && !ENDED.has(s.status);
   };
   const counts = createMemo(() => RUNTIMES.map((r) => ({ ...r, count: rail().filter((s) => runtimeOf(s) === r.id).length })));
+  const groupedRail = createMemo(() => {
+    const rows = rail();
+    if (groupMode() === "recent") return [{ label: "Recent", rows }];
+    const m = new Map<string, CcSession[]>();
+    for (const s of rows) {
+      const keys = groupMode() === "project" ? [projectOf(s)] : tagsOf(s).length ? tagsOf(s) : ["untagged"];
+      for (const key of keys) m.set(key, [...(m.get(key) ?? []), s]);
+    }
+    return [...m.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([label, grouped]) => ({ label, rows: grouped }));
+  });
 
   createEffect(on(transcript, () => {
     if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
@@ -128,8 +168,14 @@ export const Workspaces: Component = () => {
           runtime: selectedRuntime,
           provider: selectedRuntime === "opencode" ? "opencode" : info.label.toLowerCase().replace(/ /g, "_"),
           model: selectedModel || undefined,
+          tags: parseTags(tagDraft()),
+          project: projectDraft().trim() || undefined,
+          linked_entities: parseLinkedEntities(entityDraft()),
         });
         setDraft("");
+        setTagDraft("");
+        setProjectDraft("");
+        setEntityDraft("");
         setSelected(ws.id);
         await refetchSessions();
       }
@@ -182,6 +228,23 @@ export const Workspaces: Component = () => {
     </div>
   );
 
+  const conversationFields = () => (
+    <div class="conversation-fields">
+      <label>
+        <span>project</span>
+        <input value={projectDraft()} placeholder="optional project" onInput={(e) => setProjectDraft(e.currentTarget.value)} />
+      </label>
+      <label>
+        <span>tags</span>
+        <input value={tagDraft()} placeholder="ops, hive, followup" onInput={(e) => setTagDraft(e.currentTarget.value)} />
+      </label>
+      <label>
+        <span>links</span>
+        <input value={entityDraft()} placeholder="task:tsk_… topic:roadmap" onInput={(e) => setEntityDraft(e.currentTarget.value)} />
+      </label>
+    </div>
+  );
+
   const composer = (placeholder: string) => (
     <div class="chat-composer" classList={{ waiting: current()?.status === "waiting_input" }}>
       <textarea
@@ -203,30 +266,47 @@ export const Workspaces: Component = () => {
     <div class="chat">
       <div class="chat-rail">
         <button class="chat-new" onClick={() => { setSelected(null); queueMicrotask(() => inputEl?.focus()); }}>
-          <Icon name="chats" size={15} /> New agent run
+          <Icon name="chats" size={15} /> New conversation
         </button>
         <div class="runtime-strip">
           <For each={counts()}>
             {(r) => <span class={`runtime-pill rt-${r.id}`}><RuntimeDot runtime={r.id} /> {r.label} <b>{r.count}</b></span>}
           </For>
         </div>
-        <div class="chat-rows">
-          <For
-            each={rail()}
-            fallback={<EmptyState icon="chats" title="No chats yet." hint="Pick a runtime and describe a task." />}
-          >
-            {(s) => (
-              <button class="chat-row" classList={{ selected: selected() === s.id }} onClick={() => setSelected(s.id)}>
-                <span class="chat-row-title">{s.title || "Untitled run"}</span>
-                <span class="chat-row-meta">
-                  <RuntimeDot runtime={runtimeOf(s)} />
-                  {runtimeInfo(runtimeOf(s)).label}
-                  <StatusDot status={s.status} />
-                  {rel(s.last_activity_at ?? s.created_at)}
-                </span>
-              </button>
-            )}
+        <div class="conversation-group-tabs">
+          <For each={["recent", "project", "tag"] as GroupMode[]}>
+            {(mode) => <button classList={{ active: groupMode() === mode }} onClick={() => setGroupMode(mode)}>{mode}</button>}
           </For>
+        </div>
+        <div class="chat-rows">
+          <Show when={rail().length > 0} fallback={<EmptyState icon="chats" title="No conversations yet." hint="Pick a runtime and describe a task." />}>
+            <For each={groupedRail()}>
+              {(group) => (
+                <div class="conversation-group">
+                  <div class="conversation-group-title">{group.label}</div>
+                  <For each={group.rows}>
+                    {(s) => (
+                      <button class="chat-row" classList={{ selected: selected() === s.id }} onClick={() => setSelected(s.id)}>
+                        <span class="chat-row-title">{s.title || "Untitled conversation"}</span>
+                        <span class="chat-row-meta">
+                          <RuntimeDot runtime={runtimeOf(s)} />
+                          {runtimeInfo(runtimeOf(s)).label}
+                          <StatusDot status={s.status} />
+                          {rel(s.last_activity_at ?? s.created_at)}
+                        </span>
+                        <Show when={projectOf(s) !== "unfiled" || tagsOf(s).length > 0}>
+                          <span class="conversation-tags">
+                            <Show when={projectOf(s) !== "unfiled"}><b>{projectOf(s)}</b></Show>
+                            <For each={tagsOf(s)}>{(tag) => <em>#{tag}</em>}</For>
+                          </span>
+                        </Show>
+                      </button>
+                    )}
+                  </For>
+                </div>
+              )}
+            </For>
+          </Show>
         </div>
       </div>
 
@@ -237,8 +317,9 @@ export const Workspaces: Component = () => {
             <div class="chat-hero terminal-panel">
               <span class="chat-hero-icon"><Icon name="chats" size={30} /></span>
               <h3>What should the agent do?</h3>
-              <p class="dim">Choose a runtime, then start a sandboxed terminal chat that writes back to the hive.</p>
+              <p class="dim">Choose a runtime, then start a sandboxed conversation that writes back to the hive.</p>
               {runtimeControls()}
+              {conversationFields()}
               {composer("Describe the task…")}
               <Show when={err()}><div class="chat-err">{err()}</div></Show>
             </div>
@@ -256,7 +337,7 @@ export const Workspaces: Component = () => {
                     <StatusDot status={s().status} />
                     {s().status.replace("_", " ")}
                   </span>
-                  <button class="x" onClick={() => archive(s().id)} title="Archive chat" aria-label="Archive chat">✕</button>
+                  <button class="x" onClick={() => archive(s().id)} title="Archive conversation" aria-label="Archive conversation">✕</button>
                 </div>
                 <div class="chat-status-strip">
                   <span>owner <code>@{s().owner}</code></span>

@@ -61,8 +61,21 @@ pub struct NewCcSession {
     pub provider: Option<String>,
     pub title: Option<String>,
     pub model: Option<String>,
+    /// System-wide tags for grouping and search.
+    pub tags: Option<Vec<String>>,
+    /// Optional project grouping slug/name.
+    pub project: Option<String>,
+    /// Optional typed entities to relate to this conversation.
+    pub linked_entities: Option<Vec<LinkedEntity>>,
     /// Optional first prompt to kick the session off.
     pub prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LinkedEntity {
+    pub kind: String,
+    pub id: String,
+    pub rel: Option<String>,
 }
 
 /// Append-a-message request (runner → API ingest).
@@ -178,6 +191,25 @@ pub fn normalize_runtime(runtime: Option<&str>) -> String {
     }
 }
 
+fn normalize_tags(tags: Option<Vec<String>>) -> Vec<String> {
+    let mut out = Vec::new();
+    for tag in tags.unwrap_or_default() {
+        let t = tag.trim().trim_start_matches('#').to_ascii_lowercase();
+        if !t.is_empty() && !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+fn normalize_project(project: Option<String>) -> Option<String> {
+    project
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 impl Store {
     pub async fn workspace_create(
         &self,
@@ -196,7 +228,16 @@ impl Store {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        let meta = json!({ "runtime": &runtime, "provider": &provider }).to_string();
+        let tags = normalize_tags(input.tags);
+        let project = normalize_project(input.project);
+        let meta = json!({
+            "kind": "conversation",
+            "runtime": &runtime,
+            "provider": &provider,
+            "tags": &tags,
+            "project": &project,
+        })
+        .to_string();
         crate::pgq::query(
             "INSERT INTO cc_sessions \
              (id, owner, created_by, title, workdir, runtime, status, model, usage, meta, created_at, updated_at) \

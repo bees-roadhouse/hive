@@ -18,15 +18,25 @@
 // full plumbing (claim → sandbox → ingest → status → live UI) can be verified without
 // an Anthropic credential or model spend.
 
-import { execFileSync } from "node:child_process";
-import { mkdirSync, existsSync, rmSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdirSync, existsSync, rmSync, writeFileSync, mkdtempSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 
 const BASE = (process.env.HIVE_API_URL ?? "http://localhost:7878").replace(/\/+$/, "");
-const TOKEN = process.env.HIVE_API_TOKEN ?? "";
+const TOKEN = process.env.HIVE_API_TOKEN ?? process.env.HIVE_RUNNER_TOKEN ?? "";
 const POLL_MS = Number(process.env.HIVE_RUNNER_POLL_MS ?? 2000);
 const MODEL = process.env.HIVE_RUNNER_MODEL || undefined;
 const DRY_RUN = process.env.HIVE_RUNNER_DRY_RUN === "1";
+const SESSION_ISOLATION = (process.env.HIVE_SESSION_ISOLATION ?? "container") !== "host";
+const ENGINE_PREF = process.env.HIVE_CONTAINER_ENGINE ?? "auto";
+const SESSION_IMAGE = process.env.HIVE_SESSION_IMAGE ?? process.env.HIVE_RUNNER_IMAGE ?? "beesroadhouse/hive-runner:latest";
+const USER_VOLUME_PREFIX = process.env.HIVE_USER_VOLUME_PREFIX ?? "hive-user";
+const SESSION_CONTAINER_PREFIX = process.env.HIVE_SESSION_CONTAINER_PREFIX ?? "hive-session";
+const SESSION_NETWORK = process.env.HIVE_SESSION_NETWORK ?? "";
+const ENGINE_SOCKET_TARGET = process.env.HIVE_CONTAINER_SOCKET_TARGET ?? (ENGINE_PREF === "docker" ? "/var/run/docker.sock" : "/run/podman/podman.sock");
+const PROPAGATE_SOCKET = process.env.HIVE_PROPAGATE_ENGINE_SOCKET === "1";
 
 if (!TOKEN) {
   console.error("hive-runner: HIVE_API_TOKEN (an admin/service PAT) is required.");
@@ -42,15 +52,23 @@ interface Workspace {
   status: string;
   claude_session_id: string | null;
   runtime?: RuntimeKind | string;
+  model?: string | null;
 }
 type RuntimeKind = "claude_code" | "codex" | "opencode";
 interface RuntimeAuth {
   owner: string;
   runtime: RuntimeKind | string;
   provider: string | null;
+  model?: string | null;
   kind: string;
   secret: string;
   workdir: string;
+}
+interface SessionContainer {
+  engine: "podman" | "docker";
+  name: string;
+  userVolume: string;
+  workspaceDir: string;
 }
 interface Message {
   seq: number;
@@ -112,6 +130,114 @@ function requireBinary(cmd: string): void {
   }
 }
 
+function safeName(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "user";
+}
+
+function shortHash(s: string): string {
+  return createHash("sha256").update(s).digest("hex").slice(0, 10);
+}
+
+function engineEnv(cmd: "podman" | "docker"): NodeJS.ProcessEnv {
+  if (cmd === "podman") return { ...process.env, CONTAINER_HOST: `unix://${ENGINE_SOCKET_TARGET}` };
+  return process.env;
+}
+
+function commandWorks(cmd: "podman" | "docker"): boolean {
+  const r = spawnSync(cmd, ["--version"], { stdio: "ignore", env: engineEnv(cmd) });
+  return r.status === 0;
+}
+
+function resolveEngine(): "podman" | "docker" | null {
+  if (!SESSION_ISOLATION || ENGINE_PREF === "none" || ENGINE_PREF === "host") return null;
+  const wanted = ENGINE_PREF === "auto" ? ["podman", "docker"] : [ENGINE_PREF];
+  for (const candidate of wanted) {
+    if ((candidate === "podman" || candidate === "docker") && commandWorks(candidate)) return candidate;
+  }
+  throw new Error("HIVE_SESSION_ISOLATION=container but no podman/docker CLI is available");
+}
+
+const ENGINE = resolveEngine();
+
+function engine(args: string[], opts: { input?: string; quiet?: boolean } = {}): string {
+  if (!ENGINE) throw new Error("container engine unavailable");
+  const r = spawnSync(ENGINE, args, { encoding: "utf8", input: opts.input, stdio: opts.quiet ? "pipe" : "pipe", env: engineEnv(ENGINE) });
+  if (r.status !== 0) {
+    const err = (r.stderr || r.stdout || "").trim();
+    throw new Error(`${ENGINE} ${args.join(" ")} failed${err ? `: ${err}` : ""}`);
+  }
+  return (r.stdout || "").trim();
+}
+
+function inspectOk(kind: "container" | "volume", name: string): boolean {
+  if (!ENGINE) return false;
+  const r = spawnSync(ENGINE, [kind, "inspect", name], { stdio: "ignore", env: engineEnv(ENGINE) });
+  return r.status === 0;
+}
+
+function userVolumeName(owner: string): string {
+  return `${USER_VOLUME_PREFIX}-${safeName(owner)}-${shortHash(owner)}`;
+}
+
+function containerName(ws: Workspace): string {
+  return `${SESSION_CONTAINER_PREFIX}-${safeName(ws.owner)}-${shortHash(ws.owner)}-${safeName(ws.id)}`;
+}
+
+function socketMountArgs(): string[] {
+  if (!PROPAGATE_SOCKET || !ENGINE) return [];
+  if (ENGINE === "podman") return ["--volume", `${ENGINE_SOCKET_TARGET}:${ENGINE_SOCKET_TARGET}`];
+  return ["--volume", `${ENGINE_SOCKET_TARGET}:${ENGINE_SOCKET_TARGET}`];
+}
+
+function ensureSessionContainer(ws: Workspace, auth: RuntimeAuth | null): SessionContainer | null {
+  if (!ENGINE) return null;
+  const vol = userVolumeName(ws.owner);
+  const name = containerName(ws);
+  const workspaceDir = `/workspace/${safeName(ws.id)}`;
+  if (!inspectOk("volume", vol)) engine(["volume", "create", vol], { quiet: true });
+  if (!inspectOk("container", name)) {
+    const args = [
+      "run", "-d", "--name", name,
+      "--label", "hive.managed=true",
+      "--label", `hive.owner=${ws.owner}`,
+      "--label", `hive.session=${ws.id}`,
+      "--volume", `${vol}:/workspace:rw`,
+      ...(SESSION_NETWORK ? ["--network", SESSION_NETWORK] : []),
+      ...socketMountArgs(),
+      "--env", `HIVE_API_URL=${BASE}`,
+      "--env", `HIVE_SESSION_ID=${ws.id}`,
+      "--env", `HIVE_SESSION_OWNER=${ws.owner}`,
+      "--env", `HIVE_RUNTIME=${runtimeOf(ws)}`,
+      "--env", `HIVE_RUNTIME_PROVIDER=${auth?.provider ?? ""}`,
+      "--env", `HIVE_RUNTIME_MODEL=${auth?.model ?? ws.model ?? MODEL ?? ""}`,
+      SESSION_IMAGE,
+      "sh", "-lc", `mkdir -p ${workspaceDir} && tail -f /dev/null`,
+    ];
+    engine(args, { quiet: true });
+    log(`session container ${name} up · owner=${ws.owner} volume=${vol} image=${SESSION_IMAGE}`);
+  }
+  return { engine: ENGINE, name, userVolume: vol, workspaceDir };
+}
+
+function removeSessionContainer(ws: Workspace): void {
+  if (!ENGINE) return;
+  const name = containerName(ws);
+  if (inspectOk("container", name)) engine(["rm", "-f", name], { quiet: true });
+}
+
+function writePromptFile(container: SessionContainer, prompt: string): string {
+  const dir = mkdtempSync(join(tmpdir(), "hive-prompt-"));
+  const local = join(dir, "prompt.txt");
+  writeFileSync(local, prompt);
+  engine(["cp", local, `${container.name}:${container.workspaceDir}/prompt.txt`], { quiet: true });
+  return `${container.workspaceDir}/prompt.txt`;
+}
+
+function runInSession(container: SessionContainer, args: string[], env: Record<string, string> = {}): string {
+  const envArgs = Object.entries(env).flatMap(([k, v]) => ["--env", `${k}=${v}`]);
+  return engine(["exec", "--workdir", container.workspaceDir, ...envArgs, container.name, ...args], { quiet: true });
+}
+
 function ensureSandbox(workdir: string): void {
   mkdirSync(workdir, { recursive: true });
   mkdirSync(join(workdir, ".claude"), { recursive: true });
@@ -170,13 +296,20 @@ function mapSdkMessage(m: Json): IngestMsg[] {
 }
 
 // Run a single turn against Claude Code; stream messages to ingest; return session id.
-async function runTurn(ws: Workspace, prompt: string, auth: RuntimeAuth | null, resume: string | null): Promise<string | null> {
+async function runTurn(
+  ws: Workspace,
+  prompt: string,
+  auth: RuntimeAuth | null,
+  resume: string | null,
+  container: SessionContainer | null,
+): Promise<string | null> {
   if (DRY_RUN) return dryTurn(ws, prompt, resume);
 
   const runtime = runtimeOf(ws);
-  if (runtime === "codex") return runCodexTurn(ws, prompt, auth, resume);
-  if (runtime === "opencode") return runOpenCodeTurn(ws, prompt, auth, resume);
+  if (runtime === "codex") return runCodexTurn(ws, prompt, auth, resume, container);
+  if (runtime === "opencode") return runOpenCodeTurn(ws, prompt, auth, resume, container);
   if (runtime !== "claude_code") throw new Error(`unsupported runtime: ${runtime}`);
+  if (container) return runClaudeCodeContainerTurn(ws, prompt, auth, resume, container);
 
   const env: Record<string, string> = { ...process.env } as Record<string, string>;
   if (auth?.secret) {
@@ -207,28 +340,79 @@ async function runTurn(ws: Workspace, prompt: string, auth: RuntimeAuth | null, 
   return sid;
 }
 
-async function runCodexTurn(ws: Workspace, _prompt: string, auth: RuntimeAuth | null, resume: string | null): Promise<string | null> {
-  requireBinary("codex");
-  if (!auth?.secret) throw new Error("codex runtime requires a saved codex credential");
+async function runClaudeCodeContainerTurn(
+  ws: Workspace,
+  prompt: string,
+  auth: RuntimeAuth | null,
+  resume: string | null,
+  container: SessionContainer,
+): Promise<string | null> {
+  const promptFile = writePromptFile(container, prompt);
   await ingest(ws.id, {
     role: "system",
     kind: "init",
-    content: { subtype: "init", runtime: "codex", provider: auth.provider, model: MODEL ?? null, cwd: ws.workdir },
+    content: { subtype: "init", runtime: "claude_code", model: auth?.model ?? MODEL ?? null, container: container.name, volume: container.userVolume },
     claude_session_id: resume,
   });
-  throw new Error("codex runtime execution is not implemented yet; credential plumbing is ready");
+  const out = runInSession(container, ["sh", "-lc", `claude -p "$(cat ${promptFile})" --dangerously-skip-permissions`], {
+    ANTHROPIC_API_KEY: auth?.kind === "api_key" ? auth.secret : "",
+    CLAUDE_CODE_OAUTH_TOKEN: auth && auth.kind !== "api_key" ? auth.secret : "",
+    CLAUDE_CONFIG_DIR: `${container.workspaceDir}/.claude`,
+  });
+  await ingest(ws.id, { role: "assistant", kind: "text", content: { text: out }, claude_session_id: resume });
+  return resume;
 }
 
-async function runOpenCodeTurn(ws: Workspace, _prompt: string, auth: RuntimeAuth | null, resume: string | null): Promise<string | null> {
-  requireBinary("opencode");
-  if (!auth?.secret) throw new Error("opencode runtime requires a saved opencode provider/model credential");
+async function runCodexTurn(
+  ws: Workspace,
+  prompt: string,
+  auth: RuntimeAuth | null,
+  resume: string | null,
+  container: SessionContainer | null,
+): Promise<string | null> {
+  if (!auth?.secret) throw new Error("codex runtime requires a saved codex credential");
+  if (!container) throw new Error("codex runtime requires a session container");
+  const promptFile = writePromptFile(container, prompt);
   await ingest(ws.id, {
     role: "system",
     kind: "init",
-    content: { subtype: "init", runtime: "opencode", provider: auth.provider, model: MODEL ?? null, cwd: ws.workdir },
+    content: { subtype: "init", runtime: "codex", provider: auth.provider, model: auth.model ?? MODEL ?? null, container: container.name, volume: container.userVolume },
     claude_session_id: resume,
   });
-  throw new Error("opencode runtime execution is not implemented yet; credential plumbing is ready");
+  const out = runInSession(container, ["sh", "-lc", `codex exec \"$(cat ${promptFile})\"`], {
+    OPENAI_API_KEY: auth.kind === "api_key" ? auth.secret : "",
+    CODEX_OAUTH_TOKEN: auth.kind !== "api_key" ? auth.secret : "",
+  });
+  await ingest(ws.id, { role: "assistant", kind: "text", content: { text: out }, claude_session_id: resume });
+  return resume;
+}
+
+async function runOpenCodeTurn(
+  ws: Workspace,
+  prompt: string,
+  auth: RuntimeAuth | null,
+  resume: string | null,
+  container: SessionContainer | null,
+): Promise<string | null> {
+  if (!auth?.secret) throw new Error("opencode runtime requires a saved opencode provider/model credential");
+  if (!container) throw new Error("opencode runtime requires a session container");
+  const promptFile = writePromptFile(container, prompt);
+  const model = auth.model ?? ws.model ?? MODEL ?? "";
+  const modelArg = model ? ` --model "$OPENCODE_MODEL"` : "";
+  await ingest(ws.id, {
+    role: "system",
+    kind: "init",
+    content: { subtype: "init", runtime: "opencode", provider: auth.provider, model: model || null, container: container.name, volume: container.userVolume },
+    claude_session_id: resume,
+  });
+  const out = runInSession(container, ["sh", "-lc", `opencode run \"$(cat ${promptFile})\"${modelArg}`], {
+    OPENROUTER_API_KEY: auth.provider === "openrouter" ? auth.secret : "",
+    ANTHROPIC_API_KEY: auth.provider === "anthropic" ? auth.secret : "",
+    OPENAI_API_KEY: auth.provider === "openai" ? auth.secret : "",
+    OPENCODE_MODEL: model,
+  });
+  await ingest(ws.id, { role: "assistant", kind: "text", content: { text: out }, claude_session_id: resume });
+  return resume;
 }
 
 async function dryTurn(ws: Workspace, prompt: string, resume: string | null): Promise<string> {
@@ -252,8 +436,10 @@ async function drive(ws: Workspace): Promise<void> {
   await setStatus(ws.id, "running");
   ensureSandbox(ws.workdir);
   let auth: RuntimeAuth | null = null;
+  let container: SessionContainer | null = null;
   try {
     auth = await getRuntimeAuth(ws);
+    container = ensureSessionContainer(ws, auth);
   } catch (e) {
     log(`runtime auth failed: ${(e as Error).message}`);
     await ingest(ws.id, { role: "system", kind: "error", content: { error: (e as Error).message } });
@@ -286,7 +472,7 @@ async function drive(ws: Workspace): Promise<void> {
         log(`turn ${ws.id} #${inp.seq}: ${prompt.slice(0, 60)}`);
         await setStatus(ws.id, "running");
         try {
-          sid = await runTurn(ws, prompt, auth, sid);
+          sid = await runTurn(ws, prompt, auth, sid, container);
         } catch (e) {
           log(`turn failed: ${(e as Error).message}`);
           await ingest(ws.id, { role: "system", kind: "error", content: { error: (e as Error).message }, claude_session_id: sid });
@@ -301,8 +487,9 @@ async function drive(ws: Workspace): Promise<void> {
   // Teardown: archived sessions get their throwaway sandbox removed.
   if (archived) {
     try {
+      if (container) removeSessionContainer(ws);
       rmSync(ws.workdir, { recursive: true, force: true });
-      log(`done ${ws.id} (archived) · removed sandbox ${ws.workdir}`);
+      log(`done ${ws.id} (archived) · removed sandbox ${ws.workdir}${container ? ` and container ${container.name}` : ""}`);
     } catch (e) {
       log(`done ${ws.id} (archived) · teardown warning: ${(e as Error).message}`);
     }
@@ -334,7 +521,7 @@ async function tick(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  log(`hive-runner up · api=${BASE} · poll=${POLL_MS}ms · dryRun=${DRY_RUN} · model=${MODEL ?? "default"}`);
+  log(`hive-runner up · api=${BASE} · poll=${POLL_MS}ms · dryRun=${DRY_RUN} · model=${MODEL ?? "default"} · isolation=${SESSION_ISOLATION ? ENGINE ?? "unavailable" : "host"}`);
   // eslint-disable-next-line no-constant-condition
   while (true) {
     await tick();

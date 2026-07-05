@@ -66,10 +66,10 @@ const PAGES: Record<Tab, Component> = {
 
 // The destinations that stay in the sidebar — the pillars: talking to
 // Claude Code, the journal, operator inbox, and the read-only mail archive.
-// Search lives in ⌘K (free text there already lands on /search). Chats leads
+// Search lives in ⌘K (free text there already lands on /search). Conversations lead
 // the nav; Today stays the landing page.
 const PRIMARY: { id: Tab; label: string; icon: string }[] = [
-  { id: "workspaces", label: "Chats", icon: "chats" },
+  { id: "workspaces", label: "Conversations", icon: "chats" },
   { id: "journal", label: "Today", icon: "journal" },
   { id: "inbox", label: "Inbox", icon: "inbox" },
   { id: "mail", label: "Mail", icon: "mail" },

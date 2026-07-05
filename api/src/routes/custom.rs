@@ -88,7 +88,7 @@ async fn types_create(
     }
     match s.entity_types_create(input, ctx.actor()).await {
         Ok(view) => Ok((StatusCode::CREATED, Json(view)).into_response()),
-        Err(e) => type_error(e).map_err(Into::into),
+        Err(e) => type_error(e),
     }
 }
 
@@ -111,7 +111,7 @@ async fn types_update(
     match s.entity_types_update(&id_or_slug, patch, ctx.actor()).await {
         Ok(Some(view)) => Ok(Json(view).into_response()),
         Ok(None) => Ok(not_found()),
-        Err(e) => type_error(e).map_err(Into::into),
+        Err(e) => type_error(e),
     }
 }
 
@@ -161,7 +161,7 @@ async fn entities_list(
     };
     match s.custom_entities_list(&filter, &ctx.visibility()).await {
         Ok(items) => Ok(Json(items).into_response()),
-        Err(e) => entity_error(e).map_err(Into::into),
+        Err(e) => entity_error(e),
     }
 }
 
@@ -178,7 +178,7 @@ async fn entities_create(
         .await
     {
         Ok(e) => Ok((StatusCode::CREATED, Json(e)).into_response()),
-        Err(e) => entity_error(e).map_err(Into::into),
+        Err(e) => entity_error(e),
     }
 }
 
@@ -212,7 +212,7 @@ async fn entities_update(
     {
         Ok(Some(e)) => Ok(Json(e).into_response()),
         Ok(None) => Ok(not_found()),
-        Err(e) => entity_error(e).map_err(Into::into),
+        Err(e) => entity_error(e),
     }
 }
 

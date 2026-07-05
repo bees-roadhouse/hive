@@ -59,6 +59,59 @@ plugin should only wrap this command and provide setup text.
 
 See [`plugins/codex-hive-memory`](../plugins/codex-hive-memory).
 
+## Hosted session isolation
+
+`hive-runner` can create one long-lived container per hosted workspace by using
+the host Podman or Docker socket. Each human gets a named volume:
+
+```text
+hive-user-nate   -> mounted at /workspace in every Nate session container
+hive-user-maggie -> mounted at /workspace in every Maggie session container
+```
+
+Every workspace gets its own container named:
+
+```text
+hive-session-<owner>-<session-id>
+```
+
+The runner labels containers with `hive.managed=true`, `hive.owner`, and
+`hive.session`, mounts the per-user volume read/write, and writes the session
+working directory under `/workspace/<session-id>`. User volume names include a
+short hash of the owner slug so sanitized-name collisions cannot merge two
+users' workspaces. Archiving a workspace removes that session container but
+preserves the user's named volume.
+
+Deployment knobs:
+
+```bash
+HIVE_SESSION_ISOLATION=container
+HIVE_CONTAINER_ENGINE=podman        # or docker / auto
+HIVE_CONTAINER_SOCKET=/run/podman/podman.sock
+HIVE_CONTAINER_SOCKET_TARGET=/run/podman/podman.sock
+HIVE_SESSION_IMAGE=beesroadhouse/hive-runner:latest
+HIVE_USER_VOLUME_PREFIX=hive-user
+HIVE_SESSION_CONTAINER_PREFIX=hive-session
+HIVE_SESSION_NETWORK=hive_hive      # docker-compose.rust.yml pins this network name
+```
+
+For Docker, set:
+
+```bash
+HIVE_CONTAINER_ENGINE=docker
+HIVE_CONTAINER_SOCKET=/var/run/docker.sock
+HIVE_CONTAINER_SOCKET_TARGET=/var/run/docker.sock
+```
+
+The journal is the communications bus. Human inputs and assistant/system outputs
+from hosted workspaces are mirrored into `/api/journal` with `workspace`, runtime,
+and session-id tags. Transcript rows remain as a UI projection; durable
+agent-to-agent and AI-to-human communication lives in the journal.
+
+`HIVE_PROPAGATE_ENGINE_SOCKET=1` also mounts the host container socket into each
+session container. Leave it off unless the agent inside that session must manage
+nested containers; it gives that session container host-container control.
+
 ## Hermes
 
 Use the native Hermes memory-provider plugin:

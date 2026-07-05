@@ -1444,7 +1444,7 @@ async fn dispatch(
             ))
         }
         "mail_accounts_list" => {
-            let mut a = Args::new("mail_accounts_list", args);
+            let a = Args::new("mail_accounts_list", args);
             a.finish()?;
             Ok(ok_content(
                 &store.mail_accounts_list(viewer.as_deref()).await?,

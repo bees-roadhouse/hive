@@ -806,15 +806,15 @@ impl Store {
 
         let hits: Vec<SearchHit> = ranked
             .into_iter()
-            .filter_map(|(k, score)| {
+            .map(|(k, score)| {
                 let (kind, id) = split_key(&k);
-                Some(SearchHit {
+                SearchHit {
                     kind: kind.to_string(),
                     id: id.to_string(),
                     title: title_of.get(&k).cloned().unwrap_or_else(|| id.to_string()),
                     snippet: String::new(),
                     score: (score * 1000.0).round() / 1000.0,
-                })
+                }
             })
             .collect();
 

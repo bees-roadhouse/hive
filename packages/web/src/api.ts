@@ -278,7 +278,7 @@ export const api = {
   // ---- hosted Claude Code workspaces (hive → Claude Code) ----
   workspaces: (limit = 50) => req<CcSession[]>(`/workspaces?limit=${limit}`),
   workspace: (id: string) => req<CcSession>(`/workspaces/${id}`),
-  createWorkspace: (input: { title?: string; runtime?: RuntimeKind | string; provider?: string; model?: string; prompt?: string }) =>
+  createWorkspace: (input: { title?: string; runtime?: RuntimeKind | string; provider?: string; model?: string; prompt?: string; tags?: string[]; project?: string; linked_entities?: Array<{ kind: string; id: string; rel?: string }> }) =>
     req<CcSession>("/workspaces", { method: "POST", body: JSON.stringify(input) }),
   transcript: (id: string, after = 0, limit = 2000) =>
     req<CcMessage[]>(`/workspaces/${id}/messages?after=${after}&limit=${limit}`),

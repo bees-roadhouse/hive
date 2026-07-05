@@ -1677,6 +1677,13 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
 .runtime-pill.rt-codex, .runtime-tab.rt-codex.active { border-color: color-mix(in srgb, #7ab7ff 36%, var(--chat-line)); }
 .runtime-pill.rt-claude_code, .runtime-tab.rt-claude_code.active { border-color: color-mix(in srgb, #69d981 36%, var(--chat-line)); }
 .runtime-pill.rt-opencode, .runtime-tab.rt-opencode.active { border-color: color-mix(in srgb, #ff9b85 36%, var(--chat-line)); }
+.conversation-group-tabs { display: flex; gap: 0.35rem; }
+.conversation-group-tabs button {
+  border: 1px solid color-mix(in srgb, var(--chat-line) 76%, transparent);
+  border-radius: 999px; background: color-mix(in srgb, var(--panel2) 38%, transparent);
+  color: var(--dim); padding: 0.22rem 0.54rem; font-size: var(--fs-2xs); text-transform: uppercase; letter-spacing: 0.05em;
+}
+.conversation-group-tabs button.active { color: var(--ink); border-color: color-mix(in srgb, var(--honey) 36%, var(--chat-line)); }
 .chat-rows {
   flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.28rem;
   padding-right: 0.1rem; scrollbar-width: thin; scrollbar-color: var(--chat-line) transparent;
@@ -1696,6 +1703,13 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
 }
 .chat-row-title { font-size: var(--fs-sm); font-weight: 560; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .chat-row-meta { display: flex; align-items: center; gap: 0.42rem; font-size: var(--fs-2xs); color: var(--dim); }
+.conversation-group { display: grid; gap: 0.18rem; }
+.conversation-group-title { color: var(--dim); font-size: var(--fs-2xs); font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; padding: 0.45rem 0.28rem 0.1rem; }
+.conversation-tags { display: flex; gap: 0.28rem; flex-wrap: wrap; font-size: var(--fs-2xs); }
+.conversation-tags b, .conversation-tags em {
+  border: 1px solid color-mix(in srgb, var(--honey) 24%, var(--chat-line)); border-radius: 999px;
+  color: var(--accent); background: color-mix(in srgb, var(--honey) 8%, transparent); padding: 0.08rem 0.38rem; font-style: normal; font-weight: 520;
+}
 
 .chat-main {
   display: flex; flex-direction: column; min-height: 0; min-width: 0;
@@ -1779,6 +1793,9 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
 .runtime-hint { color: var(--dim); font-size: var(--fs-xs); }
 .model-field { display: flex; align-items: center; gap: 0.5rem; justify-content: center; color: var(--dim); font-size: var(--fs-xs); }
 .model-field input { min-width: min(26rem, 100%); border-radius: 999px; }
+.conversation-fields { width: min(760px, 100%); display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.55rem; }
+.conversation-fields label { display: grid; gap: 0.28rem; color: var(--dim); font-size: var(--fs-xs); text-align: left; }
+.conversation-fields input { border-radius: 999px; }
 .chat-composer {
   display: flex; align-items: flex-end; gap: 0.58rem;
   margin: 0.85rem 1rem 1rem; padding: 0.68rem 0.72rem;

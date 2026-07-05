@@ -6,7 +6,7 @@ import { liveRev } from "./live.ts";
 import { EmptyState } from "./primitives.tsx";
 
 /** Worker configuration: ingest sources (GUI ⇄ MCP), status, outbound queue,
- * and the runtime credentials that power hosted chats. */
+ * and the runtime credentials that power hosted conversations. */
 export const Settings: Component = () => {
   const actor = getActor();
   const [sources, { refetch }] = createResource(() => ({ _r: liveRev() }), () => api.sources(actor));
@@ -183,7 +183,7 @@ export const Settings: Component = () => {
 
       <For
         each={creds()}
-        fallback={<EmptyState icon="chats" title="No runtime credentials yet." hint="Chats can't start until a runtime token or provider key is saved." />}
+        fallback={<EmptyState icon="chats" title="No runtime credentials yet." hint="Conversations can't start until a runtime token or provider key is saved." />}
       >
         {(c) => (
           <div class="wire-row">
