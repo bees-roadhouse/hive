@@ -70,14 +70,16 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .nav-label { flex: 1; }
 .nav-badge { background: var(--honey); color: #1a1407; border-radius: 999px; font-size: 0.65rem; padding: 0 0.35rem; font-weight: 700; }
 
-/* The ⌘K hint sits under the four destinations, quieter than a nav item. */
+/* "More" opens the palette. Styled like a nav row with its shortcut
+   right-aligned, the way Claude desktop shows shortcuts. */
 .cmdk-hint {
   display: flex; align-items: center; gap: 0.6rem; width: 100%;
   background: transparent; border: 1px solid transparent; border-radius: 8px;
-  padding: 0.4rem 0.65rem; margin-top: 0.4rem; color: var(--dim);
-  font: inherit; font-size: 0.82rem; cursor: pointer;
+  padding: 0.5rem 0.65rem; margin-top: 0.15rem; color: var(--dim);
+  font: inherit; cursor: pointer; text-align: left;
 }
 .cmdk-hint:hover { color: var(--ink); background: var(--panel2); }
+.cmdk-hint .nav-label { flex: 1; }
 .cmdk-hint kbd {
   border: 1px solid var(--line); border-radius: 5px; padding: 0 0.35rem;
   font-size: 0.7rem; font-family: ui-monospace, monospace; color: var(--dim);
@@ -1359,8 +1361,16 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
 .cmdk-input:focus { outline: none; }
 .cmdk-list {
   list-style: none; margin: 0; padding: 0.35rem;
-  max-height: min(46vh, 360px); overflow-y: auto;
+  max-height: min(54vh, 430px); overflow-y: auto;
 }
+/* Section headers while browsing (hidden during filtering — see rows()). */
+.cmdk-sec {
+  padding: 0.6rem 0.7rem 0.25rem;
+  font-size: 0.66rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.09em;
+  color: var(--dim);
+}
+.cmdk-sec:first-child { padding-top: 0.3rem; }
 .cmdk-item {
   display: flex; align-items: center; gap: 0.65rem;
   padding: 0.5rem 0.7rem; border-radius: 8px;

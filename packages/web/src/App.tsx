@@ -133,8 +133,9 @@ const Workspace = (props: {
               )}
             </For>
             <button class="cmdk-hint" onClick={() => setPaletteOpen(true)} title="Command palette (⌘K)">
+              <span class="nav-icon"><Icon name="more" /></span>
+              <span class="nav-label">More</span>
               <kbd>⌘K</kbd>
-              <span class="nav-label">everything else</span>
             </button>
           </nav>
 

@@ -99,6 +99,14 @@ function paths(name: string): JSX.Element {
       );
     case "hex": // honeycomb cell — the day-page marker
       return <path d="M12 2.5l8.2 4.75v9.5L12 21.5l-8.2-4.75v-9.5z" />;
+    case "more": // ellipsis — the sidebar door to the command palette
+      return (
+        <>
+          <circle cx="5" cy="12" r="1" />
+          <circle cx="12" cy="12" r="1" />
+          <circle cx="19" cy="12" r="1" />
+        </>
+      );
     case "person": // user outline — head + shoulders
     case "account": // the signed-in user — same single-figure glyph
       return (
