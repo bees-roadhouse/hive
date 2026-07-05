@@ -15,11 +15,42 @@ export const Settings: Component = () => {
   const [creds, { refetch: refetchCreds }] = createResource(() => ({ _r: liveRev() }), () => api.ccCredentials());
 
   const [credForm, setCredForm] = createSignal({ kind: "codex_oauth", label: "", secret: "" });
+  const [credPanelOpen, setCredPanelOpen] = createSignal(false);
+  let secretInput: HTMLInputElement | undefined;
+  const credentialDefaults = (kind: string) => {
+    switch (kind) {
+      case "codex_oauth":
+        return { kind: "oauth_token", runtime: "codex", label: "Codex subscription" };
+      case "codex_api_key":
+        return { kind: "api_key", runtime: "codex", label: "Codex API key" };
+      case "claude_oauth":
+        return { kind: "oauth_token", runtime: "claude_code", label: "Claude Code subscription" };
+      case "anthropic_api_key":
+        return { kind: "api_key", runtime: "claude_code", provider: "anthropic", label: "Anthropic API key" };
+      case "opencode_provider_key":
+        return { kind: "api_key", runtime: "opencode", label: "OpenCode provider key" };
+      default:
+        return { kind, runtime: "claude_code", label: kind };
+    }
+  };
+  const connectRuntime = (kind: "codex_oauth" | "claude_oauth") => {
+    const defaults = credentialDefaults(kind);
+    setCredForm({ kind, label: defaults.label, secret: "" });
+    setCredPanelOpen(true);
+    queueMicrotask(() => secretInput?.focus());
+  };
   const saveCred = async (e: Event) => {
     e.preventDefault();
     const f = credForm();
     if (!f.secret.trim()) return;
-    await api.saveCcCredential({ kind: f.kind, label: f.label.trim() || undefined, secret: f.secret.trim() });
+    const defaults = credentialDefaults(f.kind);
+    await api.saveCcCredential({
+      kind: defaults.kind,
+      runtime: defaults.runtime,
+      provider: defaults.provider,
+      label: f.label.trim() || defaults.label,
+      secret: f.secret.trim(),
+    });
     setCredForm({ kind: f.kind, label: "", secret: "" });
     refetchCreds();
   };
@@ -160,13 +191,23 @@ export const Settings: Component = () => {
       </Show>
 
       <h3 class="sec">Agent runtime sign-in</h3>
-      <p class="dim sm">Credentials for Codex, Claude Code, and OpenCode. Stored encrypted; the secret is never shown again. Use fictional/test values here unless you are connected to your own backend.</p>
+      <p class="dim sm">Connect Codex or Claude Code once, then choose that runtime when starting a Conversation. Secrets are encrypted and never shown again.</p>
 
-      <div class="credential-hints">
-        <div><strong>Codex</strong><span>subscription OAuth or token from the Codex CLI sign-in flow</span></div>
-        <div><strong>Claude Code</strong><span>Claude setup token or Anthropic API key</span></div>
-        <div><strong>OpenCode</strong><span>provider API key; set provider/model when starting a run</span></div>
+      <div class="runtime-connect-cards">
+        <button type="button" class="runtime-connect-card rt-codex" onClick={() => connectRuntime("codex_oauth")}>
+          <strong>Connect Codex</strong>
+          <span>Use your Codex subscription token from the Codex sign-in flow.</span>
+          <em>Continue with Codex</em>
+        </button>
+        <button type="button" class="runtime-connect-card rt-claude_code" onClick={() => connectRuntime("claude_oauth")}>
+          <strong>Connect Claude Code</strong>
+          <span>Use your Claude Code setup token or subscription token.</span>
+          <em>Continue with Claude Code</em>
+        </button>
       </div>
+
+      <details class="runtime-advanced" open={credPanelOpen()} onToggle={(e) => setCredPanelOpen(e.currentTarget.open)}>
+        <summary>Advanced: paste or replace a credential manually</summary>
 
       <form class="source-form runtime-cred-form" onSubmit={saveCred}>
         <select value={credForm().kind} onChange={(e) => setCredForm({ ...credForm(), kind: e.currentTarget.value })}>
@@ -177,9 +218,10 @@ export const Settings: Component = () => {
           <option value="opencode_provider_key">OpenCode provider API key</option>
         </select>
         <input placeholder="label / provider hint (optional)" value={credForm().label} onInput={(e) => setCredForm({ ...credForm(), label: e.currentTarget.value })} />
-        <input class="grow" type="password" placeholder="paste token or API key" value={credForm().secret} onInput={(e) => setCredForm({ ...credForm(), secret: e.currentTarget.value })} />
+        <input ref={secretInput} class="grow" type="password" placeholder="paste token or API key" value={credForm().secret} onInput={(e) => setCredForm({ ...credForm(), secret: e.currentTarget.value })} />
         <button class="primary" type="submit">save credential</button>
       </form>
+      </details>
 
       <For
         each={creds()}

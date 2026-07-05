@@ -1830,23 +1830,37 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
 
 .chat-ended { margin: 0.9rem 1rem 1rem; text-align: center; font-size: var(--fs-sm); color: var(--dim); }
 .chat-err { margin: 0.55rem 1rem 0; color: var(--danger); font-size: var(--fs-sm); }
-.credential-hints {
-  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.7rem; margin-bottom: 0.9rem;
+.runtime-connect-cards {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.75rem; margin: 0.75rem 0 0.9rem;
 }
-.credential-hints div {
+.runtime-connect-card {
+  display: grid; gap: 0.42rem; text-align: left; min-height: 8.5rem;
   border: 1px solid color-mix(in srgb, var(--line) 64%, transparent);
-  border-radius: 14px; background: color-mix(in srgb, var(--panel2) 46%, transparent); padding: 0.78rem;
-  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ink) 4%, transparent);
+  border-radius: 16px; background:
+    radial-gradient(circle at 12% 0%, color-mix(in srgb, var(--honey) 10%, transparent), transparent 42%),
+    color-mix(in srgb, var(--panel2) 48%, transparent);
+  padding: 0.95rem; color: var(--ink);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ink) 5%, transparent), 0 12px 28px color-mix(in srgb, #000 14%, transparent);
 }
-.credential-hints strong { display: block; color: var(--ink); margin-bottom: 0.25rem; font-weight: 650; }
-.credential-hints span { display: block; color: var(--dim); font-size: var(--fs-xs); line-height: 1.45; }
+.runtime-connect-card:hover { border-color: color-mix(in srgb, var(--honey) 30%, var(--line)); transform: translateY(-1px); }
+.runtime-connect-card strong { font-size: var(--fs-md); font-weight: 700; }
+.runtime-connect-card span { color: var(--dim); font-size: var(--fs-sm); line-height: 1.45; }
+.runtime-connect-card em {
+  align-self: end; justify-self: start; font-style: normal; font-size: var(--fs-xs); font-weight: 700;
+  color: var(--honey-ink); background: var(--honey); border-radius: 999px; padding: 0.34rem 0.62rem;
+}
+.runtime-connect-card.rt-codex { border-color: color-mix(in srgb, #7ab7ff 22%, var(--line)); }
+.runtime-connect-card.rt-claude_code { border-color: color-mix(in srgb, #69d981 22%, var(--line)); }
+.runtime-advanced { margin: 0.4rem 0 1rem; }
+.runtime-advanced summary { cursor: pointer; color: var(--dim); font-size: var(--fs-sm); }
+.runtime-advanced[open] summary { color: var(--ink); }
 .runtime-cred-form select { min-width: 16rem; }
 
 @media (max-width: 900px) {
   .chat { grid-template-columns: 1fr; height: auto; gap: 0.9rem; }
   .chat-rail { border-right: none; padding-right: 0; max-height: 15rem; }
   .chat-scroll { max-height: 58vh; }
-  .credential-hints { grid-template-columns: 1fr; }
+  .runtime-connect-cards { grid-template-columns: 1fr; }
 }
 
 /* ============================================================
