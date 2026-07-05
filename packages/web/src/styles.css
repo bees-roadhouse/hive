@@ -124,7 +124,7 @@ main {
   height: 100dvh; overflow-y: auto;
   padding: 1.25rem clamp(1rem, 3vw, 2.5rem) 2.5rem;
 }
-.page-title { font-family: var(--display); text-transform: capitalize; margin: 0 0 1rem; font-size: var(--fs-xl); font-weight: 600; }
+.page-title { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; text-transform: capitalize; margin: 0 0 1rem; font-size: var(--fs-xl); font-weight: 650; letter-spacing: -0.03em; }
 
 @media (max-width: 720px) {
   .app { flex-direction: column; }
@@ -1467,6 +1467,166 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
 .mail-empty { margin: auto; text-align: center; color: var(--dim); }
 .mail-empty svg { color: var(--honey); }
 
+
+
+/* ---- primary surface polish: graphite/honey coherence ---- */
+.composer,
+.day,
+.inbox,
+.mail-rail,
+.mail-main,
+.journal-rail,
+.overlay-panel {
+  background:
+    radial-gradient(circle at 12% -18%, color-mix(in srgb, var(--honey) 7%, transparent), transparent 32%),
+    color-mix(in srgb, var(--panel) 82%, #070708);
+  border: 1px solid color-mix(in srgb, var(--line) 76%, transparent);
+  box-shadow: 0 18px 42px color-mix(in srgb, #000 22%, transparent), inset 0 1px 0 color-mix(in srgb, var(--ink) 4%, transparent);
+}
+.composer { border-radius: 18px; padding: 1.05rem; }
+.composer-preview,
+.composer-ta,
+.md pre,
+.md code {
+  background: color-mix(in srgb, var(--panel2) 62%, #060607);
+  border-color: color-mix(in srgb, var(--line) 80%, transparent);
+}
+.composer-ta { border-radius: 16px; }
+.composer-ta:focus { border-color: color-mix(in srgb, var(--honey) 48%, var(--line)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--honey) 10%, transparent); }
+.day {
+  border-radius: 22px;
+  padding: 1.9rem 2.15rem;
+}
+.day-head { border-bottom-color: color-mix(in srgb, var(--line) 70%, transparent); }
+.day-head h3 { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; font-weight: 650; letter-spacing: -0.02em; }
+.day .entry + .entry { border-top-color: color-mix(in srgb, var(--line) 58%, transparent); }
+.write-bar-inner {
+  background: color-mix(in srgb, var(--panel) 86%, #070708);
+  border-color: color-mix(in srgb, var(--line) 78%, transparent);
+  border-radius: 18px;
+  box-shadow: 0 18px 44px color-mix(in srgb, #000 30%, transparent), inset 0 1px 0 color-mix(in srgb, var(--ink) 5%, transparent);
+}
+.write-bar-inner:hover,
+.write-bar-inner:focus-visible {
+  border-color: color-mix(in srgb, var(--honey) 42%, var(--line));
+  box-shadow: 0 18px 44px color-mix(in srgb, #000 32%, transparent), 0 0 0 3px color-mix(in srgb, var(--honey) 9%, transparent), inset 0 1px 0 color-mix(in srgb, var(--ink) 5%, transparent);
+}
+.inbox {
+  border-radius: 22px;
+  padding: 1rem;
+}
+.inbox-bar {
+  background: color-mix(in srgb, var(--panel2) 42%, transparent);
+  border: 1px solid color-mix(in srgb, var(--line) 62%, transparent);
+  border-radius: 16px;
+  padding: 0.7rem;
+}
+.who-tabs button {
+  border-radius: 999px;
+  border-color: color-mix(in srgb, var(--line) 70%, transparent);
+  background: color-mix(in srgb, var(--panel) 42%, transparent);
+}
+.who-tabs button.active {
+  color: var(--ink);
+  border-color: color-mix(in srgb, var(--honey) 36%, var(--line));
+  background: color-mix(in srgb, var(--honey) 9%, var(--panel2));
+}
+.inbox-item {
+  border-radius: 16px;
+  padding: 0.82rem 0.92rem;
+  background: color-mix(in srgb, var(--panel2) 42%, transparent);
+  border-color: color-mix(in srgb, var(--line) 66%, transparent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ink) 3%, transparent);
+}
+.inbox-item.unread {
+  border-left: 0;
+  border-color: color-mix(in srgb, var(--honey) 32%, var(--line));
+  background: linear-gradient(90deg, color-mix(in srgb, var(--honey) 8%, transparent), color-mix(in srgb, var(--panel2) 44%, transparent));
+}
+.reason {
+  width: 2rem; height: 2rem;
+  background: color-mix(in srgb, var(--panel) 70%, #070708);
+  border-color: color-mix(in srgb, var(--line) 72%, transparent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ink) 4%, transparent);
+}
+.inbox-meta { align-items: center; flex-wrap: wrap; }
+.inbox-snip { color: color-mix(in srgb, var(--ink) 92%, var(--dim)); }
+.mail {
+  grid-template-columns: 340px minmax(0, 1fr);
+  gap: 1.05rem;
+}
+.mail-rail,
+.mail-main {
+  border-radius: 22px;
+  padding: 0.82rem;
+  min-height: 0;
+}
+.mail-rail { border-right: 1px solid color-mix(in srgb, var(--line) 76%, transparent); }
+.mail-tools {
+  background: color-mix(in srgb, var(--panel2) 38%, transparent);
+  border: 1px solid color-mix(in srgb, var(--line) 62%, transparent);
+  border-radius: 16px;
+  padding: 0.62rem;
+}
+.mail-search input,
+.mail-tools select { border-radius: 12px; }
+.mail-row {
+  border-radius: 15px;
+  padding: 0.72rem 0.76rem;
+  border: 1px solid transparent;
+  transition: background var(--t-base) ease, border-color var(--t-base) ease, box-shadow var(--t-base) ease;
+}
+.mail-row:hover {
+  background: color-mix(in srgb, var(--panel2) 44%, transparent);
+  border-color: color-mix(in srgb, var(--line) 58%, transparent);
+}
+.mail-row.selected {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--panel2) 70%, transparent), color-mix(in srgb, var(--panel) 76%, transparent));
+  border-color: color-mix(in srgb, var(--honey) 30%, var(--line));
+  box-shadow: 0 10px 24px color-mix(in srgb, #000 16%, transparent), inset 0 1px 0 color-mix(in srgb, var(--ink) 4%, transparent);
+}
+.mail-row-top strong { font-weight: 650; }
+.mail-row-from { color: color-mix(in srgb, var(--ink) 82%, var(--dim)); }
+.mail-row-snippet { color: var(--dim); line-height: 1.35; }
+.mail-main { overflow: hidden; }
+.mail-head {
+  margin: -0.82rem -0.82rem 0;
+  padding: 0.92rem 1rem;
+  background: color-mix(in srgb, var(--panel) 52%, transparent);
+  border-bottom-color: color-mix(in srgb, var(--line) 72%, transparent);
+}
+.mail-head h3 { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; font-weight: 650; letter-spacing: -0.02em; }
+.mail-thread { padding: 1rem 0.18rem 0; }
+.mail-msg {
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--panel2) 38%, transparent);
+  border-color: color-mix(in srgb, var(--line) 62%, transparent);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ink) 3%, transparent);
+}
+.mail-msg-head { border-bottom-color: color-mix(in srgb, var(--line) 58%, transparent); }
+.mail-plain {
+  background: color-mix(in srgb, #000 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--line) 44%, transparent);
+  border-radius: 12px;
+  padding: 0.72rem 0.8rem;
+}
+.mail-empty {
+  align-self: center;
+  justify-self: center;
+  margin: auto;
+  padding: 2rem;
+  border: 1px solid color-mix(in srgb, var(--line) 62%, transparent);
+  border-radius: 22px;
+  background: color-mix(in srgb, var(--panel2) 32%, transparent);
+}
+.journal-rail {
+  border-left: 0;
+  padding: 0.85rem;
+  border-radius: 18px;
+}
+.rail-item { border-radius: 12px; }
+.rail-item:hover,
+.rail-item.active { background: color-mix(in srgb, var(--panel2) 54%, transparent); }
 /* ---- chats: polished agent runtime surface ---- */
 .chat {
   --chat-bg: color-mix(in srgb, var(--bg) 84%, #050505);
