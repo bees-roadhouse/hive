@@ -224,7 +224,7 @@ fn build_tools() -> Value {
         {
             "name":"inbox_list",
             "title": "List an actor's inbox",
-            "description": "Unread-by-default notifications for a recipient (human or AI).",
+            "description": "Unread-by-default notifications for a recipient (human or AI). Viewer-gated: your own inbox (admins: any; sessions: also AIs you own).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -242,7 +242,7 @@ fn build_tools() -> Value {
         {
             "name":"inbox_mark_read",
             "title": "Mark inbox item(s) read",
-            "description": "Pass an item `id`, or a `recipient` to clear all their unread.",
+            "description": "Pass an item `id`, or a `recipient` to clear all their unread. Same viewer gate as inbox_list.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string"}, "recipient": {"type": "string"}},
@@ -1047,9 +1047,15 @@ async fn dispatch(
             let recipient = a.req_enum("recipient", &actor_names());
             let unread_only = a.opt_bool("unread_only");
             a.finish()?;
+            let recipient = recipient.unwrap();
+            // Viewer gate: an inbox is private to its recipient — snippets
+            // quote entries other viewers may not see (DIRECTION.md Phase 0).
+            if !can_act_for_identity(store, ctx, recipient).await? {
+                return Ok(tool_error("forbidden"));
+            }
             Ok(ok_content(
                 &store
-                    .inbox_list(recipient.unwrap(), unread_only.unwrap_or(true))
+                    .inbox_list(recipient, unread_only.unwrap_or(true))
                     .await?,
             ))
         }
@@ -1059,10 +1065,21 @@ async fn dispatch(
             let recipient = a.opt_str("recipient").map(String::from);
             a.finish()?;
             if let Some(id) = id {
+                // Resolve the item's recipient and gate on it — marking another
+                // actor's notifications read is cross-namespace tampering.
+                let Some(item) = store.inbox_get(&id).await? else {
+                    return Ok(ok_content(&json!({"marked": false})));
+                };
+                if !can_act_for_identity(store, ctx, &item.recipient).await? {
+                    return Ok(tool_error("forbidden"));
+                }
                 let marked = store.inbox_mark_read(&id).await? > 0;
                 return Ok(ok_content(&json!({"marked": marked})));
             }
             if let Some(recipient) = recipient {
+                if !can_act_for_identity(store, ctx, &recipient).await? {
+                    return Ok(tool_error("forbidden"));
+                }
                 let marked = store.inbox_mark_all_read(&recipient).await?;
                 return Ok(ok_content(&json!({"marked": marked})));
             }
@@ -1181,7 +1198,7 @@ async fn dispatch(
             let threshold = a.opt_f64("threshold");
             a.finish()?;
             let identity = identity.unwrap();
-            if !can_recall_identity(store, ctx, &identity).await? {
+            if !can_act_for_identity(store, ctx, &identity).await? {
                 return Ok(tool_error("not_your_identity"));
             }
             let opts = RecallOptions {
@@ -1408,7 +1425,10 @@ async fn journal_append(store: &Store, ctx: &AuthCtx, args: &Map<String, Value>)
     ))
 }
 
-async fn can_recall_identity(
+/// May `ctx` read/act for `identity`'s private surfaces (recall brief, inbox)?
+/// Admins: anyone. Tokens: only their own actor. Sessions: also the AIs the
+/// logged-in user owns.
+async fn can_act_for_identity(
     store: &Store,
     ctx: &AuthCtx,
     identity: &str,
