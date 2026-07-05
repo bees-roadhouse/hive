@@ -16,6 +16,7 @@ import { Onboarding } from "./Onboarding.tsx";
 import { Login } from "./Login.tsx";
 import { OAuthConsent } from "./OAuthConsent.tsx";
 import { Icon } from "./icons.tsx";
+import { EntityBoard } from "./EntityBoard.tsx";
 import { Decisions, Events, PeopleView, ProjectsView, SearchPane, Tasks, TopicsView, Wire } from "./Boards.tsx";
 
 // Every tab stays a registered route (deep links, refresh, back/forward all
@@ -157,9 +158,10 @@ const Workspace = (props: {
         </aside>
 
         <main>
-          {/* The journal carries its own day headers and the chat surface owns
-              its own header row; an auto title above either would be noise. */}
-          <Show when={pageTitle() !== "journal" && pageTitle() !== "workspaces"}>
+          {/* The journal carries its own day headers; the chat surface and
+              custom-entity boards own their header rows; an auto title above
+              any of them would be noise. */}
+          <Show when={!["journal", "workspaces", "e"].includes(pageTitle())}>
             <h2 class="page-title">{pageTitle()}</h2>
           </Show>
           {/* keyed on the leading path segment so each page remounts and re-runs
@@ -258,6 +260,8 @@ export const App: Component = () => {
                     />
                   )}
                 </For>
+                {/* User-defined entity types: one dynamic board per slug. */}
+                <Route path="/e/:slug" component={EntityBoard} />
                 <Route path="*" component={() => <Navigate href="/journal" />} />
               </Router>
             </Show>

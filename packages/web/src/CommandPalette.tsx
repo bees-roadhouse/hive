@@ -6,10 +6,12 @@
 // passthrough). Filtering is a substring match over label + keywords — no
 // fuzzy scoring, the list is small.
 
-import { createEffect, createMemo, createSignal, For, on, Show, type Component } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, on, Show, type Component } from "solid-js";
 import { useNavigate } from "@solidjs/router";
-import { getCurrentUser } from "./api.ts";
+import { api, getCurrentUser } from "./api.ts";
 import { Icon } from "./icons.tsx";
+import { kindForType } from "./kinds.ts";
+import { liveRev } from "./live.ts";
 import { paletteOpen, requestCompose, setPaletteOpen } from "./ui.ts";
 
 interface Cmd {
@@ -79,9 +81,33 @@ export const CommandPalette: Component = () => {
 
   const isAdmin = () => getCurrentUser()?.role === "admin";
 
+  // User-defined entity types earn Boards-section commands, right after the
+  // built-in boards (sections must stay contiguous for the header pass).
+  const [types] = createResource(
+    () => ({ _r: liveRev() }),
+    () => api.entityTypes(),
+  );
+  const allCommands = createMemo<Cmd[]>(() => {
+    const customs: Cmd[] = (types.latest ?? []).map((t) => {
+      const k = kindForType(t);
+      return {
+        id: `etype-${t.slug}`,
+        label: t.name_plural,
+        hint: "collection",
+        icon: k.icon,
+        section: "Boards",
+        keywords: `${t.slug} ${t.name} custom entity`,
+        run: (nav) => nav(`/e/${t.slug}`),
+      };
+    });
+    if (!customs.length) return COMMANDS;
+    const idx = COMMANDS.map((c) => c.section).lastIndexOf("Boards");
+    return [...COMMANDS.slice(0, idx + 1), ...customs, ...COMMANDS.slice(idx + 1)];
+  });
+
   const matches = createMemo(() => {
     const q = query().trim().toLowerCase();
-    return COMMANDS.filter((c) => {
+    return allCommands().filter((c) => {
       if (c.adminOnly && !isAdmin()) return false;
       if (!q) return true;
       return `${c.label} ${c.hint} ${c.keywords ?? ""}`.toLowerCase().includes(q);
