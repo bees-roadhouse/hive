@@ -41,6 +41,16 @@ interface Workspace {
   workdir: string;
   status: string;
   claude_session_id: string | null;
+  runtime?: RuntimeKind | string;
+}
+type RuntimeKind = "claude_code" | "codex" | "opencode";
+interface RuntimeAuth {
+  owner: string;
+  runtime: RuntimeKind | string;
+  provider: string | null;
+  kind: string;
+  secret: string;
+  workdir: string;
 }
 interface Message {
   seq: number;
@@ -78,13 +88,27 @@ const setStatus = (id: string, status: string) =>
 const ingest = (id: string, m: IngestMsg) =>
   api(`/api/workspaces/${id}/messages`, { method: "POST", body: JSON.stringify(m) });
 
-async function getRuntimeAuth(id: string): Promise<{ kind: string; secret: string } | null> {
+const runtimeOf = (ws: Workspace): RuntimeKind | string => ws.runtime || "claude_code";
+
+async function getRuntimeAuth(ws: Workspace): Promise<RuntimeAuth | null> {
   try {
-    return await api<{ kind: string; secret: string }>(`/api/workspaces/${id}/runtime-auth`);
+    return await api<RuntimeAuth>(`/api/workspaces/${ws.id}/runtime-auth`);
   } catch (e) {
-    // 424 = owner has no credential saved → fall back to the machine's claude login.
-    log(`no vault credential for ${id} (${(e as Error).message.slice(0, 60)}); using ambient claude login`);
-    return null;
+    // Claude Code can fall back to an ambient machine login. Codex/OpenCode need
+    // an explicit vault credential/config in this server-side contract.
+    if (runtimeOf(ws) === "claude_code") {
+      log(`no vault credential for ${ws.id} (${(e as Error).message.slice(0, 60)}); using ambient claude login`);
+      return null;
+    }
+    throw e;
+  }
+}
+
+function requireBinary(cmd: string): void {
+  try {
+    execFileSync(cmd, ["--version"], { stdio: "ignore" });
+  } catch {
+    throw new Error(`${cmd} binary is not installed or not on PATH`);
   }
 }
 
@@ -146,8 +170,13 @@ function mapSdkMessage(m: Json): IngestMsg[] {
 }
 
 // Run a single turn against Claude Code; stream messages to ingest; return session id.
-async function runTurn(ws: Workspace, prompt: string, auth: { kind: string; secret: string } | null, resume: string | null): Promise<string | null> {
+async function runTurn(ws: Workspace, prompt: string, auth: RuntimeAuth | null, resume: string | null): Promise<string | null> {
   if (DRY_RUN) return dryTurn(ws, prompt, resume);
+
+  const runtime = runtimeOf(ws);
+  if (runtime === "codex") return runCodexTurn(ws, prompt, auth, resume);
+  if (runtime === "opencode") return runOpenCodeTurn(ws, prompt, auth, resume);
+  if (runtime !== "claude_code") throw new Error(`unsupported runtime: ${runtime}`);
 
   const env: Record<string, string> = { ...process.env } as Record<string, string>;
   if (auth?.secret) {
@@ -178,10 +207,34 @@ async function runTurn(ws: Workspace, prompt: string, auth: { kind: string; secr
   return sid;
 }
 
+async function runCodexTurn(ws: Workspace, _prompt: string, auth: RuntimeAuth | null, resume: string | null): Promise<string | null> {
+  requireBinary("codex");
+  if (!auth?.secret) throw new Error("codex runtime requires a saved codex credential");
+  await ingest(ws.id, {
+    role: "system",
+    kind: "init",
+    content: { subtype: "init", runtime: "codex", provider: auth.provider, model: MODEL ?? null, cwd: ws.workdir },
+    claude_session_id: resume,
+  });
+  throw new Error("codex runtime execution is not implemented yet; credential plumbing is ready");
+}
+
+async function runOpenCodeTurn(ws: Workspace, _prompt: string, auth: RuntimeAuth | null, resume: string | null): Promise<string | null> {
+  requireBinary("opencode");
+  if (!auth?.secret) throw new Error("opencode runtime requires a saved opencode provider/model credential");
+  await ingest(ws.id, {
+    role: "system",
+    kind: "init",
+    content: { subtype: "init", runtime: "opencode", provider: auth.provider, model: MODEL ?? null, cwd: ws.workdir },
+    claude_session_id: resume,
+  });
+  throw new Error("opencode runtime execution is not implemented yet; credential plumbing is ready");
+}
+
 async function dryTurn(ws: Workspace, prompt: string, resume: string | null): Promise<string> {
   const sid = resume ?? "dry-" + Math.random().toString(36).slice(2, 10);
   const send = (m: IngestMsg) => ingest(ws.id, { ...m, claude_session_id: sid });
-  await send({ role: "system", kind: "init", content: { subtype: "init", model: "dry-run", cwd: ws.workdir } });
+  await send({ role: "system", kind: "init", content: { subtype: "init", runtime: runtimeOf(ws), model: "dry-run", cwd: ws.workdir } });
   await sleep(250);
   await send({ role: "assistant", kind: "thinking", content: { text: "(dry-run) reading the request…" } });
   await sleep(250);
@@ -195,10 +248,18 @@ async function dryTurn(ws: Workspace, prompt: string, resume: string | null): Pr
 
 // Drive a session from claim through every turn until it is archived.
 async function drive(ws: Workspace): Promise<void> {
-  log(`claim ${ws.id} (owner=${ws.owner}, dir=${ws.workdir})`);
+  log(`claim ${ws.id} (owner=${ws.owner}, runtime=${runtimeOf(ws)}, dir=${ws.workdir})`);
   await setStatus(ws.id, "running");
   ensureSandbox(ws.workdir);
-  const auth = await getRuntimeAuth(ws.id);
+  let auth: RuntimeAuth | null = null;
+  try {
+    auth = await getRuntimeAuth(ws);
+  } catch (e) {
+    log(`runtime auth failed: ${(e as Error).message}`);
+    await ingest(ws.id, { role: "system", kind: "error", content: { error: (e as Error).message } });
+    await setStatus(ws.id, "failed");
+    return;
+  }
   let sid: string | null = ws.claude_session_id;
   let lastInputSeq = 0;
   let archived = false;

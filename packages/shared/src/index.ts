@@ -146,6 +146,54 @@ export interface ApiToken {
 export const API_TOKEN_MAX_EXPIRY_DAYS = 365;
 export const API_TOKEN_DEFAULT_EXPIRY_DAYS = 90;
 
+export type RuntimeKind = "claude_code" | "codex" | "opencode";
+
+export interface CcSession {
+  id: string;
+  owner: string;
+  created_by: string;
+  title: string;
+  workdir: string;
+  claude_session_id: string | null;
+  runtime: RuntimeKind | string;
+  status: string;
+  model: string | null;
+  usage: unknown;
+  meta: unknown;
+  repo_url: string | null;
+  repo_ref: string | null;
+  created_at: string;
+  updated_at: string;
+  last_activity_at: string | null;
+}
+
+export interface NewCcSession {
+  runtime?: RuntimeKind | string;
+  title?: string;
+  model?: string;
+  prompt?: string;
+}
+
+export interface CcCredentialView {
+  id: string;
+  owner: string;
+  kind: string;
+  runtime: RuntimeKind | string;
+  provider: string | null;
+  label: string;
+  tail: string;
+  created_at: string;
+  last_used_at: string | null;
+}
+
+export interface NewCcCredential {
+  kind: string;
+  runtime?: RuntimeKind | string;
+  provider?: string;
+  label?: string;
+  secret: string;
+}
+
 /** A dynamically-registered OAuth client (RFC 7591). */
 export interface OAuthClient {
   client_id: string;

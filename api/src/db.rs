@@ -337,6 +337,7 @@ const SCHEMA: &str = r#"
       title             TEXT NOT NULL DEFAULT '',
       workdir           TEXT NOT NULL DEFAULT '',
       claude_session_id TEXT,
+      runtime           TEXT NOT NULL DEFAULT 'claude_code',
       status            TEXT NOT NULL DEFAULT 'provisioning',
       model             TEXT,
       usage             TEXT NOT NULL DEFAULT '{}',
@@ -371,6 +372,8 @@ const SCHEMA: &str = r#"
       id           TEXT PRIMARY KEY,
       owner        TEXT NOT NULL,
       kind         TEXT NOT NULL,
+      runtime      TEXT NOT NULL DEFAULT 'claude_code',
+      provider     TEXT,
       label        TEXT NOT NULL DEFAULT '',
       ciphertext   TEXT NOT NULL,
       nonce        TEXT NOT NULL,
@@ -591,6 +594,9 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS expires_at TEXT",
         "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS scope      TEXT",
         "ALTER TABLE oauth_auth_codes ADD COLUMN IF NOT EXISTS token_ttl_secs BIGINT",
+        "ALTER TABLE cc_sessions ADD COLUMN IF NOT EXISTS runtime TEXT NOT NULL DEFAULT 'claude_code'",
+        "ALTER TABLE cc_credentials ADD COLUMN IF NOT EXISTS runtime TEXT NOT NULL DEFAULT 'claude_code'",
+        "ALTER TABLE cc_credentials ADD COLUMN IF NOT EXISTS provider TEXT",
     ] {
         sqlx::raw_sql(ddl).execute(pool).await?;
     }

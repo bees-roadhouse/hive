@@ -208,27 +208,24 @@ async fn runtime_auth(
     let Some(ws) = s.workspace_get_internal(&id).await? else {
         return Ok(not_found());
     };
-    match s.cc_cred_decrypt_for_runtime(&ws.owner).await? {
-        Some((kind, secret)) => {
-            let meta = ws.meta.as_object();
-            Ok(Json(json!({
-                "owner": ws.owner,
-                "kind": kind,
-                "secret": secret,
-                "workdir": ws.workdir,
-                "runtime": meta
-                    .and_then(|m| m.get("runtime"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("claude_code"),
-                "provider": meta.and_then(|m| m.get("provider")).and_then(|v| v.as_str()),
-                "model": ws.model,
-            }))
-            .into_response())
+    match s
+        .cc_cred_decrypt_for_runtime(&ws.owner, &ws.runtime)
+        .await?
+    {
+        Some((kind, runtime, provider, secret)) => Ok(Json(json!({
+            "owner": ws.owner,
+            "runtime": runtime,
+            "provider": provider,
+            "model": ws.model,
+            "kind": kind,
+            "secret": secret,
+            "workdir": ws.workdir,
+        }))
+        .into_response()),
+        None => {
+            let msg = format!("owner has no {} credential saved", ws.runtime);
+            Ok(err(StatusCode::FAILED_DEPENDENCY, &msg))
         }
-        None => Ok(err(
-            StatusCode::FAILED_DEPENDENCY,
-            "owner has no Claude Code credential saved",
-        )),
     }
 }
 
