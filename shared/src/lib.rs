@@ -365,6 +365,7 @@ pub struct ActorDeleteResult {
     pub wire: i64,
     pub sources: i64,
     pub people: i64,
+    pub entities: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -386,6 +387,7 @@ pub struct ActorMergeResult {
     pub people_owner: i64,
     pub profile: i64,
     pub users: i64,
+    pub entities: i64,
 }
 
 /// Public first-run state — the SPA reads this before anything else.

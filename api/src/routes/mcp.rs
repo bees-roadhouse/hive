@@ -503,6 +503,14 @@ mod tests {
                 "workspace_list",
                 "workspace_get",
                 "workspace_transcript",
+                "entity_types_list",
+                "entity_type_create",
+                "entity_type_update",
+                "entities_list",
+                "entity_get",
+                "entity_create",
+                "entity_update",
+                "entity_delete",
             ]
         );
         // Spot-check a schema verbatim against the captured Node output.
