@@ -38,6 +38,12 @@ import type {
   OnboardingStatus,
   SafeUser,
   UserRole,
+  CustomEntity,
+  CustomEntityPatch,
+  EntityTypePatch,
+  EntityTypeView,
+  NewCustomEntity,
+  NewEntityType,
 } from "@hive/shared";
 
 // Vite proxies /api → hive-api in dev (see vite.config.ts).
@@ -269,6 +275,31 @@ export const api = {
     req<CcMessage>(`/workspaces/${id}/input`, { method: "POST", body: JSON.stringify({ text }) }),
   archiveWorkspace: (id: string) =>
     req<{ ok: boolean }>(`/workspaces/${id}/archive`, { method: "POST" }),
+
+  // ---- user-defined custom entity types ----
+  entityTypes: (includeArchived = false) =>
+    req<EntityTypeView[]>(`/entity-types${includeArchived ? "?include_archived=1" : ""}`),
+  createEntityType: (input: NewEntityType) =>
+    req<EntityTypeView>("/entity-types", { method: "POST", body: JSON.stringify(input) }),
+  patchEntityType: (idOrSlug: string, patch: EntityTypePatch) =>
+    req<EntityTypeView>(`/entity-types/${idOrSlug}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  deleteEntityType: (idOrSlug: string) =>
+    req<void>(`/entity-types/${idOrSlug}`, { method: "DELETE" }),
+  entities: (type: string, opts: { limit?: number; offset?: number; sort?: string; dir?: "asc" | "desc"; filters?: Record<string, string> } = {}) => {
+    const p = new URLSearchParams({ type });
+    if (opts.limit) p.set("limit", String(opts.limit));
+    if (opts.offset) p.set("offset", String(opts.offset));
+    if (opts.sort) p.set("sort", opts.sort);
+    if (opts.dir) p.set("dir", opts.dir);
+    for (const [k, v] of Object.entries(opts.filters ?? {})) if (v) p.set(`f.${k}`, v);
+    return req<CustomEntity[]>(`/entities?${p}`);
+  },
+  entity: (id: string) => req<CustomEntity>(`/entities/${id}`),
+  createEntity: (input: NewCustomEntity) =>
+    req<CustomEntity>("/entities", { method: "POST", body: JSON.stringify(input) }),
+  patchEntity: (id: string, patch: CustomEntityPatch) =>
+    req<CustomEntity>(`/entities/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  deleteEntity: (id: string) => req<void>(`/entities/${id}`, { method: "DELETE" }),
 
   // per-user Claude Code credentials (secret never returned)
   ccCredentials: () => req<CcCredentialView[]>("/cc-credentials"),

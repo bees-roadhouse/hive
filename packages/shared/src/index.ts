@@ -724,3 +724,128 @@ export function parseMentions(text: string): string[] {
   }
   return [...found];
 }
+
+// ---- user-defined custom entity types ----
+
+/** Field value types a custom entity type may declare. */
+export type FieldType = "text" | "number" | "bool" | "date" | "choice" | "ref";
+export const FIELD_TYPES: FieldType[] = ["text", "number", "bool", "date", "choice", "ref"];
+
+/** Kind slugs a custom type may never claim (built-ins, planned corpora, infra nouns). */
+export const RESERVED_KIND_SLUGS = [
+  "task", "decision", "event", "journal", "person", "topic", "project",
+  "phase", "mail", "anchor", "link", "share", "inbox", "wire", "search",
+  "source", "outbox", "user", "profile", "identity", "workspace", "entity",
+  "entity_type", "entities", "blob", "note",
+] as const;
+
+export interface EntityFieldView {
+  id: string;
+  slug: string;
+  label: string;
+  field_type: FieldType;
+  required: boolean;
+  position: number;
+  /** Non-empty iff field_type === "choice". */
+  options: string[];
+  /** Set iff field_type === "ref": person|topic|project|task or a custom slug. */
+  ref_kind: string | null;
+  archived: boolean;
+}
+
+/** The kind-config contract the board engine consumes; fields ordered by position. */
+export interface EntityTypeView {
+  id: string;
+  slug: string;
+  name: string;
+  name_plural: string;
+  description: string;
+  icon: string;
+  color: string;
+  /** null, or the slug of a live choice field the board groups by. */
+  board_field: string | null;
+  archived: boolean;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  fields: EntityFieldView[];
+}
+
+/** A custom entity instance; `fields` holds only registry-validated keys. */
+export interface CustomEntity {
+  id: string;
+  type_id: string;
+  /** The type slug, denormalized so clients never join. */
+  type: string;
+  title: string;
+  fields: Record<string, unknown>;
+  user_scope: string | null;
+  origin_entry_id: string | null;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NewEntityField {
+  slug?: string;
+  label: string;
+  field_type: FieldType;
+  required?: boolean;
+  position?: number;
+  options?: string[];
+  ref_kind?: string;
+}
+
+export interface NewEntityType {
+  slug?: string;
+  name: string;
+  name_plural?: string;
+  description?: string;
+  icon?: string;
+  color?: string;
+  board_field?: string;
+  fields?: NewEntityField[];
+}
+
+export interface EntityFieldPatch {
+  slug: string;
+  label?: string;
+  position?: number;
+  required?: boolean;
+  options?: string[];
+  archived?: boolean;
+}
+
+export interface EntityTypePatch {
+  name?: string;
+  name_plural?: string;
+  description?: string;
+  icon?: string;
+  color?: string;
+  /** null clears the board grouping; absent keeps it. */
+  board_field?: string | null;
+  archived?: boolean;
+  add_fields?: NewEntityField[];
+  update_fields?: EntityFieldPatch[];
+}
+
+export interface NewCustomEntity {
+  type: string;
+  title: string;
+  fields?: Record<string, unknown>;
+  scope?: "global" | "me";
+}
+
+export interface CustomEntityPatch {
+  title?: string;
+  /** Shallow merge; a JSON null clears that key. */
+  fields?: Record<string, unknown>;
+  scope?: "global" | "me";
+}
+
+/** One structured validation failure from the entity registry. */
+export interface EntityFieldIssue {
+  field: string;
+  code: "unknown_field" | "wrong_type" | "required" | "bad_choice" | "bad_date" | "ref_not_found" | "bad_ref_kind" | "archived_type" | "bad_slug";
+  message: string;
+}
