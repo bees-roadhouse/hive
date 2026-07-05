@@ -269,6 +269,45 @@ fn build_tools() -> Value {
     ));
     tools.push(json!(
         {
+            "name":"mail_search",
+            "title": "Search mail archive",
+            "description": "Search stored mail messages. Viewer-gated to the authenticated namespace; admins see all stored mail.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"q": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}},
+                "required": ["q"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"mail_thread_get",
+            "title": "Get a mail thread",
+            "description": "Return stored messages for a mail thread, viewer-gated from day one.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"thread_id": {"type": "string"}},
+                "required": ["thread_id"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"mail_accounts_list",
+            "title": "List mail accounts",
+            "description": "List stored mail accounts visible to the authenticated viewer.",
+            "inputSchema": empty_schema.clone(),
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
             "name":"dashboard",
             "title": "Cross-board stats",
             "inputSchema": empty_schema.clone(),
@@ -859,11 +898,12 @@ fn entity_write_result(e: crate::store::custom_entities::EntityWriteError) -> To
     match e {
         E::Issues(issues) => Ok(tool_error(&issues_text(&issues))),
         E::UnknownType => Ok(tool_error("unknown entity type")),
-        E::ArchivedType => Ok(tool_error("type is archived; unarchive it to add instances")),
+        E::ArchivedType => Ok(tool_error(
+            "type is archived; unarchive it to add instances",
+        )),
         E::Other(err) => Err(err.into()),
     }
 }
-
 
 enum ToolFailure {
     /// A validation failure — already rendered as a CallToolResult.
@@ -1382,6 +1422,34 @@ async fn dispatch(
                 &store.search(&q.unwrap(), limit, viewer.as_deref()).await?,
             ))
         }
+        "mail_search" => {
+            let mut a = Args::new("mail_search", args);
+            let q = a.req_str("q").map(String::from);
+            let limit = a.opt_int("limit", Some(1), Some(200));
+            a.finish()?;
+            Ok(ok_content(
+                &store
+                    .mail_search(&q.unwrap(), viewer.as_deref(), limit.unwrap_or(50))
+                    .await?,
+            ))
+        }
+        "mail_thread_get" => {
+            let mut a = Args::new("mail_thread_get", args);
+            let thread_id = a.req_str("thread_id").map(String::from);
+            a.finish()?;
+            Ok(ok_content(
+                &store
+                    .mail_thread_get(&thread_id.unwrap(), viewer.as_deref())
+                    .await?,
+            ))
+        }
+        "mail_accounts_list" => {
+            let mut a = Args::new("mail_accounts_list", args);
+            a.finish()?;
+            Ok(ok_content(
+                &store.mail_accounts_list(viewer.as_deref()).await?,
+            ))
+        }
         "dashboard" => {
             if !ctx.is_admin() {
                 return Ok(ok_content(&json!({"error": "admin only"})));
@@ -1719,8 +1787,9 @@ async fn dispatch(
             a.finish()?;
             let mut body = args.clone();
             body.remove("type");
-            let patch: hive_shared::EntityTypePatch = serde_json::from_value(Value::Object(body))
-                .map_err(|e| invalid_args("entity_type_update", &e.to_string()))?;
+            let patch: hive_shared::EntityTypePatch =
+                serde_json::from_value(Value::Object(body))
+                    .map_err(|e| invalid_args("entity_type_update", &e.to_string()))?;
             match store
                 .entity_types_update(&target.unwrap(), patch, actor)
                 .await
@@ -1764,10 +1833,7 @@ async fn dispatch(
                 desc: dir.as_deref() != Some("asc"),
                 fields,
             };
-            match store
-                .custom_entities_list(&filter, &ctx.visibility())
-                .await
-            {
+            match store.custom_entities_list(&filter, &ctx.visibility()).await {
                 Ok(items) => Ok(ok_content(&items)),
                 Err(e) => entity_write_result(e),
             }
@@ -1802,9 +1868,8 @@ async fn dispatch(
             a.finish()?;
             let mut body = args.clone();
             body.remove("id");
-            let patch: hive_shared::CustomEntityPatch =
-                serde_json::from_value(Value::Object(body))
-                    .map_err(|e| invalid_args("entity_update", &e.to_string()))?;
+            let patch: hive_shared::CustomEntityPatch = serde_json::from_value(Value::Object(body))
+                .map_err(|e| invalid_args("entity_update", &e.to_string()))?;
             match store
                 .custom_entities_update(
                     &id.unwrap(),

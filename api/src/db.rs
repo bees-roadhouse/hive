@@ -460,6 +460,77 @@ const SCHEMA_SEARCH: &str = r#"
     -- Dormant in v1 (filters run in Rust at household scale); enables ad-hoc
     -- psql @> queries and server-side filtering later without a migration.
     CREATE INDEX IF NOT EXISTS entities_fields_gin ON entities USING GIN (fields jsonb_path_ops);
+
+    -- Phase 1 mail archive skeleton. Sync credentials/state intentionally live
+    -- elsewhere; these tables only hold read-only rows already ingested by a
+    -- future hive-mail process. user_scope follows journal visibility.
+    CREATE TABLE IF NOT EXISTS blobs (
+      id           TEXT PRIMARY KEY,
+      sha256       TEXT NOT NULL UNIQUE,
+      content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+      byte_len     BIGINT NOT NULL DEFAULT 0,
+      storage_key  TEXT NOT NULL,
+      created_at   TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS mail_accounts (
+      id           TEXT PRIMARY KEY,
+      user_scope   TEXT NOT NULL,
+      provider     TEXT NOT NULL DEFAULT 'jmap',
+      email        TEXT NOT NULL,
+      display_name TEXT,
+      created_at   TEXT NOT NULL,
+      updated_at   TEXT NOT NULL,
+      UNIQUE (user_scope, email)
+    );
+    CREATE INDEX IF NOT EXISTS mail_accounts_scope ON mail_accounts (user_scope, email);
+
+    CREATE TABLE IF NOT EXISTS mail_mailboxes (
+      id          TEXT PRIMARY KEY,
+      account_id  TEXT NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
+      mailbox_id  TEXT NOT NULL,
+      name        TEXT NOT NULL,
+      role        TEXT,
+      sort_order  BIGINT NOT NULL DEFAULT 0,
+      UNIQUE (account_id, mailbox_id)
+    );
+    CREATE INDEX IF NOT EXISTS mail_mailboxes_account ON mail_mailboxes (account_id, sort_order);
+
+    CREATE TABLE IF NOT EXISTS mail_messages (
+      id              TEXT PRIMARY KEY,
+      account_id      TEXT NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
+      mailbox_id      TEXT REFERENCES mail_mailboxes(id) ON DELETE SET NULL,
+      thread_id       TEXT NOT NULL,
+      jmap_id         TEXT NOT NULL,
+      message_id      TEXT,
+      subject         TEXT NOT NULL DEFAULT '',
+      from_name       TEXT,
+      from_email      TEXT NOT NULL DEFAULT '',
+      to_json         TEXT NOT NULL DEFAULT '[]',
+      cc_json         TEXT NOT NULL DEFAULT '[]',
+      received_at     TEXT NOT NULL,
+      snippet         TEXT NOT NULL DEFAULT '',
+      body_text       TEXT NOT NULL DEFAULT '',
+      has_attachments BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at      TEXT NOT NULL,
+      updated_at      TEXT NOT NULL,
+      UNIQUE (account_id, jmap_id)
+    );
+    CREATE INDEX IF NOT EXISTS mail_messages_account_received ON mail_messages (account_id, received_at DESC);
+    CREATE INDEX IF NOT EXISTS mail_messages_thread ON mail_messages (thread_id, received_at ASC);
+    CREATE INDEX IF NOT EXISTS mail_messages_subject ON mail_messages (subject);
+
+    CREATE TABLE IF NOT EXISTS mail_attachments (
+      id          TEXT PRIMARY KEY,
+      message_id  TEXT NOT NULL REFERENCES mail_messages(id) ON DELETE CASCADE,
+      blob_id     TEXT REFERENCES blobs(id) ON DELETE SET NULL,
+      filename    TEXT NOT NULL DEFAULT '',
+      content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+      byte_len    BIGINT NOT NULL DEFAULT 0,
+      disposition TEXT,
+      cid         TEXT
+    );
+    CREATE INDEX IF NOT EXISTS mail_attachments_message ON mail_attachments (message_id);
 "#;
 
 pub async fn migrate(pool: &PgPool) -> Result<()> {
