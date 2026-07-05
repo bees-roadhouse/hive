@@ -4,18 +4,22 @@
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Json, Response};
+use axum::response::{IntoResponse, Json, Redirect, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Router};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use hive_shared::NewJournalEntry;
+use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::error::{err, forbidden, not_found, ApiResult};
 use crate::middleware::AuthCtx;
 use crate::store::cc_credentials::NewCcCredential;
 use crate::store::workspaces::{LinkedEntity, NewCcMessage, NewCcSession};
-use crate::store::Store;
+use crate::store::{now_iso, Store};
 
 pub fn router() -> Router<Store> {
     Router::new()
@@ -29,6 +33,14 @@ pub fn router() -> Router<Store> {
         .route("/api/workspaces/{id}/archive", post(archive))
         .route("/api/workspaces/{id}/status", post(set_status))
         .route("/api/workspaces/{id}/runtime-auth", get(runtime_auth))
+        .route(
+            "/api/runtime-oauth/{runtime}/start",
+            get(runtime_oauth_start),
+        )
+        .route(
+            "/api/runtime-oauth/{runtime}/callback",
+            get(runtime_oauth_callback),
+        )
         .route("/api/cc-credentials", get(creds_list).post(creds_put))
         .route("/api/cc-credentials/{id}", delete(creds_delete))
 }
@@ -286,6 +298,267 @@ async fn runtime_auth(
     }
 }
 
+// ---- hosted runtime OAuth callback flow (Codex / Claude Code) ----
+
+#[derive(Clone)]
+struct RuntimeOAuthConfig {
+    runtime: String,
+    provider: Option<String>,
+    client_id: String,
+    client_secret: Option<String>,
+    auth_url: String,
+    token_url: String,
+    redirect_uri: String,
+    scopes: String,
+}
+
+#[derive(Deserialize)]
+struct RuntimeOAuthStartQuery {
+    return_to: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RuntimeOAuthCallbackQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(sqlx::FromRow)]
+struct RuntimeOAuthStateRow {
+    owner: String,
+    runtime: String,
+    provider: Option<String>,
+    code_verifier: String,
+    return_to: String,
+}
+
+fn runtime_env_prefix(runtime: &str) -> Option<&'static str> {
+    match runtime {
+        "codex" => Some("HIVE_CODEX_OAUTH"),
+        "claude_code" => Some("HIVE_CLAUDE_CODE_OAUTH"),
+        _ => None,
+    }
+}
+
+fn runtime_label(runtime: &str) -> &'static str {
+    match runtime {
+        "codex" => "Codex subscription",
+        "claude_code" => "Claude Code subscription",
+        _ => "Runtime subscription",
+    }
+}
+
+fn runtime_oauth_config(runtime: &str, issuer: &str) -> Result<RuntimeOAuthConfig, String> {
+    let runtime = crate::store::workspaces::normalize_runtime(Some(runtime));
+    let Some(prefix) = runtime_env_prefix(&runtime) else {
+        return Err("unsupported runtime".to_string());
+    };
+    let get = |suffix: &str| {
+        std::env::var(format!("{prefix}_{suffix}"))
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    };
+    let client_id =
+        get("CLIENT_ID").ok_or_else(|| format!("{prefix}_CLIENT_ID is not configured"))?;
+    let auth_url = get("AUTH_URL").ok_or_else(|| format!("{prefix}_AUTH_URL is not configured"))?;
+    let token_url =
+        get("TOKEN_URL").ok_or_else(|| format!("{prefix}_TOKEN_URL is not configured"))?;
+    let redirect_uri = get("REDIRECT_URI")
+        .unwrap_or_else(|| format!("{issuer}/api/runtime-oauth/{runtime}/callback"));
+    Ok(RuntimeOAuthConfig {
+        runtime,
+        provider: get("PROVIDER"),
+        client_id,
+        client_secret: get("CLIENT_SECRET"),
+        auth_url,
+        token_url,
+        redirect_uri,
+        scopes: get("SCOPES").unwrap_or_else(|| "openid profile offline_access".to_string()),
+    })
+}
+
+fn random_urlsafe(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    URL_SAFE_NO_PAD.encode(buf)
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+fn safe_return_path(v: Option<String>) -> String {
+    let raw = v.unwrap_or_else(|| "/settings".to_string());
+    if raw.starts_with('/') && !raw.starts_with("//") && !raw.contains('\n') && !raw.contains('\r')
+    {
+        raw
+    } else {
+        "/settings".to_string()
+    }
+}
+
+fn runtime_query_string(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={}", urlencoding::encode(v)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn with_status(path: &str, status: &str) -> String {
+    let sep = if path.contains('?') { '&' } else { '?' };
+    format!("{path}{sep}runtime_oauth={}", urlencoding::encode(status))
+}
+
+async fn runtime_oauth_start(
+    State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
+    headers: axum::http::HeaderMap,
+    Path(runtime): Path<String>,
+    Query(q): Query<RuntimeOAuthStartQuery>,
+) -> ApiResult {
+    if let Err(r) = require_actor(&ctx) {
+        return Ok(r);
+    }
+    let issuer = crate::middleware::issuer_for(&s, &headers).await;
+    let cfg = match runtime_oauth_config(&runtime, &issuer) {
+        Ok(cfg) => cfg,
+        Err(msg) => return Ok(err(StatusCode::NOT_IMPLEMENTED, &msg)),
+    };
+    let state = random_urlsafe(32);
+    let verifier = random_urlsafe(64);
+    let challenge = pkce_challenge(&verifier);
+    let return_to = safe_return_path(q.return_to);
+    crate::pgq::query(
+        "INSERT INTO runtime_oauth_states (state, owner, runtime, provider, code_verifier, return_to, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&state)
+    .bind(ctx.namespace_user())
+    .bind(&cfg.runtime)
+    .bind(&cfg.provider)
+    .bind(&verifier)
+    .bind(&return_to)
+    .bind(now_iso())
+    .execute(s.db())
+    .await?;
+
+    let authorize_url = format!(
+        "{}?{}",
+        cfg.auth_url,
+        runtime_query_string(&[
+            ("response_type", "code"),
+            ("client_id", &cfg.client_id),
+            ("redirect_uri", &cfg.redirect_uri),
+            ("scope", &cfg.scopes),
+            ("state", &state),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+        ])
+    );
+    Ok(Redirect::temporary(&authorize_url).into_response())
+}
+
+async fn runtime_oauth_callback(
+    State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
+    headers: axum::http::HeaderMap,
+    Path(runtime): Path<String>,
+    Query(q): Query<RuntimeOAuthCallbackQuery>,
+) -> ApiResult {
+    if let Err(r) = require_actor(&ctx) {
+        return Ok(r);
+    }
+    let state = q.state.unwrap_or_default();
+    if state.is_empty() {
+        return Ok(err(StatusCode::BAD_REQUEST, "missing state"));
+    }
+    let row = crate::pgq::query_as::<RuntimeOAuthStateRow>(
+        "DELETE FROM runtime_oauth_states WHERE state = ? RETURNING owner, runtime, provider, code_verifier, return_to",
+    )
+    .bind(&state)
+    .fetch_optional(s.db())
+    .await?;
+    let Some(row) = row else {
+        return Ok(err(StatusCode::BAD_REQUEST, "invalid_state"));
+    };
+    let requested_runtime = crate::store::workspaces::normalize_runtime(Some(&runtime));
+    if row.runtime != requested_runtime || row.owner != ctx.namespace_user() {
+        return Ok(err(StatusCode::FORBIDDEN, "state_owner_mismatch"));
+    }
+    if q.error.is_some() {
+        return Ok(Redirect::temporary(&with_status(&row.return_to, "denied")).into_response());
+    }
+    let code = q.code.unwrap_or_default();
+    if code.is_empty() {
+        return Ok(err(StatusCode::BAD_REQUEST, "missing code"));
+    }
+    let issuer = crate::middleware::issuer_for(&s, &headers).await;
+    let cfg = match runtime_oauth_config(&row.runtime, &issuer) {
+        Ok(cfg) => cfg,
+        Err(msg) => return Ok(err(StatusCode::NOT_IMPLEMENTED, &msg)),
+    };
+    let token = exchange_runtime_code(&cfg, &code, &row.code_verifier).await?;
+    let secret = token
+        .get("refresh_token")
+        .or_else(|| token.get("access_token"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if secret.is_empty() {
+        return Ok(err(
+            StatusCode::BAD_GATEWAY,
+            "oauth token response did not include a token",
+        ));
+    }
+    let provider = row.provider.or(cfg.provider);
+    s.cc_cred_put(
+        &row.owner,
+        NewCcCredential {
+            kind: "oauth_token".to_string(),
+            runtime: Some(row.runtime.clone()),
+            provider,
+            label: Some(runtime_label(&row.runtime).to_string()),
+            secret,
+        },
+    )
+    .await?;
+    Ok(Redirect::temporary(&with_status(&row.return_to, "connected")).into_response())
+}
+
+async fn exchange_runtime_code(
+    cfg: &RuntimeOAuthConfig,
+    code: &str,
+    verifier: &str,
+) -> anyhow::Result<Value> {
+    let mut form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("redirect_uri", cfg.redirect_uri.as_str()),
+        ("client_id", cfg.client_id.as_str()),
+        ("code_verifier", verifier),
+    ];
+    if let Some(secret) = cfg.client_secret.as_deref() {
+        form.push(("client_secret", secret));
+    }
+    let res = reqwest::Client::new()
+        .post(&cfg.token_url)
+        .form(&form)
+        .send()
+        .await?;
+    let status = res.status();
+    let body: Value = res.json().await.unwrap_or_else(|_| json!({}));
+    if !status.is_success() {
+        anyhow::bail!(
+            "runtime oauth token exchange failed: {} {}",
+            status.as_u16(),
+            body
+        );
+    }
+    Ok(body)
+}
+
 // ---- per-user credentials (redacted; secret never returned) ----
 
 async fn creds_list(State(s): State<Store>, Extension(ctx): Extension<AuthCtx>) -> ApiResult {
@@ -428,5 +701,43 @@ fn input_message(text: &str) -> NewCcMessage {
         tokens_in: None,
         tokens_out: None,
         claude_session_id: None,
+    }
+}
+
+#[cfg(test)]
+mod runtime_oauth_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_oauth_only_supports_subscription_runtimes() {
+        assert_eq!(runtime_env_prefix("codex"), Some("HIVE_CODEX_OAUTH"));
+        assert_eq!(
+            runtime_env_prefix("claude_code"),
+            Some("HIVE_CLAUDE_CODE_OAUTH")
+        );
+        assert_eq!(runtime_env_prefix("opencode"), None);
+    }
+
+    #[test]
+    fn safe_return_path_blocks_open_redirects() {
+        assert_eq!(safe_return_path(Some("/settings".into())), "/settings");
+        assert_eq!(
+            safe_return_path(Some("/settings?tab=agents".into())),
+            "/settings?tab=agents"
+        );
+        assert_eq!(
+            safe_return_path(Some("https://evil.example".into())),
+            "/settings"
+        );
+        assert_eq!(safe_return_path(Some("//evil.example".into())), "/settings");
+    }
+
+    #[test]
+    fn pkce_challenge_matches_rfc7636_vector() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert_eq!(
+            pkce_challenge(verifier),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
     }
 }

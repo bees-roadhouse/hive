@@ -33,11 +33,8 @@ export const Settings: Component = () => {
         return { kind, runtime: "claude_code", label: kind };
     }
   };
-  const connectRuntime = (kind: "codex_oauth" | "claude_oauth") => {
-    const defaults = credentialDefaults(kind);
-    setCredForm({ kind, label: defaults.label, secret: "" });
-    setCredPanelOpen(true);
-    queueMicrotask(() => secretInput?.focus());
+  const connectRuntime = (runtime: "codex" | "claude_code") => {
+    window.location.href = `/api/runtime-oauth/${runtime}/start?return_to=${encodeURIComponent("/settings")}`;
   };
   const saveCred = async (e: Event) => {
     e.preventDefault();
@@ -194,14 +191,14 @@ export const Settings: Component = () => {
       <p class="dim sm">Connect Codex or Claude Code once, then choose that runtime when starting a Conversation. Secrets are encrypted and never shown again.</p>
 
       <div class="runtime-connect-cards">
-        <button type="button" class="runtime-connect-card rt-codex" onClick={() => connectRuntime("codex_oauth")}>
+        <button type="button" class="runtime-connect-card rt-codex" onClick={() => connectRuntime("codex")}>
           <strong>Connect Codex</strong>
-          <span>Use your Codex subscription token from the Codex sign-in flow.</span>
+          <span>Open Codex, approve Hive, and come back connected.</span>
           <em>Continue with Codex</em>
         </button>
-        <button type="button" class="runtime-connect-card rt-claude_code" onClick={() => connectRuntime("claude_oauth")}>
+        <button type="button" class="runtime-connect-card rt-claude_code" onClick={() => connectRuntime("claude_code")}>
           <strong>Connect Claude Code</strong>
-          <span>Use your Claude Code setup token or subscription token.</span>
+          <span>Open Claude, approve Hive, and come back connected.</span>
           <em>Continue with Claude Code</em>
         </button>
       </div>

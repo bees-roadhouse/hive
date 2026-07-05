@@ -108,6 +108,29 @@ from hosted workspaces are mirrored into `/api/journal` with `workspace`, runtim
 and session-id tags. Transcript rows remain as a UI projection; durable
 agent-to-agent and AI-to-human communication lives in the journal.
 
+Hosted runtime sign-in uses a browser OAuth authorization-code + PKCE callback.
+Configure each provider before exposing the Connect buttons:
+
+```bash
+HIVE_CODEX_OAUTH_CLIENT_ID=...
+HIVE_CODEX_OAUTH_CLIENT_SECRET=...        # optional for public PKCE clients
+HIVE_CODEX_OAUTH_AUTH_URL=https://provider.example/oauth/authorize
+HIVE_CODEX_OAUTH_TOKEN_URL=https://provider.example/oauth/token
+HIVE_CODEX_OAUTH_SCOPES="openid profile offline_access"
+HIVE_CODEX_OAUTH_REDIRECT_URI=https://hive.example.com/api/runtime-oauth/codex/callback
+
+HIVE_CLAUDE_CODE_OAUTH_CLIENT_ID=...
+HIVE_CLAUDE_CODE_OAUTH_CLIENT_SECRET=...  # optional for public PKCE clients
+HIVE_CLAUDE_CODE_OAUTH_AUTH_URL=https://provider.example/oauth/authorize
+HIVE_CLAUDE_CODE_OAUTH_TOKEN_URL=https://provider.example/oauth/token
+HIVE_CLAUDE_CODE_OAUTH_SCOPES="openid profile offline_access"
+HIVE_CLAUDE_CODE_OAUTH_REDIRECT_URI=https://hive.example.com/api/runtime-oauth/claude_code/callback
+```
+
+If a redirect URI is omitted, Hive derives it from the request issuer. The callback
+stores the returned refresh token when present, otherwise the access token, in the
+encrypted `cc_credentials` vault for the signed-in human.
+
 `HIVE_PROPAGATE_ENGINE_SOCKET=1` also mounts the host container socket into each
 session container. Leave it off unless the agent inside that session must manage
 nested containers; it gives that session container host-container control.
