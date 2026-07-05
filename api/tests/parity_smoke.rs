@@ -1296,3 +1296,249 @@ async fn spa_paths_are_not_gated() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"], "onboarding_required");
 }
+
+fn delete_req(path: &str, cookie: Option<&str>) -> Request<Body> {
+    let mut b = Request::delete(path);
+    if let Some(c) = cookie {
+        b = b.header(header::COOKIE, c);
+    }
+    b.body(Body::empty()).unwrap()
+}
+
+#[tokio::test]
+async fn custom_entity_types_full_flow() {
+    let _guard = env_guard().await;
+    reset_auth_env();
+    let (app, _store) = test_app().await;
+    let cookie = onboard(&app).await;
+
+    // A member login for the non-admin side of every gate.
+    let (status, _, _) = send(
+        &app,
+        post_json(
+            "/api/users",
+            json!({"name": "Maggie", "email": "maggie@example.com", "password": "maggie-secret-1"}),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, _, headers) = send(
+        &app,
+        post_json(
+            "/api/auth/login",
+            json!({"email": "maggie@example.com", "password": "maggie-secret-1"}),
+            None,
+        ),
+    )
+    .await;
+    let maggie = headers
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Non-admin type definition is forbidden; reserved + malformed slugs 400.
+    let recipe_type = json!({
+        "name": "Recipe",
+        "slug": "recipe",
+        "description": "Household recipes",
+        "board_field": "status",
+        "fields": [
+            {"label": "Status", "slug": "status", "field_type": "choice", "options": ["idea", "tested", "keeper"]},
+            {"label": "Servings", "slug": "servings", "field_type": "number"},
+            {"label": "Cuisine", "slug": "cuisine", "field_type": "text", "required": true},
+            {"label": "Author", "slug": "author", "field_type": "ref", "ref_kind": "person"},
+        ],
+    });
+    let (status, _, _) = send(&app, post_json("/api/entity-types", recipe_type.clone(), Some(&maggie))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for bad_slug in ["mail", "task", "Bad Slug", "x"] {
+        let (status, body, _) = send(
+            &app,
+            post_json("/api/entity-types", json!({"name": "X", "slug": bad_slug}), Some(&cookie)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "slug {bad_slug}: {body}");
+        assert_eq!(body["issues"][0]["code"], "bad_slug");
+    }
+
+    // Admin creates the type; the kind-config contract holds from birth.
+    let (status, ty, _) = send(&app, post_json("/api/entity-types", recipe_type, Some(&cookie))).await;
+    assert_eq!(status, StatusCode::CREATED, "type create: {ty}");
+    assert_eq!(ty["slug"], "recipe");
+    assert_eq!(ty["board_field"], "status");
+    assert_eq!(ty["fields"].as_array().unwrap().len(), 4);
+    assert_eq!(ty["fields"][0]["slug"], "status");
+    // Duplicate slug refused.
+    let (status, _, _) = send(
+        &app,
+        post_json("/api/entity-types", json!({"name": "Recipe Again", "slug": "recipe"}), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A person for the ref field to point at.
+    let (_, people, _) = send(&app, get("/api/people", Some(&cookie))).await;
+    let person_id = people.as_array().unwrap()[0]["id"].as_str().unwrap().to_string();
+
+    // Member creates a global instance.
+    let (status, sourdough, _) = send(
+        &app,
+        post_json(
+            "/api/entities",
+            json!({"type": "recipe", "title": "Sourdough", "fields": {
+                "status": "keeper", "servings": 4, "cuisine": "bread", "author": person_id
+            }}),
+            Some(&maggie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {sourdough}");
+    assert_eq!(sourdough["type"], "recipe");
+    let sourdough_id = sourdough["id"].as_str().unwrap().to_string();
+    assert!(sourdough_id.starts_with("ent_"));
+
+    // The validation matrix: unknown key, bad choice, wrong type, missing
+    // required, dangling ref — each a structured 400.
+    for (payload, want_code) in [
+        (json!({"type": "recipe", "title": "X", "fields": {"nope": 1, "cuisine": "a"}}), "unknown_field"),
+        (json!({"type": "recipe", "title": "X", "fields": {"status": "meh", "cuisine": "a"}}), "bad_choice"),
+        (json!({"type": "recipe", "title": "X", "fields": {"servings": "four", "cuisine": "a"}}), "wrong_type"),
+        (json!({"type": "recipe", "title": "X", "fields": {"status": "idea"}}), "required"),
+        (json!({"type": "recipe", "title": "X", "fields": {"cuisine": "a", "author": "person_missing"}}), "ref_not_found"),
+    ] {
+        let (status, body, _) = send(&app, post_json("/api/entities", payload, Some(&maggie))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{want_code}: {body}");
+        let codes: Vec<&str> = body["issues"].as_array().unwrap().iter().map(|i| i["code"].as_str().unwrap()).collect();
+        assert!(codes.contains(&want_code), "wanted {want_code} in {codes:?}");
+    }
+    // Unknown type 404s.
+    let (status, _, _) = send(
+        &app,
+        post_json("/api/entities", json!({"type": "gadget", "title": "X"}), Some(&maggie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A second, admin-scoped instance + one more keeper for filtering.
+    let (status, _, _) = send(
+        &app,
+        post_json(
+            "/api/entities",
+            json!({"type": "recipe", "title": "Secret Sauce", "scope": "me", "fields": {"cuisine": "secret"}}),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _, _) = send(
+        &app,
+        post_json(
+            "/api/entities",
+            json!({"type": "recipe", "title": "Pad Thai", "fields": {"status": "keeper", "servings": 2, "cuisine": "thai"}}),
+            Some(&maggie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // List: filter + sort ascending by servings; admin's scoped row is
+    // invisible to maggie in the list...
+    let (status, list, _) = send(
+        &app,
+        get("/api/entities?type=recipe&f.status=keeper&sort=servings&dir=asc", Some(&maggie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let titles: Vec<&str> = list.as_array().unwrap().iter().map(|e| e["title"].as_str().unwrap()).collect();
+    assert_eq!(titles, vec!["Pad Thai", "Sourdough"], "filtered+sorted: {list}");
+    let (_, all_for_maggie, _) = send(&app, get("/api/entities?type=recipe", Some(&maggie))).await;
+    assert!(all_for_maggie.as_array().unwrap().iter().all(|e| e["title"] != "Secret Sauce"));
+    // ...and in keyword search (the scope_hits custom arm), while admin sees it.
+    let (_, hits, _) = send(&app, get("/api/search?q=secret", Some(&maggie))).await;
+    assert!(hits.as_array().unwrap().is_empty(), "scoped hit leaked: {hits}");
+    let (_, hits, _) = send(&app, get("/api/search?q=secret", Some(&cookie))).await;
+    assert!(hits.as_array().unwrap().iter().any(|h| h["kind"] == "recipe"));
+    // Global instances are searchable by field text under the slug kind.
+    let (_, hits, _) = send(&app, get("/api/search?q=thai", Some(&maggie))).await;
+    assert!(hits.as_array().unwrap().iter().any(|h| h["kind"] == "recipe" && h["id"] != "\"\""), "fts: {hits}");
+    // Unknown sort field fails closed.
+    let (status, _, _) = send(&app, get("/api/entities?type=recipe&sort=bogus", Some(&maggie))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Ref mirroring: sourdough carries a field:author link to the person.
+    let (status, links, _) = send(&app, get(&format!("/api/links/{sourdough_id}"), Some(&maggie))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        links.as_array().unwrap().iter().any(|l| l["rel"] == "field:author" && l["source_kind"] == "recipe"),
+        "mirror link missing: {links}"
+    );
+
+    // Patch: null clears a key; the cleared ref's mirror link goes away.
+    let (status, patched, _) = send(
+        &app,
+        patch_json(
+            &format!("/api/entities/{sourdough_id}"),
+            json!({"fields": {"author": null, "servings": 6}}),
+            Some(&maggie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "patch: {patched}");
+    assert!(patched["fields"].get("author").is_none());
+    assert_eq!(patched["fields"]["servings"], 6);
+    let (_, links, _) = send(&app, get(&format!("/api/links/{sourdough_id}"), Some(&maggie))).await;
+    assert!(links.as_array().unwrap().iter().all(|l| l["rel"] != "field:author"));
+
+    // Registry evolution: relabel + archive a field; archived accepted-if-
+    // present, never required.
+    let (status, ty2, _) = send(
+        &app,
+        patch_json(
+            "/api/entity-types/recipe",
+            json!({"update_fields": [{"slug": "cuisine", "archived": true}]}),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "field archive: {ty2}");
+    let (status, _, _) = send(
+        &app,
+        post_json(
+            "/api/entities",
+            json!({"type": "recipe", "title": "No Cuisine Needed", "fields": {"status": "idea"}}),
+            Some(&maggie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "archived field must not be required");
+
+    // Type lifecycle: delete-with-instances 409s; archive blocks new creates.
+    let (status, _, _) = send(&app, delete_req("/api/entity-types/recipe", Some(&cookie))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _, _) = send(
+        &app,
+        patch_json("/api/entity-types/recipe", json!({"archived": true}), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = send(
+        &app,
+        post_json("/api/entities", json!({"type": "recipe", "title": "Too Late"}), Some(&maggie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Instance delete drops the row and its search presence.
+    let (status, _, _) = send(&app, delete_req(&format!("/api/entities/{sourdough_id}"), Some(&maggie))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, _) = send(&app, get(&format!("/api/entities/{sourdough_id}"), Some(&maggie))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, hits, _) = send(&app, get("/api/search?q=sourdough", Some(&maggie))).await;
+    assert!(hits.as_array().unwrap().iter().all(|h| h["id"] != sourdough_id));
+}

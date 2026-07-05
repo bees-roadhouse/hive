@@ -13,6 +13,7 @@ use crate::store::Store;
 
 pub mod admin;
 pub mod auth;
+pub mod custom;
 pub mod entities;
 pub mod journal;
 pub mod mcp;
@@ -32,6 +33,7 @@ pub fn router(store: Store) -> Router {
         .merge(people::router())
         .merge(journal::router())
         .merge(entities::router())
+        .merge(custom::router())
         .merge(search::router())
         .merge(oauth::router())
         .merge(admin::router())
