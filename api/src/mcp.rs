@@ -44,7 +44,7 @@ pub fn instructions() -> String {
         "hive is journal-first. Write prose with journal_append; attach `anchors` \
          (char-offset spans of the body) to emerge tasks/decisions/events anchored \
          to the exact text. @mention actors ({}) to notify their inbox. \
-         Read with the *_list / *_get / search / dashboard tools. \
+         Read with the *_list / *_get / search / dashboard tools. Household record kinds beyond the built-ins are the custom entity registry: entity_types_list shows what exists, entity_create / entities_list write and read typed instances (admins define types with entity_type_create). \
          For relevance retrieval prefer semantic_search with `mode: \"precision\"` (the \
          four-stage cross-encoder cascade) — it's the recommended high-quality path; drop \
          to `mode: \"standard\"` only for a broader sweep.",
@@ -636,6 +636,198 @@ fn build_tools() -> Value {
             }
         }
     ));
+    tools.push(json!(
+        {
+            "name":"entity_types_list",
+            "title": "List custom entity types",
+            "description": "The user-defined entity type registry (kind-config: fields, board grouping, presentation).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"include_archived": {"type": "boolean"}},
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"entity_type_create",
+            "title": "Define a custom entity type",
+            "description": "Admin only. Creates a type with typed fields (text|number|bool|date|choice|ref). Slugs are permanent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "slug": {"type": "string", "description": "lowercase, permanent; defaults from name"},
+                    "name_plural": {"type": "string"},
+                    "description": {"type": "string"},
+                    "icon": {"type": "string"},
+                    "color": {"type": "string"},
+                    "board_field": {"type": "string", "description": "choice-field slug the board groups by"},
+                    "fields": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "slug": {"type": "string"},
+                            "label": {"type": "string"},
+                            "field_type": {"type": "string", "enum": ["text", "number", "bool", "date", "choice", "ref"]},
+                            "required": {"type": "boolean"},
+                            "position": {"type": "integer"},
+                            "options": {"type": "array", "items": {"type": "string"}},
+                            "ref_kind": {"type": "string", "description": "person|topic|project|task or a custom slug"}
+                        },
+                        "required": ["label", "field_type"],
+                        "additionalProperties": false
+                    }}
+                },
+                "required": ["name"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"entity_type_update",
+            "title": "Evolve a custom entity type",
+            "description": "Admin only. Rename/describe/archive a type, add fields, relabel/reorder/archive fields. Slugs and field types never change.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "description": "type id or slug"},
+                    "name": {"type": "string"},
+                    "name_plural": {"type": "string"},
+                    "description": {"type": "string"},
+                    "icon": {"type": "string"},
+                    "color": {"type": "string"},
+                    "board_field": {"type": ["string", "null"]},
+                    "archived": {"type": "boolean"},
+                    "add_fields": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "slug": {"type": "string"},
+                            "label": {"type": "string"},
+                            "field_type": {"type": "string", "enum": ["text", "number", "bool", "date", "choice", "ref"]},
+                            "required": {"type": "boolean"},
+                            "position": {"type": "integer"},
+                            "options": {"type": "array", "items": {"type": "string"}},
+                            "ref_kind": {"type": "string"}
+                        },
+                        "required": ["label", "field_type"],
+                        "additionalProperties": false
+                    }},
+                    "update_fields": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "slug": {"type": "string"},
+                            "label": {"type": "string"},
+                            "position": {"type": "integer"},
+                            "required": {"type": "boolean"},
+                            "options": {"type": "array", "items": {"type": "string"}},
+                            "archived": {"type": "boolean"}
+                        },
+                        "required": ["slug"],
+                        "additionalProperties": false
+                    }}
+                },
+                "required": ["type"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"entities_list",
+            "title": "List custom entities",
+            "description": "Instances of a custom type; equality filters on field slugs, sort by field/title/created_at.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "description": "type slug"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "sort": {"type": "string"},
+                    "dir": {"type": "string", "enum": ["asc", "desc"]},
+                    "filters": {"type": "object", "description": "field slug -> required value", "additionalProperties": true}
+                },
+                "required": ["type"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"entity_get",
+            "title": "Get a custom entity",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"entity_create",
+            "title": "Create a custom entity",
+            "description": "Fields are validated against the type's registry; scope 'me' keeps it in your namespace (default global).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "description": "type slug"},
+                    "title": {"type": "string"},
+                    "fields": {"type": "object", "additionalProperties": true},
+                    "scope": {"type": "string", "enum": ["global", "me"]}
+                },
+                "required": ["type", "title"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"entity_update",
+            "title": "Update a custom entity",
+            "description": "Shallow-merges fields; a JSON null clears a key. Validated against the registry.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "fields": {"type": "object", "additionalProperties": true},
+                    "scope": {"type": "string", "enum": ["global", "me"]}
+                },
+                "required": ["id"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"entity_delete",
+            "title": "Delete a custom entity",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
     Value::Array(tools)
 }
 
@@ -651,6 +843,27 @@ fn ok_content<T: serde::Serialize>(data: &T) -> Value {
 fn tool_error(message: &str) -> Value {
     json!({"content": [{"type": "text", "text": message}], "isError": true})
 }
+
+/// Registry/instance validation issues rendered for tool consumers.
+fn issues_text(issues: &[crate::store::entity_validation::FieldIssue]) -> String {
+    let lines: Vec<String> = issues
+        .iter()
+        .map(|i| format!("{}: {} ({})", i.field, i.message, i.code))
+        .collect();
+    format!("validation failed\n{}", lines.join("\n"))
+}
+
+/// EntityWriteError → CallToolResult (store errors keep propagating).
+fn entity_write_result(e: crate::store::custom_entities::EntityWriteError) -> ToolResult {
+    use crate::store::custom_entities::EntityWriteError as E;
+    match e {
+        E::Issues(issues) => Ok(tool_error(&issues_text(&issues))),
+        E::UnknownType => Ok(tool_error("unknown entity type")),
+        E::ArchivedType => Ok(tool_error("type is archived; unarchive it to add instances")),
+        E::Other(err) => Err(err.into()),
+    }
+}
+
 
 enum ToolFailure {
     /// A validation failure — already rendered as a CallToolResult.
@@ -1453,6 +1666,151 @@ async fn dispatch(
             a.finish()?;
             let removed = store.identities_remove(id.unwrap(), actor).await?;
             Ok(ok_content(&json!({"removed": removed})))
+        }
+        "entity_types_list" => {
+            let mut a = Args::new("entity_types_list", args);
+            let include = a.opt_bool("include_archived");
+            a.finish()?;
+            Ok(ok_content(
+                &store.entity_types_list(include.unwrap_or(false)).await?,
+            ))
+        }
+        "entity_type_create" => {
+            if !is_admin(store, actor).await? {
+                return Ok(forbidden());
+            }
+            let input: hive_shared::NewEntityType =
+                serde_json::from_value(Value::Object(args.clone()))
+                    .map_err(|e| invalid_args("entity_type_create", &e.to_string()))?;
+            match store.entity_types_create(input, actor).await {
+                Ok(view) => Ok(ok_content(&view)),
+                Err(crate::store::entity_types::TypeWriteError::Issues(issues)) => {
+                    Ok(tool_error(&issues_text(&issues)))
+                }
+                Err(crate::store::entity_types::TypeWriteError::Other(e)) => Err(e.into()),
+            }
+        }
+        "entity_type_update" => {
+            if !is_admin(store, actor).await? {
+                return Ok(forbidden());
+            }
+            let mut a = Args::new("entity_type_update", args);
+            let target = a.req_str("type").map(String::from);
+            a.finish()?;
+            let mut body = args.clone();
+            body.remove("type");
+            let patch: hive_shared::EntityTypePatch = serde_json::from_value(Value::Object(body))
+                .map_err(|e| invalid_args("entity_type_update", &e.to_string()))?;
+            match store
+                .entity_types_update(&target.unwrap(), patch, actor)
+                .await
+            {
+                Ok(Some(view)) => Ok(ok_content(&view)),
+                Ok(None) => Ok(ok_content(&json!({"error": "not found"}))),
+                Err(crate::store::entity_types::TypeWriteError::Issues(issues)) => {
+                    Ok(tool_error(&issues_text(&issues)))
+                }
+                Err(crate::store::entity_types::TypeWriteError::Other(e)) => Err(e.into()),
+            }
+        }
+        "entities_list" => {
+            let mut a = Args::new("entities_list", args);
+            let type_slug = a.req_str("type").map(String::from);
+            let limit = a.opt_int("limit", Some(1), Some(500));
+            let offset = a.opt_int("offset", Some(0), None);
+            let sort = a.opt_str("sort").map(String::from);
+            let dir = a.opt_enum("dir", &["asc", "desc"]).map(String::from);
+            a.finish()?;
+            let fields = args
+                .get("filters")
+                .and_then(Value::as_object)
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| {
+                            let vs = match v {
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            (k.clone(), vs)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let filter = crate::store::custom_entities::EntityFilter {
+                type_slug: type_slug.unwrap(),
+                limit: limit.unwrap_or(100),
+                offset: offset.unwrap_or(0),
+                sort,
+                desc: dir.as_deref() != Some("asc"),
+                fields,
+            };
+            match store
+                .custom_entities_list(&filter, &ctx.visibility())
+                .await
+            {
+                Ok(items) => Ok(ok_content(&items)),
+                Err(e) => entity_write_result(e),
+            }
+        }
+        "entity_get" => {
+            let mut a = Args::new("entity_get", args);
+            let id = a.req_str("id");
+            a.finish()?;
+            match store
+                .custom_entities_get(id.unwrap(), &ctx.visibility())
+                .await?
+            {
+                Some(e) => Ok(ok_content(&e)),
+                None => Ok(ok_content(&json!({"error": "not found"}))),
+            }
+        }
+        "entity_create" => {
+            let input: hive_shared::NewCustomEntity =
+                serde_json::from_value(Value::Object(args.clone()))
+                    .map_err(|e| invalid_args("entity_create", &e.to_string()))?;
+            match store
+                .custom_entities_create(input, actor, ctx.namespace_owner())
+                .await
+            {
+                Ok(e) => Ok(ok_content(&e)),
+                Err(e) => entity_write_result(e),
+            }
+        }
+        "entity_update" => {
+            let mut a = Args::new("entity_update", args);
+            let id = a.req_str("id").map(String::from);
+            a.finish()?;
+            let mut body = args.clone();
+            body.remove("id");
+            let patch: hive_shared::CustomEntityPatch =
+                serde_json::from_value(Value::Object(body))
+                    .map_err(|e| invalid_args("entity_update", &e.to_string()))?;
+            match store
+                .custom_entities_update(
+                    &id.unwrap(),
+                    patch,
+                    actor,
+                    &ctx.visibility(),
+                    ctx.namespace_owner(),
+                )
+                .await
+            {
+                Ok(Some(e)) => Ok(ok_content(&e)),
+                Ok(None) => Ok(ok_content(&json!({"error": "not found"}))),
+                Err(e) => entity_write_result(e),
+            }
+        }
+        "entity_delete" => {
+            let mut a = Args::new("entity_delete", args);
+            let id = a.req_str("id");
+            a.finish()?;
+            match store
+                .custom_entities_delete(id.unwrap(), actor, &ctx.visibility())
+                .await?
+            {
+                Some(()) => Ok(ok_content(&json!({"deleted": true}))),
+                None => Ok(ok_content(&json!({"error": "not found"}))),
+            }
         }
         _ => Ok(tool_error(&format!(
             "MCP error -32602: Tool {name} not found"

@@ -1542,3 +1542,126 @@ async fn custom_entity_types_full_flow() {
     let (_, hits, _) = send(&app, get("/api/search?q=sourdough", Some(&maggie))).await;
     assert!(hits.as_array().unwrap().iter().all(|h| h["id"] != sourdough_id));
 }
+
+async fn mcp_call(app: &Router, token: &str, name: &str, arguments: Value) -> Value {
+    let (status, body, _) = send(
+        app,
+        Request::post("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                    "id": 1
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "mcp {name}: {body}");
+    body["result"].clone()
+}
+
+#[tokio::test]
+async fn custom_entities_over_mcp() {
+    let _guard = env_guard().await;
+    reset_auth_env();
+    let (app, _store) = test_app().await;
+    let cookie = onboard(&app).await;
+
+    // nate token = admin-capable principal; pia token = AI in nate's
+    // namespace, NOT admin (actor != namespace user).
+    let mint = |actor: &str| json!({"actor": actor, "label": format!("{actor} t"), "neverExpires": true});
+    let (_, minted, _) = send(&app, post_json("/api/tokens", mint("nate"), Some(&cookie))).await;
+    let nate_token = minted["token"].as_str().unwrap().to_string();
+    let (_, minted, _) = send(&app, post_json("/api/tokens", mint("pia"), Some(&cookie))).await;
+    let pia_token = minted["token"].as_str().unwrap().to_string();
+
+    // tools/list carries all eight custom-entity tools.
+    let (status, tools, _) = send(
+        &app,
+        Request::post("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::AUTHORIZATION, format!("Bearer {pia_token}"))
+            .body(Body::from(json!({"jsonrpc":"2.0","method":"tools/list","id":1}).to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    for want in [
+        "entity_types_list", "entity_type_create", "entity_type_update",
+        "entities_list", "entity_get", "entity_create", "entity_update", "entity_delete",
+    ] {
+        assert!(names.contains(&want), "missing tool {want}");
+    }
+
+    // Non-admin type definition is forbidden over MCP too.
+    let refused = mcp_call(
+        &app, &pia_token, "entity_type_create",
+        json!({"name": "Plant", "fields": [{"label": "Species", "field_type": "text"}]}),
+    )
+    .await;
+    // House convention: MCP forbidden is error-shaped OK content, not isError.
+    assert!(
+        refused["content"][0]["text"].as_str().unwrap().contains("forbidden"),
+        "{refused}"
+    );
+
+    // Admin defines; AI writes/reads/updates/deletes instances.
+    let created = mcp_call(
+        &app, &nate_token, "entity_type_create",
+        json!({"name": "Plant", "fields": [
+            {"label": "Species", "field_type": "text"},
+            {"label": "Watered", "field_type": "date"}
+        ]}),
+    )
+    .await;
+    assert!(created.get("isError").is_none(), "{created}");
+    let view: Value = serde_json::from_str(created["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(view["slug"], "plant");
+
+    let inst = mcp_call(
+        &app, &pia_token, "entity_create",
+        json!({"type": "plant", "title": "Monstera", "fields": {"species": "M. deliciosa", "watered": "2026-07-01"}}),
+    )
+    .await;
+    assert!(inst.get("isError").is_none(), "{inst}");
+    let monstera: Value = serde_json::from_str(inst["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(monstera["type"], "plant");
+
+    // Validation failures render the structured issue list as tool errors.
+    let bad = mcp_call(
+        &app, &pia_token, "entity_create",
+        json!({"type": "plant", "title": "X", "fields": {"watered": "yesterday"}}),
+    )
+    .await;
+    assert_eq!(bad["isError"], true);
+    assert!(bad["content"][0]["text"].as_str().unwrap().contains("bad_date"));
+
+    let listed = mcp_call(&app, &pia_token, "entities_list", json!({"type": "plant"})).await;
+    let items: Value = serde_json::from_str(listed["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(items.as_array().unwrap().len(), 1);
+
+    let updated = mcp_call(
+        &app, &pia_token, "entity_update",
+        json!({"id": monstera["id"], "fields": {"watered": null}}),
+    )
+    .await;
+    let after: Value = serde_json::from_str(updated["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(after["fields"].get("watered").is_none());
+
+    let deleted = mcp_call(&app, &pia_token, "entity_delete", json!({"id": monstera["id"]})).await;
+    let d: Value = serde_json::from_str(deleted["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(d["deleted"], true);
+}
