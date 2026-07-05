@@ -1,13 +1,13 @@
 :root {
-  --bg: #14110c;
-  --panel: #1f1b13;
-  --panel2: #262015;
-  --line: #3a3320;
-  --ink: #f3ead6;
-  --dim: #a99b78;
+  --bg: #070708;
+  --panel: #101113;
+  --panel2: #181a1d;
+  --line: #2a2d32;
+  --ink: #f2f4f5;
+  --dim: #9aa0a8;
   --honey: #f5b301;
   --accent: #ffd24a;
-  /* One color scheme: warm neutrals + the honey family. Entity kinds are
+  /* One color scheme: graphite neutrals + the BR honey family. Entity kinds are
      told apart by glyph shape (◻ ◆ ◷), so their colors only need to whisper
      — all three sit inside the gold range. --danger is the single survivor
      outside it, reserved for genuine error/overdue semantics, never for
