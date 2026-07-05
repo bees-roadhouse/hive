@@ -29,7 +29,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [api, web, worker]
+        image: [api, web, worker, runner]
     steps:
       - uses: actions/checkout@v4
 
@@ -56,6 +56,41 @@ jobs:
             org.opencontainers.image.revision=${{ github.event.pull_request.head.sha }}
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  # ===== build: hive-session-dev (full hosted-session toolbox) =====
+  # This image is large and targets The Roadhouse's arm64 hosts. Build it on a
+  # native arm runner instead of QEMU multi-arch emulation.
+  build-session-dev:
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push hive-session-dev
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.session-dev
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/hive-session-dev:sha-${{ github.event.pull_request.head.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.event.pull_request.head.sha }}
+          cache-from: type=gha,scope=session-dev-arm64
+          cache-to: type=gha,mode=max,scope=session-dev-arm64
 
   # ===== build: hive-rust (all-in-one Axum image) =====
   # Rust + onnxruntime is a real compile, so QEMU arm64 emulation is
@@ -154,7 +189,7 @@ jobs:
       packages: write
     strategy:
       matrix:
-        image: [api, web, worker, rust]
+        image: [api, web, worker, rust, runner, session-dev]
     steps:
       - uses: actions/checkout@v4
 

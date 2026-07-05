@@ -8,10 +8,16 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      "/api": {
-        target: process.env.HIVE_API_URL ?? "http://localhost:7878",
-        changeOrigin: true,
-      },
+      ...Object.fromEntries(
+        ["/api", "/oauth", "/authorize", "/.well-known", "/mcp"].map((path) => [
+          path,
+          {
+            target: process.env.HIVE_API_URL ?? "http://localhost:7878",
+            changeOrigin: true,
+            xfwd: true,
+          },
+        ]),
+      ),
     },
   },
   build: { target: "esnext" },

@@ -24,11 +24,15 @@ import type {
   WireEvent,
 } from "@hive/shared";
 import { TASK_STATUSES } from "@hive/shared";
+import { A, useSearchParams } from "@solidjs/router";
 import { api, getDoneRetentionHours, setDoneRetentionHours } from "./api.ts";
 import { liveRev } from "./live.ts";
 import { Icon } from "./icons.tsx";
-import { DECISION_GLYPH, relTime, SkeletonList, TASK_GLYPH } from "./lib.tsx";
+import { DECISION_GLYPH, highlightSnippet, relTime, SkeletonList, TASK_GLYPH } from "./lib.tsx";
 import { Markdown } from "./markdown.tsx";
+import { EmptyState } from "./primitives.tsx";
+import { KIND } from "./kinds.ts";
+import { EntityList, type EntityListConfig } from "./EntityList.tsx";
 
 // ---- due-date helpers ----
 
@@ -88,28 +92,36 @@ const TaskBody: Component<{ t: Task }> = (props) => (
   </div>
 );
 
+/** The structured ADR prose (context / decision / consequences) — shared by
+ * the drawer body below and the Decisions board rows. */
+const DecisionFields: Component<{ item: Decision }> = (props) => (
+  <>
+    <Show when={props.item.context}>
+      <div class="field">
+        <strong>Context.</strong>
+        <Markdown src={props.item.context} />
+      </div>
+    </Show>
+    <div class="field">
+      <strong>Decision.</strong>
+      <Markdown src={props.item.decision} />
+    </div>
+    <Show when={props.item.consequences}>
+      <div class="field">
+        <strong>Consequences.</strong>
+        <Markdown src={props.item.consequences} />
+      </div>
+    </Show>
+  </>
+);
+
 const DecisionBody: Component<{ d: Decision }> = (props) => (
   <div>
     <h3>
       {DECISION_GLYPH[props.d.status]} {props.d.title}
     </h3>
     <span class="badge">{props.d.status}</span>
-    <Show when={props.d.context}>
-      <div class="field">
-        <strong>Context.</strong>
-        <Markdown src={props.d.context} />
-      </div>
-    </Show>
-    <div class="field">
-      <strong>Decision.</strong>
-      <Markdown src={props.d.decision} />
-    </div>
-    <Show when={props.d.consequences}>
-      <div class="field">
-        <strong>Consequences.</strong>
-        <Markdown src={props.d.consequences} />
-      </div>
-    </Show>
+    <DecisionFields item={props.d} />
   </div>
 );
 
@@ -368,67 +380,35 @@ export const Tasks: Component = () => {
 
 // ---- Decisions ----
 
-export const Decisions: Component = () => {
-  const [decisions] = createResource(() => ({ _r: liveRev() }), () => api.decisions());
-  return (
-    <section>
-      <For each={decisions()} fallback={<p class="dim sm pad">no decisions yet — a decision emerges when you anchor one in a journal entry.</p>}>
-        {(d) => (
-          <article class={`decision status-${d.status}`}>
-            <header>
-              <span class="glyph">{DECISION_GLYPH[d.status]}</span>
-              <h3>{d.title}</h3>
-              <span class="badge">{d.status}</span>
-            </header>
-            <Show when={d.context}>
-              <div class="field">
-                <strong>Context.</strong>
-                <Markdown src={d.context} />
-              </div>
-            </Show>
-            <div class="field">
-              <strong>Decision.</strong>
-              <Markdown src={d.decision} />
-            </div>
-            <Show when={d.consequences}>
-              <div class="field">
-                <strong>Consequences.</strong>
-                <Markdown src={d.consequences} />
-              </div>
-            </Show>
-            <Show when={d.anchor_text}>
-              <blockquote class="origin">from journal: "{d.anchor_text}"</blockquote>
-            </Show>
-          </article>
-        )}
-      </For>
-    </section>
-  );
+const decisionsConfig: EntityListConfig<Decision> = {
+  kind: KIND.decision,
+  fetch: () => api.decisions(),
+  row: {
+    title: (d) => d.title,
+    // Status rides a badge (accepted glows honey, the rest stay dim) instead
+    // of the old per-status card classes.
+    badges: (d) => [{ label: d.status, tone: d.status === "accepted" ? "honey" : "dim" }],
+    body: DecisionFields,
+    originQuote: (d) => d.anchor_text ?? null,
+  },
 };
+
+export const Decisions: Component = () => <EntityList config={decisionsConfig} />;
 
 // ---- Events ----
 
-export const Events: Component = () => {
-  const [events] = createResource(() => ({ _r: liveRev() }), () => api.events());
-  return (
-    <section>
-      <For each={events()} fallback={<p class="dim sm pad">no events yet — an event emerges when you anchor one in a journal entry.</p>}>
-        {(e) => (
-          <article class="entry">
-            <h3>◷ {e.title}</h3>
-            <Show when={e.at}>
-              <span class="badge">{e.at}</span>
-            </Show>
-            <Assignees who={e.assignees} />
-            <Show when={e.anchor_text}>
-              <blockquote class="origin">from journal: "{e.anchor_text}"</blockquote>
-            </Show>
-          </article>
-        )}
-      </For>
-    </section>
-  );
+const eventsConfig: EntityListConfig<EventItem> = {
+  kind: KIND.event,
+  fetch: () => api.events(),
+  row: {
+    title: (e) => e.title,
+    badges: (e) => (e.at ? [{ label: e.at }] : []),
+    metas: (e) => e.assignees,
+    originQuote: (e) => e.anchor_text ?? null,
+  },
 };
+
+export const Events: Component = () => <EntityList config={eventsConfig} />;
 
 // ---- Search ----
 
@@ -444,14 +424,21 @@ const SearchResults: Component<{ query: string; mode: "keyword" | "semantic" }> 
   return (
     <For
       each={hits()}
-      fallback={<Show when={props.query.trim()}><p class="dim sm pad">no matches.</p></Show>}
+      fallback={
+        <Show when={props.query.trim()}>
+          <EmptyState icon="search" title="No matches." hint="Try different words, or switch modes." />
+        </Show>
+      }
     >
       {(h) => (
         <div class="hit">
-          <span class="badge">{h.kind}</span>
-          <strong>{h.title}</strong>
+          <ResultKindChip hit={h} />
+          <Show when={h.kind === "mail"} fallback={<strong>{h.title}</strong>}>
+            <A class="hit-title" href={`/mail?thread=${encodeURIComponent(h.id)}`}><strong>{h.title}</strong></A>
+          </Show>
           <Show when={h.snippet} fallback={<span class="snippet">score {h.score}</span>}>
-            <span class="snippet" innerHTML={h.snippet} />
+            {/* escape-then-mark: body text is untrusted, only our <mark>s render */}
+            <span class="snippet" innerHTML={highlightSnippet(h.snippet)} />
           </Show>
         </div>
       )}
@@ -459,10 +446,36 @@ const SearchResults: Component<{ query: string; mode: "keyword" | "semantic" }> 
   );
 };
 
+const ResultKindChip: Component<{ hit: SearchHit }> = (props) => {
+  const k = () => KIND[props.hit.kind];
+  return (
+    <Show when={k()} fallback={<span class="badge">{props.hit.kind}</span>}>
+      {(kind) => (
+        <span class="kind-chip" classList={{ "mail-chip": props.hit.kind === "mail" }} title={kind().label}>
+          <Icon name={kind().icon} size={12} /> {kind().label}
+        </span>
+      )}
+    </Show>
+  );
+};
+
 export const SearchPane: Component = () => {
-  const [q, setQ] = createSignal(""); // live input value
-  const [query, setQuery] = createSignal(""); // debounced value that drives the search
+  const [params] = useSearchParams();
+  // Seed from ?q= so the command palette's free-text passthrough (and any
+  // deep link) lands with the query already running.
+  const initial = typeof params.q === "string" ? params.q : "";
+  const [q, setQ] = createSignal(initial); // live input value
+  const [query, setQuery] = createSignal(initial); // debounced value that drives the search
   const [mode, setMode] = createSignal<"keyword" | "semantic">("keyword");
+
+  // Palette navigations while the pane is already mounted update ?q= in place.
+  createEffect(() => {
+    const next = typeof params.q === "string" ? params.q : "";
+    if (next && next !== q()) {
+      setQ(next);
+      setQuery(next);
+    }
+  });
 
   // Debounce the live input into `query` so a search fires at most ~250ms after
   // typing stops, not once per keystroke. The input stays fully responsive
@@ -493,7 +506,7 @@ export const SearchPane: Component = () => {
         </div>
       </div>
       <p class="dim sm pad">
-        {mode() === "semantic" ? "vector similarity via the local embedder" : "FTS5 keyword match"}
+        {mode() === "semantic" ? "vector similarity via the local embedder" : "full-text keyword match"}
       </p>
       <Suspense fallback={<p class="dim sm pad">searching…</p>}>
         <SearchResults query={query()} mode={mode()} />
@@ -617,12 +630,30 @@ export const Wire: Component = () => {
       </div>
 
       <Show when={filter() === "news"}>
-        <For each={shown()} fallback={<p class="dim sm pad">no news yet — add an RSS or scrape source in Settings; items land here as the worker polls them.</p>}>
+        <For
+          each={shown()}
+          fallback={
+            <EmptyState
+              icon="wire"
+              title="No news yet."
+              hint="Add an RSS or scrape source in Settings; items land here as the worker polls."
+            />
+          }
+        >
           {(e) => <NewsCard e={e} fresh={isFresh(e)} />}
         </For>
       </Show>
       <Show when={filter() !== "news"}>
-        <For each={shown()} fallback={<p class="dim sm pad">no activity yet — the wire shows live events as you and the agents work.</p>}>
+        <For
+          each={shown()}
+          fallback={
+            <EmptyState
+              icon="wire"
+              title="No activity yet."
+              hint="Live events appear here as you and the agents work."
+            />
+          }
+        >
           {(e) => (
             <div class="wire-row" classList={{ "just-landed": isFresh(e) }}>
               <time>{relTime(e.created_at)}</time>
@@ -657,7 +688,16 @@ export const PeopleView: Component = () => {
     <section>
       <p class="dim pad">Identities known to hive — humans and AIs. Click one to edit its profile (bio + role). AIs can also keep their own profile updated via MCP.</p>
       <Show when={people()} fallback={<SkeletonList rows={6} />}>
-        <For each={people() as Person[]} fallback={<p class="dim sm">no people yet — reference someone in a journal entry.</p>}>
+        <For
+          each={people() as Person[]}
+          fallback={
+            <EmptyState
+              icon="people"
+              title="No people yet."
+              hint="Mention someone in a journal entry to introduce them."
+            />
+          }
+        >
           {(p) => (
             <div class="person-card">
               <div class="entity-row person-head" onClick={() => (editing() === p.slug ? setEditing(null) : open(p))}>
@@ -690,80 +730,65 @@ export const PeopleView: Component = () => {
 
 // ---- Topics view ----
 
-export const TopicsView: Component = () => {
-  const [topics] = createResource(() => ({ _r: liveRev() }), () => api.topics());
-  return (
-    <section>
-      <p class="dim pad">Topics extracted from <code>[topic:…]</code> references in journal entries.</p>
-      <Show when={topics()} fallback={<SkeletonList rows={6} />}>
-        <For each={topics() as Topic[]} fallback={<p class="dim sm">no topics yet — reference a topic in a journal entry.</p>}>
-          {(t) => (
-            <div class="entity-row">
-              <span class="entity-icon"><Icon name="topic" size={16} /></span>
-              <span class="entity-name">{t.name}</span>
-              <span class="dim sm entity-slug">{t.slug}</span>
-            </div>
-          )}
-        </For>
-      </Show>
-    </section>
-  );
+const topicsConfig: EntityListConfig<Topic> = {
+  kind: KIND.topic,
+  fetch: () => api.topics(),
+  intro: "Topics extracted from [topic:…] references in journal entries.",
+  row: {
+    title: (t) => t.name,
+    metas: (t) => [t.slug],
+  },
 };
+
+export const TopicsView: Component = () => <EntityList config={topicsConfig} />;
 
 // ---- Projects view ----
 
-const ProjectCard: Component<{ p: Project }> = (props) => {
-  const [detail] = createResource(() => api.projectById(props.p.id));
+/** Phases + task-count summary for one project row. Each row keeps its own
+ * projectById sub-resource, exactly as the old ProjectCard did. */
+const ProjectBody: Component<{ item: Project }> = (props) => {
+  const [detail] = createResource(() => props.item.id, (id) => api.projectById(id));
   return (
-    <article class="project-card">
-      <header class="project-header">
-        <span class="entity-icon"><Icon name="project" size={16} /></span>
-        <h3 class="project-name">{props.p.name}</h3>
-        <span class="dim sm project-slug">{props.p.slug}</span>
-      </header>
+    <Show when={detail()}>
+      {(d) => (
+        <>
+          {/* Phases */}
+          <Show when={d().phases.length > 0}>
+            <div class="phases">
+              <For each={d().phases}>
+                {(ph: Phase) => (
+                  <span class="phase-chip">
+                    <Icon name="phase" size={13} />
+                    {ph.name}
+                  </span>
+                )}
+              </For>
+            </div>
+          </Show>
 
-      <Show when={detail()}>
-        {(d) => (
-          <>
-            {/* Phases */}
-            <Show when={d().phases.length > 0}>
-              <div class="phases">
-                <For each={d().phases}>
-                  {(ph: Phase) => (
-                    <span class="phase-chip">
-                      <Icon name="phase" size={13} />
-                      {ph.name}
-                    </span>
-                  )}
-                </For>
-              </div>
-            </Show>
-
-            {/* Task summary */}
-            <Show when={d().tasks.length > 0}>
-              <div class="project-tasks dim sm">
-                {d().tasks.filter((t: Task) => t.status !== "done").length} open ·{" "}
-                {d().tasks.filter((t: Task) => t.status === "done").length} done
-                <span class="dim"> ({d().tasks.length} total)</span>
-              </div>
-            </Show>
-          </>
-        )}
-      </Show>
-    </article>
+          {/* Task summary */}
+          <Show when={d().tasks.length > 0}>
+            <div class="project-tasks dim sm">
+              {d().tasks.filter((t: Task) => t.status !== "done").length} open ·{" "}
+              {d().tasks.filter((t: Task) => t.status === "done").length} done
+              <span class="dim"> ({d().tasks.length} total)</span>
+            </div>
+          </Show>
+        </>
+      )}
+    </Show>
   );
 };
 
-export const ProjectsView: Component = () => {
-  const [projects] = createResource(() => ({ _r: liveRev() }), () => api.projects());
-  return (
-    <section>
-      <p class="dim pad">Projects with their phases and task counts. Projects are created automatically when a task references one.</p>
-      <Show when={projects()} fallback={<SkeletonList rows={4} />}>
-        <For each={projects() as Project[]} fallback={<p class="dim sm">no projects yet — assign a task a project in a journal entry.</p>}>
-          {(p) => <ProjectCard p={p} />}
-        </For>
-      </Show>
-    </section>
-  );
+const projectsConfig: EntityListConfig<Project> = {
+  kind: KIND.project,
+  fetch: () => api.projects(),
+  intro: "Projects with their phases and task counts. Projects are created automatically when a task references one.",
+  row: {
+    title: (p) => p.name,
+    metas: (p) => [p.slug],
+    body: ProjectBody,
+  },
 };
+
+export const ProjectsView: Component = () => <EntityList config={projectsConfig} />;

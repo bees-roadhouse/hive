@@ -1,5 +1,6 @@
 import { createMemo, createResource, createSignal, For, Show, type Component } from "solid-js";
-import type { ActorDeleteResult, ActorMergeResult, Person } from "@hive/shared";
+import type { ActorDeleteResult, ActorMergeResult, NewEntityField, Person } from "@hive/shared";
+import { FIELD_TYPES } from "@hive/shared";
 import { api } from "./api.ts";
 import { relTime } from "./lib.tsx";
 import { liveRev } from "./live.ts";
@@ -262,6 +263,225 @@ const WritersSection: Component = () => {
 
 /** Operational view: worker heartbeat + last cycle, embedding coverage,
  * outbound job queue, and writer management. */
+// ---- custom entity types (the registry) ----
+// Admin defines the household's own kinds (plants, gear, …); instances are
+// written by anyone through /e/<slug>, the palette, or the MCP entity tools.
+// Deliberately calm v1: create with fields, archive/unarchive, add a field,
+// delete only while empty. Relabel/reorder live in entity_type_update (MCP).
+
+/** One row of the field repeater in the create/add forms. */
+const FieldRow: Component<{
+  field: NewEntityField;
+  refKinds: string[];
+  onChange: (patch: Partial<NewEntityField>) => void;
+  onRemove: () => void;
+}> = (props) => (
+  <div class="source-row">
+    <input
+      placeholder="label"
+      value={props.field.label}
+      onInput={(e) => props.onChange({ label: e.currentTarget.value })}
+    />
+    <select
+      value={props.field.field_type}
+      onChange={(e) => props.onChange({ field_type: e.currentTarget.value as NewEntityField["field_type"] })}
+    >
+      <For each={FIELD_TYPES}>{(t) => <option value={t}>{t}</option>}</For>
+    </select>
+    <Show when={props.field.field_type === "choice"}>
+      <input
+        class="grow"
+        placeholder="options, comma-separated"
+        value={(props.field.options ?? []).join(", ")}
+        onInput={(e) =>
+          props.onChange({
+            options: e.currentTarget.value.split(",").map((s) => s.trim()).filter(Boolean),
+          })
+        }
+      />
+    </Show>
+    <Show when={props.field.field_type === "ref"}>
+      <select
+        value={props.field.ref_kind ?? "person"}
+        onChange={(e) => props.onChange({ ref_kind: e.currentTarget.value })}
+      >
+        <For each={props.refKinds}>{(k) => <option value={k}>{k}</option>}</For>
+      </select>
+    </Show>
+    <label class="sw dim sm">
+      <input
+        type="checkbox"
+        checked={props.field.required ?? false}
+        onChange={(e) => props.onChange({ required: e.currentTarget.checked })}
+      />
+      required
+    </label>
+    <button class="x" onClick={props.onRemove}>✕</button>
+  </div>
+);
+
+const EntityTypesSection: Component = () => {
+  const [types, { refetch }] = createResource(
+    () => ({ _r: liveRev() }),
+    () => api.entityTypes(true),
+  );
+  const [err, setErr] = createSignal<string | null>(null);
+  const [creating, setCreating] = createSignal(false);
+  const [name, setName] = createSignal("");
+  const [desc, setDesc] = createSignal("");
+  const [fields, setFields] = createSignal<NewEntityField[]>([]);
+  // per-type inline "add field" mini-form (type id or null)
+  const [addingTo, setAddingTo] = createSignal<string | null>(null);
+  const [newField, setNewField] = createSignal<NewEntityField>({ label: "", field_type: "text" });
+
+  const refKinds = createMemo(() => [
+    "person",
+    "topic",
+    "project",
+    "task",
+    ...(types.latest ?? []).filter((t) => !t.archived).map((t) => t.slug),
+  ]);
+
+  const surface = (e: unknown) => setErr(e instanceof Error ? e.message : String(e));
+
+  const create = async (e: Event) => {
+    e.preventDefault();
+    setErr(null);
+    try {
+      await api.createEntityType({
+        name: name().trim(),
+        description: desc().trim(),
+        fields: fields().filter((f) => f.label.trim()),
+      });
+      setName("");
+      setDesc("");
+      setFields([]);
+      setCreating(false);
+      refetch();
+    } catch (e2) {
+      surface(e2);
+    }
+  };
+
+  const addFieldTo = async (idOrSlug: string) => {
+    setErr(null);
+    try {
+      await api.patchEntityType(idOrSlug, { add_fields: [newField()] });
+      setNewField({ label: "", field_type: "text" });
+      setAddingTo(null);
+      refetch();
+    } catch (e) {
+      surface(e);
+    }
+  };
+
+  const setArchived = async (idOrSlug: string, archived: boolean) => {
+    setErr(null);
+    try {
+      await api.patchEntityType(idOrSlug, { archived });
+      refetch();
+    } catch (e) {
+      surface(e);
+    }
+  };
+
+  const remove = async (idOrSlug: string) => {
+    setErr(null);
+    try {
+      await api.deleteEntityType(idOrSlug);
+      refetch();
+    } catch (e) {
+      surface(e);
+    }
+  };
+
+  return (
+    <>
+      <div class="admin-head">
+        <h3 class="sec">Entity types</h3>
+        <button class="ghost" onClick={() => setCreating((v) => !v)}>
+          {creating() ? "cancel" : "+ new type"}
+        </button>
+      </div>
+      <p class="dim sm">
+        Household kinds beyond the built-ins. Instances are keyword-searchable;
+        semantic recall for custom kinds comes later.
+      </p>
+
+      <Show when={creating()}>
+        <form class="source-form" onSubmit={create}>
+          <input placeholder="name (e.g. Plant)" value={name()} onInput={(e) => setName(e.currentTarget.value)} />
+          <input class="grow" placeholder="what this kind is for" value={desc()} onInput={(e) => setDesc(e.currentTarget.value)} />
+          <button type="button" onClick={() => setFields([...fields(), { label: "", field_type: "text" }])}>
+            + field
+          </button>
+          <button class="primary" type="submit" disabled={!name().trim()}>
+            create type
+          </button>
+        </form>
+        <For each={fields()}>
+          {(f, i) => (
+            <FieldRow
+              field={f}
+              refKinds={refKinds()}
+              onChange={(patch) => setFields(fields().map((x, j) => (j === i() ? { ...x, ...patch } : x)))}
+              onRemove={() => setFields(fields().filter((_, j) => j !== i()))}
+            />
+          )}
+        </For>
+      </Show>
+
+      <For each={types.latest ?? []} fallback={<p class="dim sm pad">no custom types yet.</p>}>
+        {(t) => (
+          <div class="source-row" classList={{ off: t.archived }}>
+            <div class="source-main">
+              <div class="source-name">
+                {t.name}
+                <span class="badge">{t.slug}</span>
+                <span class="badge dim">{t.fields.filter((f) => !f.archived).length} fields</span>
+                <Show when={t.archived}><span class="badge">archived</span></Show>
+              </div>
+              <Show when={t.description}>
+                <div class="dim sm">{t.description}</div>
+              </Show>
+              <div class="dim sm">
+                {t.fields.filter((f) => !f.archived).map((f) => `${f.label} (${f.field_type})`).join(" · ") || "no fields"}
+              </div>
+              <Show when={addingTo() === t.id}>
+                <FieldRow
+                  field={newField()}
+                  refKinds={refKinds()}
+                  onChange={(patch) => setNewField({ ...newField(), ...patch })}
+                  onRemove={() => setAddingTo(null)}
+                />
+                <button class="ghost" disabled={!newField().label.trim()} onClick={() => addFieldTo(t.id)}>
+                  save field
+                </button>
+              </Show>
+            </div>
+            <Show when={addingTo() !== t.id}>
+              <button class="ghost" onClick={() => { setAddingTo(t.id); setNewField({ label: "", field_type: "text" }); }}>
+                add field…
+              </button>
+            </Show>
+            <button class="ghost" onClick={() => setArchived(t.id, !t.archived)}>
+              {t.archived ? "unarchive" : "archive"}
+            </button>
+            <Show when={t.archived}>
+              <button class="ghost danger" onClick={() => remove(t.id)} title="only succeeds while the type has no instances">
+                delete
+              </button>
+            </Show>
+          </div>
+        )}
+      </For>
+      <Show when={err()}>
+        <p class="dim sm" style={{ color: "var(--danger)" }}>{err()}</p>
+      </Show>
+    </>
+  );
+};
+
 export const Admin: Component = () => {
   const [worker, { refetch: rw }] = createResource(() => ({ _r: liveRev() }), () => api.worker());
   const [emb, { refetch: re }] = createResource(() => ({ _r: liveRev() }), () => api.embeddings());
@@ -278,6 +498,8 @@ export const Admin: Component = () => {
   return (
     <section class="admin">
       <WritersSection />
+
+      <EntityTypesSection />
 
       <div class="admin-head">
         <h3 class="sec">Worker</h3>

@@ -122,8 +122,9 @@ export interface SafeUser {
 
 /** A bearer token for programmatic clients (CLI, MCP, AI agents). The plaintext
  *  is shown once at creation; only its hash is stored. `kind='oauth'` tokens were
- *  minted via the OAuth consent flow and carry a client + expiry; `kind='pat'`
- *  (or null) are admin-minted personal tokens with no expiry. */
+ *  minted via the OAuth consent flow and carry a client + granting human;
+ *  `kind='pat'` are admin-minted personal tokens. `expires_at=null` means
+ *  non-expiring for either kind. */
 export interface ApiToken {
   id: string;
   actor: string;
@@ -145,6 +146,54 @@ export interface ApiToken {
 export const API_TOKEN_MAX_EXPIRY_DAYS = 365;
 export const API_TOKEN_DEFAULT_EXPIRY_DAYS = 90;
 
+export type RuntimeKind = "claude_code" | "codex" | "opencode";
+
+export interface CcSession {
+  id: string;
+  owner: string;
+  created_by: string;
+  title: string;
+  workdir: string;
+  claude_session_id: string | null;
+  runtime: RuntimeKind | string;
+  status: string;
+  model: string | null;
+  usage: unknown;
+  meta: unknown;
+  repo_url: string | null;
+  repo_ref: string | null;
+  created_at: string;
+  updated_at: string;
+  last_activity_at: string | null;
+}
+
+export interface NewCcSession {
+  runtime?: RuntimeKind | string;
+  title?: string;
+  model?: string;
+  prompt?: string;
+}
+
+export interface CcCredentialView {
+  id: string;
+  owner: string;
+  kind: string;
+  runtime: RuntimeKind | string;
+  provider: string | null;
+  label: string;
+  tail: string;
+  created_at: string;
+  last_used_at: string | null;
+}
+
+export interface NewCcCredential {
+  kind: string;
+  runtime?: RuntimeKind | string;
+  provider?: string;
+  label?: string;
+  secret: string;
+}
+
 /** A dynamically-registered OAuth client (RFC 7591). */
 export interface OAuthClient {
   client_id: string;
@@ -152,6 +201,17 @@ export interface OAuthClient {
   redirect_uris: string[];
   grant_types: string[];
   created_at: string;
+}
+
+/** A registered OAuth client plus live token stats, for the admin connected-apps view. */
+export interface OAuthClientStatus {
+  client_id: string;
+  client_name: string;
+  created_at: string;
+  /** Count of this client's currently-active (non-expired) oauth tokens. */
+  active_tokens: number;
+  /** Most-recent last_used_at across this client's tokens (null = never used). */
+  last_used_at: string | null;
 }
 
 /** An AI identity a signed-in human owns and may grant via the consent flow. */
@@ -165,11 +225,14 @@ export interface OAuthConsentContext {
   client_name: string;
   identities: AiIdentity[];
   csrf: string;
+  allow_never_expires: boolean;
 }
 
 /** Public auth capabilities the SPA reads before login. */
 export interface AuthConfig {
   oidc: boolean;
+  localAuth: boolean;
+  oauthNeverExpires: boolean;
   instanceName: string | null;
 }
 
@@ -285,7 +348,14 @@ export type DecisionStatus = "proposed" | "accepted" | "rejected" | "superseded"
 /** The structured kinds that can be anchored into a journal entry. */
 export type AnchorKind = "task" | "decision" | "event";
 /** Everything addressable in search / inbox / links. */
-export type EntityKind = AnchorKind | "journal" | "person" | "topic" | "project" | "phase";
+export type EntityKind =
+  | AnchorKind
+  | "journal"
+  | "person"
+  | "topic"
+  | "project"
+  | "phase"
+  | "mail";
 
 export const TASK_STATUSES: TaskStatus[] = ["todo", "doing", "blocked", "done"];
 export const PRIORITIES: Priority[] = ["low", "normal", "high", "urgent"];
@@ -306,6 +376,11 @@ export interface JournalEntry {
   tags: string[];
   /** actors @mentioned in the body. */
   mentions: string[];
+  /**
+   * Memory namespace owner (the human the writing principal acts for).
+   * null/absent = global/continuous history.
+   */
+  user_scope?: string | null;
   created_at: string;
 }
 
@@ -380,7 +455,8 @@ export interface InboxItem {
   recipient: string;
   from: string;
   reason: InboxReason;
-  ref_kind: EntityKind;
+  /** Kind string, not the closed union: custom entity type slugs flow here. */
+  ref_kind: string;
   ref_id: string;
   entry_id: string | null;
   snippet: string;
@@ -442,9 +518,10 @@ export interface AutocompleteItem {
 
 export interface Link {
   id: string;
-  source_kind: EntityKind;
+  /** Kind strings, not the closed union: custom entity type slugs flow here. */
+  source_kind: string;
   source_id: string;
-  target_kind: EntityKind;
+  target_kind: string;
   target_id: string;
   rel: string;
   created_at: string;
@@ -459,11 +536,50 @@ export interface WireEvent {
 }
 
 export interface SearchHit {
-  kind: EntityKind;
+  /** Kind string, not the closed union: custom entity type slugs flow here. */
+  kind: string;
   id: string;
   title: string;
   snippet: string;
   score: number;
+}
+
+// ---- mail archive (read-only) ----
+
+/** A configured mailbox/account visible to the signed-in viewer. */
+export interface MailAccount {
+  id: string;
+  label: string;
+  address: string;
+  provider?: string | null;
+  last_synced_at?: string | null;
+}
+
+/** Dense row returned by /api/mail/messages for the archive rail. */
+export interface MailMessageSummary {
+  id: string;
+  thread_id: string;
+  account_id: string;
+  /** JMAP keywords rendered as system-wide tags. Folders/mailboxes stay internal to ingest. */
+  labels: string[];
+  from: string;
+  to?: string[];
+  cc?: string[];
+  subject: string;
+  snippet?: string | null;
+  received_at: string;
+  has_attachments?: boolean;
+}
+
+/** Plaintext message body returned in a thread. HTML is intentionally absent. */
+export interface MailThreadMessage extends MailMessageSummary {
+  body_text: string;
+}
+
+export interface MailThread {
+  thread_id: string;
+  subject: string;
+  messages: MailThreadMessage[];
 }
 
 // ---- knowledge graph ----
@@ -471,7 +587,8 @@ export interface SearchHit {
 /** A node in the knowledge graph; `id` is the `kind:ref_id` composite key. */
 export interface GraphNode {
   id: string;
-  kind: EntityKind;
+  /** Kind string, not the closed union: custom entity type slugs flow here. */
+  kind: string;
   title: string;
 }
 
@@ -621,8 +738,9 @@ export interface ProfilePatch {
 
 // ---- recall (the read/inject composition) ----
 
-/** A journal hit returned by recall — a search hit plus the author + snippet. */
-export interface RecallJournalHit extends SearchHit {
+/** A journal hit returned by recall — a search hit plus the author + timestamp. */
+export interface RecallJournalHit {
+  hit: SearchHit;
   author: string;
   created_at: string;
 }
@@ -680,7 +798,8 @@ export interface NewAnchor {
 }
 
 export interface NewJournalEntry {
-  author: string;
+  /** Optional legacy/client hint. The server overwrites authorship from auth. */
+  author?: string;
   body: string;
   tags?: string[];
   anchors?: NewAnchor[];
@@ -697,4 +816,129 @@ export function parseMentions(text: string): string[] {
     if (ACTOR_NAMES.includes(name)) found.add(name);
   }
   return [...found];
+}
+
+// ---- user-defined custom entity types ----
+
+/** Field value types a custom entity type may declare. */
+export type FieldType = "text" | "number" | "bool" | "date" | "choice" | "ref";
+export const FIELD_TYPES: FieldType[] = ["text", "number", "bool", "date", "choice", "ref"];
+
+/** Kind slugs a custom type may never claim (built-ins, planned corpora, infra nouns). */
+export const RESERVED_KIND_SLUGS = [
+  "task", "decision", "event", "journal", "person", "topic", "project",
+  "phase", "mail", "anchor", "link", "share", "inbox", "wire", "search",
+  "source", "outbox", "user", "profile", "identity", "workspace", "entity",
+  "entity_type", "entities", "blob", "note",
+] as const;
+
+export interface EntityFieldView {
+  id: string;
+  slug: string;
+  label: string;
+  field_type: FieldType;
+  required: boolean;
+  position: number;
+  /** Non-empty iff field_type === "choice". */
+  options: string[];
+  /** Set iff field_type === "ref": person|topic|project|task or a custom slug. */
+  ref_kind: string | null;
+  archived: boolean;
+}
+
+/** The kind-config contract the board engine consumes; fields ordered by position. */
+export interface EntityTypeView {
+  id: string;
+  slug: string;
+  name: string;
+  name_plural: string;
+  description: string;
+  icon: string;
+  color: string;
+  /** null, or the slug of a live choice field the board groups by. */
+  board_field: string | null;
+  archived: boolean;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  fields: EntityFieldView[];
+}
+
+/** A custom entity instance; `fields` holds only registry-validated keys. */
+export interface CustomEntity {
+  id: string;
+  type_id: string;
+  /** The type slug, denormalized so clients never join. */
+  type: string;
+  title: string;
+  fields: Record<string, unknown>;
+  user_scope: string | null;
+  origin_entry_id: string | null;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NewEntityField {
+  slug?: string;
+  label: string;
+  field_type: FieldType;
+  required?: boolean;
+  position?: number;
+  options?: string[];
+  ref_kind?: string;
+}
+
+export interface NewEntityType {
+  slug?: string;
+  name: string;
+  name_plural?: string;
+  description?: string;
+  icon?: string;
+  color?: string;
+  board_field?: string;
+  fields?: NewEntityField[];
+}
+
+export interface EntityFieldPatch {
+  slug: string;
+  label?: string;
+  position?: number;
+  required?: boolean;
+  options?: string[];
+  archived?: boolean;
+}
+
+export interface EntityTypePatch {
+  name?: string;
+  name_plural?: string;
+  description?: string;
+  icon?: string;
+  color?: string;
+  /** null clears the board grouping; absent keeps it. */
+  board_field?: string | null;
+  archived?: boolean;
+  add_fields?: NewEntityField[];
+  update_fields?: EntityFieldPatch[];
+}
+
+export interface NewCustomEntity {
+  type: string;
+  title: string;
+  fields?: Record<string, unknown>;
+  scope?: "global" | "me";
+}
+
+export interface CustomEntityPatch {
+  title?: string;
+  /** Shallow merge; a JSON null clears that key. */
+  fields?: Record<string, unknown>;
+  scope?: "global" | "me";
+}
+
+/** One structured validation failure from the entity registry. */
+export interface EntityFieldIssue {
+  field: string;
+  code: "unknown_field" | "wrong_type" | "required" | "bad_choice" | "bad_date" | "ref_not_found" | "bad_ref_kind" | "archived_type" | "bad_slug";
+  message: string;
 }

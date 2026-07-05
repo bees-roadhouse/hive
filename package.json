@@ -1,19 +1,19 @@
 {
-  "name": "hive-node",
+  "name": "hive",
   "private": true,
-  "version": "0.3.0",
-  "description": "A fun Node.js + Solid.js rewrite of hive \u00e2\u20ac\u201d the shared state (tasks, journal, notes, search) for the Bee's Roadhouse AI configs.",
+  "version": "0.5.0",
+  "description": "Rust + Solid.js shared AI workspace for journal memory, MCP, tasks, search, and agent integrations.",
   "type": "module",
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "dev": "pnpm --parallel --filter @hive/api --filter @hive/web dev",
-    "dev:api": "pnpm --filter @hive/api dev",
+    "dev": "pnpm dev:web",
+    "dev:api": "cargo run -p hive-api",
     "dev:web": "pnpm --filter @hive/web dev",
-    "worker": "pnpm --filter @hive/worker start",
-    "worker:once": "pnpm --filter @hive/worker once",
-    "build": "pnpm --filter @hive/shared build && pnpm -r --filter @hive/api --filter @hive/web --filter @hive/cli --filter @hive/worker build",
+    "worker": "cargo run -p hive-worker",
+    "worker:once": "cargo run -p hive-worker -- once",
+    "build": "pnpm --filter @hive/shared build && pnpm -r --filter @hive/api --filter @hive/web --filter @hive/cli --filter @hive/agent --filter @hive/worker build",
     "seed": "pnpm --filter @hive/api seed",
     "import": "pnpm --filter @hive/api import",
     "hive": "pnpm --filter @hive/cli start --"

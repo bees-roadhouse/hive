@@ -1,0 +1,28 @@
+{
+  "name": "codex-hive-memory",
+  "version": "0.1.0",
+  "description": "Hive memory integration for Codex sessions.",
+  "author": {
+    "name": "Bee's Roadhouse",
+    "email": "nate.smith@beesroadhouse.com",
+    "url": "https://github.com/bees-roadhouse/hive"
+  },
+  "homepage": "https://github.com/bees-roadhouse/hive",
+  "repository": "https://github.com/bees-roadhouse/hive",
+  "license": "MIT",
+  "keywords": ["hive", "memory", "journal", "codex"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Hive Memory",
+    "shortDescription": "Inject Hive recall and save journal memories.",
+    "longDescription": "Adds Codex-facing instructions for using Hive as the durable session memory backend through the shared @hive/agent adapter.",
+    "developerName": "Bee's Roadhouse",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": [
+      "Load my Hive session memory.",
+      "Save this as a Hive journal memory."
+    ],
+    "brandColor": "#F5B301"
+  }
+}

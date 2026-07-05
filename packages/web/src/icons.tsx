@@ -3,7 +3,7 @@ import type { JSX } from "solid-js";
 // One cohesive line-icon family (currentColor, consistent stroke) so the whole
 // shell reads as a single system instead of a mix of emoji and glyphs. The nav
 // tasks/decisions/events marks deliberately echo their inline anchor glyphs
-// (square / diamond / clock). The bee 🐝 stays as the brand mark.
+// (square / diamond / clock). The hex cell carries the brand mark.
 
 // Fresh nodes per call (a DOM node can't live in two places) — so this is a
 // function, not a lookup table of pre-built JSX.
@@ -90,8 +90,30 @@ function paths(name: string): JSX.Element {
           <path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1" />
         </>
       );
+    case "workspaces": // terminal window — a hosted Claude Code session
+      return (
+        <>
+          <rect x="3" y="4" width="18" height="16" rx="2" />
+          <path d="M7 9l3 3-3 3M13 15h4" />
+        </>
+      );
+    case "chats": // speech bubble with a prompt caret — talking to Claude Code
+      return (
+        <>
+          <path d="M21 11.6a8.5 8.5 0 0 1-8.6 8.4 8.9 8.9 0 0 1-3.8-.85L3 20.5l1.4-4.3a8.2 8.2 0 0 1-1.3-4.6A8.5 8.5 0 0 1 11.7 3.2h.7a8.5 8.5 0 0 1 8.6 8.4z" />
+          <path d="M9.2 9.6l2.4 2.2-2.4 2.2M13.4 14h2.4" />
+        </>
+      );
     case "hex": // honeycomb cell — the day-page marker
       return <path d="M12 2.5l8.2 4.75v9.5L12 21.5l-8.2-4.75v-9.5z" />;
+    case "more": // ellipsis — the sidebar door to the command palette
+      return (
+        <>
+          <circle cx="5" cy="12" r="1" />
+          <circle cx="12" cy="12" r="1" />
+          <circle cx="19" cy="12" r="1" />
+        </>
+      );
     case "person": // user outline — head + shoulders
     case "account": // the signed-in user — same single-figure glyph
       return (
@@ -127,6 +149,31 @@ function paths(name: string): JSX.Element {
         <>
           <path d="M6 4v16" />
           <path d="M6 4h11l-3 4 3 4H6" />
+        </>
+      );
+    case "link": // chain links
+      return (
+        <>
+          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+        </>
+      );
+    case "quote": // quotation mark — blockquote
+      return (
+        <>
+          <path d="M9.5 6.5c-3 1-4.5 3.2-4.5 6.5v4.5h5.5v-5.5H8c0-2 .8-3.3 2.5-4z" />
+          <path d="M20 6.5c-3 1-4.5 3.2-4.5 6.5v4.5H21v-5.5h-2.5c0-2 .8-3.3 2.5-4z" />
+        </>
+      );
+    case "chev-l": // chevron left
+      return <path d="M14.5 5.5 8 12l6.5 6.5" />;
+    case "chev-r": // chevron right
+      return <path d="M9.5 5.5 16 12l-6.5 6.5" />;
+    case "mail": // envelope — the ingested-mail entity (distinct from the inbox tray)
+      return (
+        <>
+          <rect x="2.5" y="5" width="19" height="14" rx="2" />
+          <path d="m3 6.5 9 7 9-7" />
         </>
       );
     default:

@@ -4,7 +4,7 @@
 // one write path: journal append.)
 import type { Decision, EventItem, InboxItem, JournalEntryView, SearchHit, Task } from "@hive/shared";
 
-const BASE = process.env.HIVE_API_URL ?? "http://localhost:8787";
+const BASE = process.env.HIVE_API_URL ?? "http://localhost:7878";
 const ACTOR = process.env.HIVE_ACTOR ?? "cli";
 // v0.1.1+: hive-api requires auth. Programmatic clients present a Bearer API
 // token (mint one in the UI: Admin → API tokens). The actor is the token's.

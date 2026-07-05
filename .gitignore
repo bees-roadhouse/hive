@@ -21,3 +21,4 @@ data/*.db-wal
 
 # Stale duplicate of the old node/ layout (app lives under packages/ at root)
 /node/
+hive.local.env

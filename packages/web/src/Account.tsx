@@ -2,12 +2,23 @@ import { createResource, createSignal, For, Show, type Component } from "solid-j
 import { ACTORS, API_TOKEN_DEFAULT_EXPIRY_DAYS, type ImportResult, type UserRole } from "@hive/shared";
 import { api, getCurrentUser } from "./api.ts";
 
-// Token expiry presets (days). The server hard-caps at API_TOKEN_MAX_EXPIRY_DAYS (365).
+// Initials for the user-row avatar chip ("Nate Smith" → "NS") — same shape as
+// the sidebar footer's (App.tsx).
+const initials = (name: string): string =>
+  name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((w) => w[0]!.toUpperCase())
+    .join("") || "?";
+
+// Token expiry presets (days). 0 asks the server for a non-expiring token.
 const EXPIRY_OPTIONS = [
   { label: "30 days", days: 30 },
   { label: "90 days", days: 90 },
   { label: "180 days", days: 180 },
   { label: "1 year", days: 365 },
+  { label: "Never", days: 0 },
 ];
 
 // Admin panel (v0.1.1): manage login users and programmatic API tokens.
@@ -16,6 +27,7 @@ export const Account: Component = () => {
   const me = getCurrentUser();
   const [users, { refetch: refetchUsers }] = createResource(() => api.users());
   const [tokens, { refetch: refetchTokens }] = createResource(() => api.apiTokens());
+  const [apps, { refetch: refetchApps }] = createResource(() => api.oauthClients());
 
   // new user form
   const [uName, setUName] = createSignal("");
@@ -46,7 +58,13 @@ export const Account: Component = () => {
 
   const mintToken = async (e: Event) => {
     e.preventDefault();
-    const { token } = await api.createToken(tActor().trim(), tLabel().trim() || `${tActor()} token`, tExpiry());
+    const neverExpires = tExpiry() === 0;
+    const { token } = await api.createToken(
+      tActor().trim(),
+      tLabel().trim() || `${tActor()} token`,
+      neverExpires ? undefined : tExpiry(),
+      neverExpires,
+    );
     setFreshToken(token); // shown once
     setTLabel("");
     refetchTokens();
@@ -55,6 +73,45 @@ export const Account: Component = () => {
   const revoke = async (id: string) => {
     await api.deleteToken(id);
     refetchTokens();
+  };
+
+  // connected apps: revoke every token a client holds (disconnects it).
+  const revokeApp = async (id: string, name: string) => {
+    if (!confirm(`Disconnect "${name}"? This revokes all of its tokens.`)) return;
+    await api.revokeOAuthClient(id);
+    refetchApps();
+    refetchTokens();
+  };
+
+  // memory-namespace bulk reassignment (admin-only, bulk → confirm first)
+  const [rUnscoped, setRUnscoped] = createSignal(false);
+  const [rFromUser, setRFromUser] = createSignal("");
+  const [rAuthor, setRAuthor] = createSignal("");
+  const [rTo, setRTo] = createSignal("");
+  const [rResult, setRResult] = createSignal<string | null>(null);
+  const [rErr, setRErr] = createSignal<string | null>(null);
+
+  const reassignScope = async (e: Event) => {
+    e.preventDefault();
+    setRResult(null);
+    setRErr(null);
+    const from = rFromUser().trim();
+    const author = rAuthor().trim();
+    const to = rTo().trim();
+    const target = to ? `user "${to}"` : "global (no owner)";
+    if (!confirm(`Bulk-reassign matching journal entries to ${target}? This can't be undone in one click.`))
+      return;
+    try {
+      const { changed } = await api.reassignJournalScope({
+        match_unscoped: rUnscoped(),
+        from_user: from || undefined,
+        author: author || undefined,
+        to: to ? to : null,
+      });
+      setRResult(`${changed} entries reassigned.`);
+    } catch (err) {
+      setRErr(String(err instanceof Error ? err.message : err));
+    }
   };
 
   // legacy import (upload an old hive.db)
@@ -86,23 +143,21 @@ export const Account: Component = () => {
     <div class="account">
       <section>
         <h3>Users</h3>
-        <table class="data-table">
-          <thead>
-            <tr><th>Name</th><th>Email</th><th>Actor</th><th>Role</th></tr>
-          </thead>
-          <tbody>
-            <For each={users() ?? []}>
-              {(u) => (
-                <tr>
-                  <td>{u.name}{u.id === me?.id ? " (you)" : ""}</td>
-                  <td>{u.email}</td>
-                  <td>{u.actor}</td>
-                  <td>{u.role}</td>
-                </tr>
-              )}
-            </For>
-          </tbody>
-        </table>
+        <div>
+          <For each={users() ?? []}>
+            {(u) => (
+              <div class="source-row">
+                <span class="avatar">{initials(u.name)}</span>
+                <div class="source-main">
+                  <div class="source-name">{u.name}{u.id === me?.id ? " (you)" : ""}</div>
+                  <div class="dim sm">{u.email}</div>
+                </div>
+                <span class="actor-chip sm">{u.actor}</span>
+                <span class="badge">{u.role}</span>
+              </div>
+            )}
+          </For>
+        </div>
         <form class="inline-form" onSubmit={addUser}>
           <input placeholder="name" value={uName()} onInput={(e) => setUName(e.currentTarget.value)} required />
           <input type="email" placeholder="email" value={uEmail()} onInput={(e) => setUEmail(e.currentTarget.value)} required />
@@ -125,41 +180,85 @@ export const Account: Component = () => {
             <code>{freshToken()}</code>
           </div>
         </Show>
-        <table class="data-table">
-          <thead>
-            <tr><th>Actor</th><th>Label</th><th>Created</th><th>Expires</th><th>Last used</th><th></th></tr>
-          </thead>
-          <tbody>
-            <For each={tokens() ?? []}>
-              {(t) => (
-                <tr classList={{ "row-expired": isExpired(t.expires_at) }}>
-                  <td>{t.actor}</td>
-                  <td>{t.label}</td>
-                  <td>{t.created_at.slice(0, 10)}</td>
-                  <td>
-                    {t.expires_at
-                      ? isExpired(t.expires_at)
-                        ? `expired ${t.expires_at.slice(0, 10)}`
-                        : t.expires_at.slice(0, 10)
-                      : "never"}
-                  </td>
-                  <td>{t.last_used_at ? t.last_used_at.slice(0, 10) : "—"}</td>
-                  <td><button class="danger" onClick={() => revoke(t.id)}>revoke</button></td>
-                </tr>
-              )}
-            </For>
-          </tbody>
-        </table>
+        <div>
+          <For each={tokens() ?? []}>
+            {(t) => (
+              <div class="source-row" classList={{ "row-expired": isExpired(t.expires_at) }}>
+                <span class="actor-chip sm">{t.actor}</span>
+                <div class="source-main">
+                  <div class="source-name">{t.label}</div>
+                  <div class="dim sm">
+                    {`created ${t.created_at.slice(0, 10)} · ${
+                      t.expires_at
+                        ? isExpired(t.expires_at)
+                          ? `expired ${t.expires_at.slice(0, 10)}`
+                          : `expires ${t.expires_at.slice(0, 10)}`
+                        : "never expires"
+                    } · last used ${t.last_used_at ? t.last_used_at.slice(0, 10) : "—"}`}
+                  </div>
+                </div>
+                <Show when={isExpired(t.expires_at)}>
+                  <span class="badge">expired</span>
+                </Show>
+                <button class="ghost danger" onClick={() => revoke(t.id)}>revoke</button>
+              </div>
+            )}
+          </For>
+        </div>
         <form class="inline-form" onSubmit={mintToken}>
           <select value={tActor()} onChange={(e) => setTActor(e.currentTarget.value)}>
             <For each={ACTORS}>{(a) => <option value={a.name}>{a.name} ({a.kind})</option>}</For>
           </select>
           <input placeholder="label (e.g. pia laptop)" value={tLabel()} onInput={(e) => setTLabel(e.currentTarget.value)} />
-          <select value={tExpiry()} onChange={(e) => setTExpiry(Number(e.currentTarget.value))} title="Token expiry (max 1 year)">
+          <select value={tExpiry()} onChange={(e) => setTExpiry(Number(e.currentTarget.value))} title="Token expiry">
             <For each={EXPIRY_OPTIONS}>{(o) => <option value={o.days}>{o.label}</option>}</For>
           </select>
           <button type="submit">Mint token</button>
         </form>
+      </section>
+
+      <section>
+        <h3>Connected apps</h3>
+        <p class="dim">OAuth clients that have been granted access via the consent flow. Revoking disconnects the app by deleting all of its tokens.</p>
+        <div>
+          <For each={apps() ?? []}>
+            {(c) => (
+              <div class="source-row">
+                <div class="source-main">
+                  <div class="source-name">{c.client_name}</div>
+                  <div class="dim sm">
+                    {`connected ${c.created_at.slice(0, 10)} · ${c.active_tokens} active ${
+                      c.active_tokens === 1 ? "token" : "tokens"
+                    } · last used ${c.last_used_at ? c.last_used_at.slice(0, 10) : "—"}`}
+                  </div>
+                </div>
+                <button class="ghost danger" onClick={() => revokeApp(c.client_id, c.client_name)}>Revoke app</button>
+              </div>
+            )}
+          </For>
+        </div>
+        <Show when={(apps() ?? []).length === 0}><p class="dim">No apps connected.</p></Show>
+      </section>
+
+      <section>
+        <h3>Memory namespaces</h3>
+        <p class="dim">
+          Admin tool: bulk-reassign journal ownership across per-user memory namespaces. Filters are
+          ANDed; an empty "to user" makes matched entries global (visible to everyone). This is a bulk
+          mutation — you'll be asked to confirm.
+        </p>
+        <form class="inline-form" onSubmit={reassignScope}>
+          <label class="checkbox-label">
+            <input type="checkbox" checked={rUnscoped()} onChange={(e) => setRUnscoped(e.currentTarget.checked)} />
+            match unscoped (global) entries
+          </label>
+          <input placeholder="from user (optional)" value={rFromUser()} onInput={(e) => setRFromUser(e.currentTarget.value)} />
+          <input placeholder="author (optional)" value={rAuthor()} onInput={(e) => setRAuthor(e.currentTarget.value)} />
+          <input placeholder="to user (blank = global)" value={rTo()} onInput={(e) => setRTo(e.currentTarget.value)} />
+          <button type="submit" class="danger">Reassign</button>
+        </form>
+        <Show when={rResult()}><p class="dim">{rResult()}</p></Show>
+        <Show when={rErr()}><p class="auth-error">{rErr()}</p></Show>
       </section>
 
       <section>
@@ -189,7 +288,7 @@ export const Account: Component = () => {
               </p>
               <Show when={r().warnings.length}>
                 <ul class="dim sm">
-                  <For each={r().warnings}>{(w) => <li>⚠ {w}</li>}</For>
+                  <For each={r().warnings}>{(w) => <li>warning: {w}</li>}</For>
                 </ul>
               </Show>
             </div>

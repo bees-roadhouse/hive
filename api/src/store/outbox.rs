@@ -6,7 +6,13 @@ use hive_shared::{OutboxJob, OutboxStatus, WorkerOutboxCounts};
 use serde_json::json;
 use sqlx::Row;
 
-use super::{new_id, now_iso, Store};
+use super::{new_id, now_iso, placeholders_or_never, Store};
+
+/// The job kinds the worker's drainer owns. The claim is narrowed to these so
+/// foreign kinds (Phase 2 `mail.send`, drained by hive-mail) stay queued for
+/// their own drainer instead of being swallowed as no-op successes
+/// (DIRECTION.md Phase 0 item 6).
+const WORKER_OUTBOX_KINDS: &[&str] = &["webhook", "log"];
 
 impl Store {
     pub async fn outbox_enqueue(
@@ -57,15 +63,19 @@ impl Store {
         rows.iter().map(row_to_job).collect()
     }
 
-    /// Pending jobs whose run_after has elapsed, oldest first.
-    pub async fn outbox_claim(&self, limit: i64) -> Result<Vec<OutboxJob>> {
-        let rows = crate::pgq::query(
-            "SELECT * FROM outbox WHERE status = 'pending' AND run_after <= ? ORDER BY run_after LIMIT ?",
-        )
-        .bind(now_iso())
-        .bind(limit)
-        .fetch_all(self.db())
-        .await?;
+    /// Pending jobs of the given kinds whose run_after has elapsed, oldest
+    /// first. Kinds are explicit so each drainer claims only work it owns.
+    pub async fn outbox_claim(&self, kinds: &[&str], limit: i64) -> Result<Vec<OutboxJob>> {
+        let sql = format!(
+            "SELECT * FROM outbox WHERE status = 'pending' AND run_after <= ? \
+             AND kind IN ({}) ORDER BY run_after LIMIT ?",
+            placeholders_or_never(kinds.len())
+        );
+        let mut q = crate::pgq::query(&sql).bind(now_iso());
+        for k in kinds {
+            q = q.bind(*k);
+        }
+        let rows = q.bind(limit).fetch_all(self.db()).await?;
         rows.iter().map(row_to_job).collect()
     }
 
@@ -116,13 +126,13 @@ impl Store {
         })
     }
 
-    /// The worker's drainOutbox: claim up to 20 due jobs, run each ("webhook"
-    /// POSTs JSON; "log" and unknown kinds just succeed), complete or fail with
+    /// The worker's drainOutbox: claim up to 20 due jobs of the kinds it owns
+    /// ("webhook" POSTs JSON; "log" just succeeds), complete or fail with
     /// backoff. Returns the number completed.
     pub async fn drain_outbox(&self) -> Result<i64> {
         let mut done = 0;
         let client = reqwest::Client::new();
-        for job in self.outbox_claim(20).await? {
+        for job in self.outbox_claim(WORKER_OUTBOX_KINDS, 20).await? {
             let run: Result<()> = async {
                 if job.kind == "webhook" {
                     let url = job
@@ -140,7 +150,8 @@ impl Store {
                         anyhow::bail!("HTTP {}", res.status().as_u16());
                     }
                 } else {
-                    // "log" and unknown kinds just succeed (room to grow).
+                    // "log": success is the whole job. Unknown kinds are never
+                    // claimed (WORKER_OUTBOX_KINDS), so they can't be swallowed.
                     tracing::debug!(kind = %job.kind, "outbox job ran");
                 }
                 Ok(())

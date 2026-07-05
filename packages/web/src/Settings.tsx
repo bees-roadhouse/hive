@@ -3,13 +3,54 @@ import { ACTOR_NAMES, SEVERITIES, type Severity, type SourceKind } from "@hive/s
 import { api, getActor } from "./api.ts";
 import { relTime } from "./lib.tsx";
 import { liveRev } from "./live.ts";
+import { EmptyState } from "./primitives.tsx";
 
-/** Worker configuration: ingest sources (GUI ⇄ MCP), status, outbound queue. */
+/** Worker configuration: ingest sources (GUI ⇄ MCP), status, outbound queue,
+ * and the runtime credentials that power hosted conversations. */
 export const Settings: Component = () => {
   const actor = getActor();
   const [sources, { refetch }] = createResource(() => ({ _r: liveRev() }), () => api.sources(actor));
   const [status, { refetch: refetchStatus }] = createResource(() => ({ _r: liveRev() }), () => api.worker());
   const [outbox] = createResource(() => ({ _r: liveRev() }), () => api.outbox());
+  const [creds, { refetch: refetchCreds }] = createResource(() => ({ _r: liveRev() }), () => api.ccCredentials());
+
+  const [credForm, setCredForm] = createSignal({ kind: "codex_oauth", label: "", secret: "" });
+  const [credPanelOpen, setCredPanelOpen] = createSignal(false);
+  let secretInput: HTMLInputElement | undefined;
+  const credentialDefaults = (kind: string) => {
+    switch (kind) {
+      case "codex_oauth":
+        return { kind: "oauth_token", runtime: "codex", label: "Codex subscription" };
+      case "codex_api_key":
+        return { kind: "api_key", runtime: "codex", label: "Codex API key" };
+      case "claude_oauth":
+        return { kind: "oauth_token", runtime: "claude_code", label: "Claude Code subscription" };
+      case "anthropic_api_key":
+        return { kind: "api_key", runtime: "claude_code", provider: "anthropic", label: "Anthropic API key" };
+      case "opencode_provider_key":
+        return { kind: "api_key", runtime: "opencode", label: "OpenCode provider key" };
+      default:
+        return { kind, runtime: "claude_code", label: kind };
+    }
+  };
+  const connectRuntime = (runtime: "codex" | "claude_code") => {
+    window.location.href = `/api/runtime-oauth/${runtime}/start?return_to=${encodeURIComponent("/settings")}`;
+  };
+  const saveCred = async (e: Event) => {
+    e.preventDefault();
+    const f = credForm();
+    if (!f.secret.trim()) return;
+    const defaults = credentialDefaults(f.kind);
+    await api.saveCcCredential({
+      kind: defaults.kind,
+      runtime: defaults.runtime,
+      provider: defaults.provider,
+      label: f.label.trim() || defaults.label,
+      secret: f.secret.trim(),
+    });
+    setCredForm({ kind: f.kind, label: "", secret: "" });
+    refetchCreds();
+  };
   const [form, setForm] = createSignal({
     name: "",
     url: "",
@@ -101,7 +142,10 @@ export const Settings: Component = () => {
         <button class="primary" type="submit">add source</button>
       </form>
 
-      <For each={sources()} fallback={<p class="dim sm pad">no sources yet — add one above.</p>}>
+      <For
+        each={sources()}
+        fallback={<EmptyState icon="wire" title="No sources yet." hint="Add one above to feed the wire." />}
+      >
         {(s) => (
           <div class="source-row" classList={{ off: !s.enabled }}>
             <label class="sw">
@@ -127,7 +171,10 @@ export const Settings: Component = () => {
       </For>
 
       <h3 class="sec">Outbound queue</h3>
-      <Show when={outbox()?.length} fallback={<p class="dim sm">no outbound jobs.</p>}>
+      <Show
+        when={outbox()?.length}
+        fallback={<EmptyState icon="inbox" title="No outbound jobs." hint="Deliveries queue here on their way out." />}
+      >
         <For each={outbox()}>
           {(j) => (
             <div class="wire-row">
@@ -139,6 +186,54 @@ export const Settings: Component = () => {
           )}
         </For>
       </Show>
+
+      <h3 class="sec">Agent runtime sign-in</h3>
+      <p class="dim sm">Connect Codex or Claude Code once, then choose that runtime when starting a Conversation. Secrets are encrypted and never shown again.</p>
+
+      <div class="runtime-connect-cards">
+        <button type="button" class="runtime-connect-card rt-codex" onClick={() => connectRuntime("codex")}>
+          <strong>Connect Codex</strong>
+          <span>Open Codex, approve Hive, and come back connected.</span>
+          <em>Continue with Codex</em>
+        </button>
+        <button type="button" class="runtime-connect-card rt-claude_code" onClick={() => connectRuntime("claude_code")}>
+          <strong>Connect Claude Code</strong>
+          <span>Open Claude, approve Hive, and come back connected.</span>
+          <em>Continue with Claude Code</em>
+        </button>
+      </div>
+
+      <details class="runtime-advanced" open={credPanelOpen()} onToggle={(e) => setCredPanelOpen(e.currentTarget.open)}>
+        <summary>Advanced: paste or replace a credential manually</summary>
+
+      <form class="source-form runtime-cred-form" onSubmit={saveCred}>
+        <select value={credForm().kind} onChange={(e) => setCredForm({ ...credForm(), kind: e.currentTarget.value })}>
+          <option value="codex_oauth">Codex subscription OAuth/token</option>
+          <option value="codex_api_key">Codex API token</option>
+          <option value="claude_oauth">Claude Code subscription OAuth token</option>
+          <option value="anthropic_api_key">Claude Code / Anthropic API key</option>
+          <option value="opencode_provider_key">OpenCode provider API key</option>
+        </select>
+        <input placeholder="label / provider hint (optional)" value={credForm().label} onInput={(e) => setCredForm({ ...credForm(), label: e.currentTarget.value })} />
+        <input ref={secretInput} class="grow" type="password" placeholder="paste token or API key" value={credForm().secret} onInput={(e) => setCredForm({ ...credForm(), secret: e.currentTarget.value })} />
+        <button class="primary" type="submit">save credential</button>
+      </form>
+      </details>
+
+      <For
+        each={creds()}
+        fallback={<EmptyState icon="chats" title="No runtime credentials yet." hint="Conversations can't start until a runtime token or provider key is saved." />}
+      >
+        {(c) => (
+          <div class="wire-row">
+            <span class="badge">{c.kind}</span>
+            <code>…{c.tail}</code>
+            <span class="dim sm">{c.label}</span>
+            <span class="dim sm">{c.last_used_at ? `used ${relTime(c.last_used_at)}` : `added ${relTime(c.created_at)}`}</span>
+            <button class="x" onClick={() => api.deleteCcCredential(c.id).then(refetchCreds)}>✕</button>
+          </div>
+        )}
+      </For>
     </section>
   );
 };

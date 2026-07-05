@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use hive_shared::OAuthClient;
+use hive_shared::{OAuthClient, OAuthClientStatus};
 use sqlx::Row;
 
 use crate::auth::{generate_token, iso_in_secs, token_hash, AUTH_CODE_PREFIX, AUTH_CODE_TTL_SECS};
@@ -18,11 +18,13 @@ pub struct AuthCodeGrant {
     pub ai_actor: String,
     pub granted_by: String,
     pub scope: String,
+    /// Requested access-token lifetime (seconds); None → server default.
+    pub token_ttl_secs: Option<i64>,
 }
 
 pub enum RedeemOutcome {
     Ok(AuthCodeGrant),
-    Replay,
+    Replay { client_id: String },
     Expired,
     Unknown,
 }
@@ -81,12 +83,42 @@ impl Store {
         )
     }
 
+    /// List every OAuth client with its live token stats: a count of currently
+    /// active (non-expired) oauth tokens and the most-recent `last_used_at`. A
+    /// token is active when `expires_at` is NULL (legacy) or still in the future.
+    pub async fn oauth_clients_list(&self) -> Result<Vec<OAuthClientStatus>> {
+        let now = now_iso();
+        let rows = crate::pgq::query(
+            "SELECT c.client_id, c.client_name, c.created_at, \
+                    COUNT(t.id) FILTER (WHERE t.expires_at IS NULL OR t.expires_at > ?) AS active_tokens, \
+                    MAX(t.last_used_at) AS last_used_at \
+             FROM oauth_clients c \
+             LEFT JOIN api_tokens t ON t.client_id = c.client_id AND t.kind = 'oauth' \
+             GROUP BY c.client_id, c.client_name, c.created_at \
+             ORDER BY c.created_at DESC",
+        )
+        .bind(&now)
+        .fetch_all(self.db())
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(OAuthClientStatus {
+                    client_id: r.try_get("client_id")?,
+                    client_name: r.try_get("client_name")?,
+                    created_at: r.try_get("created_at")?,
+                    active_tokens: r.try_get("active_tokens")?,
+                    last_used_at: r.try_get("last_used_at")?,
+                })
+            })
+            .collect()
+    }
+
     /// Issue a single-use auth code (60s TTL); returns the plaintext code.
     pub async fn oauth_codes_create(&self, grant: &AuthCodeGrant) -> Result<String> {
         let code = generate_token(AUTH_CODE_PREFIX);
         crate::pgq::query(
-            "INSERT INTO oauth_auth_codes (code_hash, client_id, redirect_uri, code_challenge, ai_actor, granted_by, scope, created_at, expires_at, used_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            "INSERT INTO oauth_auth_codes (code_hash, client_id, redirect_uri, code_challenge, ai_actor, granted_by, scope, created_at, expires_at, used_at, token_ttl_secs) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
         )
         .bind(token_hash(&code))
         .bind(&grant.client_id)
@@ -97,6 +129,7 @@ impl Store {
         .bind(&grant.scope)
         .bind(now_iso())
         .bind(iso_in_secs(AUTH_CODE_TTL_SECS))
+        .bind(grant.token_ttl_secs)
         .execute(self.db())
         .await?;
         Ok(code)
@@ -120,7 +153,9 @@ impl Store {
         };
         let used_at: Option<String> = row.try_get("used_at")?;
         if used_at.is_some() {
-            return Ok(RedeemOutcome::Replay);
+            return Ok(RedeemOutcome::Replay {
+                client_id: row.try_get("client_id")?,
+            });
         }
         let expires_at: String = row.try_get("expires_at")?;
         let expired = chrono::DateTime::parse_from_rfc3339(&expires_at)
@@ -142,6 +177,7 @@ impl Store {
             ai_actor: row.try_get("ai_actor")?,
             granted_by: row.try_get("granted_by")?,
             scope: row.try_get("scope")?,
+            token_ttl_secs: row.try_get("token_ttl_secs")?,
         }))
     }
 }

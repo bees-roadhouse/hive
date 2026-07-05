@@ -1,7 +1,7 @@
 // Knowledge-graph links (store.ts `links`). Owned by core-stores.
 
 use anyhow::Result;
-use hive_shared::{EntityKind, Link};
+use hive_shared::Link;
 use sqlx::Row;
 
 use super::{new_id, now_iso, Store};
@@ -10,17 +10,17 @@ impl Store {
     /// store.ts links.create — Node takes (and ignores) an actor arg; no emit.
     pub async fn links_create(
         &self,
-        source_kind: EntityKind,
+        source_kind: &str,
         source_id: &str,
-        target_kind: EntityKind,
+        target_kind: &str,
         target_id: &str,
         rel: &str,
     ) -> Result<Link> {
         let l = Link {
             id: new_id("link"),
-            source_kind,
+            source_kind: source_kind.to_string(),
             source_id: source_id.to_string(),
-            target_kind,
+            target_kind: target_kind.to_string(),
             target_id: target_id.to_string(),
             rel: rel.to_string(),
             created_at: now_iso(),
@@ -30,9 +30,9 @@ impl Store {
              VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&l.id)
-        .bind(l.source_kind.as_str())
+        .bind(&l.source_kind)
         .bind(&l.source_id)
-        .bind(l.target_kind.as_str())
+        .bind(&l.target_kind)
         .bind(&l.target_id)
         .bind(&l.rel)
         .bind(&l.created_at)
@@ -53,12 +53,15 @@ impl Store {
     }
 }
 
+/// Kinds pass through as strings: with user-defined entity types an
+/// enum-unknown kind is a VALID row (a custom slug), not a hazard — nothing
+/// mislabels now that the lossy default is gone.
 pub(crate) fn row_to_link(r: &sqlx::postgres::PgRow) -> Result<Link> {
     Ok(Link {
         id: r.try_get("id")?,
-        source_kind: EntityKind::from_str_lossy(r.try_get::<String, _>("source_kind")?.as_str()),
+        source_kind: r.try_get("source_kind")?,
         source_id: r.try_get("source_id")?,
-        target_kind: EntityKind::from_str_lossy(r.try_get::<String, _>("target_kind")?.as_str()),
+        target_kind: r.try_get("target_kind")?,
         target_id: r.try_get("target_id")?,
         rel: r.try_get("rel")?,
         created_at: r.try_get("created_at")?,

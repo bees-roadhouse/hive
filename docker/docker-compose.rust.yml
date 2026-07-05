@@ -9,7 +9,8 @@
 
 services:
   postgres:
-    image: postgres:17
+    # Mirror of Docker Hub's official image — avoids the anonymous pull rate limit.
+    image: mirror.gcr.io/library/postgres:17
     environment:
       - POSTGRES_USER=hive
       - POSTGRES_PASSWORD=hive
@@ -76,10 +77,47 @@ services:
       hive-api:
         condition: service_healthy
 
+  hive-runner:
+    profiles: ["runner"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.runner
+    image: beesroadhouse/hive-runner:latest
+    environment:
+      - HIVE_API_URL=http://hive-api:7878
+      - HIVE_API_TOKEN=${HIVE_API_TOKEN:?set an admin/service Hive API token for hive-runner}
+      - HIVE_CONTAINER_ENGINE=${HIVE_CONTAINER_ENGINE:-podman}
+      - HIVE_SESSION_ISOLATION=container
+      - HIVE_SESSION_IMAGE=${HIVE_SESSION_IMAGE:-beesroadhouse/hive-session-dev:latest}
+      - HIVE_SESSION_NETWORK=${HIVE_SESSION_NETWORK:-hive_hive}
+      - HIVE_USER_VOLUME_PREFIX=${HIVE_USER_VOLUME_PREFIX:-hive-user}
+      - HIVE_SESSION_CONTAINER_PREFIX=${HIVE_SESSION_CONTAINER_PREFIX:-hive-session}
+      - HIVE_PROPAGATE_ENGINE_SOCKET=${HIVE_PROPAGATE_ENGINE_SOCKET:-0}
+      - HIVE_SESSION_GUI=${HIVE_SESSION_GUI:-1}
+      - HIVE_SESSION_VNC=${HIVE_SESSION_VNC:-0}
+      - HIVE_SESSION_VNC_PORT=${HIVE_SESSION_VNC_PORT:-5900}
+      - HIVE_SESSION_NOVNC_PORT=${HIVE_SESSION_NOVNC_PORT:-6080}
+      - HIVE_RUNNER_POLL_MS=2000
+    volumes:
+      - type: bind
+        source: ${HIVE_CONTAINER_SOCKET:-/run/podman/podman.sock}
+        target: ${HIVE_CONTAINER_SOCKET_TARGET:-/run/podman/podman.sock}
+        bind:
+          create_host_path: false
+      - hive-runner-workspaces:/workspaces
+    restart: unless-stopped
+    networks:
+      - hive
+    depends_on:
+      hive-api:
+        condition: service_healthy
+
 volumes:
   hive-pgdata:
   hive-models:
+  hive-runner-workspaces:
 
 networks:
   hive:
+    name: ${HIVE_NETWORK_NAME:-hive_hive}
     driver: bridge

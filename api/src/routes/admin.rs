@@ -38,7 +38,10 @@ pub fn router() -> Router<Store> {
 /// Node requireAdminActor: session admin, or a Bearer token whose actor maps to
 /// an admin user (sessions carry role directly; tokens don't, so resolve via
 /// the user record).
-async fn require_admin_actor(s: &Store, ctx: &AuthCtx) -> Result<bool, crate::error::ApiError> {
+pub(crate) async fn require_admin_actor(
+    s: &Store,
+    ctx: &AuthCtx,
+) -> Result<bool, crate::error::ApiError> {
     if ctx.is_admin() {
         return Ok(true);
     }

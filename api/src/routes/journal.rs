@@ -1,13 +1,16 @@
-// Journal routes: GET/POST /api/journal, /api/journal/{id}, /api/journal/writers.
-// Parity port of the server.ts journal section.
+// Journal routes: GET/POST /api/journal, /api/journal/{id}, /api/journal/writers,
+// POST /api/journal/reassign-scope (admin). Parity port of the server.ts journal
+// section, with per-user-namespace visibility derived from the AUTHENTICATED
+// principal (never a client-supplied ?viewer= param).
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Extension, Router};
 use hive_shared::NewJournalEntry;
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::error::{err, not_found, ApiResult};
 use crate::middleware::AuthCtx;
@@ -17,47 +20,56 @@ pub fn router() -> Router<Store> {
     Router::new()
         .route("/api/journal/writers", get(writers))
         .route("/api/journal", get(list).post(append))
+        .route("/api/journal/reassign-scope", post(reassign_scope))
         .route("/api/journal/{id}", get(get_one))
 }
 
-#[derive(Deserialize)]
-struct WritersQuery {
-    viewer: Option<String>,
-}
-
-async fn writers(State(s): State<Store>, Query(q): Query<WritersQuery>) -> ApiResult {
-    let Some(viewer) = q.viewer.filter(|v| !v.is_empty()) else {
-        return Ok(err(StatusCode::BAD_REQUEST, "viewer required"));
-    };
-    Ok(Json(s.journal_writers(&viewer).await?).into_response())
+async fn writers(State(s): State<Store>, Extension(ctx): Extension<AuthCtx>) -> ApiResult {
+    Ok(Json(s.journal_writers(&ctx.visibility()).await?).into_response())
 }
 
 #[derive(Deserialize)]
 struct ListQuery {
     limit: Option<i64>,
     offset: Option<i64>,
-    viewer: Option<String>,
     writers: Option<String>,
+    /// Optional namespace filter: a user slug, or `global`/`continuous` for the
+    /// un-owned stream. Only NARROWS the principal's already-permitted feed.
+    scope: Option<String>,
 }
 
-async fn list(State(s): State<Store>, Query(q): Query<ListQuery>) -> ApiResult {
+/// Map the `?scope=` query value to the store's filter sentinel. `global` /
+/// `continuous` (case-insensitive) mean the un-owned stream; any other
+/// non-empty value is a literal owner slug; empty/absent means no filter.
+fn parse_scope(raw: Option<&str>) -> Option<&str> {
+    let v = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    match v.to_ascii_lowercase().as_str() {
+        "global" | "continuous" => Some(crate::store::journal::GLOBAL_SCOPE),
+        _ => Some(v),
+    }
+}
+
+async fn list(
+    State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
+    Query(q): Query<ListQuery>,
+) -> ApiResult {
     let limit = q.limit.unwrap_or(50);
     let offset = q.offset.unwrap_or(0);
-    // Node truthiness: an empty viewer string falls through to the unscoped list.
-    if let Some(viewer) = q.viewer.filter(|v| !v.is_empty()) {
-        let writers: Option<Vec<String>> = q.writers.map(|w| {
-            w.split(',')
-                .map(str::trim)
-                .filter(|x| !x.is_empty())
-                .map(String::from)
-                .collect()
-        });
-        let entries = s
-            .visible_journal(&viewer, writers.as_deref(), limit, offset)
-            .await?;
-        return Ok(Json(entries).into_response());
-    }
-    Ok(Json(s.journal_list(limit, offset).await?).into_response())
+    let writers: Option<Vec<String>> = q.writers.map(|w| {
+        w.split(',')
+            .map(str::trim)
+            .filter(|x| !x.is_empty())
+            .map(String::from)
+            .collect()
+    });
+    let scope = parse_scope(q.scope.as_deref());
+    // Visibility is the authenticated principal's, not a client param. The scope
+    // filter only narrows within what visibility already permits.
+    let entries = s
+        .visible_journal(&ctx.visibility(), writers.as_deref(), scope, limit, offset)
+        .await?;
+    Ok(Json(entries).into_response())
 }
 
 async fn append(
@@ -76,13 +88,50 @@ async fn append(
     // Author is the authenticated identity — a client can't write as someone else.
     let actor = ctx.actor().to_string();
     input.author = Some(actor.clone());
-    let view = s.journal_append(input, Some(&actor)).await?;
+    // The entry lands in the writing principal's namespace (their granting user).
+    let view = s
+        .journal_append(input, Some(&actor), ctx.namespace_owner())
+        .await?;
     Ok((StatusCode::CREATED, Json(view)).into_response())
 }
 
-async fn get_one(State(s): State<Store>, Path(id): Path<String>) -> ApiResult {
-    match s.journal_get(&id).await? {
+async fn get_one(
+    State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    match s.journal_get(&id, &ctx.visibility()).await? {
         Some(e) => Ok(Json(e).into_response()),
         None => Ok(not_found()),
     }
+}
+
+#[derive(Deserialize)]
+struct ReassignBody {
+    #[serde(default)]
+    match_unscoped: bool,
+    from_user: Option<String>,
+    author: Option<String>,
+    /// New owner; null/omitted makes the matched entries global.
+    to: Option<String>,
+}
+
+/// Admin: bulk-change the namespace owner of journal entries.
+async fn reassign_scope(
+    State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
+    Json(b): Json<ReassignBody>,
+) -> ApiResult {
+    if !ctx.is_admin() {
+        return Ok(err(StatusCode::FORBIDDEN, "admin only"));
+    }
+    let changed = s
+        .journal_reassign_scope(
+            b.match_unscoped,
+            b.from_user.as_deref(),
+            b.author.as_deref(),
+            b.to.as_deref(),
+        )
+        .await?;
+    Ok(Json(json!({ "changed": changed })).into_response())
 }

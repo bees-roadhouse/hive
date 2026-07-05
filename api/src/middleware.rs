@@ -6,7 +6,7 @@
 // own auth so they can shape their 401s (www-authenticate, raw JSON).
 
 use axum::extract::{Request, State};
-use axum::http::{header, HeaderValue, Method, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Json, Response};
 use hive_shared::UserRole;
@@ -21,6 +21,11 @@ pub struct AuthCtx {
     /// "session" | "token"
     pub principal: Option<&'static str>,
     pub role: Option<UserRole>,
+    /// The human user whose namespace this principal reads/writes in: the
+    /// logged-in user for a session, or the token's granter for a Bearer token
+    /// (so an AI sees the memory namespace of whoever it acts for). `role` is
+    /// resolved from THIS user, so admin-bypass follows the granting human.
+    pub namespace_user: Option<String>,
     /// The raw session cookie value (the OAuth CSRF token derives from it).
     pub session_cookie: Option<String>,
 }
@@ -31,10 +36,69 @@ impl AuthCtx {
         self.actor.as_deref().unwrap_or("anon")
     }
 
-    /// Session-principal admin (Node `requireAdmin`).
+    /// The human user whose namespace governs visibility (falls back to the
+    /// acting identity when no distinct granter is known).
+    pub fn namespace_user(&self) -> &str {
+        self.namespace_user
+            .as_deref()
+            .unwrap_or_else(|| self.actor())
+    }
+
+    /// The owner to stamp on writes — the namespace user when authenticated,
+    /// else None (a system/anon write lands in the global/continuous history).
+    pub fn namespace_owner(&self) -> Option<&str> {
+        self.namespace_user.as_deref()
+    }
+
+    /// Admin authority belongs to an admin session, or to a token acting as the
+    /// same admin human. Delegated/AI tokens keep the grantor's namespace but do
+    /// not inherit admin-wide visibility.
     pub fn is_admin(&self) -> bool {
         self.role == Some(UserRole::Admin)
+            && (self.principal == Some("session")
+                || self.actor.as_deref() == self.namespace_user.as_deref())
     }
+
+    /// What this principal may see across the per-user memory namespaces.
+    pub fn visibility(&self) -> Visibility {
+        if self.is_admin() {
+            Visibility::All
+        } else {
+            Visibility::Namespace(self.namespace_user().to_string())
+        }
+    }
+}
+
+/// Per-user namespace visibility: admins see everything; everyone else sees
+/// global (NULL-scoped) entries plus their own namespace (plus explicit
+/// shares/@mentions, applied separately).
+#[derive(Clone, Debug)]
+pub enum Visibility {
+    All,
+    Namespace(String),
+}
+
+/// May this principal read/act for `identity`'s private surfaces (recall
+/// brief, inbox)? Admins: anyone. Tokens: only their own actor. Sessions:
+/// also the AIs the logged-in user owns. Shared by the MCP tools and the
+/// HTTP routes so the two doors can't drift apart.
+pub async fn can_act_for_identity(
+    store: &Store,
+    ctx: &AuthCtx,
+    identity: &str,
+) -> anyhow::Result<bool> {
+    if ctx.is_admin() || identity == ctx.actor() {
+        return Ok(true);
+    }
+    if ctx.principal == Some("session") {
+        let owner = ctx.namespace_user();
+        return Ok(store
+            .people_ais_owned_by(owner)
+            .await?
+            .iter()
+            .any(|p| p.slug == identity));
+    }
+    Ok(false)
 }
 
 const PUBLIC_PATHS: &[&str] = &[
@@ -88,9 +152,14 @@ pub async fn resolve_auth(store: &Store, headers: &axum::http::HeaderMap) -> Aut
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::trim)
     {
-        if let Ok(Some(actor)) = store.tokens_resolve(bearer).await {
+        if let Ok(Some((actor, namespace_user))) = store.tokens_resolve(bearer).await {
             ctx.actor = Some(actor);
             ctx.principal = Some("token");
+            // Admin-bypass and namespace follow the granting human user.
+            if let Ok(Some(u)) = store.users_by_actor(&namespace_user).await {
+                ctx.role = Some(u.role);
+            }
+            ctx.namespace_user = Some(namespace_user);
         }
     }
 
@@ -98,9 +167,10 @@ pub async fn resolve_auth(store: &Store, headers: &axum::http::HeaderMap) -> Aut
     if ctx.actor.is_none() {
         if let Some(value) = &cookie {
             if let Ok(Some(user)) = store.sessions_resolve(value).await {
-                ctx.actor = Some(user.actor);
+                ctx.actor = Some(user.actor.clone());
                 ctx.principal = Some("session");
                 ctx.role = Some(user.role);
+                ctx.namespace_user = Some(user.actor);
             }
         }
     }
@@ -170,18 +240,86 @@ fn apply_cors(res: &mut Response, origin: Option<&HeaderValue>) {
     );
 }
 
+/// First value of a possibly comma-joined proxy header, trimmed.
+fn first_forwarded(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// The public origin of this instance — all OAuth metadata URLs derive from it.
-pub async fn issuer_for(store: &Store, host: Option<&str>) -> String {
+/// An explicit `instance.url` config or `HIVE_PUBLIC_URL` wins; otherwise the
+/// origin is reconstructed from the request, honoring the reverse proxy's
+/// `X-Forwarded-Proto`/`X-Forwarded-Host` (Traefik terminates TLS, so the app
+/// sees plain HTTP — without this the metadata would advertise `http://` and
+/// break OAuth 2.1 clients like Claude Desktop). This also yields the right
+/// origin whether the client arrived via the LAN host or the public one.
+pub async fn issuer_for(store: &Store, headers: &HeaderMap) -> String {
     if let Ok(Some(url)) = store.config_get("instance.url").await {
         return url;
     }
     if let Ok(url) = std::env::var("HIVE_PUBLIC_URL") {
         return url;
     }
-    let port = std::env::var("PORT").unwrap_or_else(|_| "7878".to_string());
-    format!(
-        "http://{}",
-        host.map(String::from)
-            .unwrap_or(format!("localhost:{port}"))
-    )
+    let proto = first_forwarded(headers, "x-forwarded-proto").unwrap_or_else(|| "http".to_string());
+    let host = first_forwarded(headers, "x-forwarded-host")
+        .or_else(|| {
+            headers
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| {
+            let port = std::env::var("PORT").unwrap_or_else(|_| "7878".to_string());
+            format!("localhost:{port}")
+        });
+    format!("{proto}://{host}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_forwarded;
+    use axum::http::header::HeaderName;
+    use axum::http::HeaderMap;
+
+    fn hm(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn forwarded_proto_and_host_drive_the_issuer() {
+        // Behind Traefik: X-Forwarded-Proto=https must win over the plain HTTP
+        // the app actually sees, and the comma-joined first value is taken.
+        let h = hm(&[
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-host", "hive.home.beesroadhouse.com"),
+            ("host", "hive-api:7878"),
+        ]);
+        assert_eq!(
+            first_forwarded(&h, "x-forwarded-proto").as_deref(),
+            Some("https")
+        );
+        assert_eq!(
+            first_forwarded(&h, "x-forwarded-host").as_deref(),
+            Some("hive.home.beesroadhouse.com")
+        );
+
+        let chained = hm(&[("x-forwarded-proto", "https, http")]);
+        assert_eq!(
+            first_forwarded(&chained, "x-forwarded-proto").as_deref(),
+            Some("https")
+        );
+
+        let none = hm(&[("host", "h:7878")]);
+        assert_eq!(first_forwarded(&none, "x-forwarded-proto"), None);
+    }
 }

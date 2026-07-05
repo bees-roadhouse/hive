@@ -4,8 +4,8 @@
 
 use anyhow::Result;
 use hive_shared::{
-    snip, EventItem, Priority, Profile, ProjectRef, RecallData, RecallJournalHit, RecallResult,
-    SearchHit, Task, TaskStatus, RECALL_DEFAULT_BUDGET,
+    snip, EntityKind, EventItem, Priority, Profile, ProjectRef, RecallData, RecallJournalHit,
+    RecallResult, SearchHit, Task, TaskStatus, RECALL_DEFAULT_BUDGET,
 };
 use sqlx::Row;
 
@@ -82,6 +82,10 @@ pub struct RecallOptions {
     pub peer: Option<String>,
     pub query: Option<String>,
     pub budget: Option<usize>,
+    /// Optional minimum semantic score for journal hits included in recall.
+    pub threshold: Option<f64>,
+    /// Namespace user to scope the journal recall to (None = admin/unscoped).
+    pub viewer: Option<String>,
 }
 
 impl Store {
@@ -119,6 +123,9 @@ impl Store {
         };
 
         // Precision mode — degrades to the standard blend when no reranker.
+        // Journal-only via the kinds filter INSIDE the search: post-filtering
+        // the returned pool would let other kinds (tasks today, mail tomorrow)
+        // crowd the 8-hit pool toward empty (DIRECTION.md D9).
         let raw_hits: Vec<SearchHit> = if query.is_empty() {
             vec![]
         } else {
@@ -129,16 +136,16 @@ impl Store {
                     identity: Some(identity.to_string()),
                     peer: peer.map(String::from),
                     mode: Some("precision".to_string()),
+                    threshold: opts.threshold,
+                    viewer: opts.viewer.clone(),
+                    kinds: Some(vec![EntityKind::Journal]),
                     ..Default::default()
                 },
             )
             .await?
         };
         let mut journal_hits: Vec<RecallJournalHit> = Vec::new();
-        for h in raw_hits
-            .into_iter()
-            .filter(|h| h.kind == hive_shared::EntityKind::Journal)
-        {
+        for h in raw_hits {
             let row =
                 crate::pgq::query("SELECT author, body, created_at FROM journal WHERE id = ?")
                     .bind(&h.id)

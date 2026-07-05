@@ -18,6 +18,7 @@ use hive_shared::{
 };
 use serde_json::{json, Map, Value};
 
+use crate::middleware::AuthCtx;
 use crate::store::recall::RecallOptions;
 use crate::store::semantic::SemanticOptions;
 use crate::store::tasks::TaskFilter;
@@ -43,7 +44,7 @@ pub fn instructions() -> String {
         "hive is journal-first. Write prose with journal_append; attach `anchors` \
          (char-offset spans of the body) to emerge tasks/decisions/events anchored \
          to the exact text. @mention actors ({}) to notify their inbox. \
-         Read with the *_list / *_get / search / dashboard tools. \
+         Read with the *_list / *_get / search / dashboard tools. Household record kinds beyond the built-ins are the custom entity registry: entity_types_list shows what exists, entity_create / entities_list write and read typed instances (admins define types with entity_type_create). \
          For relevance retrieval prefer semantic_search with `mode: \"precision\"` (the \
          four-stage cross-encoder cascade) — it's the recommended high-quality path; drop \
          to `mode: \"standard\"` only for a broader sweep.",
@@ -223,7 +224,7 @@ fn build_tools() -> Value {
         {
             "name":"inbox_list",
             "title": "List an actor's inbox",
-            "description": "Unread-by-default notifications for a recipient (human or AI).",
+            "description": "Unread-by-default notifications for a recipient (human or AI). Viewer-gated: your own inbox (admins: any; sessions: also AIs you own).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -241,7 +242,7 @@ fn build_tools() -> Value {
         {
             "name":"inbox_mark_read",
             "title": "Mark inbox item(s) read",
-            "description": "Pass an item `id`, or a `recipient` to clear all their unread.",
+            "description": "Pass an item `id`, or a `recipient` to clear all their unread. Same viewer gate as inbox_list.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string"}, "recipient": {"type": "string"}},
@@ -263,6 +264,45 @@ fn build_tools() -> Value {
                 "additionalProperties": false,
                 "$schema": "http://json-schema.org/draft-07/schema#"
             },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"mail_search",
+            "title": "Search mail archive",
+            "description": "Search stored mail messages. Viewer-gated to the authenticated namespace; admins see all stored mail.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"q": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}},
+                "required": ["q"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"mail_thread_get",
+            "title": "Get a mail thread",
+            "description": "Return stored messages for a mail thread, viewer-gated from day one.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"thread_id": {"type": "string"}},
+                "required": ["thread_id"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"mail_accounts_list",
+            "title": "List mail accounts",
+            "description": "List stored mail accounts visible to the authenticated viewer.",
+            "inputSchema": empty_schema.clone(),
             "execution": {"taskSupport": FORBIDDEN}
         }
     ));
@@ -353,7 +393,8 @@ fn build_tools() -> Value {
                     "identity": {"type": "string", "description": "the AI/actor recalling (whose tasks/inbox to pull)"},
                     "peer": {"type": "string", "description": "optional focus actor, e.g. the human in the session"},
                     "query": {"type": "string", "description": "optional topic; defaults to recent + open threads"},
-                    "budget": {"type": "integer", "description": "approx token budget for the brief"}
+                    "budget": {"type": "integer", "description": "approx token budget for the brief"},
+                    "threshold": {"type": "number", "description": "optional minimum semantic score for journal hits"}
                 },
                 "required": ["identity"],
                 "additionalProperties": false,
@@ -598,6 +639,234 @@ fn build_tools() -> Value {
             }
         }
     ));
+    tools.push(json!(
+        {
+            "name": "workspace_list",
+            "description": "List hosted Claude Code workspaces (sessions) visible to you. Each is a sandboxed Claude Code session hive runs; use workspace_transcript to read one's full chat history.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 500}}
+            }
+        }
+    ));
+    tools.push(json!(
+        {
+            "name": "workspace_get",
+            "description": "Get one hosted Claude Code workspace by id (status, owner, sandbox dir, claude_session_id).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"]
+            }
+        }
+    ));
+    tools.push(json!(
+        {
+            "name": "workspace_transcript",
+            "description": "Read the complete transcript (chat history) of a hosted Claude Code workspace — every message and tool call. Use this to dream over a session and append/enrich journal memory based on what happened.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "after": {"type": "integer", "minimum": 0, "description": "only messages with seq greater than this"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 5000}
+                },
+                "required": ["id"]
+            }
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"entity_types_list",
+            "title": "List custom entity types",
+            "description": "The user-defined entity type registry (kind-config: fields, board grouping, presentation).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"include_archived": {"type": "boolean"}},
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"entity_type_create",
+            "title": "Define a custom entity type",
+            "description": "Admin only. Creates a type with typed fields (text|number|bool|date|choice|ref). Slugs are permanent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "slug": {"type": "string", "description": "lowercase, permanent; defaults from name"},
+                    "name_plural": {"type": "string"},
+                    "description": {"type": "string"},
+                    "icon": {"type": "string"},
+                    "color": {"type": "string"},
+                    "board_field": {"type": "string", "description": "choice-field slug the board groups by"},
+                    "fields": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "slug": {"type": "string"},
+                            "label": {"type": "string"},
+                            "field_type": {"type": "string", "enum": ["text", "number", "bool", "date", "choice", "ref"]},
+                            "required": {"type": "boolean"},
+                            "position": {"type": "integer"},
+                            "options": {"type": "array", "items": {"type": "string"}},
+                            "ref_kind": {"type": "string", "description": "person|topic|project|task or a custom slug"}
+                        },
+                        "required": ["label", "field_type"],
+                        "additionalProperties": false
+                    }}
+                },
+                "required": ["name"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"entity_type_update",
+            "title": "Evolve a custom entity type",
+            "description": "Admin only. Rename/describe/archive a type, add fields, relabel/reorder/archive fields. Slugs and field types never change.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "description": "type id or slug"},
+                    "name": {"type": "string"},
+                    "name_plural": {"type": "string"},
+                    "description": {"type": "string"},
+                    "icon": {"type": "string"},
+                    "color": {"type": "string"},
+                    "board_field": {"type": ["string", "null"]},
+                    "archived": {"type": "boolean"},
+                    "add_fields": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "slug": {"type": "string"},
+                            "label": {"type": "string"},
+                            "field_type": {"type": "string", "enum": ["text", "number", "bool", "date", "choice", "ref"]},
+                            "required": {"type": "boolean"},
+                            "position": {"type": "integer"},
+                            "options": {"type": "array", "items": {"type": "string"}},
+                            "ref_kind": {"type": "string"}
+                        },
+                        "required": ["label", "field_type"],
+                        "additionalProperties": false
+                    }},
+                    "update_fields": {"type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "slug": {"type": "string"},
+                            "label": {"type": "string"},
+                            "position": {"type": "integer"},
+                            "required": {"type": "boolean"},
+                            "options": {"type": "array", "items": {"type": "string"}},
+                            "archived": {"type": "boolean"}
+                        },
+                        "required": ["slug"],
+                        "additionalProperties": false
+                    }}
+                },
+                "required": ["type"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"entities_list",
+            "title": "List custom entities",
+            "description": "Instances of a custom type; equality filters on field slugs, sort by field/title/created_at.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "description": "type slug"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "sort": {"type": "string"},
+                    "dir": {"type": "string", "enum": ["asc", "desc"]},
+                    "filters": {"type": "object", "description": "field slug -> required value", "additionalProperties": true}
+                },
+                "required": ["type"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"entity_get",
+            "title": "Get a custom entity",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"entity_create",
+            "title": "Create a custom entity",
+            "description": "Fields are validated against the type's registry; scope 'me' keeps it in your namespace (default global).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "description": "type slug"},
+                    "title": {"type": "string"},
+                    "fields": {"type": "object", "additionalProperties": true},
+                    "scope": {"type": "string", "enum": ["global", "me"]}
+                },
+                "required": ["type", "title"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"entity_update",
+            "title": "Update a custom entity",
+            "description": "Shallow-merges fields; a JSON null clears a key. Validated against the registry.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "title": {"type": "string"},
+                    "fields": {"type": "object", "additionalProperties": true},
+                    "scope": {"type": "string", "enum": ["global", "me"]}
+                },
+                "required": ["id"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"entity_delete",
+            "title": "Delete a custom entity",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
     Value::Array(tools)
 }
 
@@ -612,6 +881,28 @@ fn ok_content<T: serde::Serialize>(data: &T) -> Value {
 /// The SDK's createToolError — a thrown handler error becomes isError content.
 fn tool_error(message: &str) -> Value {
     json!({"content": [{"type": "text", "text": message}], "isError": true})
+}
+
+/// Registry/instance validation issues rendered for tool consumers.
+fn issues_text(issues: &[crate::store::entity_validation::FieldIssue]) -> String {
+    let lines: Vec<String> = issues
+        .iter()
+        .map(|i| format!("{}: {} ({})", i.field, i.message, i.code))
+        .collect();
+    format!("validation failed\n{}", lines.join("\n"))
+}
+
+/// EntityWriteError → CallToolResult (store errors keep propagating).
+fn entity_write_result(e: crate::store::custom_entities::EntityWriteError) -> ToolResult {
+    use crate::store::custom_entities::EntityWriteError as E;
+    match e {
+        E::Issues(issues) => Ok(tool_error(&issues_text(&issues))),
+        E::UnknownType => Ok(tool_error("unknown entity type")),
+        E::ArchivedType => Ok(tool_error(
+            "type is archived; unarchive it to add instances",
+        )),
+        E::Other(err) => Err(err.into()),
+    }
 }
 
 enum ToolFailure {
@@ -939,30 +1230,85 @@ impl<'a> Args<'a> {
 /// thrown handler errors become isError content, an unknown tool is the SDK's
 /// "MCP error -32602: Tool X not found" isError result. `actor` is the
 /// authenticated identity (authorship pin).
-pub async fn call_tool(store: &Store, actor: &str, name: &str, args: &Map<String, Value>) -> Value {
-    match dispatch(store, actor, name, args).await {
+pub async fn call_tool(
+    store: &Store,
+    ctx: &AuthCtx,
+    name: &str,
+    args: &Map<String, Value>,
+) -> Value {
+    match dispatch(store, ctx, name, args).await {
         Ok(v) => v,
         Err(ToolFailure::Invalid(v)) => v,
         Err(ToolFailure::Store(e)) => tool_error(&e.to_string()),
     }
 }
 
-async fn dispatch(store: &Store, actor: &str, name: &str, args: &Map<String, Value>) -> ToolResult {
+async fn dispatch(
+    store: &Store,
+    ctx: &AuthCtx,
+    name: &str,
+    args: &Map<String, Value>,
+) -> ToolResult {
+    // Authorship pin is the authenticated identity; reads/writes are scoped to
+    // its per-user namespace (admins are unscoped).
+    let actor = ctx.actor();
+    let viewer: Option<String> = if ctx.is_admin() {
+        None
+    } else {
+        Some(ctx.namespace_user().to_string())
+    };
     match name {
-        "journal_append" => journal_append(store, actor, args).await,
+        "workspace_list" => {
+            let mut a = Args::new("workspace_list", args);
+            let limit = a.opt_int("limit", Some(1), Some(500));
+            a.finish()?;
+            Ok(ok_content(
+                &store
+                    .workspace_list(&ctx.visibility(), limit.unwrap_or(50))
+                    .await?,
+            ))
+        }
+        "workspace_get" => {
+            let mut a = Args::new("workspace_get", args);
+            let id = a.req_str("id");
+            a.finish()?;
+            match store.workspace_get(&ctx.visibility(), id.unwrap()).await? {
+                Some(ws) => Ok(ok_content(&ws)),
+                None => Ok(ok_content(&json!({"error": "not found"}))),
+            }
+        }
+        "workspace_transcript" => {
+            let mut a = Args::new("workspace_transcript", args);
+            let id = a.req_str("id");
+            let after = a.opt_int("after", Some(0), None);
+            let limit = a.opt_int("limit", Some(1), Some(5000));
+            a.finish()?;
+            let id = id.unwrap();
+            if store.workspace_get(&ctx.visibility(), id).await?.is_none() {
+                return Ok(ok_content(&json!({"error": "not found"})));
+            }
+            Ok(ok_content(
+                &store
+                    .workspace_transcript(id, after.unwrap_or(0), limit.unwrap_or(2000))
+                    .await?,
+            ))
+        }
+        "journal_append" => journal_append(store, ctx, args).await,
         "journal_list" => {
             let mut a = Args::new("journal_list", args);
             let limit = a.opt_int("limit", Some(1), Some(200));
             a.finish()?;
             Ok(ok_content(
-                &store.journal_list(limit.unwrap_or(30), 0).await?,
+                &store
+                    .visible_journal(&ctx.visibility(), None, None, limit.unwrap_or(30), 0)
+                    .await?,
             ))
         }
         "journal_get" => {
             let mut a = Args::new("journal_get", args);
             let id = a.req_str("id");
             a.finish()?;
-            match store.journal_get(id.unwrap()).await? {
+            match store.journal_get(id.unwrap(), &ctx.visibility()).await? {
                 Some(e) => Ok(ok_content(&e)),
                 None => Ok(ok_content(&json!({"error": "not found"}))),
             }
@@ -1025,9 +1371,15 @@ async fn dispatch(store: &Store, actor: &str, name: &str, args: &Map<String, Val
             let recipient = a.req_enum("recipient", &actor_names());
             let unread_only = a.opt_bool("unread_only");
             a.finish()?;
+            let recipient = recipient.unwrap();
+            // Viewer gate: an inbox is private to its recipient — snippets
+            // quote entries other viewers may not see (DIRECTION.md Phase 0).
+            if !can_act_for_identity(store, ctx, recipient).await? {
+                return Ok(tool_error("forbidden"));
+            }
             Ok(ok_content(
                 &store
-                    .inbox_list(recipient.unwrap(), unread_only.unwrap_or(true))
+                    .inbox_list(recipient, unread_only.unwrap_or(true))
                     .await?,
             ))
         }
@@ -1037,10 +1389,24 @@ async fn dispatch(store: &Store, actor: &str, name: &str, args: &Map<String, Val
             let recipient = a.opt_str("recipient").map(String::from);
             a.finish()?;
             if let Some(id) = id {
+                // Gate on the item's recipient (kind-agnostic — the row must
+                // stay markable even when its ref_kind postdates this build).
+                // Missing and foreign ids answer the same {"marked": false} so
+                // the tool doesn't oracle which ids exist in others' inboxes.
+                let allowed = match store.inbox_recipient(&id).await? {
+                    Some(recipient) => can_act_for_identity(store, ctx, &recipient).await?,
+                    None => false,
+                };
+                if !allowed {
+                    return Ok(ok_content(&json!({"marked": false})));
+                }
                 let marked = store.inbox_mark_read(&id).await? > 0;
                 return Ok(ok_content(&json!({"marked": marked})));
             }
             if let Some(recipient) = recipient {
+                if !can_act_for_identity(store, ctx, &recipient).await? {
+                    return Ok(tool_error("forbidden"));
+                }
                 let marked = store.inbox_mark_all_read(&recipient).await?;
                 return Ok(ok_content(&json!({"marked": marked})));
             }
@@ -1052,9 +1418,44 @@ async fn dispatch(store: &Store, actor: &str, name: &str, args: &Map<String, Val
             let limit = a.opt_int("limit", None, None);
             a.finish()?;
             let limit = limit.unwrap_or(25).max(0) as usize;
-            Ok(ok_content(&store.search(&q.unwrap(), limit, None).await?))
+            Ok(ok_content(
+                &store.search(&q.unwrap(), limit, viewer.as_deref()).await?,
+            ))
         }
-        "dashboard" => Ok(ok_content(&store.dashboard().await?)),
+        "mail_search" => {
+            let mut a = Args::new("mail_search", args);
+            let q = a.req_str("q").map(String::from);
+            let limit = a.opt_int("limit", Some(1), Some(200));
+            a.finish()?;
+            Ok(ok_content(
+                &store
+                    .mail_search(&q.unwrap(), viewer.as_deref(), limit.unwrap_or(50))
+                    .await?,
+            ))
+        }
+        "mail_thread_get" => {
+            let mut a = Args::new("mail_thread_get", args);
+            let thread_id = a.req_str("thread_id").map(String::from);
+            a.finish()?;
+            Ok(ok_content(
+                &store
+                    .mail_thread_get(&thread_id.unwrap(), viewer.as_deref())
+                    .await?,
+            ))
+        }
+        "mail_accounts_list" => {
+            let a = Args::new("mail_accounts_list", args);
+            a.finish()?;
+            Ok(ok_content(
+                &store.mail_accounts_list(viewer.as_deref()).await?,
+            ))
+        }
+        "dashboard" => {
+            if !ctx.is_admin() {
+                return Ok(ok_content(&json!({"error": "admin only"})));
+            }
+            Ok(ok_content(&store.dashboard().await?))
+        }
         "semantic_search" => {
             let mut a = Args::new("semantic_search", args);
             let q = a.req_str("q").map(String::from);
@@ -1074,6 +1475,7 @@ async fn dispatch(store: &Store, actor: &str, name: &str, args: &Map<String, Val
                 rerank,
                 blanket,
                 threshold,
+                viewer: viewer.clone(),
                 ..Default::default()
             };
             Ok(ok_content(&store.semantic_search(&q.unwrap(), opts).await?))
@@ -1133,9 +1535,13 @@ async fn dispatch(store: &Store, actor: &str, name: &str, args: &Map<String, Val
                 kind,
                 sections,
             };
+            let target = target.unwrap();
+            if !can_edit_actor_profile(store, ctx, &target).await? {
+                return Ok(tool_error("forbidden"));
+            }
             // Node passes "mcp" as the acting principal here (not the token actor).
             Ok(ok_content(
-                &store.profile_update(&target.unwrap(), patch, "mcp").await?,
+                &store.profile_update(&target, patch, "mcp").await?,
             ))
         }
         "recall" => {
@@ -1144,13 +1550,20 @@ async fn dispatch(store: &Store, actor: &str, name: &str, args: &Map<String, Val
             let peer = a.opt_str("peer").map(String::from);
             let query = a.opt_str("query").map(String::from);
             let budget = a.opt_int("budget", None, None);
+            let threshold = a.opt_f64("threshold");
             a.finish()?;
+            let identity = identity.unwrap();
+            if !can_act_for_identity(store, ctx, &identity).await? {
+                return Ok(tool_error("not_your_identity"));
+            }
             let opts = RecallOptions {
                 peer,
                 query,
                 budget: budget.map(|b| b.max(0) as usize),
+                threshold,
+                viewer: viewer.clone(),
             };
-            Ok(ok_content(&store.recall(&identity.unwrap(), opts).await?))
+            Ok(ok_content(&store.recall(&identity, opts).await?))
         }
         "sources_list" => Ok(ok_content(&store.sources_list(None).await?)),
         "sources_add" => {
@@ -1342,13 +1755,155 @@ async fn dispatch(store: &Store, actor: &str, name: &str, args: &Map<String, Val
             let removed = store.identities_remove(id.unwrap(), actor).await?;
             Ok(ok_content(&json!({"removed": removed})))
         }
+        "entity_types_list" => {
+            let mut a = Args::new("entity_types_list", args);
+            let include = a.opt_bool("include_archived");
+            a.finish()?;
+            Ok(ok_content(
+                &store.entity_types_list(include.unwrap_or(false)).await?,
+            ))
+        }
+        "entity_type_create" => {
+            if !is_admin(store, actor).await? {
+                return Ok(forbidden());
+            }
+            let input: hive_shared::NewEntityType =
+                serde_json::from_value(Value::Object(args.clone()))
+                    .map_err(|e| invalid_args("entity_type_create", &e.to_string()))?;
+            match store.entity_types_create(input, actor).await {
+                Ok(view) => Ok(ok_content(&view)),
+                Err(crate::store::entity_types::TypeWriteError::Issues(issues)) => {
+                    Ok(tool_error(&issues_text(&issues)))
+                }
+                Err(crate::store::entity_types::TypeWriteError::Other(e)) => Err(e.into()),
+            }
+        }
+        "entity_type_update" => {
+            if !is_admin(store, actor).await? {
+                return Ok(forbidden());
+            }
+            let mut a = Args::new("entity_type_update", args);
+            let target = a.req_str("type").map(String::from);
+            a.finish()?;
+            let mut body = args.clone();
+            body.remove("type");
+            let patch: hive_shared::EntityTypePatch =
+                serde_json::from_value(Value::Object(body))
+                    .map_err(|e| invalid_args("entity_type_update", &e.to_string()))?;
+            match store
+                .entity_types_update(&target.unwrap(), patch, actor)
+                .await
+            {
+                Ok(Some(view)) => Ok(ok_content(&view)),
+                Ok(None) => Ok(ok_content(&json!({"error": "not found"}))),
+                Err(crate::store::entity_types::TypeWriteError::Issues(issues)) => {
+                    Ok(tool_error(&issues_text(&issues)))
+                }
+                Err(crate::store::entity_types::TypeWriteError::Other(e)) => Err(e.into()),
+            }
+        }
+        "entities_list" => {
+            let mut a = Args::new("entities_list", args);
+            let type_slug = a.req_str("type").map(String::from);
+            let limit = a.opt_int("limit", Some(1), Some(500));
+            let offset = a.opt_int("offset", Some(0), None);
+            let sort = a.opt_str("sort").map(String::from);
+            let dir = a.opt_enum("dir", &["asc", "desc"]).map(String::from);
+            a.finish()?;
+            let fields = args
+                .get("filters")
+                .and_then(Value::as_object)
+                .map(|m| {
+                    m.iter()
+                        .map(|(k, v)| {
+                            let vs = match v {
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            (k.clone(), vs)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let filter = crate::store::custom_entities::EntityFilter {
+                type_slug: type_slug.unwrap(),
+                limit: limit.unwrap_or(100),
+                offset: offset.unwrap_or(0),
+                sort,
+                desc: dir.as_deref() != Some("asc"),
+                fields,
+            };
+            match store.custom_entities_list(&filter, &ctx.visibility()).await {
+                Ok(items) => Ok(ok_content(&items)),
+                Err(e) => entity_write_result(e),
+            }
+        }
+        "entity_get" => {
+            let mut a = Args::new("entity_get", args);
+            let id = a.req_str("id");
+            a.finish()?;
+            match store
+                .custom_entities_get(id.unwrap(), &ctx.visibility())
+                .await?
+            {
+                Some(e) => Ok(ok_content(&e)),
+                None => Ok(ok_content(&json!({"error": "not found"}))),
+            }
+        }
+        "entity_create" => {
+            let input: hive_shared::NewCustomEntity =
+                serde_json::from_value(Value::Object(args.clone()))
+                    .map_err(|e| invalid_args("entity_create", &e.to_string()))?;
+            match store
+                .custom_entities_create(input, actor, ctx.namespace_owner())
+                .await
+            {
+                Ok(e) => Ok(ok_content(&e)),
+                Err(e) => entity_write_result(e),
+            }
+        }
+        "entity_update" => {
+            let mut a = Args::new("entity_update", args);
+            let id = a.req_str("id").map(String::from);
+            a.finish()?;
+            let mut body = args.clone();
+            body.remove("id");
+            let patch: hive_shared::CustomEntityPatch = serde_json::from_value(Value::Object(body))
+                .map_err(|e| invalid_args("entity_update", &e.to_string()))?;
+            match store
+                .custom_entities_update(
+                    &id.unwrap(),
+                    patch,
+                    actor,
+                    &ctx.visibility(),
+                    ctx.namespace_owner(),
+                )
+                .await
+            {
+                Ok(Some(e)) => Ok(ok_content(&e)),
+                Ok(None) => Ok(ok_content(&json!({"error": "not found"}))),
+                Err(e) => entity_write_result(e),
+            }
+        }
+        "entity_delete" => {
+            let mut a = Args::new("entity_delete", args);
+            let id = a.req_str("id");
+            a.finish()?;
+            match store
+                .custom_entities_delete(id.unwrap(), actor, &ctx.visibility())
+                .await?
+            {
+                Some(()) => Ok(ok_content(&json!({"deleted": true}))),
+                None => Ok(ok_content(&json!({"error": "not found"}))),
+            }
+        }
         _ => Ok(tool_error(&format!(
             "MCP error -32602: Tool {name} not found"
         ))),
     }
 }
 
-async fn journal_append(store: &Store, actor: &str, args: &Map<String, Value>) -> ToolResult {
+async fn journal_append(store: &Store, ctx: &AuthCtx, args: &Map<String, Value>) -> ToolResult {
     let mut a = Args::new("journal_append", args);
     a.req_str("body");
     a.finish()?;
@@ -1356,9 +1911,41 @@ async fn journal_append(store: &Store, actor: &str, args: &Map<String, Value>) -
     // serde message inside the SDK's "Input validation error" wrapper.
     let mut input: NewJournalEntry = serde_json::from_value(Value::Object(args.clone()))
         .map_err(|e| invalid_args("journal_append", &e.to_string()))?;
-    // Author is the token's actor — a client cannot write as someone else.
-    input.author = Some(actor.to_string());
-    Ok(ok_content(&store.journal_append(input, Some(actor)).await?))
+    // Author is the token's actor — a client cannot write as someone else. The
+    // entry lands in the writing principal's namespace (its granting user).
+    let actor = ctx.actor().to_string();
+    input.author = Some(actor.clone());
+    Ok(ok_content(
+        &store
+            .journal_append(input, Some(&actor), ctx.namespace_owner())
+            .await?,
+    ))
+}
+
+/// One shared identity gate for MCP and HTTP: crate::middleware::can_act_for_identity.
+async fn can_act_for_identity(
+    store: &Store,
+    ctx: &AuthCtx,
+    identity: &str,
+) -> Result<bool, ToolFailure> {
+    Ok(crate::middleware::can_act_for_identity(store, ctx, identity).await?)
+}
+
+async fn can_edit_actor_profile(
+    store: &Store,
+    ctx: &AuthCtx,
+    actor: &str,
+) -> Result<bool, ToolFailure> {
+    if ctx.is_admin() || actor == ctx.actor() {
+        return Ok(true);
+    }
+    if ctx.principal == Some("session") {
+        let Some(target) = store.people_get(actor).await? else {
+            return Ok(false);
+        };
+        return Ok(target.owner.as_deref() == Some(ctx.actor()));
+    }
+    Ok(false)
 }
 
 /// mcp.ts isAdmin(): the token's actor maps to a user with role 'admin'.

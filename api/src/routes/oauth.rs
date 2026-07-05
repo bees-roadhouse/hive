@@ -7,10 +7,10 @@ use std::sync::OnceLock;
 use anyhow::{anyhow, bail, Result as AnyResult};
 use axum::body::Bytes;
 use axum::extract::rejection::FormRejection;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Json, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Extension, Form, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -20,8 +20,12 @@ use rand::RngCore;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::auth::{csrf_for, token_hash, verify_pkce, SESSION_COOKIE, SESSION_TTL_SECS};
-use crate::error::{err, ApiResult};
+use crate::auth::{
+    csrf_for, oauth_never_expires_enabled, oidc_enabled, token_hash, verify_pkce,
+    OAUTH_TOKEN_TTL_MAX_SECS, OAUTH_TOKEN_TTL_MIN_SECS, OAUTH_TOKEN_TTL_NEVER,
+    OAUTH_TOKEN_TTL_SECS, SESSION_COOKIE, SESSION_TTL_SECS,
+};
+use crate::error::{err, forbidden, ApiResult};
 use crate::middleware::{cookie_value, issuer_for, AuthCtx};
 use crate::store::oauth::{AuthCodeGrant, RedeemOutcome};
 use crate::store::users::NewUser;
@@ -49,12 +53,10 @@ pub fn router() -> Router<Store> {
         .route("/oauth/authorize/context", get(consent_context))
         .route("/oauth/authorize/grant", post(consent_grant))
         .route("/oauth/token", post(token))
+        .route("/api/oauth/clients", get(clients_list))
+        .route("/api/oauth/clients/{client_id}", delete(clients_revoke))
         .route("/api/auth/oidc/start", get(oidc_start))
         .route("/api/auth/oidc/callback", get(oidc_callback))
-}
-
-fn host_of(headers: &HeaderMap) -> Option<&str> {
-    headers.get(header::HOST).and_then(|v| v.to_str().ok())
 }
 
 /// 302 redirect (Hono's `c.redirect` default status).
@@ -67,10 +69,26 @@ fn redirect(location: &str) -> AnyResult<Response> {
 
 /// Node's `htmlError` page — 400 text/html with the same body shape.
 fn html_error(msg: &str) -> Response {
+    let msg = html_escape(msg);
     let body = format!(
         "<!doctype html><meta charset=utf-8><title>Authorization error</title>\n<body style=\"font-family:system-ui;background:#0e1116;color:#e6e9ee;padding:3rem\">\n<h1>🐝 Authorization error</h1><p>{msg}</p></body>"
     );
     (StatusCode::BAD_REQUEST, Html(body)).into_response()
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// `key=value&key=value` with percent-encoded values (URLSearchParams shape).
@@ -85,7 +103,7 @@ fn query_string(pairs: &[(&str, &str)]) -> String {
 // ---- Discovery metadata (RFC 8414 + RFC 9728) ----
 
 async fn authorization_server_metadata(State(s): State<Store>, headers: HeaderMap) -> ApiResult {
-    let iss = issuer_for(&s, host_of(&headers)).await;
+    let iss = issuer_for(&s, &headers).await;
     Ok(Json(json!({
         "issuer": iss,
         "authorization_endpoint": format!("{iss}/authorize"),
@@ -101,7 +119,7 @@ async fn authorization_server_metadata(State(s): State<Store>, headers: HeaderMa
 }
 
 async fn protected_resource_metadata(State(s): State<Store>, headers: HeaderMap) -> ApiResult {
-    let iss = issuer_for(&s, host_of(&headers)).await;
+    let iss = issuer_for(&s, &headers).await;
     Ok(Json(json!({
         "resource": format!("{iss}/mcp"),
         "authorization_servers": [iss],
@@ -113,15 +131,36 @@ async fn protected_resource_metadata(State(s): State<Store>, headers: HeaderMap)
 
 // ---- Dynamic Client Registration (RFC 7591) ----
 
-/// http/https URL with no (non-empty) fragment — JS `new URL(u)` + `!url.hash`.
+/// Redirect URI policy for dynamic MCP clients. HTTPS is accepted for any host;
+/// HTTP is limited to loopback development callbacks.
 fn valid_redirect(u: &str) -> bool {
     match reqwest::Url::parse(u) {
         Ok(url) => {
-            (url.scheme() == "https" || url.scheme() == "http")
-                && !matches!(url.fragment(), Some(f) if !f.is_empty())
+            let scheme_ok = match url.scheme() {
+                "https" => true,
+                "http" => url
+                    .host_str()
+                    .map(|host| matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]"))
+                    .unwrap_or(false),
+                _ => false,
+            };
+            scheme_ok && !matches!(url.fragment(), Some(f) if !f.is_empty())
         }
         Err(_) => false,
     }
+}
+
+fn valid_pkce_challenge(challenge: &str) -> bool {
+    let len = challenge.len();
+    (43..=128).contains(&len)
+        && challenge
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~'))
+}
+
+fn valid_oauth_scope(scope: &str) -> bool {
+    let trimmed = scope.trim();
+    trimmed.is_empty() || trimmed.split_whitespace().all(|s| s == "mcp")
 }
 
 async fn register(State(s): State<Store>, body: Bytes) -> ApiResult {
@@ -197,13 +236,16 @@ async fn authorize(State(s): State<Store>, Query(q): Query<HashMap<String, Strin
     }
     let code_challenge = q.get("code_challenge").map(String::as_str).unwrap_or("");
     if q.get("code_challenge_method").map(String::as_str) != Some("S256")
-        || code_challenge.is_empty()
+        || !valid_pkce_challenge(code_challenge)
     {
         return Ok(back("invalid_request")?);
     }
     // Hand to the SPA consent route (same origin). The session check happens
     // there (the /oauth/authorize/context call requires a logged-in human).
     let scope = q.get("scope").map(String::as_str).unwrap_or("mcp");
+    if !valid_oauth_scope(scope) {
+        return Ok(back("invalid_scope")?);
+    }
     let client_id = q.get("client_id").map(String::as_str).unwrap_or("");
     let qs = query_string(&[
         ("client_id", client_id),
@@ -250,6 +292,7 @@ async fn consent_context(
         client_name: client.client_name,
         identities,
         csrf: csrf_for(&cookie),
+        allow_never_expires: oauth_never_expires_enabled(),
     })
     .into_response())
 }
@@ -265,6 +308,25 @@ struct GrantBody {
     scope: Option<String>,
     ai_actor: Option<String>,
     csrf: Option<String>,
+    /// Requested access-token lifetime (seconds); clamped server-side.
+    token_ttl_secs: Option<i64>,
+}
+
+/// Clamp a requested OAuth token lifetime to [MIN, MAX]; None stays None (the
+/// mint step then applies the server default). 0 is a sentinel for a
+/// non-expiring token when enabled.
+fn clamp_token_ttl_with_policy(secs: Option<i64>, allow_never_expires: bool) -> Option<i64> {
+    secs.map(|s| {
+        if s == OAUTH_TOKEN_TTL_NEVER && allow_never_expires {
+            OAUTH_TOKEN_TTL_NEVER
+        } else {
+            s.clamp(OAUTH_TOKEN_TTL_MIN_SECS, OAUTH_TOKEN_TTL_MAX_SECS)
+        }
+    })
+}
+
+fn clamp_token_ttl(secs: Option<i64>) -> Option<i64> {
+    clamp_token_ttl_with_policy(secs, oauth_never_expires_enabled())
 }
 
 async fn consent_grant(
@@ -278,7 +340,7 @@ async fn consent_grant(
     }
     // CSRF: per-session token + same-origin Origin check (not SameSite alone).
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        if origin != issuer_for(&s, host_of(&headers)).await {
+        if origin != issuer_for(&s, &headers).await {
             return Ok(err(StatusCode::FORBIDDEN, "bad_origin"));
         }
     }
@@ -297,6 +359,14 @@ async fn consent_grant(
     if !valid {
         return Ok(err(StatusCode::BAD_REQUEST, "invalid_client"));
     }
+    let code_challenge = body.code_challenge.unwrap_or_default();
+    if !valid_pkce_challenge(&code_challenge) {
+        return Ok(err(StatusCode::BAD_REQUEST, "invalid_request"));
+    }
+    let scope = body.scope.unwrap_or_else(|| "mcp".to_string());
+    if !valid_oauth_scope(&scope) {
+        return Ok(err(StatusCode::BAD_REQUEST, "invalid_scope"));
+    }
     let owner = ctx.actor().to_string();
     let ai_actor = body.ai_actor.unwrap_or_default();
     let owned = s
@@ -311,10 +381,11 @@ async fn consent_grant(
         .oauth_codes_create(&AuthCodeGrant {
             client_id,
             redirect_uri: redirect_uri.clone(),
-            code_challenge: body.code_challenge.unwrap_or_default(),
+            code_challenge,
             ai_actor,
             granted_by: owner,
-            scope: body.scope.unwrap_or_else(|| "mcp".to_string()),
+            scope,
+            token_ttl_secs: clamp_token_ttl(body.token_ttl_secs),
         })
         .await?;
     let state = body.state.unwrap_or_default();
@@ -354,10 +425,12 @@ async fn token(State(s): State<Store>, form: Result<Form<TokenForm>, FormRejecti
 
     let grant = match s.oauth_codes_redeem(&code).await? {
         RedeemOutcome::Ok(g) => g,
-        RedeemOutcome::Replay => {
+        RedeemOutcome::Replay {
+            client_id: replayed_client_id,
+        } => {
             // Code reuse — treat as compromise: revoke any token already
             // minted for this client.
-            s.tokens_revoke_by_client(&client_id).await?;
+            s.tokens_revoke_by_client(&replayed_client_id).await?;
             return Ok(err(StatusCode::BAD_REQUEST, "invalid_grant"));
         }
         RedeemOutcome::Expired | RedeemOutcome::Unknown => {
@@ -371,21 +444,55 @@ async fn token(State(s): State<Store>, form: Result<Form<TokenForm>, FormRejecti
         return Ok(err(StatusCode::BAD_REQUEST, "invalid_grant"));
     }
 
+    // The lifetime chosen at consent (clamped) governs the real expiry. For a
+    // non-expiring token, omit expires_in instead of sending 0 (many clients
+    // interpret 0 as already expired).
+    let expires_in = match grant.token_ttl_secs {
+        Some(OAUTH_TOKEN_TTL_NEVER) => None,
+        Some(secs) => Some(secs.clamp(OAUTH_TOKEN_TTL_MIN_SECS, OAUTH_TOKEN_TTL_MAX_SECS)),
+        None => Some(OAUTH_TOKEN_TTL_SECS),
+    };
     let (token, _record) = s
         .tokens_create_oauth(
             &grant.ai_actor,
             &grant.client_id,
             &grant.granted_by,
             &grant.scope,
+            grant.token_ttl_secs,
         )
         .await?;
-    Ok(Json(json!({
+    let mut body = json!({
         "access_token": token,
         "token_type": "Bearer",
         "scope": grant.scope,
-        "expires_in": 31_536_000,
-    }))
-    .into_response())
+    });
+    if let Some(expires_in) = expires_in {
+        body["expires_in"] = json!(expires_in);
+    }
+    Ok(Json(body).into_response())
+}
+
+// ---- Connected apps (admin): list registered clients + revoke all tokens ----
+
+/// Admin: list OAuth clients with their active-token counts and last-used time.
+async fn clients_list(State(s): State<Store>, Extension(ctx): Extension<AuthCtx>) -> ApiResult {
+    if !ctx.is_admin() {
+        return Ok(forbidden());
+    }
+    Ok(Json(s.oauth_clients_list().await?).into_response())
+}
+
+/// Admin: revoke every token a client holds (disconnects the app).
+async fn clients_revoke(
+    State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
+    Path(client_id): Path<String>,
+) -> ApiResult {
+    if !ctx.is_admin() {
+        return Ok(forbidden());
+    }
+    let revoked = s.tokens_revoke_by_client(&client_id).await?;
+    Ok(Json(json!({ "revoked": revoked })).into_response())
 }
 
 // ============================================================================
@@ -402,14 +509,23 @@ struct OidcConfig {
 
 /// Read OIDC config from env, or None when unconfigured (feature off).
 fn oidc_config() -> Option<OidcConfig> {
+    if !oidc_enabled() {
+        return None;
+    }
     let issuer = std::env::var("OIDC_ISSUER")
         .ok()
         .filter(|v| !v.is_empty())?;
+    let client_id = std::env::var("OIDC_CLIENT_ID")
+        .ok()
+        .filter(|v| !v.trim().is_empty())?;
+    let redirect_uri = std::env::var("OIDC_REDIRECT_URI")
+        .ok()
+        .filter(|v| !v.trim().is_empty())?;
     Some(OidcConfig {
         issuer: issuer.strip_suffix('/').unwrap_or(&issuer).to_string(),
-        client_id: std::env::var("OIDC_CLIENT_ID").unwrap_or_default(),
+        client_id,
         client_secret: std::env::var("OIDC_CLIENT_SECRET").unwrap_or_default(),
-        redirect_uri: std::env::var("OIDC_REDIRECT_URI").unwrap_or_default(),
+        redirect_uri,
         allowed_domains: std::env::var("OIDC_ALLOWED_DOMAINS")
             .unwrap_or_default()
             .split(',')
@@ -455,6 +571,25 @@ fn oidc_cookie(name: &str, value: &str) -> AnyResult<HeaderValue> {
     ))?)
 }
 
+fn clear_oidc_cookie(name: &str) -> AnyResult<HeaderValue> {
+    Ok(HeaderValue::from_str(&format!(
+        "{name}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+    ))?)
+}
+
+fn safe_return_to(v: &str) -> Option<String> {
+    let trimmed = v.trim();
+    if trimmed.starts_with('/')
+        && !trimmed.starts_with("//")
+        && !trimmed.contains('\\')
+        && !trimmed.chars().any(char::is_control)
+    {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
 #[derive(Deserialize)]
 struct OidcStartQuery {
     return_to: Option<String>,
@@ -479,7 +614,7 @@ async fn oidc_start(Query(q): Query<OidcStartQuery>) -> ApiResult {
     let headers = res.headers_mut();
     headers.append(header::SET_COOKIE, oidc_cookie(OIDC_STATE_COOKIE, &state)?);
     headers.append(header::SET_COOKIE, oidc_cookie(OIDC_NONCE_COOKIE, &nonce)?);
-    if let Some(rt) = q.return_to.filter(|v| !v.is_empty()) {
+    if let Some(rt) = q.return_to.as_deref().and_then(safe_return_to) {
         headers.append(header::SET_COOKIE, oidc_cookie(OIDC_RETURN_COOKIE, &rt)?);
     }
     Ok(res)
@@ -547,7 +682,7 @@ async fn oidc_sign_in(
     };
     let session = s.sessions_create(&user.id).await?;
     let back = cookie_value(headers, OIDC_RETURN_COOKIE)
-        .filter(|v| !v.is_empty())
+        .and_then(|v| safe_return_to(&v))
         .unwrap_or_else(|| "/".to_string());
     let mut res = redirect(&back)?;
     let h = res.headers_mut();
@@ -557,10 +692,9 @@ async fn oidc_sign_in(
             "{SESSION_COOKIE}={session}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_TTL_SECS}"
         ))?,
     );
-    h.append(
-        header::SET_COOKIE,
-        HeaderValue::from_str(&format!("{OIDC_RETURN_COOKIE}=; Path=/; Max-Age=0"))?,
-    );
+    h.append(header::SET_COOKIE, clear_oidc_cookie(OIDC_STATE_COOKIE)?);
+    h.append(header::SET_COOKIE, clear_oidc_cookie(OIDC_NONCE_COOKIE)?);
+    h.append(header::SET_COOKIE, clear_oidc_cookie(OIDC_RETURN_COOKIE)?);
     Ok(res)
 }
 
@@ -604,7 +738,8 @@ async fn verify_id_token(
     nonce: &str,
 ) -> AnyResult<IdClaims> {
     let mut segs = id_token.split('.');
-    let (Some(h), Some(p), Some(sig)) = (segs.next(), segs.next(), segs.next()) else {
+    let (Some(h), Some(p), Some(sig), None) = (segs.next(), segs.next(), segs.next(), segs.next())
+    else {
         bail!("malformed id_token");
     };
     if h.is_empty() || p.is_empty() || sig.is_empty() {
@@ -617,11 +752,13 @@ async fn verify_id_token(
     let empty = Vec::new();
     let keys = jwks.get("keys").and_then(Value::as_array).unwrap_or(&empty);
     let kid = header.get("kid").and_then(Value::as_str);
-    let jwk = keys
-        .iter()
-        .find(|k| k.get("kid").and_then(Value::as_str) == kid)
-        .or_else(|| keys.first())
-        .ok_or_else(|| anyhow!("no jwks key"))?;
+    let jwk = match kid {
+        Some(kid) => keys
+            .iter()
+            .find(|k| k.get("kid").and_then(Value::as_str) == Some(kid))
+            .ok_or_else(|| anyhow!("no jwks key"))?,
+        None => keys.first().ok_or_else(|| anyhow!("no jwks key"))?,
+    };
     let n = jwk
         .get("n")
         .and_then(Value::as_str)
@@ -648,12 +785,12 @@ async fn verify_id_token(
     if !aud_ok {
         bail!("aud mismatch");
     }
-    // Node: `Number(payload.exp) * 1000 < Date.now()` — a missing exp is NaN,
-    // which never compares true, so absence passes (parity, not preference).
-    if let Some(exp) = payload.get("exp").and_then(Value::as_f64) {
-        if exp * 1000.0 < chrono::Utc::now().timestamp_millis() as f64 {
-            bail!("id_token expired");
-        }
+    let exp = payload
+        .get("exp")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| anyhow!("no exp in id_token"))?;
+    if exp * 1000.0 < chrono::Utc::now().timestamp_millis() as f64 {
+        bail!("id_token expired");
     }
     if payload.get("nonce").and_then(Value::as_str) != Some(nonce) {
         bail!("nonce mismatch");
@@ -679,11 +816,35 @@ mod tests {
     fn redirect_validation_matches_node() {
         assert!(valid_redirect("https://example.com/cb"));
         assert!(valid_redirect("http://localhost:3000/cb"));
+        assert!(valid_redirect("http://127.0.0.1:3912/cb"));
+        assert!(valid_redirect("http://[::1]:3912/cb"));
+        assert!(!valid_redirect("http://example.com/cb"));
         assert!(!valid_redirect("ftp://example.com/cb"));
         assert!(!valid_redirect("not a url"));
         assert!(!valid_redirect("https://example.com/cb#frag"));
         // JS `!url.hash` treats a bare trailing '#' as no fragment.
         assert!(valid_redirect("https://example.com/cb#"));
+    }
+
+    #[test]
+    fn pkce_challenge_validation_is_strict() {
+        let valid = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        assert!(valid_pkce_challenge(valid));
+        assert!(!valid_pkce_challenge(""));
+        assert!(!valid_pkce_challenge("short"));
+        assert!(!valid_pkce_challenge(&"a".repeat(129)));
+        assert!(!valid_pkce_challenge(
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw=cM"
+        ));
+    }
+
+    #[test]
+    fn oauth_scope_only_allows_mcp() {
+        assert!(valid_oauth_scope(""));
+        assert!(valid_oauth_scope("mcp"));
+        assert!(valid_oauth_scope("mcp mcp"));
+        assert!(!valid_oauth_scope("openid"));
+        assert!(!valid_oauth_scope("mcp admin"));
     }
 
     #[test]
@@ -700,8 +861,53 @@ mod tests {
     }
 
     #[test]
+    fn html_escape_escapes_message_text() {
+        assert_eq!(
+            html_escape("<bad & \"quoted\" 'text'>"),
+            "&lt;bad &amp; &quot;quoted&quot; &#39;text&#39;&gt;"
+        );
+    }
+
+    #[test]
     fn query_string_encodes_values() {
         let qs = query_string(&[("scope", "openid email profile"), ("state", "a&b")]);
         assert_eq!(qs, "scope=openid%20email%20profile&state=a%26b");
+    }
+
+    #[test]
+    fn token_ttl_preserves_never_expire_sentinel() {
+        assert_eq!(
+            clamp_token_ttl_with_policy(Some(OAUTH_TOKEN_TTL_NEVER), true),
+            Some(0)
+        );
+        assert_eq!(
+            clamp_token_ttl_with_policy(Some(OAUTH_TOKEN_TTL_MIN_SECS - 1), true),
+            Some(OAUTH_TOKEN_TTL_MIN_SECS)
+        );
+        assert_eq!(
+            clamp_token_ttl_with_policy(Some(OAUTH_TOKEN_TTL_MAX_SECS + 1), true),
+            Some(OAUTH_TOKEN_TTL_MAX_SECS)
+        );
+    }
+
+    #[test]
+    fn token_ttl_clamps_never_sentinel_when_disabled() {
+        assert_eq!(
+            clamp_token_ttl_with_policy(Some(OAUTH_TOKEN_TTL_NEVER), false),
+            Some(OAUTH_TOKEN_TTL_MIN_SECS)
+        );
+    }
+
+    #[test]
+    fn oidc_return_to_stays_same_origin() {
+        assert_eq!(safe_return_to("/journal").as_deref(), Some("/journal"));
+        assert_eq!(
+            safe_return_to("/consent?client_id=abc").as_deref(),
+            Some("/consent?client_id=abc")
+        );
+        assert_eq!(safe_return_to("https://evil.example/cb"), None);
+        assert_eq!(safe_return_to("//evil.example/cb"), None);
+        assert_eq!(safe_return_to("/\\evil"), None);
+        assert_eq!(safe_return_to("/bad\npath"), None);
     }
 }

@@ -26,6 +26,7 @@ import type {
   AnchorKind,
   AutocompleteItem,
   JournalEntryView,
+  JournalWriter,
   NewAnchor,
   Priority,
   ResolvedAnchor,
@@ -37,7 +38,9 @@ import Link from "@tiptap/extension-link";
 import { Markdown as MarkdownExt } from "tiptap-markdown";
 import { api, getActor } from "./api.ts";
 import { liveRev } from "./live.ts";
+import { composeReq, consumeComposeRequest } from "./ui.ts";
 import { ANCHOR_GLYPH, relTime } from "./lib.tsx";
+import { KIND } from "./kinds.ts";
 import { Icon } from "./icons.tsx";
 import { JournalBody } from "./markdown.tsx";
 import { EntityCard } from "./Boards.tsx";
@@ -51,6 +54,10 @@ interface Pending {
 
 const PAGE = 20;
 
+// Namespace-filter sentinel: the active scope is either a user slug, this token
+// for the global/continuous (un-owned) stream, or null for "all namespaces".
+const GLOBAL_SCOPE = "global";
+
 // Autocomplete trigger scheme:
 //   @  → person
 //   #  → topic
@@ -63,14 +70,6 @@ const TRIGGERS: Record<string, string[]> = {
   "+": ["project"],
   "!": ["task"],
   "[": ["person", "topic", "project", "phase", "task"],
-};
-
-const KIND_GLYPH: Record<string, string> = {
-  person: "👤",
-  topic: "#",
-  project: "◈",
-  phase: "◷",
-  task: "◻",
 };
 
 /** "Today" / "Yesterday" / "Tuesday, June 2, 2026" for a day header. */
@@ -178,6 +177,28 @@ export const Journal: Component = () => {
   const [fetchDone, setFetchDone] = createSignal(false);
   const [visibleDays, setVisibleDays] = createSignal(1);
 
+  // ---- namespace (memory-scope) filter ----
+  // null = all namespaces; GLOBAL_SCOPE = continuous/un-owned; else a user slug.
+  const [activeScope, setActiveScope] = createSignal<string | null>(null);
+  // slug → friendly name, from the writers the viewer already sees.
+  const [writers, setWriters] = createSignal<JournalWriter[]>([]);
+  const scopeName = (slug: string): string =>
+    writers().find((w) => w.slug === slug)?.name ?? slug;
+  // Friendly label for an entry's namespace chip.
+  const chipLabel = (scope: string | null | undefined): string =>
+    scope ? scopeName(scope) : "Continuous";
+  // AI-authored entries render in the serif voice face (see .entry-ai) so who
+  // is speaking reads at a glance. Unknown authors default to the human face.
+  const isAi = (author: string): boolean =>
+    writers().find((w) => w.slug === author)?.kind === "ai";
+  // The token a chip filters by (its entry's scope, or GLOBAL_SCOPE when null).
+  const chipScope = (scope: string | null | undefined): string => scope ?? GLOBAL_SCOPE;
+  const activeScopeLabel = createMemo(() => {
+    const s = activeScope();
+    if (s === null) return "";
+    return s === GLOBAL_SCOPE ? "Continuous" : scopeName(s);
+  });
+
   const allDayGroups = createMemo(() => groupByDay(buffer()));
   const days = createMemo(() => allDayGroups().slice(0, visibleDays()));
   const hasBufferedDays = createMemo(() => allDayGroups().length > visibleDays());
@@ -235,7 +256,7 @@ export const Journal: Component = () => {
     setFetching(true);
     try {
       while (true) {
-        const batch = await api.journal(PAGE, buffer().length);
+        const batch = await api.journal(PAGE, buffer().length, activeScope());
         if (batch.length === 0) { setFetchDone(true); return false; }
         setBuffer((prev) => [...prev, ...batch]);
         if (batch.length < PAGE) setFetchDone(true);
@@ -248,6 +269,10 @@ export const Journal: Component = () => {
   };
 
   const revealNextDay = async () => {
+    // reload() may still be in flight (the sentinel intersects immediately on
+    // mount); starting a second fetch at the same offset would append the
+    // same page twice. The sentinel re-fires on scroll, so skipping is safe.
+    if (fetching()) return;
     if (hasBufferedDays()) { setVisibleDays((n) => n + 1); return; }
     const got = await fetchUntilNewDay();
     if (got) setVisibleDays((n) => n + 1);
@@ -259,12 +284,19 @@ export const Journal: Component = () => {
     setVisibleDays(1);
     setFetching(true);
     try {
-      const batch = await api.journal(PAGE, 0);
+      const batch = await api.journal(PAGE, 0, activeScope());
       setBuffer(batch);
       if (batch.length < PAGE) setFetchDone(true);
     } finally {
       setFetching(false);
     }
+  };
+
+  // Apply (or clear) the namespace filter, then reload the feed from the top.
+  const setScope = (scope: string | null) => {
+    if (activeScope() === scope) return;
+    setActiveScope(scope);
+    void reload();
   };
 
   createEffect(on(liveRev, () => { void reload(); }, { defer: true }));
@@ -274,6 +306,8 @@ export const Journal: Component = () => {
 
   onMount(() => {
     void reload();
+    // Resolve namespace slugs → friendly names for the chips (best-effort).
+    void api.journalWriters(getActor()).then(setWriters).catch(() => {});
 
     const scrollObs = new IntersectionObserver(
       (ents) => { if (ents.some((x) => x.isIntersecting)) void revealNextDay(); },
@@ -457,6 +491,13 @@ export const Journal: Component = () => {
     dismissAc();
   };
 
+  // The command palette's "New entry" action lands here (see ui.ts). The
+  // deferred effect covers a palette fired while the journal is mounted; the
+  // mount-time consume covers "New entry" from another route, where the bump
+  // happens before this component (and the listener) exists.
+  createEffect(on(composeReq, () => { if (consumeComposeRequest()) openOverlay(); }, { defer: true }));
+  onMount(() => { if (consumeComposeRequest()) openOverlay(); });
+
   // ---- autocomplete ----
   const dismissAc = () => {
     setAcItems([]);
@@ -634,12 +675,18 @@ export const Journal: Component = () => {
   // ---- render ----
   return (
     <section class="journal">
-      {/* ---- journal header + "new entry" button ---- */}
-      <div class="journal-header">
-        <button class="primary journal-new-btn" onClick={openOverlay}>
-          + new entry
-        </button>
-      </div>
+      {/* ---- active namespace filter (only when one is set) ---- */}
+      <Show when={activeScope() !== null}>
+        <div class="journal-header">
+          <div class="ns-filter-bar">
+            <span class="dim sm">namespace</span>
+            <span class="ns-chip ns-chip-active">◆ {activeScopeLabel()}</span>
+            <button class="ns-clear" onClick={() => setScope(null)} title="Show all namespaces">
+              ✕ all namespaces
+            </button>
+          </div>
+        </div>
+      </Show>
 
       {/* ---- feed + anchored-entities rail ---- */}
       <div class="journal-layout">
@@ -656,9 +703,23 @@ export const Journal: Component = () => {
               </header>
               <For each={d.items}>
                 {(e) => (
-                  <article class="entry entry-fade" id={`entry-${e.id}`} data-entry-id={e.id}>
+                  <article
+                    class="entry entry-fade"
+                    classList={{ "entry-ai": isAi(e.author) }}
+                    id={`entry-${e.id}`}
+                    data-entry-id={e.id}
+                  >
                     <header>
                       <span class="actor-chip">{e.author}</span>
+                      <button
+                        type="button"
+                        class="ns-chip"
+                        classList={{ "ns-chip-global": !e.user_scope }}
+                        title={`Filter to ${chipLabel(e.user_scope)}`}
+                        onClick={() => setScope(chipScope(e.user_scope))}
+                      >
+                        ◆ {chipLabel(e.user_scope)}
+                      </button>
                       <time>{relTime(e.created_at)}</time>
                       <Show when={e.anchors.length}>
                         <span class="dim">
@@ -730,10 +791,29 @@ export const Journal: Component = () => {
       </aside>
       </div>
 
-      {/* ---- floating action button ---- */}
-      <button class="journal-fab" onClick={openOverlay} title="New entry" aria-label="New entry">
-        ✦
-      </button>
+      {/* ---- write bar: the always-there composer entry point, pinned to the
+              bottom of the viewport like a chat input. Clicking anywhere on it
+              opens the full overlay composer (rich editor, anchors, tags). ---- */}
+      <div class="write-bar">
+        <div
+          class="write-bar-inner"
+          role="button"
+          tabindex="0"
+          aria-label="New entry"
+          onClick={openOverlay}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              openOverlay();
+            }
+          }}
+        >
+          <span class="write-hint">Write to the hive…</span>
+          <span class="write-glyph" title="@name mentions people">@</span>
+          <span class="write-glyph" title="#topic +project !task tags">#</span>
+          <span class="write-send" aria-hidden="true">↑</span>
+        </div>
+      </div>
 
       {/* ---- new-entry overlay ---- */}
       <Show when={overlayOpen()}>
@@ -784,9 +864,9 @@ export const Journal: Component = () => {
                 <button title="inline code"   onClick={toolCode}>   {"</>"}     </button>
                 <button title="heading"       onClick={toolHeading}>H            </button>
                 <button title="bullet list"   onClick={toolBullet}> •            </button>
-                <button title="checkbox task" onClick={toolCheckbox}>☑           </button>
-                <button title="blockquote"    onClick={toolQuote}>  ❝            </button>
-                <button title="link"          onClick={toolLink}>   🔗           </button>
+                <button title="checkbox task" onClick={toolCheckbox}><Icon name="tasks" size={14} /></button>
+                <button title="blockquote"    onClick={toolQuote}><Icon name="quote" size={14} /></button>
+                <button title="link"          onClick={toolLink}><Icon name="link" size={14} /></button>
               </div>
 
               {/* TipTap mount point + autocomplete dropdown */}
@@ -827,7 +907,7 @@ export const Journal: Component = () => {
                           onMouseDown={(e) => { e.preventDefault(); selectAcItem(item); }}
                           onMouseEnter={() => setAcActive(i())}
                         >
-                          <span class="ac-kind-glyph">{KIND_GLYPH[item.kind] ?? "·"}</span>
+                          <span class="ac-kind-glyph">{KIND[item.kind]?.glyph ?? "·"}</span>
                           <span class="ac-label">{item.label}</span>
                           <span class="ac-kind dim">{item.kind}</span>
                         </li>
@@ -864,7 +944,7 @@ export const Journal: Component = () => {
                           onMouseDown={(e) => { e.preventDefault(); selectAcItem(item); }}
                           onMouseEnter={() => setAcActive(i())}
                         >
-                          <span class="ac-kind-glyph">{KIND_GLYPH[item.kind] ?? "·"}</span>
+                          <span class="ac-kind-glyph">{KIND[item.kind]?.glyph ?? "·"}</span>
                           <span class="ac-label">{item.label}</span>
                           <span class="ac-kind dim">{item.kind}</span>
                         </li>

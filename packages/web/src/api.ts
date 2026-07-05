@@ -11,6 +11,9 @@ import type {
   InboxItem,
   JournalEntryView,
   JournalWriter,
+  MailAccount,
+  MailMessageSummary,
+  MailThread,
   NewJournalEntry,
   NewShare,
   NewSource,
@@ -33,10 +36,17 @@ import type {
   AuthConfig,
   AuthMe,
   OAuthConsentContext,
+  OAuthClientStatus,
   OnboardingPayload,
   OnboardingStatus,
   SafeUser,
   UserRole,
+  CustomEntity,
+  CustomEntityPatch,
+  EntityTypePatch,
+  EntityTypeView,
+  NewCustomEntity,
+  NewEntityType,
 } from "@hive/shared";
 
 // Vite proxies /api → hive-api in dev (see vite.config.ts).
@@ -82,8 +92,13 @@ async function req<T>(path: string, init?: RequestInit, timeoutMs = 15000): Prom
 }
 
 export const api = {
-  journal: (limit = 50, offset = 0) =>
-    req<JournalEntryView[]>(`/journal?limit=${limit}&offset=${offset}`),
+  // `scope` narrows the feed to one memory namespace: a user slug, or "global"
+  // for the continuous (un-owned) stream. Omitted = no namespace filter.
+  journal: (limit = 50, offset = 0, scope?: string | null) => {
+    const p = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (scope) p.set("scope", scope);
+    return req<JournalEntryView[]>(`/journal?${p}`);
+  },
   journalScoped: (viewer: string, writers?: string[], limit = 50, offset = 0) => {
     const p = new URLSearchParams({ viewer, limit: String(limit), offset: String(offset) });
     if (writers && writers.length > 0) p.set("writers", writers.join(","));
@@ -112,6 +127,14 @@ export const api = {
 
   search: (query: string, mode: "keyword" | "semantic" | "precision" = "keyword") =>
     req<SearchHit[]>(`/search?q=${encodeURIComponent(query)}&mode=${mode}`),
+  mailAccounts: () => req<MailAccount[]>("/mail/accounts"),
+  mailMessages: (q: { query?: string; account_id?: string } = {}) => {
+    const p = new URLSearchParams();
+    if (q.query) p.set("query", q.query);
+    if (q.account_id) p.set("account_id", q.account_id);
+    return req<MailMessageSummary[]>(`/mail/messages?${p}`);
+  },
+  mailThread: (threadId: string) => req<MailThread>(`/mail/thread/${encodeURIComponent(threadId)}`),
   wire: () => req<WireEvent[]>("/wire"),
   // Trigger an immediate source poll (worker normally polls on a schedule).
   // The backend endpoint may not exist yet — callers should catch and fall
@@ -199,6 +222,7 @@ export const api = {
     scope: string;
     ai_actor: string;
     csrf: string;
+    token_ttl_secs?: number;
   }) =>
     fetch("/oauth/authorize/grant", {
       method: "POST",
@@ -215,12 +239,31 @@ export const api = {
   addUser: (u: { name: string; email: string; password: string; role?: UserRole; kind?: "human" | "ai" }) =>
     req<SafeUser>("/users", { method: "POST", body: JSON.stringify(u) }),
   apiTokens: () => req<ApiToken[]>("/tokens"),
-  createToken: (actor: string, label: string, expiresInDays?: number) =>
+  createToken: (actor: string, label: string, expiresInDays?: number, neverExpires = false) =>
     req<{ token: string; record: ApiToken }>("/tokens", {
       method: "POST",
-      body: JSON.stringify({ actor, label, expiresInDays }),
+      body: JSON.stringify({ actor, label, expiresInDays, neverExpires }),
     }),
   deleteToken: (id: string) => req<void>(`/tokens/${id}`, { method: "DELETE" }),
+
+  // admin: connected OAuth apps — list clients with live token stats, revoke all
+  // of a client's tokens (disconnects the app).
+  oauthClients: () => req<OAuthClientStatus[]>("/oauth/clients"),
+  revokeOAuthClient: (id: string) =>
+    req<{ revoked: number }>(`/oauth/clients/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  // admin: bulk-reassign journal namespace ownership. Filters are ANDed; `to`
+  // omitted/null makes matched entries global.
+  reassignJournalScope: (body: {
+    match_unscoped?: boolean;
+    from_user?: string;
+    author?: string;
+    to?: string | null;
+  }) =>
+    req<{ changed: number }>("/journal/reassign-scope", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 
   // admin: bulk import from a legacy hive.db (SQLite). Multipart upload — we let the
   // browser set the content-type/boundary, so this bypasses the JSON `req` helper.
@@ -231,4 +274,94 @@ export const api = {
     if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
     return res.json() as Promise<ImportResult & { warnings: string[] }>;
   },
+
+  // ---- hosted Claude Code workspaces (hive → Claude Code) ----
+  workspaces: (limit = 50) => req<CcSession[]>(`/workspaces?limit=${limit}`),
+  workspace: (id: string) => req<CcSession>(`/workspaces/${id}`),
+  createWorkspace: (input: { title?: string; runtime?: RuntimeKind | string; provider?: string; model?: string; prompt?: string; tags?: string[]; project?: string; linked_entities?: Array<{ kind: string; id: string; rel?: string }> }) =>
+    req<CcSession>("/workspaces", { method: "POST", body: JSON.stringify(input) }),
+  transcript: (id: string, after = 0, limit = 2000) =>
+    req<CcMessage[]>(`/workspaces/${id}/messages?after=${after}&limit=${limit}`),
+  sendInput: (id: string, text: string) =>
+    req<CcMessage>(`/workspaces/${id}/input`, { method: "POST", body: JSON.stringify({ text }) }),
+  archiveWorkspace: (id: string) =>
+    req<{ ok: boolean }>(`/workspaces/${id}/archive`, { method: "POST" }),
+
+  // ---- user-defined custom entity types ----
+  entityTypes: (includeArchived = false) =>
+    req<EntityTypeView[]>(`/entity-types${includeArchived ? "?include_archived=1" : ""}`),
+  createEntityType: (input: NewEntityType) =>
+    req<EntityTypeView>("/entity-types", { method: "POST", body: JSON.stringify(input) }),
+  patchEntityType: (idOrSlug: string, patch: EntityTypePatch) =>
+    req<EntityTypeView>(`/entity-types/${idOrSlug}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  deleteEntityType: (idOrSlug: string) =>
+    req<void>(`/entity-types/${idOrSlug}`, { method: "DELETE" }),
+  entities: (type: string, opts: { limit?: number; offset?: number; sort?: string; dir?: "asc" | "desc"; filters?: Record<string, string> } = {}) => {
+    const p = new URLSearchParams({ type });
+    if (opts.limit) p.set("limit", String(opts.limit));
+    if (opts.offset) p.set("offset", String(opts.offset));
+    if (opts.sort) p.set("sort", opts.sort);
+    if (opts.dir) p.set("dir", opts.dir);
+    for (const [k, v] of Object.entries(opts.filters ?? {})) if (v) p.set(`f.${k}`, v);
+    return req<CustomEntity[]>(`/entities?${p}`);
+  },
+  entity: (id: string) => req<CustomEntity>(`/entities/${id}`),
+  createEntity: (input: NewCustomEntity) =>
+    req<CustomEntity>("/entities", { method: "POST", body: JSON.stringify(input) }),
+  patchEntity: (id: string, patch: CustomEntityPatch) =>
+    req<CustomEntity>(`/entities/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  deleteEntity: (id: string) => req<void>(`/entities/${id}`, { method: "DELETE" }),
+
+  // per-user Claude Code credentials (secret never returned)
+  ccCredentials: () => req<CcCredentialView[]>("/cc-credentials"),
+  saveCcCredential: (input: { kind: string; runtime?: RuntimeKind; provider?: string; label?: string; secret: string }) =>
+    req<CcCredentialView>("/cc-credentials", { method: "POST", body: JSON.stringify(input) }),
+  deleteCcCredential: (id: string) => req<void>(`/cc-credentials/${id}`, { method: "DELETE" }),
 };
+
+// ---- hosted Claude Code workspace types (kept local; mirror api/src/store) ----
+export type RuntimeKind = "claude_code" | "codex" | "opencode";
+
+export interface CcSession {
+  id: string;
+  owner: string;
+  created_by: string;
+  title: string;
+  workdir: string;
+  claude_session_id: string | null;
+  runtime: RuntimeKind | string;
+  status: string;
+  model: string | null;
+  usage: unknown;
+  meta: unknown;
+  repo_url: string | null;
+  repo_ref: string | null;
+  created_at: string;
+  updated_at: string;
+  last_activity_at: string | null;
+}
+
+export interface CcMessage {
+  id: string;
+  session_id: string;
+  seq: number;
+  role: string;
+  kind: string;
+  content: { text?: string; [k: string]: unknown };
+  raw: unknown;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  created_at: string;
+}
+
+export interface CcCredentialView {
+  id: string;
+  owner: string;
+  kind: string;
+  runtime: RuntimeKind | string;
+  provider: string | null;
+  label: string;
+  tail: string;
+  created_at: string;
+  last_used_at: string | null;
+}

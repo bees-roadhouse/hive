@@ -84,8 +84,7 @@ async fn entry(
     // handleMcp; OPTIONS is short-circuited by the middleware): 401 + RFC 9728
     // resource-metadata pointer.
     if store.onboarding_required().await? || ctx.actor.is_none() {
-        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
-        let issuer = issuer_for(&store, host).await;
+        let issuer = issuer_for(&store, &headers).await;
         let mut res = http_rpc_error(
             StatusCode::UNAUTHORIZED,
             -32001,
@@ -100,7 +99,6 @@ async fn entry(
             .insert("access-control-allow-origin", HeaderValue::from_static("*"));
         return Ok(res);
     }
-    let actor = ctx.actor().to_string();
 
     // Authenticated non-POST gets Node's 405 (handleMcp).
     if method != Method::POST {
@@ -192,7 +190,7 @@ async fn entry(
 
     let mut responses: Vec<Value> = Vec::new();
     for m in messages.iter().filter(|m| is_request(m)) {
-        responses.push(handle_request(&store, &actor, m).await);
+        responses.push(handle_request(&store, &ctx, m).await);
     }
     let out = if responses.len() == 1 {
         responses.pop().unwrap_or(Value::Null)
@@ -202,7 +200,7 @@ async fn entry(
     Ok(Json(out).into_response())
 }
 
-async fn handle_request(store: &Store, actor: &str, msg: &Value) -> Value {
+async fn handle_request(store: &Store, ctx: &AuthCtx, msg: &Value) -> Value {
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let params = msg.get("params");
@@ -233,7 +231,7 @@ async fn handle_request(store: &Store, actor: &str, msg: &Value) -> Value {
                     )
                 }
             };
-            rpc_result(&id, mcp::call_tool(store, actor, name, &arguments).await)
+            rpc_result(&id, mcp::call_tool(store, ctx, name, &arguments).await)
         }
         // Notifications never reach here (no id ⇒ no response); a request
         // using a notification method has no request handler in Node either.
@@ -372,7 +370,19 @@ mod tests {
         AuthCtx {
             actor: Some("nate".to_string()),
             principal: Some("token"),
+            role: Some(hive_shared::UserRole::Admin),
+            namespace_user: Some("nate".to_string()),
+            session_cookie: None,
+        }
+    }
+
+    /// A non-admin token principal acting as `actor` (its own namespace).
+    fn ctx_for(actor: &str) -> AuthCtx {
+        AuthCtx {
+            actor: Some(actor.to_string()),
+            principal: Some("token"),
             role: None,
+            namespace_user: Some(actor.to_string()),
             session_cookie: None,
         }
     }
@@ -395,7 +405,7 @@ mod tests {
         let (store, _dir) = test_store().await;
         let res = handle_request(
             &store,
-            "nate",
+            &authed(),
             &req(
                 "initialize",
                 json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
@@ -420,7 +430,7 @@ mod tests {
         // Unsupported version → the SDK's latest.
         let res = handle_request(
             &store,
-            "nate",
+            &authed(),
             &req(
                 "initialize",
                 json!({"protocolVersion": "1999-01-01", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
@@ -436,7 +446,7 @@ mod tests {
         // Missing params → the protocol layer's -32603 zod message (measured).
         let res = handle_request(
             &store,
-            "nate",
+            &authed(),
             &json!({"jsonrpc": "2.0", "id": 3, "method": "initialize"}),
         )
         .await;
@@ -450,10 +460,10 @@ mod tests {
     #[tokio::test]
     async fn tools_list_matches_node_surface() {
         let (store, _dir) = test_store().await;
-        let res = handle_request(&store, "nate", &req("tools/list", json!({}), 1)).await;
+        let res = handle_request(&store, &authed(), &req("tools/list", json!({}), 1)).await;
         let tools = res["result"]["tools"].as_array().expect("tools array");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        // Node order, then the Rust-branch identity tools.
+        // Node order, then the Rust-branch identity + workspace tools.
         assert_eq!(
             names,
             vec![
@@ -468,6 +478,9 @@ mod tests {
                 "inbox_list",
                 "inbox_mark_read",
                 "search",
+                "mail_search",
+                "mail_thread_get",
+                "mail_accounts_list",
                 "dashboard",
                 "semantic_search",
                 "profile_get",
@@ -490,6 +503,17 @@ mod tests {
                 "identity_resolve",
                 "identity_list",
                 "identity_unlink",
+                "workspace_list",
+                "workspace_get",
+                "workspace_transcript",
+                "entity_types_list",
+                "entity_type_create",
+                "entity_type_update",
+                "entities_list",
+                "entity_get",
+                "entity_create",
+                "entity_update",
+                "entity_delete",
             ]
         );
         // Spot-check a schema verbatim against the captured Node output.
@@ -522,7 +546,7 @@ mod tests {
         // Authorship pins to the token actor even if the client tries to spoof.
         let res = handle_request(
             &store,
-            "pia",
+            &ctx_for("pia"),
             &req(
                 "tools/call",
                 json!({"name": "journal_append", "arguments": {"body": "hello hive", "author": "nate"}}),
@@ -536,7 +560,7 @@ mod tests {
         // Missing required arg → the SDK's exact wrapped zod message (measured).
         let res = handle_request(
             &store,
-            "nate",
+            &authed(),
             &req(
                 "tools/call",
                 json!({"name": "journal_get", "arguments": {}}),
@@ -553,7 +577,7 @@ mod tests {
         // Unknown tool → isError content, not a JSON-RPC error (measured).
         let res = handle_request(
             &store,
-            "nate",
+            &authed(),
             &req(
                 "tools/call",
                 json!({"name": "nope_not_a_tool", "arguments": {}}),
@@ -568,14 +592,14 @@ mod tests {
         );
 
         // Unknown method → -32601 (measured).
-        let res = handle_request(&store, "nate", &req("no/such_method", json!({}), 4)).await;
+        let res = handle_request(&store, &authed(), &req("no/such_method", json!({}), 4)).await;
         assert_eq!(res["error"]["code"], -32601);
         assert_eq!(res["error"]["message"], "Method not found");
 
         // ping → empty result (measured).
         let res = handle_request(
             &store,
-            "nate",
+            &authed(),
             &json!({"jsonrpc": "2.0", "id": 5, "method": "ping"}),
         )
         .await;
@@ -584,7 +608,7 @@ mod tests {
         // Admin gate: nate (onboarding admin) previews; pia is refused.
         let res = handle_request(
             &store,
-            "pia",
+            &ctx_for("pia"),
             &req(
                 "tools/call",
                 json!({"name": "actor_delete", "arguments": {"slug": "nate"}}),
@@ -598,7 +622,7 @@ mod tests {
         );
         let res = handle_request(
             &store,
-            "nate",
+            &authed(),
             &req(
                 "tools/call",
                 json!({"name": "actor_delete", "arguments": {"slug": "nate", "dry_run": true}}),
@@ -610,6 +634,113 @@ mod tests {
             res["result"]["isError"].is_null(),
             "dry-run preview should succeed: {res}"
         );
+    }
+
+    #[tokio::test]
+    async fn inbox_tools_are_viewer_gated() {
+        let (store, _dir) = test_store().await;
+        let item = store
+            .inbox_add(
+                "nate",
+                "maggie",
+                hive_shared::InboxReason::Mention,
+                hive_shared::EntityKind::Journal.as_str(),
+                "jrnl_secret",
+                None,
+                "private snippet only nate may see",
+            )
+            .await
+            .expect("inbox add")
+            .expect("delivered");
+
+        // Another actor's token can no longer read nate's inbox…
+        let res = handle_request(
+            &store,
+            &ctx_for("pia"),
+            &req(
+                "tools/call",
+                json!({"name": "inbox_list", "arguments": {"recipient": "nate"}}),
+                1,
+            ),
+        )
+        .await;
+        assert_eq!(
+            res["result"]["isError"], true,
+            "cross-actor inbox_list: {res}"
+        );
+        assert_eq!(res["result"]["content"][0]["text"], "forbidden");
+
+        // …nor mark nate's notifications read, by item id (a foreign id
+        // answers exactly like a missing one — no existence oracle) or
+        // wholesale.
+        let res = handle_request(
+            &store,
+            &ctx_for("pia"),
+            &req(
+                "tools/call",
+                json!({"name": "inbox_mark_read", "arguments": {"id": item.id}}),
+                2,
+            ),
+        )
+        .await;
+        assert_eq!(
+            content_text(&res["result"]),
+            json!({"marked": false}),
+            "cross-actor mark by id: {res}"
+        );
+        let res = handle_request(
+            &store,
+            &ctx_for("pia"),
+            &req(
+                "tools/call",
+                json!({"name": "inbox_mark_read", "arguments": {"recipient": "nate"}}),
+                3,
+            ),
+        )
+        .await;
+        assert_eq!(
+            res["result"]["isError"], true,
+            "cross-actor mark all: {res}"
+        );
+        assert_eq!(store.inbox_unread_count("nate").await.unwrap(), 1);
+
+        // The recipient reads their own; an admin token may read anyone's.
+        let res = handle_request(
+            &store,
+            &ctx_for("nate"),
+            &req(
+                "tools/call",
+                json!({"name": "inbox_list", "arguments": {"recipient": "nate"}}),
+                4,
+            ),
+        )
+        .await;
+        let items = content_text(&res["result"]);
+        assert_eq!(items.as_array().map(Vec::len), Some(1), "own inbox: {res}");
+        let res = handle_request(
+            &store,
+            &authed(),
+            &req(
+                "tools/call",
+                json!({"name": "inbox_list", "arguments": {"recipient": "maggie"}}),
+                5,
+            ),
+        )
+        .await;
+        assert!(res["result"]["isError"].is_null(), "admin list: {res}");
+
+        // Own mark-read still works.
+        let res = handle_request(
+            &store,
+            &ctx_for("nate"),
+            &req(
+                "tools/call",
+                json!({"name": "inbox_mark_read", "arguments": {"id": item.id}}),
+                6,
+            ),
+        )
+        .await;
+        assert_eq!(content_text(&res["result"]), json!({"marked": true}));
     }
 
     #[tokio::test]

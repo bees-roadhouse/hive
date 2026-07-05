@@ -9,15 +9,20 @@ use sqlx::PgPool;
 use tokio::sync::broadcast;
 
 pub mod actors;
+pub mod cc_credentials;
 pub mod config;
+pub mod custom_entities;
 pub mod dashboard;
 pub mod decisions;
+pub mod entity_types;
+pub mod entity_validation;
 pub mod events;
 pub mod identities;
 pub mod import;
 pub mod inbox;
 pub mod journal;
 pub mod links;
+pub mod mail;
 pub mod oauth;
 pub mod outbox;
 pub mod people;
@@ -35,6 +40,7 @@ pub mod tokens;
 pub mod topics;
 pub mod users;
 pub mod workerstatus;
+pub mod workspaces;
 
 pub use crate::auth::now_iso;
 
@@ -124,6 +130,15 @@ impl WireRow {
 /// `prefix_<nanoid(12)>` — the Node id() helper.
 pub fn new_id(prefix: &str) -> String {
     format!("{prefix}_{}", nanoid::nanoid!(12))
+}
+
+/// `?,?,?` for n binds, or the never-matching literal Node uses when a set is empty.
+pub(crate) fn placeholders_or_never(n: usize) -> String {
+    if n == 0 {
+        "'__never__'".to_string()
+    } else {
+        vec!["?"; n].join(",")
+    }
 }
 
 /// Truncate to 140 chars with `…` (the Node snip default).

@@ -1,0 +1,16 @@
+{
+  "name": "hive-memory",
+  "displayName": "Hive Memory",
+  "version": "0.1.0",
+  "description": "Injects Hive recall at Claude Code session start, exposes Hive MCP, and teaches Claude to save durable memory as Hive journal prose.",
+  "author": {
+    "name": "Bee's Roadhouse",
+    "url": "https://github.com/bees-roadhouse/hive"
+  },
+  "homepage": "https://github.com/bees-roadhouse/hive",
+  "repository": "https://github.com/bees-roadhouse/hive",
+  "license": "MIT",
+  "keywords": ["hive", "memory", "journal", "recall", "mcp"],
+  "hooks": "./hooks/hooks.json",
+  "mcpServers": "./.mcp.json"
+}

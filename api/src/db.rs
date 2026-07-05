@@ -39,6 +39,10 @@ const SCHEMA: &str = r#"
       body       TEXT NOT NULL,
       tags       TEXT NOT NULL DEFAULT '[]',
       mentions   TEXT NOT NULL DEFAULT '[]',
+      -- Namespace owner: the human user this entry belongs to. NULL = global /
+      -- "continuous" history visible to everyone. Non-NULL = visible only to
+      -- that user (+ admins). See the Visibility model in middleware.rs.
+      user_scope TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -295,7 +299,9 @@ const SCHEMA: &str = r#"
       scope          TEXT NOT NULL,
       created_at     TEXT NOT NULL,
       expires_at     TEXT NOT NULL,
-      used_at        TEXT
+      used_at        TEXT,
+      -- Requested access-token lifetime (seconds) carried from consent; NULL = default.
+      token_ttl_secs BIGINT
     );
     CREATE INDEX IF NOT EXISTS oauth_codes_expiry ON oauth_auth_codes (expires_at);
 
@@ -320,6 +326,75 @@ const SCHEMA: &str = r#"
       created_at  TEXT NOT NULL,
       UNIQUE (platform, platform_id)
     );
+
+    -- ===== Hosted Claude Code workspaces (hive → Claude Code) =====
+    -- One row per session hive spins up and drives in an isolated sandbox.
+    -- Separate from the journal; scoped per owner (see Visibility in middleware.rs).
+    CREATE TABLE IF NOT EXISTS cc_sessions (
+      id                TEXT PRIMARY KEY,
+      owner             TEXT NOT NULL,
+      created_by        TEXT NOT NULL,
+      title             TEXT NOT NULL DEFAULT '',
+      workdir           TEXT NOT NULL DEFAULT '',
+      claude_session_id TEXT,
+      runtime           TEXT NOT NULL DEFAULT 'claude_code',
+      status            TEXT NOT NULL DEFAULT 'provisioning',
+      model             TEXT,
+      usage             TEXT NOT NULL DEFAULT '{}',
+      meta              TEXT NOT NULL DEFAULT '{}',
+      repo_url          TEXT,
+      repo_ref          TEXT,
+      created_at        TEXT NOT NULL,
+      updated_at        TEXT NOT NULL,
+      last_activity_at  TEXT
+    );
+    CREATE INDEX IF NOT EXISTS cc_sessions_owner ON cc_sessions (owner);
+
+    -- Complete chat history per session: every Agent-SDK message, lossless.
+    CREATE TABLE IF NOT EXISTS cc_messages (
+      id          TEXT PRIMARY KEY,
+      session_id  TEXT NOT NULL,
+      seq         BIGINT NOT NULL,
+      role        TEXT NOT NULL,
+      kind        TEXT NOT NULL,
+      content     TEXT NOT NULL DEFAULT '{}',
+      raw         TEXT NOT NULL DEFAULT '{}',
+      tokens_in   BIGINT,
+      tokens_out  BIGINT,
+      created_at  TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS cc_messages_session ON cc_messages (session_id, seq);
+
+    -- Per-user Claude Code credentials, encrypted at rest (AES-256-GCM via
+    -- HIVE_CRED_KEY). Reversible (unlike PAT/password hashes): the runner must
+    -- hand the real token to Claude Code. Plaintext never leaves the server.
+    CREATE TABLE IF NOT EXISTS cc_credentials (
+      id           TEXT PRIMARY KEY,
+      owner        TEXT NOT NULL,
+      kind         TEXT NOT NULL,
+      runtime      TEXT NOT NULL DEFAULT 'claude_code',
+      provider     TEXT,
+      label        TEXT NOT NULL DEFAULT '',
+      ciphertext   TEXT NOT NULL,
+      nonce        TEXT NOT NULL,
+      tail         TEXT NOT NULL DEFAULT '',
+      created_at   TEXT NOT NULL,
+      last_used_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS cc_credentials_owner ON cc_credentials (owner);
+
+    -- Browser-based OAuth handshakes for hosted agent runtimes. State rows are
+    -- short-lived and redeemed exactly once by /api/runtime-oauth/:runtime/callback.
+    CREATE TABLE IF NOT EXISTS runtime_oauth_states (
+      state         TEXT PRIMARY KEY,
+      owner         TEXT NOT NULL,
+      runtime       TEXT NOT NULL,
+      provider      TEXT,
+      code_verifier TEXT NOT NULL,
+      return_to     TEXT NOT NULL DEFAULT '/settings',
+      created_at    TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS runtime_oauth_states_owner ON runtime_oauth_states (owner);
 "#;
 
 /// Unified full-text index. Postgres equivalent of the old FTS5 virtual table:
@@ -337,6 +412,167 @@ const SCHEMA_SEARCH: &str = r#"
       PRIMARY KEY (kind, ref_id)
     );
     CREATE INDEX IF NOT EXISTS search_tsv ON search USING GIN (tsv);
+
+    -- ===== User-defined custom entity types =====
+    -- Registry (entity_types + entity_fields) + validated JSONB instances
+    -- (entities). fields is REAL JSONB — a deliberate departure from the
+    -- TEXT-JSON habit: server-side operators/indexes for user-shaped data.
+    -- Rust binds it as TEXT with ?::jsonb casts and reads fields::text
+    -- (workspace sqlx has no 'json' feature; SELECT * would fail to decode),
+    -- so row_to_entity in store/custom_entities.rs is the only read path.
+    -- Kind at the seams (search.kind, links.*_kind) is entity_types.slug;
+    -- instance ids are uniformly 'ent_'.
+    CREATE TABLE IF NOT EXISTS entity_types (
+      id          TEXT PRIMARY KEY,
+      slug        TEXT NOT NULL UNIQUE,
+      name        TEXT NOT NULL,
+      name_plural TEXT NOT NULL DEFAULT '',
+      description TEXT NOT NULL DEFAULT '',
+      icon        TEXT NOT NULL DEFAULT '',
+      color       TEXT NOT NULL DEFAULT '',
+      -- slug of a choice field the generic board groups by; NULL = flat list.
+      board_field TEXT,
+      archived    BOOLEAN NOT NULL DEFAULT FALSE,
+      created_by  TEXT NOT NULL,
+      created_at  TEXT NOT NULL,
+      updated_at  TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS entity_fields (
+      id         TEXT PRIMARY KEY,
+      type_id    TEXT NOT NULL,
+      slug       TEXT NOT NULL,
+      label      TEXT NOT NULL,
+      -- text | number | bool | date | choice | ref (validated in Rust only,
+      -- same enforcement level as tasks.status).
+      field_type TEXT NOT NULL,
+      required   BOOLEAN NOT NULL DEFAULT FALSE,
+      position   BIGINT NOT NULL DEFAULT 0,
+      options    TEXT NOT NULL DEFAULT '[]',
+      -- ref fields: target kind — person|topic|project|task or a custom slug.
+      ref_kind   TEXT,
+      archived   BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE (type_id, slug)
+    );
+    CREATE INDEX IF NOT EXISTS entity_fields_type ON entity_fields (type_id, position);
+
+    CREATE TABLE IF NOT EXISTS entities (
+      id              TEXT PRIMARY KEY,
+      type_id         TEXT NOT NULL,
+      title           TEXT NOT NULL,
+      fields          JSONB NOT NULL DEFAULT '{}'::jsonb,
+      -- Visibility: same model as journal.user_scope (NULL = global).
+      user_scope      TEXT,
+      -- v2 journal-emergence provenance; carried now so nothing blocks it.
+      origin_entry_id TEXT,
+      created_by      TEXT NOT NULL,
+      created_at      TEXT NOT NULL,
+      updated_at      TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS entities_type  ON entities (type_id, created_at);
+    CREATE INDEX IF NOT EXISTS entities_scope ON entities (user_scope);
+    -- Dormant in v1 (filters run in Rust at household scale); enables ad-hoc
+    -- psql @> queries and server-side filtering later without a migration.
+    CREATE INDEX IF NOT EXISTS entities_fields_gin ON entities USING GIN (fields jsonb_path_ops);
+
+    -- Phase 1 mail archive skeleton. Sync credentials/state intentionally live
+    -- elsewhere; these tables only hold read-only rows already ingested by a
+    -- future hive-mail process. user_scope follows journal visibility.
+    CREATE TABLE IF NOT EXISTS blobs (
+      hash       TEXT PRIMARY KEY,
+      size       BIGINT NOT NULL DEFAULT 0,
+      mime       TEXT NOT NULL DEFAULT 'application/octet-stream',
+      data       BYTEA,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS mail_accounts (
+      id              TEXT PRIMARY KEY,
+      owner           TEXT NOT NULL,
+      address         TEXT NOT NULL,
+      jmap_url        TEXT NOT NULL DEFAULT '',
+      jmap_account_id TEXT NOT NULL DEFAULT '',
+      cred_id         TEXT,
+      email_state     TEXT,
+      mailbox_state   TEXT,
+      backfill_status TEXT NOT NULL DEFAULT 'pending',
+      backfill_cursor JSONB,
+      attempts        BIGINT NOT NULL DEFAULT 0,
+      next_attempt_at TEXT,
+      last_error      TEXT,
+      last_synced_at  TEXT,
+      last_status     TEXT,
+      enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at      TEXT NOT NULL,
+      updated_at      TEXT NOT NULL,
+      UNIQUE (owner, address)
+    );
+    CREATE INDEX IF NOT EXISTS mail_accounts_owner ON mail_accounts (owner, address);
+
+    CREATE TABLE IF NOT EXISTS mail_mailboxes (
+      id         TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
+      jmap_id    TEXT NOT NULL,
+      name       TEXT NOT NULL,
+      role       TEXT,
+      ingest     BOOLEAN NOT NULL DEFAULT FALSE,
+      sort_order BIGINT NOT NULL DEFAULT 0,
+      UNIQUE (account_id, jmap_id)
+    );
+    CREATE INDEX IF NOT EXISTS mail_mailboxes_account ON mail_mailboxes (account_id, sort_order);
+
+    CREATE TABLE IF NOT EXISTS mail_messages (
+      id               TEXT PRIMARY KEY,
+      account_id       TEXT NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
+      jmap_id          TEXT NOT NULL,
+      jmap_thread_id   TEXT NOT NULL,
+      message_id_hdr   TEXT,
+      in_reply_to      TEXT,
+      references_json  TEXT NOT NULL DEFAULT '[]',
+      from_addr        TEXT NOT NULL DEFAULT '',
+      from_name        TEXT,
+      to_json          TEXT NOT NULL DEFAULT '[]',
+      cc_json          TEXT NOT NULL DEFAULT '[]',
+      reply_to_json    TEXT NOT NULL DEFAULT '[]',
+      subject          TEXT NOT NULL DEFAULT '',
+      sent_at          TEXT,
+      received_at      TEXT NOT NULL,
+      mailbox_ids_json TEXT NOT NULL DEFAULT '[]',
+      keywords_json    TEXT NOT NULL DEFAULT '{}',
+      body_text        TEXT NOT NULL DEFAULT '',
+      body_source      TEXT NOT NULL DEFAULT 'plain',
+      snippet          TEXT NOT NULL DEFAULT '',
+      size             BIGINT NOT NULL DEFAULT 0,
+      has_attachments  BOOLEAN NOT NULL DEFAULT FALSE,
+      embed_state      TEXT NOT NULL DEFAULT 'pending',
+      user_scope       TEXT NOT NULL,
+      deleted_at       TEXT,
+      created_at       TEXT NOT NULL,
+      updated_at       TEXT NOT NULL,
+      UNIQUE (account_id, jmap_id)
+    );
+    CREATE INDEX IF NOT EXISTS mail_messages_scope_received ON mail_messages (user_scope, received_at DESC);
+    CREATE INDEX IF NOT EXISTS mail_messages_account_thread ON mail_messages (account_id, jmap_thread_id);
+    CREATE INDEX IF NOT EXISTS mail_messages_message_id ON mail_messages (message_id_hdr);
+    CREATE INDEX IF NOT EXISTS mail_messages_subject ON mail_messages (subject);
+
+    CREATE TABLE IF NOT EXISTS mail_attachments (
+      id             TEXT PRIMARY KEY,
+      message_id     TEXT NOT NULL REFERENCES mail_messages(id) ON DELETE CASCADE,
+      blob_hash      TEXT REFERENCES blobs(hash) ON DELETE SET NULL,
+      jmap_blob_id   TEXT NOT NULL DEFAULT '',
+      filename       TEXT NOT NULL DEFAULT '',
+      mime           TEXT NOT NULL DEFAULT 'application/octet-stream',
+      size           BIGINT NOT NULL DEFAULT 0,
+      content_id     TEXT,
+      disposition    TEXT,
+      skipped_reason TEXT,
+      created_at     TEXT NOT NULL,
+      UNIQUE NULLS NOT DISTINCT (message_id, jmap_blob_id, content_id)
+    );
+    CREATE INDEX IF NOT EXISTS mail_attachments_message ON mail_attachments (message_id);
 "#;
 
 pub async fn migrate(pool: &PgPool) -> Result<()> {
@@ -357,6 +593,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
     // Idempotent column additions for DBs created before these columns existed.
     // Postgres has ADD COLUMN IF NOT EXISTS, so no existence probe is needed.
     for ddl in [
+        "ALTER TABLE journal    ADD COLUMN IF NOT EXISTS user_scope TEXT",
         "ALTER TABLE sources    ADD COLUMN IF NOT EXISTS owner      TEXT",
         "ALTER TABLE tasks      ADD COLUMN IF NOT EXISTS phase      TEXT",
         "ALTER TABLE tasks      ADD COLUMN IF NOT EXISTS due        TEXT",
@@ -369,6 +606,12 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS granted_by TEXT",
         "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS expires_at TEXT",
         "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS scope      TEXT",
+        "ALTER TABLE oauth_auth_codes ADD COLUMN IF NOT EXISTS token_ttl_secs BIGINT",
+        "ALTER TABLE cc_sessions ADD COLUMN IF NOT EXISTS runtime TEXT NOT NULL DEFAULT 'claude_code'",
+        "ALTER TABLE cc_credentials ADD COLUMN IF NOT EXISTS runtime TEXT NOT NULL DEFAULT 'claude_code'",
+        "ALTER TABLE cc_credentials ADD COLUMN IF NOT EXISTS provider TEXT",
+        "CREATE TABLE IF NOT EXISTS runtime_oauth_states (state TEXT PRIMARY KEY, owner TEXT NOT NULL, runtime TEXT NOT NULL, provider TEXT, code_verifier TEXT NOT NULL, return_to TEXT NOT NULL DEFAULT '/settings', created_at TEXT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS runtime_oauth_states_owner ON runtime_oauth_states (owner)",
     ] {
         sqlx::raw_sql(ddl).execute(pool).await?;
     }
