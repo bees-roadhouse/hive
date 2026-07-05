@@ -595,8 +595,10 @@ button.ghost { background: transparent; color: var(--dim); font-size: var(--fs-s
   background: var(--panel2); border-radius: var(--r-sm); border: 1px solid transparent;
   font-size: var(--fs-xs); display: flex; flex-direction: column; gap: 2px;
 }
+/* .cal-today sits after .cal-cell and .cal-empty, so plain source order wins
+   the border-color — no !important needed. */
 .cal-empty { background: transparent; border-color: transparent; }
-.cal-today { border-color: var(--honey) !important; background: color-mix(in srgb, var(--honey) 8%, transparent); }
+.cal-today { border-color: var(--honey); background: color-mix(in srgb, var(--honey) 8%, transparent); }
 .cal-num { font-size: var(--fs-xs); color: var(--dim); line-height: 1; }
 .cal-today .cal-num { color: var(--honey); font-weight: 700; }
 
@@ -631,7 +633,10 @@ button.ghost { background: transparent; color: var(--dim); font-size: var(--fs-s
 .upcoming-row { display: flex; align-items: center; justify-content: space-between; gap: 0.4rem; }
 .upcoming-row .cal-task-chip { flex: 1; min-width: 0; font-size: var(--fs-xs); padding: 0.15rem 0.4rem; }
 
-/* Sparkline chart */
+/* Sparkline chart — bars are honey; zero-days stay as faint placeholders. */
+.spark-svg { width: 100%; display: block; }
+.spark-bar { fill: var(--honey); opacity: 0.82; }
+.spark-bar-zero { opacity: 0.08; }
 .spark-axis { display: flex; justify-content: space-between; margin-top: 0.25rem; }
 .dash-chart-sub { margin: 0.25rem 0 0; }
 
@@ -639,7 +644,7 @@ button.ghost { background: transparent; color: var(--dim); font-size: var(--fs-s
 .dash-hbar-row { display: flex; align-items: center; gap: 0.5rem; margin: 0.3rem 0; font-size: var(--fs-sm); }
 .dash-hbar-label { width: 5.5rem; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-transform: capitalize; }
 .dash-hbar-track { flex: 1; height: 9px; background: var(--panel2); border-radius: var(--r-xs); overflow: hidden; }
-.dash-hbar-fill { height: 100%; border-radius: var(--r-xs); transition: width var(--t-slow) ease; }
+.dash-hbar-fill { height: 100%; background: var(--honey); border-radius: var(--r-xs); transition: width var(--t-slow) ease; }
 .dash-hbar-val { width: 2rem; text-align: right; color: var(--dim); font-size: var(--fs-xs); }
 
 /* Agent live feed */
