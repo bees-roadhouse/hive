@@ -1,6 +1,5 @@
-import { createResource, createSignal, For, Show, type Component } from "solid-js";
-import { ACTORS } from "@hive/shared";
-import { api, getActor } from "./api.ts";
+import { createMemo, createResource, createSignal, For, Show, type Component } from "solid-js";
+import { api, getActor, getCurrentUser } from "./api.ts";
 import { liveRev } from "./live.ts";
 import { Mentions, relTime } from "./lib.tsx";
 
@@ -11,10 +10,30 @@ const REASON_GLYPH: Record<string, string> = {
   event: "◷",
 };
 
-/** Per-actor inbox. Humans and AIs each get one; switch the recipient to peek. */
+/** Per-actor inbox. The tabs mirror the server's viewer gate: yourself and
+ *  the AIs you own; admins can open anyone's. */
 export const Inbox: Component = () => {
   const [who, setWho] = createSignal(getActor());
   const [unreadOnly, setUnreadOnly] = createSignal(true);
+  const [people] = createResource(api.people);
+
+  const tabs = createMemo(() => {
+    const me = getActor();
+    const all = people() ?? [];
+    const visible =
+      getCurrentUser()?.role === "admin"
+        ? all
+        : all.filter((p) => p.slug === me || (p.kind === "ai" && p.owner === me));
+    // Self first, then humans, then AIs — stable regardless of API order.
+    const rank = (p: { slug: string; kind: string }) =>
+      p.slug === me ? 0 : p.kind === "human" ? 1 : 2;
+    const sorted = visible
+      .map((p) => ({ slug: p.slug, name: p.name, kind: p.kind }))
+      .sort((a, b) => rank(a) - rank(b) || a.slug.localeCompare(b.slug));
+    // Until people load (or if self has no person row yet), keep a self tab.
+    return sorted.length ? sorted : [{ slug: me, name: me, kind: "human" }];
+  });
+
   const [items, { refetch }] = createResource(
     () => ({ who: who(), unread: unreadOnly(), _r: liveRev() }),
     (k) => api.inbox(k.who, k.unread),
@@ -33,9 +52,9 @@ export const Inbox: Component = () => {
     <section class="inbox">
       <div class="inbox-bar">
         <div class="who-tabs">
-          <For each={ACTORS}>
+          <For each={tabs()}>
             {(a) => (
-              <button classList={{ active: who() === a.name }} onClick={() => setWho(a.name)}>
+              <button classList={{ active: who() === a.slug }} onClick={() => setWho(a.slug)}>
                 {a.name}
                 <span class="kind-dot" classList={{ ai: a.kind === "ai" }} />
               </button>

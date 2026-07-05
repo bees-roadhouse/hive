@@ -641,6 +641,166 @@ async fn onboarding_gate_then_full_flow() {
     );
 }
 
+/// REST twin of the MCP `inbox_tools_are_viewer_gated` test: the inbox routes
+/// answer only for yourself, AIs you own (sessions), or anyone if admin.
+#[tokio::test]
+async fn rest_inbox_routes_are_viewer_gated() {
+    let _guard = env_guard().await;
+    reset_auth_env();
+    let (app, store) = test_app().await;
+    let admin = onboard(&app).await; // nate, admin
+
+    // A member with a login (maggie) and an AI she owns (pia).
+    let (status, body, _) = send(
+        &app,
+        post_json(
+            "/api/users",
+            json!({"name": "Maggie", "email": "maggie@example.com", "password": "hunter22-strong", "role": "member"}),
+            Some(&admin),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "member create: {body}");
+    assert_eq!(body["actor"], "maggie");
+    let (status, body, headers) = send(
+        &app,
+        post_json(
+            "/api/auth/login",
+            json!({"email": "maggie@example.com", "password": "hunter22-strong"}),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "member login: {body}");
+    let maggie = headers
+        .get(header::SET_COOKIE)
+        .expect("member session cookie")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let (status, _, _) = send(
+        &app,
+        post_json(
+            "/api/people",
+            json!({"name": "pia", "kind": "ai"}),
+            Some(&admin),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body, _) = send(
+        &app,
+        patch_json("/api/people/pia", json!({"owner": "maggie"}), Some(&admin)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "grant pia to maggie: {body}");
+
+    // One notification per recipient.
+    let mut items = std::collections::HashMap::new();
+    for (to, from) in [("nate", "maggie"), ("maggie", "nate"), ("pia", "nate")] {
+        let item = store
+            .inbox_add(
+                to,
+                from,
+                hive_shared::InboxReason::Mention,
+                hive_shared::EntityKind::Journal,
+                "jrnl_secret",
+                None,
+                &format!("private snippet only {to} may see"),
+            )
+            .await
+            .expect("inbox add")
+            .expect("delivered");
+        items.insert(to, item);
+    }
+
+    // A member can no longer read another human's inbox, nor mark it read —
+    // by item or wholesale.
+    let (status, body, _) = send(&app, get("/api/inbox/nate", Some(&maggie))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "cross-actor list: {body}");
+    assert_eq!(body["error"], "forbidden");
+    let (status, _, _) = send(
+        &app,
+        post_json("/api/inbox/nate/read", json!({}), Some(&maggie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) = send(
+        &app,
+        post_json(
+            &format!("/api/inbox/item/{}/read", items["nate"].id),
+            json!({}),
+            Some(&maggie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(store.inbox_unread_count("nate").await.unwrap(), 1);
+
+    // Self and owned-AI inboxes still answer; admins may peek anyone's.
+    let (status, body, _) = send(&app, get("/api/inbox/maggie", Some(&maggie))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().map(Vec::len), Some(1), "own inbox: {body}");
+    let (status, body, _) = send(&app, get("/api/inbox/pia", Some(&maggie))).await;
+    assert_eq!(status, StatusCode::OK, "owned-AI inbox: {body}");
+    assert_eq!(body.as_array().map(Vec::len), Some(1));
+    let (status, _, _) = send(&app, get("/api/inbox/maggie", Some(&admin))).await;
+    assert_eq!(status, StatusCode::OK, "admin peeks any inbox");
+
+    // Own mark-read works, both shapes.
+    let (status, body, _) = send(
+        &app,
+        post_json(
+            &format!("/api/inbox/item/{}/read", items["maggie"].id),
+            json!({}),
+            Some(&maggie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"marked": true}));
+    let (status, body, _) = send(
+        &app,
+        post_json("/api/inbox/pia/read", json!({}), Some(&maggie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"marked": 1}));
+
+    // An AI's bearer token reads its own inbox and nobody else's — not even
+    // its owner's or its granter's.
+    let (status, minted, _) = send(
+        &app,
+        post_json(
+            "/api/tokens",
+            json!({"actor": "pia", "label": "test", "expiresInDays": 30}),
+            Some(&admin),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "token mint: {minted}");
+    let token = minted["token"].as_str().unwrap();
+    let (status, body, _) = send(&app, bearer("/api/inbox/pia?unread=0", token)).await;
+    assert_eq!(status, StatusCode::OK, "AI token, own inbox: {body}");
+    assert_eq!(body.as_array().map(Vec::len), Some(1));
+    let (status, _, _) = send(&app, bearer("/api/inbox/maggie", token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "AI token, owner's inbox");
+    let (status, _, _) = send(&app, bearer("/api/inbox/nate", token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "AI token, granter's inbox");
+
+    // Unknown item ids stay a soft no-op rather than an existence probe.
+    let (status, body, _) = send(
+        &app,
+        post_json("/api/inbox/item/inb_missing/read", json!({}), Some(&maggie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"marked": false}));
+}
+
 #[tokio::test]
 async fn oidc_callback_provisions_allowed_user_and_sets_session() {
     let _guard = env_guard().await;

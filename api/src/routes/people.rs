@@ -130,6 +130,24 @@ async fn can_edit_actor_profile(s: &Store, ctx: &AuthCtx, actor: &str) -> anyhow
 
 // ---- inbox ----
 
+/// May `ctx` read/act for `identity`'s private surfaces (inbox)? Admins:
+/// anyone. Tokens: only their own actor. Sessions: also the AIs the logged-in
+/// user owns. Same predicate as the MCP tools' `can_act_for_identity`.
+async fn can_act_for_identity(s: &Store, ctx: &AuthCtx, identity: &str) -> anyhow::Result<bool> {
+    if ctx.is_admin() || identity == ctx.actor() {
+        return Ok(true);
+    }
+    if ctx.principal == Some("session") {
+        let owner = ctx.namespace_user();
+        return Ok(s
+            .people_ais_owned_by(owner)
+            .await?
+            .iter()
+            .any(|p| p.slug == identity));
+    }
+    Ok(false)
+}
+
 #[derive(Deserialize)]
 struct InboxQuery {
     unread: Option<String>,
@@ -137,20 +155,45 @@ struct InboxQuery {
 
 async fn inbox_list(
     State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
     Path(recipient): Path<String>,
     Query(q): Query<InboxQuery>,
 ) -> ApiResult {
+    // An inbox is private to its recipient — snippets quote entries other
+    // viewers may not see (DIRECTION.md Phase 0 item 3).
+    if !can_act_for_identity(&s, &ctx, &recipient).await? {
+        return Ok(forbidden());
+    }
     let unread = matches!(q.unread.as_deref(), Some("1") | Some("true"));
     Ok(Json(s.inbox_list(&recipient, unread).await?).into_response())
 }
 
-async fn inbox_read_all(State(s): State<Store>, Path(recipient): Path<String>) -> ApiResult {
+async fn inbox_read_all(
+    State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
+    Path(recipient): Path<String>,
+) -> ApiResult {
+    if !can_act_for_identity(&s, &ctx, &recipient).await? {
+        return Ok(forbidden());
+    }
     let marked = s.inbox_mark_all_read(&recipient).await?;
     Ok(Json(json!({"marked": marked})).into_response())
 }
 
-async fn inbox_read_item(State(s): State<Store>, Path(id): Path<String>) -> ApiResult {
-    let marked = s.inbox_mark_read(&id).await?;
+async fn inbox_read_item(
+    State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    // Resolve the item's recipient and gate on it — marking another actor's
+    // notifications read is cross-namespace tampering.
+    let Some(item) = s.inbox_get(&id).await? else {
+        return Ok(Json(json!({"marked": false})).into_response());
+    };
+    if !can_act_for_identity(&s, &ctx, &item.recipient).await? {
+        return Ok(forbidden());
+    }
+    let marked = s.inbox_mark_read(&id).await? > 0;
     Ok(Json(json!({"marked": marked})).into_response())
 }
 
