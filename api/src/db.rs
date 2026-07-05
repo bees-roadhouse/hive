@@ -382,6 +382,19 @@ const SCHEMA: &str = r#"
       last_used_at TEXT
     );
     CREATE INDEX IF NOT EXISTS cc_credentials_owner ON cc_credentials (owner);
+
+    -- Browser-based OAuth handshakes for hosted agent runtimes. State rows are
+    -- short-lived and redeemed exactly once by /api/runtime-oauth/:runtime/callback.
+    CREATE TABLE IF NOT EXISTS runtime_oauth_states (
+      state         TEXT PRIMARY KEY,
+      owner         TEXT NOT NULL,
+      runtime       TEXT NOT NULL,
+      provider      TEXT,
+      code_verifier TEXT NOT NULL,
+      return_to     TEXT NOT NULL DEFAULT '/settings',
+      created_at    TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS runtime_oauth_states_owner ON runtime_oauth_states (owner);
 "#;
 
 /// Unified full-text index. Postgres equivalent of the old FTS5 virtual table:
@@ -597,6 +610,8 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         "ALTER TABLE cc_sessions ADD COLUMN IF NOT EXISTS runtime TEXT NOT NULL DEFAULT 'claude_code'",
         "ALTER TABLE cc_credentials ADD COLUMN IF NOT EXISTS runtime TEXT NOT NULL DEFAULT 'claude_code'",
         "ALTER TABLE cc_credentials ADD COLUMN IF NOT EXISTS provider TEXT",
+        "CREATE TABLE IF NOT EXISTS runtime_oauth_states (state TEXT PRIMARY KEY, owner TEXT NOT NULL, runtime TEXT NOT NULL, provider TEXT, code_verifier TEXT NOT NULL, return_to TEXT NOT NULL DEFAULT '/settings', created_at TEXT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS runtime_oauth_states_owner ON runtime_oauth_states (owner)",
     ] {
         sqlx::raw_sql(ddl).execute(pool).await?;
     }
