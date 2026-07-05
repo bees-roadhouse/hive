@@ -465,12 +465,11 @@ const SCHEMA_SEARCH: &str = r#"
     -- elsewhere; these tables only hold read-only rows already ingested by a
     -- future hive-mail process. user_scope follows journal visibility.
     CREATE TABLE IF NOT EXISTS blobs (
-      id           TEXT PRIMARY KEY,
-      sha256       TEXT NOT NULL UNIQUE,
-      content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
-      byte_len     BIGINT NOT NULL DEFAULT 0,
-      storage_key  TEXT NOT NULL,
-      created_at   TEXT NOT NULL
+      hash       TEXT PRIMARY KEY,
+      size       BIGINT NOT NULL DEFAULT 0,
+      mime       TEXT NOT NULL DEFAULT 'application/octet-stream',
+      data       BYTEA,
+      created_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS mail_accounts (
@@ -500,6 +499,7 @@ const SCHEMA_SEARCH: &str = r#"
       id              TEXT PRIMARY KEY,
       account_id      TEXT NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
       mailbox_id      TEXT REFERENCES mail_mailboxes(id) ON DELETE SET NULL,
+      user_scope      TEXT NOT NULL,
       thread_id       TEXT NOT NULL,
       jmap_id         TEXT NOT NULL,
       message_id      TEXT,
@@ -516,19 +516,23 @@ const SCHEMA_SEARCH: &str = r#"
       updated_at      TEXT NOT NULL,
       UNIQUE (account_id, jmap_id)
     );
-    CREATE INDEX IF NOT EXISTS mail_messages_account_received ON mail_messages (account_id, received_at DESC);
-    CREATE INDEX IF NOT EXISTS mail_messages_thread ON mail_messages (thread_id, received_at ASC);
+    CREATE INDEX IF NOT EXISTS mail_messages_scope_received ON mail_messages (user_scope, received_at DESC);
+    CREATE INDEX IF NOT EXISTS mail_messages_account_thread ON mail_messages (account_id, thread_id);
+    CREATE INDEX IF NOT EXISTS mail_messages_message_id ON mail_messages (message_id);
     CREATE INDEX IF NOT EXISTS mail_messages_subject ON mail_messages (subject);
 
     CREATE TABLE IF NOT EXISTS mail_attachments (
       id          TEXT PRIMARY KEY,
-      message_id  TEXT NOT NULL REFERENCES mail_messages(id) ON DELETE CASCADE,
-      blob_id     TEXT REFERENCES blobs(id) ON DELETE SET NULL,
-      filename    TEXT NOT NULL DEFAULT '',
-      content_type TEXT NOT NULL DEFAULT 'application/octet-stream',
-      byte_len    BIGINT NOT NULL DEFAULT 0,
-      disposition TEXT,
-      cid         TEXT
+      message_id      TEXT NOT NULL REFERENCES mail_messages(id) ON DELETE CASCADE,
+      blob_hash       TEXT REFERENCES blobs(hash) ON DELETE SET NULL,
+      jmap_blob_id    TEXT NOT NULL DEFAULT '',
+      filename        TEXT NOT NULL DEFAULT '',
+      content_type    TEXT NOT NULL DEFAULT 'application/octet-stream',
+      byte_len        BIGINT NOT NULL DEFAULT 0,
+      disposition     TEXT,
+      content_id      TEXT,
+      skipped_reason  TEXT,
+      UNIQUE NULLS NOT DISTINCT (message_id, jmap_blob_id, content_id)
     );
     CREATE INDEX IF NOT EXISTS mail_attachments_message ON mail_attachments (message_id);
 "#;

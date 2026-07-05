@@ -163,7 +163,7 @@ impl Store {
         let rows = match viewer {
             Some(viewer) => {
                 crate::pgq::query_as::<MailMessageRow>(&mail_message_select(
-                    "WHERE a.user_scope = ? AND m.thread_id = ? ORDER BY m.received_at ASC",
+                    "WHERE m.user_scope = ? AND m.thread_id = ? ORDER BY m.received_at ASC",
                 ))
                 .bind(viewer)
                 .bind(thread_id)
@@ -202,7 +202,7 @@ impl Store {
         let limit = limit.clamp(1, 200);
         let mut clauses: Vec<&str> = Vec::new();
         if viewer.is_some() {
-            clauses.push("a.user_scope = ?");
+            clauses.push("m.user_scope = ?");
         }
         if account_id.is_some() {
             clauses.push("m.account_id = ?");
@@ -296,10 +296,11 @@ mod tests {
         .await
         .unwrap();
         crate::pgq::query(
-            "INSERT INTO mail_messages (id, account_id, mailbox_id, thread_id, jmap_id, message_id, subject, from_name, from_email, to_json, cc_json, received_at, snippet, body_text, has_attachments, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO mail_messages (id, account_id, user_scope, mailbox_id, thread_id, jmap_id, message_id, subject, from_name, from_email, to_json, cc_json, received_at, snippet, body_text, has_attachments, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind("msg-alice-1")
         .bind("acct-alice")
+        .bind("alice")
         .bind("mbox-alice-inbox")
         .bind("thread-shared")
         .bind("jmap-alice-1")
@@ -319,10 +320,11 @@ mod tests {
         .await
         .unwrap();
         crate::pgq::query(
-            "INSERT INTO mail_messages (id, account_id, mailbox_id, thread_id, jmap_id, message_id, subject, from_name, from_email, to_json, cc_json, received_at, snippet, body_text, has_attachments, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO mail_messages (id, account_id, user_scope, mailbox_id, thread_id, jmap_id, message_id, subject, from_name, from_email, to_json, cc_json, received_at, snippet, body_text, has_attachments, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind("msg-bob-1")
         .bind("acct-bob")
+        .bind("bob")
         .bind(Option::<String>::None)
         .bind("thread-shared")
         .bind("jmap-bob-1")

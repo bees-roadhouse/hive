@@ -15,6 +15,7 @@ use crate::middleware::AuthCtx;
 use crate::store::recall::RecallOptions;
 use crate::store::semantic::SemanticOptions;
 use crate::store::Store;
+use hive_shared::SearchHit;
 
 pub fn router() -> Router<Store> {
     Router::new()
@@ -69,7 +70,20 @@ async fn search(
         };
         return Ok(Json(s.semantic_search(&query, opts).await?).into_response());
     }
-    Ok(Json(s.search(&query, limit, viewer.as_deref()).await?).into_response())
+    let mut hits = s.search(&query, limit, viewer.as_deref()).await?;
+    let remaining = limit.saturating_sub(hits.len()).max(1);
+    let mail_hits = s
+        .mail_search(&query, viewer.as_deref(), remaining as i64)
+        .await?;
+    hits.extend(mail_hits.into_iter().map(|m| SearchHit {
+        kind: "mail".to_string(),
+        id: m.id,
+        title: m.subject,
+        snippet: m.snippet.unwrap_or_default(),
+        score: 0.5,
+    }));
+    hits.truncate(limit);
+    Ok(Json(hits).into_response())
 }
 
 #[derive(Deserialize, Default)]
