@@ -65,6 +65,7 @@ async fn search(
             viewer: viewer.clone(),
             identity: q.get("identity").filter(|v| !v.is_empty()).cloned(),
             peer: q.get("peer").filter(|v| !v.is_empty()).cloned(),
+            kinds: None,
         };
         return Ok(Json(s.semantic_search(&query, opts).await?).into_response());
     }
