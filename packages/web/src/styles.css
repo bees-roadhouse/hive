@@ -1467,99 +1467,115 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
 .mail-empty { margin: auto; text-align: center; color: var(--dim); }
 .mail-empty svg { color: var(--honey); }
 
-/* ---- chats: hosted Claude Code sessions as conversations ---- */
-/* Claude-desktop shape inside the hive shell: recents rail, turns in the
-   middle, composer at the bottom. Fills main's viewport (minus its padding)
-   so the transcript owns the scroll, not the page. */
+/* ---- chats: Codex/OpenCode-like terminal sessions ---- */
 .chat {
-  display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 1.2rem;
+  display: grid; grid-template-columns: 280px minmax(0, 1fr); gap: 1rem;
   height: calc(100dvh - 3.75rem);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 .chat-rail {
   display: flex; flex-direction: column; gap: 0.6rem; min-height: 0;
-  border-right: 1px solid var(--line); padding-right: 1.2rem;
+  border-right: 1px solid var(--line); padding-right: 1rem;
 }
 .chat-new {
   display: flex; align-items: center; justify-content: center; gap: 0.5rem;
-  border-radius: var(--r-lg); padding: 0.5rem 0.65rem;
+  border-radius: var(--r-xs); padding: 0.52rem 0.65rem;
+  background: #0f0d09; border-color: var(--line);
 }
+.runtime-strip { display: grid; gap: 0.35rem; }
+.runtime-pill, .runtime-tab {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  border: 1px solid var(--line); border-radius: var(--r-xs);
+  background: #17130d; color: var(--dim);
+  padding: 0.22rem 0.45rem; font-size: var(--fs-xs);
+}
+.runtime-pill b { color: var(--ink); font-weight: 600; }
+.runtime-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex: none; }
+.runtime-dot.rt-codex { background: #58a6ff; }
+.runtime-dot.rt-claude_code { background: #56d364; }
+.runtime-dot.rt-opencode { background: #ff7b72; }
+.runtime-pill.rt-codex, .runtime-tab.rt-codex.active { border-color: color-mix(in srgb, #58a6ff 42%, var(--line)); }
+.runtime-pill.rt-claude_code, .runtime-tab.rt-claude_code.active { border-color: color-mix(in srgb, #56d364 42%, var(--line)); }
+.runtime-pill.rt-opencode, .runtime-tab.rt-opencode.active { border-color: color-mix(in srgb, #ff7b72 42%, var(--line)); }
 .chat-rows {
-  flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.15rem;
+  flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.2rem;
   scrollbar-width: thin; scrollbar-color: var(--line) transparent;
 }
 .chat-row {
-  display: flex; flex-direction: column; gap: 0.2rem; width: 100%;
-  background: transparent; border: 1px solid transparent; border-radius: var(--r-md);
-  padding: 0.5rem 0.6rem; text-align: left; color: var(--dim);
+  display: flex; flex-direction: column; gap: 0.24rem; width: 100%;
+  background: transparent; border: 1px solid transparent; border-radius: var(--r-xs);
+  padding: 0.55rem 0.6rem; text-align: left; color: var(--dim);
   font: inherit; cursor: pointer;
 }
-.chat-row:hover { background: var(--panel2); color: var(--ink); border-color: transparent; }
-.chat-row.selected { background: var(--panel2); color: var(--ink); }
-.chat-row-title {
-  font-size: var(--fs-base);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.chat-row-meta { display: flex; align-items: center; gap: 0.4rem; font-size: var(--fs-xs); color: var(--dim); }
-
-/* Status is a dot, not a rainbow: honey while Claude works or waits on you,
-   neutral at rest, danger only for genuine failure. The .chat-dot.st-*
-   selectors are aliased into the shared dot family (see "shared primitives"
-   near the end of this file) so there is exactly one source for dot color. */
+.chat-row:hover, .chat-row.selected { background: #19150f; color: var(--ink); border-color: var(--line); }
+.chat-row-title { font-size: var(--fs-sm); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-row-meta { display: flex; align-items: center; gap: 0.4rem; font-size: var(--fs-2xs); color: var(--dim); }
 
 .chat-main { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 .chat-head {
-  display: flex; align-items: center; gap: 0.8rem;
-  padding-bottom: 0.7rem; border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 0.6rem;
+  padding-bottom: 0.65rem; border-bottom: 1px solid var(--line);
 }
 .chat-title {
-  flex: 1; min-width: 0; font-family: var(--display);
-  font-size: var(--fs-lg); font-weight: 600;
+  flex: 1; min-width: 0; font-size: var(--fs-base); font-weight: 700;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+.chat-model { color: var(--accent); font-size: var(--fs-xs); }
 .chat-status { display: flex; align-items: center; gap: 0.4rem; font-size: var(--fs-xs); color: var(--dim); letter-spacing: 0.03em; }
-
+.chat-status-strip {
+  display: flex; gap: 0.75rem; flex-wrap: wrap; padding: 0.45rem 0;
+  color: var(--dim); font-size: var(--fs-2xs); border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent);
+}
+.chat-status-strip code { color: var(--ink); }
+.terminal-panel {
+  background: #100d09; border: 1px solid var(--line); border-radius: var(--r-xs);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--ink) 5%, transparent);
+}
 .chat-scroll {
   flex: 1; overflow-y: auto; min-height: 0;
-  display: flex; flex-direction: column; gap: 0.9rem;
-  padding: 1.1rem 0.15rem;
+  display: flex; flex-direction: column; gap: 0.7rem;
+  margin-top: 0.65rem; padding: 0.85rem;
   scrollbar-width: thin; scrollbar-color: var(--line) transparent;
 }
-/* Your turn: a bubble on the right. Claude's turn: plain prose in the serif
-   voice (same convention as AI journal entries). */
-.chat-turn-user {
-  align-self: flex-end; max-width: min(80%, 46rem);
-  background: var(--panel2); border: 1px solid var(--line);
-  border-radius: var(--r-xl) var(--r-xl) var(--r-xs) var(--r-xl); padding: 0.6rem 0.9rem;
-  white-space: pre-wrap; word-break: break-word;
+.chat-turn-user, .chat-turn-ai {
+  max-width: 76rem; white-space: pre-wrap; word-break: break-word;
+  border-left: 2px solid var(--line); padding: 0.1rem 0 0.1rem 0.7rem;
+  line-height: 1.5;
 }
-.chat-turn-ai {
-  max-width: 66rem; font-family: var(--display);
-  font-size: var(--fs-md); line-height: 1.55;
-  white-space: pre-wrap; word-break: break-word;
+.chat-turn-user { color: var(--ink); border-left-color: var(--honey); }
+.chat-turn-ai { color: #efe4cc; border-left-color: #56d364; }
+.turn-label, .tool-kind {
+  display: inline-block; min-width: 3.7rem; margin-right: 0.5rem;
+  color: var(--dim); font-size: var(--fs-2xs); text-transform: uppercase; letter-spacing: 0.08em;
 }
-/* Machine traffic (tool calls, results, thinking) folds into one quiet
-   monospace line; open it when you actually care. */
-.chat-tool { max-width: 66rem; font-size: var(--fs-xs); color: var(--dim); border: 1px solid transparent; border-radius: var(--r-md); }
+.chat-tool { max-width: 76rem; font-size: var(--fs-xs); color: var(--dim); border: 1px solid var(--line); border-radius: var(--r-xs); background: #15110c; }
 .chat-tool summary {
-  cursor: pointer; list-style: none;
-  padding: 0.18rem 0.45rem; border-radius: var(--r-sm);
-  font-family: ui-monospace, "SF Mono", monospace;
+  cursor: pointer; list-style: none; padding: 0.35rem 0.55rem;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .chat-tool summary::-webkit-details-marker { display: none; }
-.chat-tool summary:hover { background: var(--panel2); color: var(--ink); }
-.chat-tool[open] { background: var(--panel); border-color: var(--line); }
+.chat-tool summary:hover { color: var(--ink); }
+.chat-tool.tool-in { border-left: 2px solid #58a6ff; }
+.chat-tool.tool-out { border-left: 2px solid #56d364; }
+.chat-tool.tool-think { border-left: 2px solid var(--honey); }
 .chat-tool pre {
-  margin: 0; padding: 0.6rem 0.8rem; font-size: var(--fs-xs);
-  white-space: pre-wrap; word-break: break-word;
-  max-height: 320px; overflow-y: auto;
+  margin: 0; padding: 0.65rem 0.8rem; font-size: var(--fs-xs);
+  white-space: pre-wrap; word-break: break-word; color: var(--ink);
+  border-top: 1px solid var(--line); max-height: 320px; overflow-y: auto;
 }
 .chat-sys { font-size: var(--fs-xs); color: var(--dim); opacity: 0.85; }
 
+.runtime-controls { width: min(720px, 100%); display: grid; gap: 0.5rem; margin-bottom: 0.2rem; }
+.runtime-tabs { display: flex; gap: 0.4rem; justify-content: center; flex-wrap: wrap; }
+.runtime-tab { cursor: pointer; padding: 0.4rem 0.55rem; }
+.runtime-tab.active { color: var(--ink); background: #121820; }
+.runtime-hint { color: var(--dim); font-size: var(--fs-xs); }
+.model-field { display: flex; align-items: center; gap: 0.5rem; justify-content: center; color: var(--dim); font-size: var(--fs-xs); }
+.model-field input { min-width: min(26rem, 100%); }
 .chat-composer {
-  display: flex; align-items: flex-end; gap: 0.7rem;
-  margin-top: 0.8rem; padding: 0.55rem 0.7rem;
-  background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-xl);
+  display: flex; align-items: flex-end; gap: 0.55rem;
+  margin-top: 0.75rem; padding: 0.5rem 0.6rem;
+  background: #100d09; border: 1px solid var(--line); border-radius: var(--r-xs);
   transition: border-color var(--t-base) ease;
 }
 .chat-composer:focus-within, .chat-composer.waiting { border-color: var(--honey); }
@@ -1569,23 +1585,30 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
   field-sizing: content; max-height: 9rem; min-height: 1.4em;
 }
 
-/* Blank slate: an invitation, not an empty admin panel. */
 .chat-hero {
   flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
-  gap: 0.55rem; text-align: center; padding-bottom: 9vh;
+  gap: 0.65rem; text-align: center; padding: 2rem; margin-top: 0.25rem;
 }
 .chat-hero-icon { color: var(--honey); }
-.chat-hero h3 { margin: 0; font-family: var(--display); font-size: 1.5rem; font-weight: 600; }
-.chat-hero p { margin: 0 0 0.9rem; }
-.chat-hero .chat-composer { width: min(620px, 100%); margin-top: 0; text-align: left; }
+.chat-hero h3 { margin: 0; font-size: 1.45rem; font-weight: 700; }
+.chat-hero p { margin: 0 0 0.6rem; }
+.chat-hero .chat-composer { width: min(720px, 100%); margin-top: 0; text-align: left; }
 
 .chat-ended { margin-top: 0.8rem; text-align: center; font-size: var(--fs-sm); color: var(--dim); }
 .chat-err { margin-top: 0.5rem; color: var(--danger); font-size: var(--fs-sm); }
+.credential-hints {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.55rem; margin-bottom: 0.75rem;
+}
+.credential-hints div { border: 1px solid var(--line); border-radius: var(--r-xs); background: #17130d; padding: 0.65rem; }
+.credential-hints strong { display: block; font-family: ui-monospace, monospace; color: var(--ink); margin-bottom: 0.25rem; }
+.credential-hints span { display: block; color: var(--dim); font-size: var(--fs-xs); line-height: 1.4; }
+.runtime-cred-form select { min-width: 16rem; }
 
 @media (max-width: 900px) {
   .chat { grid-template-columns: 1fr; height: auto; gap: 0.9rem; }
-  .chat-rail { border-right: none; padding-right: 0; max-height: 13rem; }
+  .chat-rail { border-right: none; padding-right: 0; max-height: 15rem; }
   .chat-scroll { max-height: 58vh; }
+  .credential-hints { grid-template-columns: 1fr; }
 }
 
 /* ============================================================
@@ -1612,13 +1635,14 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
 
 /* StatusDot — the one dot family. .chat-dot (Workspaces markup) aliases the
    same declarations so the chats rail and every other status light share a
-   single source: honey live (pulse while working), accent waiting on you,
-   danger for genuine failure, dim at rest. */
+   single source: blue provisioning, green running, honey waiting on you,
+   red failure, dim at rest. */
 .dot, .chat-dot { width: 7px; height: 7px; border-radius: var(--r-pill); background: var(--line); flex: none; display: inline-block; }
-.dot-rest, .chat-dot.st-idle { background: var(--dim); }
-.dot-live, .chat-dot.st-provisioning, .chat-dot.st-running { background: var(--honey); }
+.dot-rest, .chat-dot.st-idle, .chat-dot.st-completed { background: var(--dim); }
+.dot-live, .chat-dot.st-running { background: #56d364; }
+.chat-dot.st-provisioning { background: #58a6ff; }
 .dot-waiting, .chat-dot.st-waiting_input { background: var(--accent); }
-.dot-danger, .chat-dot.st-failed { background: var(--danger); }
+.dot-danger, .chat-dot.st-failed { background: #ff7b72; }
 .dot-pulse, .chat-dot.st-provisioning, .chat-dot.st-running { animation: dot-pulse 1.6s ease-in-out infinite; }
 @keyframes dot-pulse { 50% { opacity: 0.3; } }
 

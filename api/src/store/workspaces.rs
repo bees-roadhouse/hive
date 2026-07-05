@@ -54,6 +54,10 @@ pub struct CcMessage {
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewCcSession {
     pub title: Option<String>,
+    /// Agent runtime selected by the UI/runner ("codex", "claude_code", "opencode").
+    pub runtime: Option<String>,
+    /// Provider hint for runtimes that multiplex providers (notably OpenCode).
+    pub provider: Option<String>,
     pub model: Option<String>,
     /// Optional first prompt to kick the session off.
     pub prompt: Option<String>,
@@ -172,10 +176,20 @@ impl Store {
         let workdir = format!("{}/{}/{}", workspaces_root(), owner, id);
         let ts = now_iso();
         let title = input.title.unwrap_or_default();
+        let runtime = input
+            .runtime
+            .clone()
+            .filter(|r| !r.trim().is_empty())
+            .unwrap_or_else(|| "claude_code".to_string());
+        let meta = json!({
+            "runtime": runtime,
+            "provider": input.provider.clone().filter(|p| !p.trim().is_empty()),
+        })
+        .to_string();
         crate::pgq::query(
             "INSERT INTO cc_sessions \
              (id, owner, created_by, title, workdir, status, model, usage, meta, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, 'provisioning', ?, '{}', '{}', ?, ?)",
+             VALUES (?, ?, ?, ?, ?, 'provisioning', ?, '{}', ?, ?, ?)",
         )
         .bind(&id)
         .bind(owner)
@@ -183,6 +197,7 @@ impl Store {
         .bind(&title)
         .bind(&workdir)
         .bind(&input.model)
+        .bind(&meta)
         .bind(&ts)
         .bind(&ts)
         .execute(self.db())
@@ -190,7 +205,7 @@ impl Store {
         self.emit(
             "workspace.created",
             created_by,
-            json!({"id": id, "owner": owner, "title": title}),
+            json!({"id": id, "owner": owner, "title": title, "runtime": runtime}),
         )
         .await?;
         self.workspace_get_internal(&id)

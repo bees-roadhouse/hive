@@ -209,13 +209,22 @@ async fn runtime_auth(
         return Ok(not_found());
     };
     match s.cc_cred_decrypt_for_runtime(&ws.owner).await? {
-        Some((kind, secret)) => Ok(Json(json!({
-            "owner": ws.owner,
-            "kind": kind,
-            "secret": secret,
-            "workdir": ws.workdir,
-        }))
-        .into_response()),
+        Some((kind, secret)) => {
+            let meta = ws.meta.as_object();
+            Ok(Json(json!({
+                "owner": ws.owner,
+                "kind": kind,
+                "secret": secret,
+                "workdir": ws.workdir,
+                "runtime": meta
+                    .and_then(|m| m.get("runtime"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("claude_code"),
+                "provider": meta.and_then(|m| m.get("provider")).and_then(|v| v.as_str()),
+                "model": ws.model,
+            }))
+            .into_response())
+        }
         None => Ok(err(
             StatusCode::FAILED_DEPENDENCY,
             "owner has no Claude Code credential saved",
