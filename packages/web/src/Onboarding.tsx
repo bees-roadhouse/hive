@@ -1,5 +1,6 @@
 import { createSignal, Show, type Component } from "solid-js";
 import { api, setCurrentUser } from "./api.ts";
+import { Icon } from "./icons.tsx";
 
 // First-run setup (v0.1.1). Shown only when /onboarding/status reports the
 // instance hasn't been set up. Creates the first admin and names the instance,
@@ -39,7 +40,7 @@ export const Onboarding: Component<{ onDone: () => void }> = (props) => {
     <div class="auth-screen">
       <form class="auth-card" onSubmit={submit}>
         <div class="auth-brand">
-          <span class="logo">🐝</span>
+          <span class="brand-logo"><Icon name="hex" size={28} /></span>
           <span class="brand-name">hive</span>
         </div>
         <h1>Welcome — let's set up hive</h1>

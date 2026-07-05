@@ -24,10 +24,11 @@ import type {
   WireEvent,
 } from "@hive/shared";
 import { TASK_STATUSES } from "@hive/shared";
+import { useSearchParams } from "@solidjs/router";
 import { api, getDoneRetentionHours, setDoneRetentionHours } from "./api.ts";
 import { liveRev } from "./live.ts";
 import { Icon } from "./icons.tsx";
-import { DECISION_GLYPH, relTime, SkeletonList, TASK_GLYPH } from "./lib.tsx";
+import { DECISION_GLYPH, highlightSnippet, relTime, SkeletonList, TASK_GLYPH } from "./lib.tsx";
 import { Markdown } from "./markdown.tsx";
 
 // ---- due-date helpers ----
@@ -451,7 +452,8 @@ const SearchResults: Component<{ query: string; mode: "keyword" | "semantic" }> 
           <span class="badge">{h.kind}</span>
           <strong>{h.title}</strong>
           <Show when={h.snippet} fallback={<span class="snippet">score {h.score}</span>}>
-            <span class="snippet" innerHTML={h.snippet} />
+            {/* escape-then-mark: body text is untrusted, only our <mark>s render */}
+            <span class="snippet" innerHTML={highlightSnippet(h.snippet)} />
           </Show>
         </div>
       )}
@@ -460,9 +462,22 @@ const SearchResults: Component<{ query: string; mode: "keyword" | "semantic" }> 
 };
 
 export const SearchPane: Component = () => {
-  const [q, setQ] = createSignal(""); // live input value
-  const [query, setQuery] = createSignal(""); // debounced value that drives the search
+  const [params] = useSearchParams();
+  // Seed from ?q= so the command palette's free-text passthrough (and any
+  // deep link) lands with the query already running.
+  const initial = typeof params.q === "string" ? params.q : "";
+  const [q, setQ] = createSignal(initial); // live input value
+  const [query, setQuery] = createSignal(initial); // debounced value that drives the search
   const [mode, setMode] = createSignal<"keyword" | "semantic">("keyword");
+
+  // Palette navigations while the pane is already mounted update ?q= in place.
+  createEffect(() => {
+    const next = typeof params.q === "string" ? params.q : "";
+    if (next && next !== q()) {
+      setQ(next);
+      setQuery(next);
+    }
+  });
 
   // Debounce the live input into `query` so a search fires at most ~250ms after
   // typing stops, not once per keystroke. The input stays fully responsive

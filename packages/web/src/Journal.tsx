@@ -38,6 +38,7 @@ import Link from "@tiptap/extension-link";
 import { Markdown as MarkdownExt } from "tiptap-markdown";
 import { api, getActor } from "./api.ts";
 import { liveRev } from "./live.ts";
+import { composeReq, consumeComposeRequest } from "./ui.ts";
 import { ANCHOR_GLYPH, relTime } from "./lib.tsx";
 import { Icon } from "./icons.tsx";
 import { JournalBody } from "./markdown.tsx";
@@ -193,6 +194,10 @@ export const Journal: Component = () => {
   // Friendly label for an entry's namespace chip.
   const chipLabel = (scope: string | null | undefined): string =>
     scope ? scopeName(scope) : "Continuous";
+  // AI-authored entries render in the serif voice face (see .entry-ai) so who
+  // is speaking reads at a glance. Unknown authors default to the human face.
+  const isAi = (author: string): boolean =>
+    writers().find((w) => w.slug === author)?.kind === "ai";
   // The token a chip filters by (its entry's scope, or GLOBAL_SCOPE when null).
   const chipScope = (scope: string | null | undefined): string => scope ?? GLOBAL_SCOPE;
   const activeScopeLabel = createMemo(() => {
@@ -271,6 +276,10 @@ export const Journal: Component = () => {
   };
 
   const revealNextDay = async () => {
+    // reload() may still be in flight (the sentinel intersects immediately on
+    // mount); starting a second fetch at the same offset would append the
+    // same page twice. The sentinel re-fires on scroll, so skipping is safe.
+    if (fetching()) return;
     if (hasBufferedDays()) { setVisibleDays((n) => n + 1); return; }
     const got = await fetchUntilNewDay();
     if (got) setVisibleDays((n) => n + 1);
@@ -489,6 +498,13 @@ export const Journal: Component = () => {
     dismissAc();
   };
 
+  // The command palette's "New entry" action lands here (see ui.ts). The
+  // deferred effect covers a palette fired while the journal is mounted; the
+  // mount-time consume covers "New entry" from another route, where the bump
+  // happens before this component (and the listener) exists.
+  createEffect(on(composeReq, () => { if (consumeComposeRequest()) openOverlay(); }, { defer: true }));
+  onMount(() => { if (consumeComposeRequest()) openOverlay(); });
+
   // ---- autocomplete ----
   const dismissAc = () => {
     setAcItems([]);
@@ -666,12 +682,9 @@ export const Journal: Component = () => {
   // ---- render ----
   return (
     <section class="journal">
-      {/* ---- journal header + "new entry" button ---- */}
-      <div class="journal-header">
-        <button class="primary journal-new-btn" onClick={openOverlay}>
-          + new entry
-        </button>
-        <Show when={activeScope() !== null}>
+      {/* ---- active namespace filter (only when one is set) ---- */}
+      <Show when={activeScope() !== null}>
+        <div class="journal-header">
           <div class="ns-filter-bar">
             <span class="dim sm">namespace</span>
             <span class="ns-chip ns-chip-active">◆ {activeScopeLabel()}</span>
@@ -679,8 +692,8 @@ export const Journal: Component = () => {
               ✕ all namespaces
             </button>
           </div>
-        </Show>
-      </div>
+        </div>
+      </Show>
 
       {/* ---- feed + anchored-entities rail ---- */}
       <div class="journal-layout">
@@ -697,7 +710,12 @@ export const Journal: Component = () => {
               </header>
               <For each={d.items}>
                 {(e) => (
-                  <article class="entry entry-fade" id={`entry-${e.id}`} data-entry-id={e.id}>
+                  <article
+                    class="entry entry-fade"
+                    classList={{ "entry-ai": isAi(e.author) }}
+                    id={`entry-${e.id}`}
+                    data-entry-id={e.id}
+                  >
                     <header>
                       <span class="actor-chip">{e.author}</span>
                       <button
@@ -780,10 +798,29 @@ export const Journal: Component = () => {
       </aside>
       </div>
 
-      {/* ---- floating action button ---- */}
-      <button class="journal-fab" onClick={openOverlay} title="New entry" aria-label="New entry">
-        ✦
-      </button>
+      {/* ---- write bar: the always-there composer entry point, pinned to the
+              bottom of the viewport like a chat input. Clicking anywhere on it
+              opens the full overlay composer (rich editor, anchors, tags). ---- */}
+      <div class="write-bar">
+        <div
+          class="write-bar-inner"
+          role="button"
+          tabindex="0"
+          aria-label="New entry"
+          onClick={openOverlay}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              openOverlay();
+            }
+          }}
+        >
+          <span class="write-hint">Write to the hive…</span>
+          <span class="write-glyph" title="@name mentions people">@</span>
+          <span class="write-glyph" title="#topic +project !task tags">#</span>
+          <span class="write-send" aria-hidden="true">↑</span>
+        </div>
+      </div>
 
       {/* ---- new-entry overlay ---- */}
       <Show when={overlayOpen()}>

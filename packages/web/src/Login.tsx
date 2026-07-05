@@ -1,5 +1,6 @@
 import { createResource, createSignal, Show, type Component } from "solid-js";
 import { api, setCurrentUser } from "./api.ts";
+import { Icon } from "./icons.tsx";
 
 // Login screen. Shown when onboarding is complete but no valid session exists.
 export const Login: Component<{ instanceName: string | null; onLogin: () => void }> = (props) => {
@@ -35,7 +36,7 @@ export const Login: Component<{ instanceName: string | null; onLogin: () => void
     <div class="auth-screen">
       <form class="auth-card" onSubmit={submit}>
         <div class="auth-brand">
-          <span class="logo">🐝</span>
+          <span class="brand-logo"><Icon name="hex" size={28} /></span>
           <span class="brand-name">{props.instanceName ?? "hive"}</span>
         </div>
         <h1>Sign in</h1>

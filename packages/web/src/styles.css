@@ -22,7 +22,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 /* Fills the viewport at any width: the sidebar is fixed-width, the content
    area takes all remaining space. Readable measures live on the prose column
    and the journal layout, never on the whole content pane. */
-.app { display: flex; flex: 1; min-height: 100dvh; width: 100%; }
+.app { display: flex; flex: 1; min-height: 100dvh; width: 100%; border-top: 3px solid var(--honey); }
 
 .sidebar {
   position: sticky; top: 0; align-self: flex-start;
@@ -38,7 +38,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .sidebar::-webkit-scrollbar-track { background: transparent; }
 .sidebar::-webkit-scrollbar-thumb { background: var(--line); border-radius: 999px; }
 .brand { display: flex; align-items: center; gap: 0.5rem; padding: 0.25rem 0.5rem 0.75rem; }
-.brand .logo { font-size: 1.5rem; }
+.brand-logo { color: var(--honey); display: flex; align-items: center; }
 .brand-name { font-size: 1.08rem; line-height: 1.15; font-weight: 700; }
 
 .sidebar nav { display: flex; flex-direction: column; gap: 0.15rem; flex: 1; }
@@ -46,7 +46,7 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .sidebar nav a {
   display: flex; align-items: center; gap: 0.6rem; width: 100%;
   background: transparent; border: 1px solid transparent; border-radius: 8px;
-  padding: 0.5rem 0.65rem; text-align: left; text-transform: capitalize; color: var(--dim);
+  padding: 0.5rem 0.65rem; text-align: left; color: var(--dim);
   text-decoration: none; cursor: pointer; font: inherit;
   transition: background 0.15s ease, color 0.15s ease, transform 0.12s ease;
 }
@@ -59,7 +59,30 @@ body { margin: 0; background: var(--bg); color: var(--ink); }
 .nav-label { flex: 1; }
 .nav-badge { background: #ff5a3c; color: #fff; border-radius: 999px; font-size: 0.65rem; padding: 0 0.35rem; font-weight: 700; }
 
+/* The ⌘K hint sits under the four destinations, quieter than a nav item. */
+.cmdk-hint {
+  display: flex; align-items: center; gap: 0.6rem; width: 100%;
+  background: transparent; border: 1px dashed var(--line); border-radius: 8px;
+  padding: 0.4rem 0.65rem; margin-top: 0.4rem; color: var(--dim);
+  font: inherit; font-size: 0.82rem; cursor: pointer;
+}
+.cmdk-hint:hover { color: var(--ink); border-color: var(--dim); }
+.cmdk-hint kbd {
+  border: 1px solid var(--line); border-radius: 5px; padding: 0 0.35rem;
+  font-size: 0.7rem; font-family: ui-monospace, monospace; color: var(--dim);
+}
+
 .sidebar-foot { border-top: 1px solid var(--line); padding-top: 0.7rem; display: flex; flex-direction: column; gap: 0.5rem; }
+.foot-user { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
+.avatar {
+  width: 26px; height: 26px; flex: none; border-radius: 50%;
+  background: color-mix(in srgb, var(--honey) 18%, transparent);
+  color: var(--honey); display: grid; place-items: center;
+  font-size: 0.68rem; font-weight: 700;
+}
+.foot-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.85rem; }
+.foot-icon { color: var(--dim); display: flex; align-items: center; padding: 0.2rem; border-radius: 6px; }
+.foot-icon:hover { color: var(--honey); }
 .actor { font-size: 0.82rem; display: flex; flex-direction: column; gap: 0.3rem; }
 .actor select { width: 100%; }
 .foot-note { font-size: 0.68rem; line-height: 1.4; }
@@ -265,7 +288,13 @@ table.mini .num { text-align: right; }
 /* ---- search / wire ---- */
 .hit { display: flex; gap: 0.6rem; align-items: baseline; padding: 0.5rem 0; border-bottom: 1px solid var(--line); }
 .snippet { color: var(--dim); font-size: 0.85rem; }
-.snippet b { color: var(--accent); }
+/* highlightSnippet (lib.tsx) escapes body text and emits <mark> for ts_headline matches */
+.snippet mark {
+  background: color-mix(in srgb, var(--honey) 20%, transparent);
+  color: var(--accent);
+  border-radius: 3px;
+  padding: 0 0.12em;
+}
 .wire-row { display: flex; gap: 0.7rem; align-items: center; padding: 0.3rem 0; font-size: 0.85rem; border-bottom: 1px solid var(--line); }
 .wire-row time { color: var(--dim); font-variant-numeric: tabular-nums; min-width: 4.5rem; }
 
@@ -600,7 +629,7 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 }
 /* ---- journal overlay editor ---- */
 
-/* Header row above the feed: "new entry" button aligned right */
+/* Header row above the feed — only rendered while a namespace filter is set */
 .journal-header {
   display: flex;
   justify-content: space-between;
@@ -608,11 +637,6 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
   gap: 0.75rem;
   flex-wrap: wrap;
   margin-bottom: 1.1rem;
-}
-.journal-new-btn {
-  font-size: 0.88rem;
-  padding: 0.4rem 0.9rem;
-  margin-left: auto;
 }
 
 /* ---- namespace (memory-scope) chips + filter bar ---- */
@@ -648,29 +672,49 @@ button.ghost { background: transparent; color: var(--dim); font-size: 0.8rem; pa
 }
 .ns-clear:hover { color: var(--accent); border-color: var(--accent); }
 
-/* Floating action button — bottom-right corner of the viewport */
-.journal-fab {
+/* ---- write bar: chat-style composer entry point pinned to the viewport
+   bottom over the feed. It floats above the sidebar-offset content area and
+   opens the full overlay composer on click. ---- */
+.write-bar {
   position: fixed;
-  bottom: 1.75rem;
-  right: 1.75rem;
-  width: 3rem;
-  height: 3rem;
+  bottom: 1.1rem;
+  left: 200px; /* clear the fixed sidebar; reset on mobile below */
+  right: 0;
+  display: flex;
+  justify-content: center;
+  padding: 0 clamp(1rem, 3vw, 2.5rem);
+  pointer-events: none; /* only the inner bar is interactive */
+  z-index: 8;
+}
+.write-bar-inner {
+  pointer-events: auto;
+  width: min(720px, 100%);
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 0.65rem 0.9rem;
+  cursor: text;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  transition: border-color 0.15s ease;
+}
+.write-bar-inner:hover, .write-bar-inner:focus-visible { border-color: var(--honey); outline: none; }
+.write-hint { flex: 1; color: var(--dim); }
+.write-glyph { color: var(--dim); font-size: 0.95rem; }
+.write-send {
+  width: 30px;
+  height: 30px;
   border-radius: 50%;
   background: var(--honey);
   color: #1a1407;
-  border: none;
-  font-size: 1.3rem;
   display: grid;
   place-items: center;
-  box-shadow: 0 4px 18px rgba(0,0,0,0.45);
-  z-index: 30;
-  transition: transform 0.15s, box-shadow 0.15s;
+  font-weight: 700;
 }
-.journal-fab:hover:not(:disabled) {
-  transform: scale(1.08);
-  box-shadow: 0 6px 24px rgba(0,0,0,0.55);
-  border-color: transparent;
-}
+/* Keep the last entries readable above the floating bar. */
+.journal { padding-bottom: 4.5rem; }
 
 /* Full-screen dimmed backdrop */
 .overlay-backdrop {
@@ -994,13 +1038,17 @@ button.ghost.danger { background: transparent; color: #d98a8a; }
    suppressed under prefers-reduced-motion at the bottom.
    ============================================================ */
 
-/* ---- route transition: each page fades + lifts in on navigation ---- */
+/* ---- route transition: each page fades in on navigation ---- */
 /* The .route-view node is keyed on the path segment in App.tsx, so it
-   remounts per route and this animation re-runs on every navigation. */
+   remounts per route and this animation re-runs on every navigation.
+   Opacity ONLY — `both` keeps the final keyframe applied forever, and any
+   persistent transform (even identity) makes .route-view the containing
+   block for fixed-position descendants, pinning the write bar and overlay
+   backdrops to the feed instead of the viewport. */
 .route-view { animation: route-in 0.26s cubic-bezier(0.22, 1, 0.36, 1) both; }
 @keyframes route-in {
-  from { opacity: 0; transform: translateY(8px); }
-  to   { opacity: 1; transform: translateY(0); }
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
 .page-title { animation: title-in 0.3s ease both; }
 @keyframes title-in {
@@ -1060,7 +1108,7 @@ button.ghost.danger { background: transparent; color: #d98a8a; }
 /* Primary/honey buttons get a soft press. */
 button { transition: border-color 0.15s ease, background 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease; }
 button:active:not(:disabled) { transform: translateY(1px); }
-button.primary:hover:not(:disabled), .journal-new-btn:hover:not(:disabled) {
+button.primary:hover:not(:disabled) {
   box-shadow: 0 3px 12px rgba(245, 179, 1, 0.35);
 }
 
@@ -1262,4 +1310,56 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
 @media (prefers-reduced-motion: reduce) {
   .rail-item:hover { transform: none; }
   .entry-flash { animation: none; }
+}
+
+/* ---- AI voice: entries authored by an AI writer render in serif so who is
+   speaking reads at a glance (typography as attribution). ---- */
+.entry-ai .prose {
+  font-family: Georgia, "Iowan Old Style", "Palatino Linotype", "Times New Roman", serif;
+}
+
+/* ---- command palette (⌘K) ---- */
+.cmdk-backdrop {
+  position: fixed; inset: 0; z-index: 40;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex; justify-content: center; align-items: flex-start;
+  padding: 12vh 1rem 0;
+}
+.cmdk {
+  width: min(560px, 100%);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+}
+.cmdk-input {
+  width: 100%;
+  background: var(--panel2);
+  border: none;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  padding: 0.85rem 1rem;
+  font-size: 1rem;
+}
+.cmdk-input:focus { outline: none; }
+.cmdk-list {
+  list-style: none; margin: 0; padding: 0.35rem;
+  max-height: min(46vh, 360px); overflow-y: auto;
+}
+.cmdk-item {
+  display: flex; align-items: center; gap: 0.65rem;
+  padding: 0.5rem 0.7rem; border-radius: 8px;
+  color: var(--dim); cursor: pointer;
+}
+.cmdk-item-active { background: var(--panel2); color: var(--ink); }
+.cmdk-icon { display: flex; align-items: center; }
+.cmdk-label { flex: 1; }
+.cmdk-item-hint { font-size: 0.78rem; }
+
+/* Mobile: the sidebar stacks on top (no fixed left column), so the write bar
+   spans the full width; the palette just gets a little more top room. */
+@media (max-width: 720px) {
+  .write-bar { left: 0; }
+  .cmdk-backdrop { padding-top: 8vh; }
 }
