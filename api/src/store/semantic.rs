@@ -214,20 +214,24 @@ impl Store {
         .bind(fetch as i64)
         .fetch_all(self.db())
         .await?;
-        let hits: Vec<SearchHit> = rows
-            .iter()
-            .map(|r| -> Result<SearchHit> {
-                // ts_rank is f32 and higher = better; clamp to a 0..1 score.
-                let rank: f32 = r.try_get("rank")?;
-                Ok(SearchHit {
-                    kind: EntityKind::from_str_lossy(r.try_get::<String, _>("kind")?.as_str()),
-                    id: r.try_get("ref_id")?,
-                    title: r.try_get("title")?,
-                    snippet: r.try_get("snip")?,
-                    score: ((rank.clamp(0.0, 1.0) as f64) * 1000.0).round() / 1000.0,
-                })
-            })
-            .collect::<Result<_>>()?;
+        let mut hits: Vec<SearchHit> = Vec::with_capacity(rows.len());
+        for r in &rows {
+            // Fail closed: skip rows whose kind this build doesn't know (a
+            // newer binary's rows must not surface mislabeled).
+            let kind_s: String = r.try_get("kind")?;
+            let Some(kind) = EntityKind::parse(&kind_s) else {
+                continue;
+            };
+            // ts_rank is f32 and higher = better; clamp to a 0..1 score.
+            let rank: f32 = r.try_get("rank")?;
+            hits.push(SearchHit {
+                kind,
+                id: r.try_get("ref_id")?,
+                title: r.try_get("title")?,
+                snippet: r.try_get("snip")?,
+                score: ((rank.clamp(0.0, 1.0) as f64) * 1000.0).round() / 1000.0,
+            });
+        }
         let mut hits = match viewer {
             Some(v) => self.scope_hits(hits, v).await?,
             None => hits,
@@ -622,15 +626,17 @@ impl Store {
 
         let hits: Vec<SearchHit> = ranked
             .into_iter()
-            .map(|(k, score)| {
+            .filter_map(|(k, score)| {
                 let (kind, id) = split_key(&k);
-                SearchHit {
-                    kind: EntityKind::from_str_lossy(kind),
+                // Fail closed: drop vectors of kinds this build doesn't know.
+                let kind = EntityKind::parse(kind)?;
+                Some(SearchHit {
+                    kind,
                     id: id.to_string(),
                     title: title_of.get(&k).cloned().unwrap_or_else(|| id.to_string()),
                     snippet: String::new(),
                     score: (score * 1000.0).round() / 1000.0,
-                }
+                })
             })
             .collect();
 

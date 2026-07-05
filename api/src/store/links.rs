@@ -49,18 +49,29 @@ impl Store {
         .bind(ref_id)
         .fetch_all(self.db())
         .await?;
-        rows.iter().map(row_to_link).collect()
+        rows.iter()
+            .filter_map(|r| row_to_link(r).transpose())
+            .collect()
     }
 }
 
-pub(crate) fn row_to_link(r: &sqlx::postgres::PgRow) -> Result<Link> {
-    Ok(Link {
+/// `Ok(None)` = a row whose endpoint kinds this build doesn't know — dropped,
+/// never mislabeled (fail closed).
+pub(crate) fn row_to_link(r: &sqlx::postgres::PgRow) -> Result<Option<Link>> {
+    let source_kind: String = r.try_get("source_kind")?;
+    let target_kind: String = r.try_get("target_kind")?;
+    let (Some(source_kind), Some(target_kind)) =
+        (EntityKind::parse(&source_kind), EntityKind::parse(&target_kind))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Link {
         id: r.try_get("id")?,
-        source_kind: EntityKind::from_str_lossy(r.try_get::<String, _>("source_kind")?.as_str()),
+        source_kind,
         source_id: r.try_get("source_id")?,
-        target_kind: EntityKind::from_str_lossy(r.try_get::<String, _>("target_kind")?.as_str()),
+        target_kind,
         target_id: r.try_get("target_id")?,
         rel: r.try_get("rel")?,
         created_at: r.try_get("created_at")?,
-    })
+    }))
 }

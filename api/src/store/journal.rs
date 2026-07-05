@@ -602,14 +602,18 @@ impl Store {
                 }
             };
             if let Some((id, slug, name)) = resolved {
-                refs.push(JournalRef {
-                    kind: EntityKind::from_str_lossy(t.kind),
-                    id,
-                    slug,
-                    name,
-                    start,
-                    end,
-                });
+                // TOKEN_KINDS is a subset of EntityKind strings, so this never
+                // skips today; parse keeps it fail-closed if they ever drift.
+                if let Some(kind) = EntityKind::parse(t.kind) {
+                    refs.push(JournalRef {
+                        kind,
+                        id,
+                        slug,
+                        name,
+                        start,
+                        end,
+                    });
+                }
             }
         }
         Ok(refs)
