@@ -82,6 +82,14 @@ short hash of the owner slug so sanitized-name collisions cannot merge two
 users' workspaces. Archiving a workspace removes that session container but
 preserves the user's named volume.
 
+The default session image is now `beesroadhouse/hive-session-dev:latest`, built
+from `docker/Dockerfile.session-dev`. It includes the actual hosted-agent CLIs
+(`claude`, `codex`, `opencode`), Rust/rustfmt/clippy, Node/pnpm/yarn, Python/uv/pytest,
+.NET, Java/Maven/Gradle, Go, C/C++ build/debug tools, PostgreSQL/Redis clients,
+Chromium, Firefox, Xvfb, Fluxbox, x11vnc, and noVNC. GUI is on by default via
+`DISPLAY=:99`; set `HIVE_VNC=1` to expose VNC/noVNC inside the session container
+when a human needs to watch or drive the desktop.
+
 Deployment knobs:
 
 ```bash
@@ -89,10 +97,12 @@ HIVE_SESSION_ISOLATION=container
 HIVE_CONTAINER_ENGINE=podman        # or docker / auto
 HIVE_CONTAINER_SOCKET=/run/podman/podman.sock
 HIVE_CONTAINER_SOCKET_TARGET=/run/podman/podman.sock
-HIVE_SESSION_IMAGE=beesroadhouse/hive-runner:latest
+HIVE_SESSION_IMAGE=beesroadhouse/hive-session-dev:latest
 HIVE_USER_VOLUME_PREFIX=hive-user
 HIVE_SESSION_CONTAINER_PREFIX=hive-session
 HIVE_SESSION_NETWORK=hive_hive      # docker-compose.rust.yml pins this network name
+HIVE_SESSION_GUI=1                  # starts Xvfb/Fluxbox for GUI tests
+HIVE_SESSION_VNC=0                  # set 1 to start x11vnc/noVNC inside sessions
 ```
 
 For Docker, set:
