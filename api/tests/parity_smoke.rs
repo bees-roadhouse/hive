@@ -717,8 +717,9 @@ async fn rest_inbox_routes_are_viewer_gated() {
         items.insert(to, item);
     }
 
-    // A member can no longer read another human's inbox, nor mark it read —
-    // by item or wholesale.
+    // A member can no longer read another human's inbox, nor mark it read.
+    // Slug routes 403 (slugs are public); mark-by-id answers the same soft
+    // {"marked": false} as a missing id so it doesn't oracle foreign ids.
     let (status, body, _) = send(&app, get("/api/inbox/nate", Some(&maggie))).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "cross-actor list: {body}");
     assert_eq!(body["error"], "forbidden");
@@ -728,7 +729,7 @@ async fn rest_inbox_routes_are_viewer_gated() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, _, _) = send(
+    let (status, body, _) = send(
         &app,
         post_json(
             &format!("/api/inbox/item/{}/read", items["nate"].id),
@@ -737,7 +738,8 @@ async fn rest_inbox_routes_are_viewer_gated() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"marked": false}), "foreign id soft no-op");
     assert_eq!(store.inbox_unread_count("nate").await.unwrap(), 1);
 
     // Self and owned-AI inboxes still answer; admins may peek anyone's.
@@ -791,7 +793,7 @@ async fn rest_inbox_routes_are_viewer_gated() {
     let (status, _, _) = send(&app, bearer("/api/inbox/nate", token)).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "AI token, granter's inbox");
 
-    // Unknown item ids stay a soft no-op rather than an existence probe.
+    // Unknown ids answer exactly like foreign ones — no existence probe.
     let (status, body, _) = send(
         &app,
         post_json("/api/inbox/item/inb_missing/read", json!({}), Some(&maggie)),

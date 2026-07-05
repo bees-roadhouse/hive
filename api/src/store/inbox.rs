@@ -87,20 +87,6 @@ impl Store {
         )
     }
 
-    pub async fn inbox_get(&self, item_id: &str) -> Result<Option<InboxItem>> {
-        let row = crate::pgq::query(
-            r#"SELECT id, recipient, "from", reason, ref_kind, ref_id, entry_id, snippet, created_at, read_at
-               FROM inbox WHERE id = ?"#,
-        )
-        .bind(item_id)
-        .fetch_optional(self.db())
-        .await?;
-        match row {
-            Some(r) => row_to_inbox(&r).map(Some),
-            None => Ok(None),
-        }
-    }
-
     pub async fn inbox_mark_read(&self, item_id: &str) -> Result<u64> {
         let res =
             crate::pgq::query("UPDATE inbox SET read_at = ? WHERE id = ? AND read_at IS NULL")

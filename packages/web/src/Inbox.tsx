@@ -1,4 +1,5 @@
-import { createMemo, createResource, createSignal, For, Show, type Component } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, Show, type Component } from "solid-js";
+import type { Person } from "@hive/shared";
 import { api, getActor, getCurrentUser } from "./api.ts";
 import { liveRev } from "./live.ts";
 import { Mentions, relTime } from "./lib.tsx";
@@ -15,7 +16,14 @@ const REASON_GLYPH: Record<string, string> = {
 export const Inbox: Component = () => {
   const [who, setWho] = createSignal(getActor());
   const [unreadOnly, setUnreadOnly] = createSignal(true);
-  const [people] = createResource(api.people);
+  // Live like the other people views so mid-session grants/revocations move
+  // the tabs. A failed fetch keeps the previous list (resolving with a
+  // fallback would overwrite Solid's stale-value retention and collapse the
+  // tabs mid-session); before any list has loaded it degrades to the self tab.
+  const [people] = createResource<Person[], { _r: number }>(
+    () => ({ _r: liveRev() }),
+    (_k, info) => api.people().catch(() => info.value ?? []),
+  );
 
   const tabs = createMemo(() => {
     const me = getActor();
@@ -27,25 +35,48 @@ export const Inbox: Component = () => {
     // Self first, then humans, then AIs — stable regardless of API order.
     const rank = (p: { slug: string; kind: string }) =>
       p.slug === me ? 0 : p.kind === "human" ? 1 : 2;
-    const sorted = visible
-      .map((p) => ({ slug: p.slug, name: p.name, kind: p.kind }))
-      .sort((a, b) => rank(a) - rank(b) || a.slug.localeCompare(b.slug));
-    // Until people load (or if self has no person row yet), keep a self tab.
-    return sorted.length ? sorted : [{ slug: me, name: me, kind: "human" }];
+    const sorted = [...visible].sort((a, b) => rank(a) - rank(b) || a.slug.localeCompare(b.slug));
+    // Self always keeps a tab — while people load, and when its person row
+    // is missing (a self-rename re-slugs people but not users.actor).
+    return sorted.some((p) => p.slug === me)
+      ? sorted
+      : [{ slug: me, name: me, kind: "human" }, ...sorted];
+  });
+
+  // A revoked/vanished tab falls back to your own inbox instead of pinning
+  // a recipient the server now refuses.
+  createEffect(() => {
+    if (!tabs().some((t) => t.slug === who())) setWho(getActor());
   });
 
   const [items, { refetch }] = createResource(
     () => ({ who: who(), unread: unreadOnly(), _r: liveRev() }),
-    (k) => api.inbox(k.who, k.unread),
+    // A 403 (tab revoked between refetches) reads as an empty inbox; real
+    // outages still surface through the app-level boundary.
+    (k) =>
+      api.inbox(k.who, k.unread).catch((e) => {
+        if (String(e?.message ?? e).startsWith("403")) return [];
+        throw e;
+      }),
   );
 
   const read = async (id: string) => {
-    await api.markRead(id);
-    refetch();
+    try {
+      await api.markRead(id);
+    } catch (e) {
+      console.error("mark read failed", e);
+    } finally {
+      refetch();
+    }
   };
   const readAll = async () => {
-    await api.markAllRead(who());
-    refetch();
+    try {
+      await api.markAllRead(who());
+    } catch (e) {
+      console.error("mark all read failed", e);
+    } finally {
+      refetch();
+    }
   };
 
   return (
