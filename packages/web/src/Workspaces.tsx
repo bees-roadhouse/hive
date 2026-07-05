@@ -1,20 +1,14 @@
-// Workspaces — hosted Claude Code sessions hive spins up and drives in isolated
-// sandboxes. Left: your sessions + a "new session" form + your Claude Code
-// credentials. Right: the live transcript of the selected session + an input box.
+// Chats — hosted Claude Code sessions, presented as conversations rather than
+// an ops panel. Recents rail on the left; the selected session renders as
+// turns (your messages as bubbles, Claude's prose in the serif voice, tool
+// traffic collapsed to quiet expandable rows) with a composer pinned at the
+// bottom. Starting a chat is just typing the first prompt — the title derives
+// from it. Credentials management lives in Settings, not here.
 // Everything refetches on liveRev() (any SSE event), so transcripts stream in.
-import { createResource, createSignal, For, Show, type Component } from "solid-js";
+import { createEffect, createResource, createSignal, For, on, Show, type Component } from "solid-js";
 import { api, type CcMessage, type CcSession } from "./api.ts";
+import { Icon } from "./icons.tsx";
 import { liveRev } from "./live.ts";
-
-const STATUS_COLOR: Record<string, string> = {
-  provisioning: "#b58900",
-  running: "#268bd2",
-  idle: "#2aa198",
-  waiting_input: "#6c71c4",
-  completed: "#859900",
-  failed: "#dc322f",
-  archived: "#586e75",
-};
 
 function rel(iso: string | null | undefined): string {
   if (!iso) return "";
@@ -27,61 +21,50 @@ function rel(iso: string | null | undefined): string {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
-const StatusChip: Component<{ status: string }> = (p) => (
-  <span
-    style={{
-      background: STATUS_COLOR[p.status] ?? "#586e75",
-      color: "#fff",
-      "border-radius": "4px",
-      padding: "1px 6px",
-      "font-size": "11px",
-      "text-transform": "uppercase",
-      "letter-spacing": "0.04em",
-    }}
-  >
-    {p.status}
-  </span>
+const oneLine = (s: string, max = 90): string => {
+  const flat = s.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
+};
+
+const StatusDot: Component<{ status: string }> = (p) => (
+  <span class={`chat-dot st-${p.status}`} title={p.status.replace("_", " ")} />
 );
 
-function messageText(m: CcMessage): string {
+// A transcript row folded into one of four calm shapes: your turn, Claude's
+// turn, collapsed machine traffic (tools/thinking), or a system whisper.
+type Turn =
+  | { t: "user" | "ai"; text: string }
+  | { t: "tool"; head: string; body: string }
+  | { t: "sys"; text: string };
+
+function toTurn(m: CcMessage): Turn {
   const c = (m.content ?? {}) as Record<string, unknown>;
-  if (typeof c.text === "string") return c.text;
-  if (m.kind === "tool_use" && typeof c.name === "string") {
-    return `→ ${c.name}(${c.input ? JSON.stringify(c.input) : ""})`;
+  const text = typeof c.text === "string" ? c.text : "";
+  if (m.kind === "tool_use") {
+    const name = typeof c.name === "string" ? c.name : "tool";
+    const input = c.input === undefined ? "" : JSON.stringify(c.input, null, 2);
+    return { t: "tool", head: `→ ${name} ${oneLine(input)}`, body: input };
   }
-  if (m.kind === "tool_result") return typeof c.output === "string" ? c.output : JSON.stringify(c);
-  return JSON.stringify(c);
+  if (m.kind === "tool_result") {
+    const out = typeof c.output === "string" ? c.output : JSON.stringify(c, null, 2);
+    return { t: "tool", head: `← ${oneLine(out)}`, body: out };
+  }
+  if (m.kind === "thinking") return { t: "tool", head: `✳ ${oneLine(text || "thinking…")}`, body: text };
+  if (m.role === "user") return { t: "user", text: text || JSON.stringify(c) };
+  if (m.role === "assistant") return { t: "ai", text: text || JSON.stringify(c) };
+  return { t: "sys", text: oneLine(text || JSON.stringify(c), 160) };
 }
 
-const Message: Component<{ m: CcMessage }> = (p) => {
-  const muted = () => p.m.role === "system" || p.m.kind === "thinking";
-  return (
-    <div style={{ margin: "8px 0", opacity: muted() ? 0.7 : 1 }}>
-      <div class="dim" style={{ "font-size": "11px", "margin-bottom": "2px" }}>
-        {p.m.role} · {p.m.kind} · #{p.m.seq}
-      </div>
-      <pre
-        style={{
-          margin: 0,
-          "white-space": "pre-wrap",
-          "word-break": "break-word",
-          "font-family": p.m.kind === "tool_use" || p.m.kind === "tool_result" ? "monospace" : "inherit",
-          "font-size": "13px",
-        }}
-      >
-        {messageText(p.m)}
-      </pre>
-    </div>
-  );
-};
+// Sessions still doing (or awaiting) something; the rail hides archived ones.
+const ENDED = new Set(["archived", "completed", "failed"]);
 
 export const Workspaces: Component = () => {
   const [selected, setSelected] = createSignal<string | null>(null);
-  const [title, setTitle] = createSignal("");
-  const [prompt, setPrompt] = createSignal("");
-  const [input, setInput] = createSignal("");
+  const [draft, setDraft] = createSignal("");
   const [busy, setBusy] = createSignal(false);
   const [err, setErr] = createSignal<string | null>(null);
+  let scrollEl: HTMLDivElement | undefined;
+  let inputEl: HTMLTextAreaElement | undefined;
 
   const [sessions, { refetch: refetchSessions }] = createResource(
     () => liveRev(),
@@ -91,25 +74,46 @@ export const Workspaces: Component = () => {
     () => ({ id: selected(), _r: liveRev() }),
     (k) => (k.id ? api.transcript(k.id) : Promise.resolve([] as CcMessage[])),
   );
-  const [creds, { refetch: refetchCreds }] = createResource(
-    () => liveRev(),
-    () => api.ccCredentials(),
-  );
 
-  const current = (): CcSession | undefined => sessions()?.find((s) => s.id === selected());
+  // Both resources re-key on every SSE event; read .latest so an in-flight
+  // refetch shows the previous state instead of flashing the UI empty.
+  const rail = () => sessions.latest?.filter((s) => s.status !== "archived") ?? [];
+  const current = (): CcSession | undefined => sessions.latest?.find((s) => s.id === selected());
+  const msgs = () => transcript.latest ?? [];
+  const canSend = () => {
+    const s = current();
+    return !!s && !ENDED.has(s.status);
+  };
 
-  const start = async () => {
+  // Keep the newest turn in view as transcripts stream, and hand focus to the
+  // composer whenever the conversation (or the blank slate) changes.
+  createEffect(on(transcript, () => {
+    if (scrollEl) scrollEl.scrollTop = scrollEl.scrollHeight;
+  }));
+  createEffect(on(selected, () => {
     setErr(null);
-    setBusy(true);
+    queueMicrotask(() => inputEl?.focus());
+  }));
+
+  const submit = async () => {
+    const text = draft().trim();
+    if (!text || busy()) return;
+    setErr(null);
+    const id = selected();
     try {
-      const ws = await api.createWorkspace({
-        title: title().trim() || undefined,
-        prompt: prompt().trim() || undefined,
-      });
-      setTitle("");
-      setPrompt("");
-      setSelected(ws.id);
-      await refetchSessions();
+      if (id) {
+        setDraft("");
+        await api.sendInput(id, text);
+      } else {
+        setBusy(true);
+        const ws = await api.createWorkspace({
+          title: oneLine(text, 60),
+          prompt: text,
+        });
+        setDraft("");
+        setSelected(ws.id);
+        await refetchSessions();
+      }
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -117,191 +121,113 @@ export const Workspaces: Component = () => {
     }
   };
 
-  const send = async () => {
-    const id = selected();
-    const text = input().trim();
-    if (!id || !text) return;
-    setInput("");
-    try {
-      await api.sendInput(id, text);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    }
-  };
-
   const archive = async (id: string) => {
     try {
       await api.archiveWorkspace(id);
+      setSelected(null);
       await refetchSessions();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     }
   };
 
-  // ---- credentials sub-form ----
-  const [credKind, setCredKind] = createSignal("oauth_token");
-  const [credLabel, setCredLabel] = createSignal("");
-  const [credSecret, setCredSecret] = createSignal("");
-  const saveCred = async () => {
-    if (!credSecret().trim()) return;
-    try {
-      await api.saveCcCredential({ kind: credKind(), label: credLabel().trim() || undefined, secret: credSecret().trim() });
-      setCredSecret("");
-      setCredLabel("");
-      await refetchCreds();
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+  const onComposerKey = (e: KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      submit();
     }
   };
 
+  const composer = (placeholder: string) => (
+    <div class="chat-composer" classList={{ waiting: current()?.status === "waiting_input" }}>
+      <textarea
+        ref={inputEl}
+        rows="1"
+        placeholder={placeholder}
+        value={draft()}
+        onInput={(e) => setDraft(e.currentTarget.value)}
+        onKeyDown={onComposerKey}
+        aria-label={placeholder}
+      />
+      <button class="write-send" onClick={submit} disabled={busy() || !draft().trim()} title="Send (Enter)" aria-label="Send">
+        ↑
+      </button>
+    </div>
+  );
+
   return (
-    <div style={{ display: "grid", "grid-template-columns": "340px 1fr", gap: "16px", "align-items": "start" }}>
-      {/* LEFT: new session + list + credentials */}
-      <div style={{ display: "flex", "flex-direction": "column", gap: "16px" }}>
-        <div style={{ border: "1px solid var(--line, #333)", "border-radius": "8px", padding: "12px" }}>
-          <strong>New session</strong>
-          <input
-            placeholder="title (optional)"
-            value={title()}
-            onInput={(e) => setTitle(e.currentTarget.value)}
-            style={{ width: "100%", "margin-top": "8px" }}
-          />
-          <textarea
-            placeholder="first prompt — what should Claude Code do?"
-            rows="3"
-            value={prompt()}
-            onInput={(e) => setPrompt(e.currentTarget.value)}
-            style={{ width: "100%", "margin-top": "8px" }}
-          />
-          <button onClick={start} disabled={busy()} style={{ "margin-top": "8px" }}>
-            {busy() ? "Starting…" : "Start session"}
-          </button>
-        </div>
-
-        <div>
-          <div class="dim" style={{ "margin-bottom": "6px" }}>Sessions</div>
-          <Show when={(sessions()?.length ?? 0) > 0} fallback={<div class="dim">No sessions yet.</div>}>
-            <For each={sessions()}>
-              {(s) => (
-                <div
-                  onClick={() => setSelected(s.id)}
-                  style={{
-                    border: "1px solid var(--line, #333)",
-                    "border-radius": "6px",
-                    padding: "8px",
-                    "margin-bottom": "6px",
-                    cursor: "pointer",
-                    background: selected() === s.id ? "rgba(120,120,120,0.15)" : "transparent",
-                  }}
-                >
-                  <div style={{ display: "flex", "justify-content": "space-between", gap: "6px" }}>
-                    <strong style={{ overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
-                      {s.title || "(untitled)"}
-                    </strong>
-                    <StatusChip status={s.status} />
-                  </div>
-                  <div class="dim" style={{ "font-size": "11px", "margin-top": "2px" }}>
-                    {s.owner} · {rel(s.last_activity_at ?? s.created_at)}
-                  </div>
-                </div>
-              )}
-            </For>
-          </Show>
-        </div>
-
-        <div style={{ border: "1px solid var(--line, #333)", "border-radius": "8px", padding: "12px" }}>
-          <strong>Claude Code credentials</strong>
-          <div class="dim" style={{ "font-size": "12px", "margin": "4px 0 8px" }}>
-            Stored encrypted; used to run your sessions. Never shown again.
-          </div>
-          <For each={creds()}>
-            {(c) => (
-              <div style={{ display: "flex", "justify-content": "space-between", "align-items": "center", "margin-bottom": "4px" }}>
-                <span style={{ "font-size": "12px" }}>
-                  {c.kind} <code>{c.tail}</code> {c.label ? `· ${c.label}` : ""}
+    <div class="chat">
+      <div class="chat-rail">
+        <button class="chat-new" onClick={() => { setSelected(null); queueMicrotask(() => inputEl?.focus()); }}>
+          <Icon name="chats" size={15} /> New chat
+        </button>
+        <div class="chat-rows">
+          <For each={rail()} fallback={<p class="dim sm">No chats yet.</p>}>
+            {(s) => (
+              <button class="chat-row" classList={{ selected: selected() === s.id }} onClick={() => setSelected(s.id)}>
+                <span class="chat-row-title">{s.title || "Untitled chat"}</span>
+                <span class="chat-row-meta">
+                  <StatusDot status={s.status} />
+                  {rel(s.last_activity_at ?? s.created_at)}
                 </span>
-                <button onClick={() => api.deleteCcCredential(c.id).then(refetchCreds)} style={{ "font-size": "11px" }}>
-                  delete
-                </button>
-              </div>
+              </button>
             )}
           </For>
-          <select value={credKind()} onChange={(e) => setCredKind(e.currentTarget.value)} style={{ "margin-top": "8px", width: "100%" }}>
-            <option value="oauth_token">Subscription OAuth token (claude setup-token)</option>
-            <option value="api_key">Anthropic API key</option>
-          </select>
-          <input
-            placeholder="label (optional)"
-            value={credLabel()}
-            onInput={(e) => setCredLabel(e.currentTarget.value)}
-            style={{ width: "100%", "margin-top": "6px" }}
-          />
-          <input
-            type="password"
-            placeholder="paste secret"
-            value={credSecret()}
-            onInput={(e) => setCredSecret(e.currentTarget.value)}
-            style={{ width: "100%", "margin-top": "6px" }}
-          />
-          <button onClick={saveCred} style={{ "margin-top": "6px" }}>Save credential</button>
         </div>
       </div>
 
-      {/* RIGHT: transcript + input */}
-      <div>
-        <Show when={current()} fallback={<div class="dim">Select or start a session to see its transcript.</div>}>
-          {(s) => (
-            <div>
-              <div style={{ display: "flex", "justify-content": "space-between", "align-items": "center", "margin-bottom": "8px" }}>
-                <div>
-                  <strong>{s().title || "(untitled)"}</strong> <StatusChip status={s().status} />
-                  <div class="dim" style={{ "font-size": "11px" }}>
-                    {s().workdir}{s().claude_session_id ? ` · cc:${s().claude_session_id.slice(0, 8)}` : ""}
-                  </div>
-                </div>
-                <Show when={s().status !== "archived"}>
-                  <button onClick={() => archive(s().id)} style={{ "font-size": "12px" }}>Archive</button>
-                </Show>
-              </div>
-
-              <div
-                style={{
-                  border: "1px solid var(--line, #333)",
-                  "border-radius": "8px",
-                  padding: "12px",
-                  "min-height": "240px",
-                  "max-height": "60vh",
-                  "overflow-y": "auto",
-                }}
-              >
-                <Show when={(transcript()?.length ?? 0) > 0} fallback={<div class="dim">No messages yet.</div>}>
-                  <For each={transcript()}>{(m) => <Message m={m} />}</For>
-                </Show>
-              </div>
-
-              <Show when={s().status !== "archived" && s().status !== "completed"}>
-                <div style={{ display: "flex", gap: "8px", "margin-top": "8px" }}>
-                  <textarea
-                    placeholder="send input to the session…"
-                    rows="2"
-                    value={input()}
-                    onInput={(e) => setInput(e.currentTarget.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) send();
-                    }}
-                    style={{ flex: 1 }}
-                  />
-                  <button onClick={send}>Send</button>
-                </div>
-              </Show>
+      <div class="chat-main">
+        <Show
+          when={current()}
+          fallback={
+            <div class="chat-hero">
+              <span class="chat-hero-icon"><Icon name="chats" size={30} /></span>
+              <h3>What should Claude Code do?</h3>
+              <p class="dim">Each chat runs in its own hosted sandbox and writes back to the hive.</p>
+              {composer("Describe the task…")}
+              <Show when={err()}><div class="chat-err">{err()}</div></Show>
             </div>
+          }
+        >
+          {(s) => (
+            <>
+              <div class="chat-head">
+                <span class="chat-title">{s().title || "Untitled chat"}</span>
+                <span class="chat-status">
+                  <StatusDot status={s().status} />
+                  {s().status.replace("_", " ")}
+                </span>
+                <button class="x" onClick={() => archive(s().id)} title="Archive chat" aria-label="Archive chat">✕</button>
+              </div>
+              <div class="chat-scroll" ref={scrollEl}>
+                <Show when={msgs().length > 0} fallback={<p class="dim sm">Nothing here yet — Claude is warming up.</p>}>
+                  <For each={msgs()}>
+                    {(m) => {
+                      const turn = toTurn(m);
+                      return turn.t === "user" ? (
+                        <div class="chat-turn-user">{turn.text}</div>
+                      ) : turn.t === "ai" ? (
+                        <div class="chat-turn-ai">{turn.text}</div>
+                      ) : turn.t === "tool" ? (
+                        <details class="chat-tool">
+                          <summary>{turn.head}</summary>
+                          <pre>{turn.body}</pre>
+                        </details>
+                      ) : (
+                        <div class="chat-sys">{turn.text}</div>
+                      );
+                    }}
+                  </For>
+                </Show>
+              </div>
+              <Show when={canSend()} fallback={<div class="chat-ended">This chat has ended.</div>}>
+                {composer(s().status === "waiting_input" ? "Claude is waiting on you…" : "Reply…")}
+              </Show>
+              <Show when={err()}><div class="chat-err">{err()}</div></Show>
+            </>
           )}
         </Show>
       </div>
-
-      <Show when={err()}>
-        <div style={{ "grid-column": "1 / -1", color: "#dc322f", "font-size": "12px" }}>{err()}</div>
-      </Show>
     </div>
   );
 };

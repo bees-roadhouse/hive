@@ -60,13 +60,13 @@ const PAGES: Record<Tab, Component> = {
   settings: Settings,
 };
 
-// The four destinations that stay in the sidebar. The journal is the primary
-// surface ("Today"); the rest are the daily loops.
+// The three destinations that stay in the sidebar — the pillars: talking to
+// Claude Code, the journal, and the inbox. Search lives in ⌘K (free text there
+// already lands on /search). Chats leads the nav; Today stays the landing page.
 const PRIMARY: { id: Tab; label: string; icon: string }[] = [
+  { id: "workspaces", label: "Chats", icon: "chats" },
   { id: "journal", label: "Today", icon: "journal" },
   { id: "inbox", label: "Inbox", icon: "inbox" },
-  { id: "search", label: "Search", icon: "search" },
-  { id: "workspaces", label: "Workspaces", icon: "workspaces" },
 ];
 
 // Initials for the footer avatar chip ("Nate Smith" → "NS").
@@ -157,9 +157,9 @@ const Workspace = (props: {
         </aside>
 
         <main>
-          {/* The journal carries its own day headers; a "journal" title above
-              them would just be noise. */}
-          <Show when={pageTitle() !== "journal"}>
+          {/* The journal carries its own day headers and the chat surface owns
+              its own header row; an auto title above either would be noise. */}
+          <Show when={pageTitle() !== "journal" && pageTitle() !== "workspaces"}>
             <h2 class="page-title">{pageTitle()}</h2>
           </Show>
           {/* keyed on the leading path segment so each page remounts and re-runs

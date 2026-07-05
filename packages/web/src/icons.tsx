@@ -97,6 +97,13 @@ function paths(name: string): JSX.Element {
           <path d="M7 9l3 3-3 3M13 15h4" />
         </>
       );
+    case "chats": // speech bubble with a prompt caret — talking to Claude Code
+      return (
+        <>
+          <path d="M21 11.6a8.5 8.5 0 0 1-8.6 8.4 8.9 8.9 0 0 1-3.8-.85L3 20.5l1.4-4.3a8.2 8.2 0 0 1-1.3-4.6A8.5 8.5 0 0 1 11.7 3.2h.7a8.5 8.5 0 0 1 8.6 8.4z" />
+          <path d="M9.2 9.6l2.4 2.2-2.4 2.2M13.4 14h2.4" />
+        </>
+      );
     case "hex": // honeycomb cell — the day-page marker
       return <path d="M12 2.5l8.2 4.75v9.5L12 21.5l-8.2-4.75v-9.5z" />;
     case "more": // ellipsis — the sidebar door to the command palette

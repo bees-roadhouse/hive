@@ -1387,3 +1387,128 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
   .write-bar { left: 0; }
   .cmdk-backdrop { padding-top: 8vh; }
 }
+
+/* ---- chats: hosted Claude Code sessions as conversations ---- */
+/* Claude-desktop shape inside the hive shell: recents rail, turns in the
+   middle, composer at the bottom. Fills main's viewport (minus its padding)
+   so the transcript owns the scroll, not the page. */
+.chat {
+  display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 1.2rem;
+  height: calc(100dvh - 3.75rem);
+}
+.chat-rail {
+  display: flex; flex-direction: column; gap: 0.6rem; min-height: 0;
+  border-right: 1px solid var(--line); padding-right: 1.2rem;
+}
+.chat-new {
+  display: flex; align-items: center; justify-content: center; gap: 0.5rem;
+  border-radius: 10px; padding: 0.5rem 0.65rem;
+}
+.chat-rows {
+  flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 0.15rem;
+  scrollbar-width: thin; scrollbar-color: var(--line) transparent;
+}
+.chat-row {
+  display: flex; flex-direction: column; gap: 0.2rem; width: 100%;
+  background: transparent; border: 1px solid transparent; border-radius: 8px;
+  padding: 0.5rem 0.6rem; text-align: left; color: var(--dim);
+  font: inherit; cursor: pointer;
+}
+.chat-row:hover { background: var(--panel2); color: var(--ink); border-color: transparent; }
+.chat-row.selected { background: var(--panel2); color: var(--ink); }
+.chat-row-title {
+  font-size: 0.92rem;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.chat-row-meta { display: flex; align-items: center; gap: 0.4rem; font-size: 0.72rem; color: var(--dim); }
+
+/* Status is a dot, not a rainbow: honey while Claude works or waits on you,
+   neutral at rest, danger only for genuine failure. */
+.chat-dot { width: 7px; height: 7px; border-radius: 999px; background: var(--line); flex: none; }
+.chat-dot.st-provisioning, .chat-dot.st-running { background: var(--honey); animation: chat-pulse 1.6s ease-in-out infinite; }
+.chat-dot.st-waiting_input { background: var(--accent); }
+.chat-dot.st-idle { background: var(--dim); }
+.chat-dot.st-failed { background: var(--danger); }
+@keyframes chat-pulse { 50% { opacity: 0.3; } }
+
+.chat-main { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.chat-head {
+  display: flex; align-items: center; gap: 0.8rem;
+  padding-bottom: 0.7rem; border-bottom: 1px solid var(--line);
+}
+.chat-title {
+  flex: 1; min-width: 0; font-family: var(--display);
+  font-size: 1.15rem; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.chat-status { display: flex; align-items: center; gap: 0.4rem; font-size: 0.74rem; color: var(--dim); letter-spacing: 0.03em; }
+
+.chat-scroll {
+  flex: 1; overflow-y: auto; min-height: 0;
+  display: flex; flex-direction: column; gap: 0.9rem;
+  padding: 1.1rem 0.15rem;
+  scrollbar-width: thin; scrollbar-color: var(--line) transparent;
+}
+/* Your turn: a bubble on the right. Claude's turn: plain prose in the serif
+   voice (same convention as AI journal entries). */
+.chat-turn-user {
+  align-self: flex-end; max-width: min(80%, 46rem);
+  background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 14px 14px 4px 14px; padding: 0.6rem 0.9rem;
+  white-space: pre-wrap; word-break: break-word;
+}
+.chat-turn-ai {
+  max-width: 66rem; font-family: var(--display);
+  font-size: 1.02rem; line-height: 1.55;
+  white-space: pre-wrap; word-break: break-word;
+}
+/* Machine traffic (tool calls, results, thinking) folds into one quiet
+   monospace line; open it when you actually care. */
+.chat-tool { max-width: 66rem; font-size: 0.78rem; color: var(--dim); border: 1px solid transparent; border-radius: 8px; }
+.chat-tool summary {
+  cursor: pointer; list-style: none;
+  padding: 0.18rem 0.45rem; border-radius: 6px;
+  font-family: ui-monospace, "SF Mono", monospace;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.chat-tool summary::-webkit-details-marker { display: none; }
+.chat-tool summary:hover { background: var(--panel2); color: var(--ink); }
+.chat-tool[open] { background: var(--panel); border-color: var(--line); }
+.chat-tool pre {
+  margin: 0; padding: 0.6rem 0.8rem; font-size: 0.74rem;
+  white-space: pre-wrap; word-break: break-word;
+  max-height: 320px; overflow-y: auto;
+}
+.chat-sys { font-size: 0.72rem; color: var(--dim); opacity: 0.85; }
+
+.chat-composer {
+  display: flex; align-items: flex-end; gap: 0.7rem;
+  margin-top: 0.8rem; padding: 0.55rem 0.7rem;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+  transition: border-color 0.15s ease;
+}
+.chat-composer:focus-within, .chat-composer.waiting { border-color: var(--honey); }
+.chat-composer textarea {
+  flex: 1; background: transparent; border: none; resize: none; outline: none;
+  color: var(--ink); font: inherit; line-height: 1.4;
+  field-sizing: content; max-height: 9rem; min-height: 1.4em;
+}
+
+/* Blank slate: an invitation, not an empty admin panel. */
+.chat-hero {
+  flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 0.55rem; text-align: center; padding-bottom: 9vh;
+}
+.chat-hero-icon { color: var(--honey); }
+.chat-hero h3 { margin: 0; font-family: var(--display); font-size: 1.5rem; font-weight: 600; }
+.chat-hero p { margin: 0 0 0.9rem; }
+.chat-hero .chat-composer { width: min(620px, 100%); margin-top: 0; text-align: left; }
+
+.chat-ended { margin-top: 0.8rem; text-align: center; font-size: 0.8rem; color: var(--dim); }
+.chat-err { margin-top: 0.5rem; color: var(--danger); font-size: 0.8rem; }
+
+@media (max-width: 900px) {
+  .chat { grid-template-columns: 1fr; height: auto; gap: 0.9rem; }
+  .chat-rail { border-right: none; padding-right: 0; max-height: 13rem; }
+  .chat-scroll { max-height: 58vh; }
+}
