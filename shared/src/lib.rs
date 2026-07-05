@@ -568,6 +568,7 @@ pub enum EntityKind {
     Topic,
     Project,
     Phase,
+    Mail,
 }
 
 impl EntityKind {
@@ -581,18 +582,24 @@ impl EntityKind {
             EntityKind::Topic => "topic",
             EntityKind::Project => "project",
             EntityKind::Phase => "phase",
+            EntityKind::Mail => "mail",
         }
     }
-    pub fn from_str_lossy(s: &str) -> Self {
+    /// Fail closed: an unknown kind is `None`, never a default. Rows written by
+    /// a newer binary (a kind this build predates) must be dropped by callers,
+    /// not surfaced mislabeled as tasks (DIRECTION.md, Phase 0).
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "decision" => EntityKind::Decision,
-            "event" => EntityKind::Event,
-            "journal" => EntityKind::Journal,
-            "person" => EntityKind::Person,
-            "topic" => EntityKind::Topic,
-            "project" => EntityKind::Project,
-            "phase" => EntityKind::Phase,
-            _ => EntityKind::Task,
+            "task" => Some(EntityKind::Task),
+            "decision" => Some(EntityKind::Decision),
+            "event" => Some(EntityKind::Event),
+            "journal" => Some(EntityKind::Journal),
+            "person" => Some(EntityKind::Person),
+            "topic" => Some(EntityKind::Topic),
+            "project" => Some(EntityKind::Project),
+            "phase" => Some(EntityKind::Phase),
+            "mail" => Some(EntityKind::Mail),
+            _ => None,
         }
     }
 }
@@ -1457,6 +1464,20 @@ mod tests {
     fn slugify_matches_node() {
         assert_eq!(slugify("Bee's Roadhouse"), "bees-roadhouse");
         assert_eq!(slugify("MiXeD 123"), "mixed-123");
+    }
+
+    #[test]
+    fn entity_kind_parses_fail_closed() {
+        assert_eq!(EntityKind::parse("mail"), Some(EntityKind::Mail));
+        assert_eq!(EntityKind::parse("task"), Some(EntityKind::Task));
+        // Unknown kinds must never default to Task.
+        assert_eq!(EntityKind::parse("document"), None);
+        assert_eq!(EntityKind::parse(""), None);
+        // serde round-trip stays lowercase.
+        assert_eq!(
+            serde_json::to_string(&EntityKind::Mail).unwrap(),
+            "\"mail\""
+        );
     }
 
     #[test]
