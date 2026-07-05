@@ -231,7 +231,8 @@ textarea { width: 100%; resize: vertical; font-size: var(--fs-base); line-height
 
 /* ---- drawer ---- */
 .drawer-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: flex; justify-content: flex-end; z-index: 10; }
-.drawer { width: min(420px, 92vw); height: 100%; background: var(--panel); border-left: 1px solid var(--line); padding: 1.1rem; overflow: auto; }
+.drawer { width: min(420px, 92vw); height: 100%; background: var(--panel); border-left: 1px solid var(--line); padding: 1.1rem; overflow: auto; animation: drawer-in var(--t-slow) var(--ease-out); }
+@keyframes drawer-in { from { opacity: 0; transform: translateX(12px); } }
 .drawer-head { display: flex; justify-content: space-between; align-items: center; }
 .drawer blockquote, blockquote.origin { border-left: 3px solid var(--honey); margin: 0.6rem 0; padding: 0.3rem 0.7rem; color: var(--dim); font-style: italic; }
 blockquote.origin { font-size: var(--fs-sm); }
@@ -486,7 +487,9 @@ button.ghost { background: transparent; color: var(--dim); font-size: var(--fs-s
   box-shadow: 0 8px 24px rgba(0,0,0,0.45);
   max-height: 280px;
   overflow-y: auto;
+  animation: rise-in var(--t-base) var(--ease-out);
 }
+@keyframes rise-in { from { opacity: 0; transform: translateY(2px); } }
 .ac-item {
   display: flex;
   align-items: center;
@@ -517,9 +520,6 @@ button.ghost { background: transparent; color: var(--dim); font-size: var(--fs-s
 .entry-visible {
   opacity: 1;
   transform: translateY(0);
-}
-@media (prefers-reduced-motion: reduce) {
-  .entry-fade { opacity: 1; transform: none; transition: none; }
 }
 
 @media (max-width: 760px) {
@@ -770,9 +770,6 @@ button.ghost { background: transparent; color: var(--dim); font-size: var(--fs-s
   from { opacity: 0; }
   to   { opacity: 1; }
 }
-@media (prefers-reduced-motion: reduce) {
-  .overlay-backdrop { animation: none; }
-}
 
 /* Full-page writing panel */
 .overlay-panel {
@@ -793,9 +790,6 @@ button.ghost { background: transparent; color: var(--dim); font-size: var(--fs-s
 @keyframes overlay-slide-in {
   from { opacity: 0; transform: scale(0.97) translateY(6px); }
   to   { opacity: 1; transform: scale(1)    translateY(0); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .overlay-panel { animation: none; }
 }
 
 /* Panel header: title + write/preview seg + close button */
@@ -1073,8 +1067,8 @@ button.ghost.danger { background: transparent; color: #d98a8a; }
 
 /* ============================================================
    motion + life — route transitions, micro-interactions,
-   list entrances, loading skeletons. CSS-first; all motion is
-   suppressed under prefers-reduced-motion at the bottom.
+   list entrances, loading skeletons. CSS-first; the master
+   reduced-motion switch at the end of the file stops all of it.
    ============================================================ */
 
 /* ---- route transition: each page fades in on navigation ---- */
@@ -1202,19 +1196,6 @@ button.primary:hover:not(:disabled) {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* ---- reduced motion: honour the user's preference everywhere ---- */
-@media (prefers-reduced-motion: reduce) {
-  .route-view, .page-title,
-  .route-view .card, .route-view .decision, .route-view .inbox-item,
-  .route-view .entity-row, .route-view .project-card, .route-view .kpi,
-  .route-view .panel, .nav-badge, .unread-pill, .just-landed {
-    animation: none;
-  }
-  .card:hover, .kpi:hover { transform: none; box-shadow: none; }
-  .skeleton { animation: none; }
-  .spinner { animation-duration: 2s; }
-}
-
 /* ============================================================
    wire — live news / info feed
    ============================================================ */
@@ -1267,10 +1248,6 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
 .sev-badge.sev-high { background: color-mix(in srgb, var(--danger) 12%, transparent); color: color-mix(in srgb, var(--danger) 70%, var(--dim)); }
 .sev-badge.sev-medium { background: color-mix(in srgb, var(--honey) 16%, transparent); color: var(--accent); }
 .sev-badge.sev-low { background: color-mix(in srgb, var(--task) 16%, transparent); color: var(--task); }
-
-@media (prefers-reduced-motion: reduce) {
-  .news-card:hover { transform: none; }
-}
 
 /* ============================================================
    journal right rail — entities anchored in entries in view
@@ -1348,10 +1325,6 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
     border-top: 1px solid var(--line); padding-left: 0; padding-top: 1rem;
   }
 }
-@media (prefers-reduced-motion: reduce) {
-  .rail-item:hover { transform: none; }
-  .entry-flash { animation: none; }
-}
 
 /* ---- AI voice: entries authored by an AI writer render in serif so who is
    speaking reads at a glance (typography as attribution). ---- */
@@ -1365,7 +1338,10 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
   background: rgba(0, 0, 0, 0.55);
   display: flex; justify-content: center; align-items: flex-start;
   padding: 12vh 1rem 0;
+  animation: overlay-fade-in var(--t-base) ease;
 }
+/* Entrance reuses the overlay-panel keyframes so the palette rises through
+   the same house motion as the composer overlay. */
 .cmdk {
   width: min(560px, 100%);
   background: var(--panel);
@@ -1373,6 +1349,7 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
   border-radius: var(--r-lg);
   overflow: hidden;
   box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+  animation: overlay-slide-in var(--t-slow) var(--ease-out);
 }
 .cmdk-input {
   width: 100%;
@@ -1536,4 +1513,20 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
   .chat { grid-template-columns: 1fr; height: auto; gap: 0.9rem; }
   .chat-rail { border-right: none; padding-right: 0; max-height: 13rem; }
   .chat-scroll { max-height: 58vh; }
+}
+
+/* ---- reduced motion: one master switch ----
+   Everything stops except meaning-bearing progress (spinner) — status-dot
+   pulses go static at full opacity. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  .spinner { animation-duration: 0.7s !important; animation-iteration-count: infinite !important; }
+  .live-dot, .chat-dot, .ws-dot { animation: none !important; opacity: 1 !important; }
+  /* Folded from the old per-feature blocks: scroll-fade journal entries must
+     never sit hidden waiting for an entrance transition that no longer runs. */
+  .entry-fade { opacity: 1; transform: none; }
 }
