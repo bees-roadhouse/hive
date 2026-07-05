@@ -135,6 +135,15 @@ fn mark_transformers_unavailable(reason: &str) {
     }
 }
 
+/// Whether the transformers provider is configured but has latched to the hash
+/// fallback (a model-load failure; clears on restart). While latched, embed()
+/// returns 256-dim hash vectors although embed_model() still names the ONNX
+/// model — callers that persist vectors must pause instead of writing those
+/// mislabeled fallback vectors (DIRECTION.md Phase 0 item 4).
+pub fn transformers_latched() -> bool {
+    provider_is_transformers() && TRANSFORMERS_FAILED.load(Ordering::Relaxed)
+}
+
 /// Whether a cross-encoder reranker is available right now.
 pub fn rerank_available() -> bool {
     if !provider_is_transformers() || TRANSFORMERS_FAILED.load(Ordering::Relaxed) {
@@ -285,6 +294,34 @@ pub fn content_hash(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct FailingEngine;
+    impl OnnxProvider for FailingEngine {
+        fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+            anyhow::bail!("model load failed (test)")
+        }
+        fn rerank(&self, _query: &str, _docs: &[String]) -> anyhow::Result<Vec<f64>> {
+            anyhow::bail!("no reranker (test)")
+        }
+        fn supports_rerank(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn onnx_failure_latches_and_is_observable() {
+        if !provider_is_transformers() {
+            return; // HIVE_EMBED=hash in this environment — nothing to latch.
+        }
+        // Wire a broken engine before the lazy default can install itself.
+        set_onnx_provider(Box::new(FailingEngine));
+        let v = embed("latch trip");
+        // Degraded to the hash fallback…
+        assert_eq!(v.len(), HASH_DIM);
+        // …and observable, so persisting callers (worker backfill) can pause
+        // instead of storing fallback vectors under the ONNX model tag.
+        assert!(transformers_latched());
+    }
 
     #[test]
     fn fnv1a_matches_js() {
