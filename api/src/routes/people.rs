@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::{err, forbidden, not_found, ApiResult};
-use crate::middleware::AuthCtx;
+use crate::middleware::{can_act_for_identity, AuthCtx};
 use crate::store::Store;
 
 pub fn router() -> Router<Store> {
@@ -137,20 +137,48 @@ struct InboxQuery {
 
 async fn inbox_list(
     State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
     Path(recipient): Path<String>,
     Query(q): Query<InboxQuery>,
 ) -> ApiResult {
+    // An inbox is private to its recipient — snippets quote entries other
+    // viewers may not see (DIRECTION.md Phase 0 item 3).
+    if !can_act_for_identity(&s, &ctx, &recipient).await? {
+        return Ok(forbidden());
+    }
     let unread = matches!(q.unread.as_deref(), Some("1") | Some("true"));
     Ok(Json(s.inbox_list(&recipient, unread).await?).into_response())
 }
 
-async fn inbox_read_all(State(s): State<Store>, Path(recipient): Path<String>) -> ApiResult {
+async fn inbox_read_all(
+    State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
+    Path(recipient): Path<String>,
+) -> ApiResult {
+    if !can_act_for_identity(&s, &ctx, &recipient).await? {
+        return Ok(forbidden());
+    }
     let marked = s.inbox_mark_all_read(&recipient).await?;
     Ok(Json(json!({"marked": marked})).into_response())
 }
 
-async fn inbox_read_item(State(s): State<Store>, Path(id): Path<String>) -> ApiResult {
-    let marked = s.inbox_mark_read(&id).await?;
+async fn inbox_read_item(
+    State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    // Resolve the item's recipient and gate on it — marking another actor's
+    // notifications read is cross-namespace tampering. Missing and foreign
+    // ids answer the same {"marked": false} so the route doesn't oracle
+    // which ids exist in others' inboxes (same as the MCP twin).
+    let allowed = match s.inbox_recipient(&id).await? {
+        Some(recipient) => can_act_for_identity(&s, &ctx, &recipient).await?,
+        None => false,
+    };
+    if !allowed {
+        return Ok(Json(json!({"marked": false})).into_response());
+    }
+    let marked = s.inbox_mark_read(&id).await? > 0;
     Ok(Json(json!({"marked": marked})).into_response())
 }
 
