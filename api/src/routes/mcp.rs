@@ -656,7 +656,9 @@ mod tests {
         );
         assert_eq!(res["result"]["content"][0]["text"], "forbidden");
 
-        // …nor mark nate's notifications read, by item id or wholesale.
+        // …nor mark nate's notifications read, by item id (a foreign id
+        // answers exactly like a missing one — no existence oracle) or
+        // wholesale.
         let res = handle_request(
             &store,
             &ctx_for("pia"),
@@ -668,7 +670,8 @@ mod tests {
         )
         .await;
         assert_eq!(
-            res["result"]["isError"], true,
+            content_text(&res["result"]),
+            json!({"marked": false}),
             "cross-actor mark by id: {res}"
         );
         let res = handle_request(

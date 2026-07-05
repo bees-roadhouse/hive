@@ -12,7 +12,7 @@ use anyhow::Result;
 use hive_shared::{EmbeddingKindCount, EmbeddingModelCount, EmbeddingStats, EntityKind, SearchHit};
 use sqlx::Row;
 
-use super::Store;
+use super::{placeholders_or_never, Store};
 
 /// Options for `semantic_search` — mirrors store.ts `SemanticOptions` (every
 /// field optional; defaults applied inside, exactly as the Node code does).
@@ -173,7 +173,16 @@ impl VisibilityIndex {
 }
 
 impl Store {
-    async fn visibility_index(&self, viewer: &str) -> Result<VisibilityIndex> {
+    /// Resolved once per scoped semantic query. The cascade needs a pure
+    /// predicate over EVERY vector candidate, so origin maps load their whole
+    /// (small) tables up front — but only for kinds the query can return:
+    /// `kinds` skips excluded tables (recall's journal-only path pays nothing
+    /// here).
+    async fn visibility_index(
+        &self,
+        viewer: &str,
+        kinds: Option<&[EntityKind]>,
+    ) -> Result<VisibilityIndex> {
         // `viewer` is always a concrete namespace user here (admins search
         // unscoped — the route passes viewer=None). The visible set is already
         // namespace-gated inside visible_entry_ids.
@@ -185,6 +194,9 @@ impl Store {
             .unwrap_or_default();
         let mut origin_of: HashMap<String, Option<String>> = HashMap::new();
         for (kind, table) in ORIGIN_TABLE {
+            if kinds.is_some_and(|ks| !ks.iter().any(|k| k.as_str() == *kind)) {
+                continue;
+            }
             let rows =
                 crate::pgq::query(&format!("SELECT id, origin_entry_id FROM {table}"))
                     .fetch_all(self.db())
@@ -202,12 +214,48 @@ impl Store {
         })
     }
 
-    /// Drop search hits a viewer can't see (store.ts `scopeHits`).
+    /// Drop search hits a viewer can't see (store.ts `scopeHits`). Hits are
+    /// already a bounded candidate list, so origins resolve in one batched
+    /// IN query per kind present instead of full-table scans.
     async fn scope_hits(&self, hits: Vec<SearchHit>, viewer: &str) -> Result<Vec<SearchHit>> {
-        let visible = self.visibility_index(viewer).await?;
+        let visible_entries = self
+            .visible_entry_ids(&crate::middleware::Visibility::Namespace(
+                viewer.to_string(),
+            ))
+            .await?
+            .unwrap_or_default();
+        let mut origin_of: HashMap<String, Option<String>> = HashMap::new();
+        for (kind, table) in ORIGIN_TABLE {
+            let ids: Vec<&str> = hits
+                .iter()
+                .filter(|h| h.kind.as_str() == *kind)
+                .map(|h| h.id.as_str())
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            let sql = format!(
+                "SELECT id, origin_entry_id FROM {table} WHERE id IN ({})",
+                placeholders_or_never(ids.len())
+            );
+            let mut q = crate::pgq::query(&sql);
+            for id in &ids {
+                q = q.bind(*id);
+            }
+            for r in &q.fetch_all(self.db()).await? {
+                origin_of.insert(
+                    ref_key(kind, r.try_get::<String, _>("id")?.as_str()),
+                    r.try_get("origin_entry_id")?,
+                );
+            }
+        }
+        let index = VisibilityIndex {
+            visible_entries,
+            origin_of,
+        };
         Ok(hits
             .into_iter()
-            .filter(|h| visible.allows(h.kind.as_str(), &h.id))
+            .filter(|h| index.allows(h.kind.as_str(), &h.id))
             .collect())
     }
 
@@ -480,18 +528,26 @@ impl Store {
             return Ok(vec![]);
         }
 
-        // Resolve the viewer ACL once, up front. `allowed` is pure after that,
-        // so every stage below can scope candidates before its cut.
+        // Resolve the viewer ACL once, up front. `admit` is pure after that:
+        // a candidate enters any pool only if its kind parses (a newer
+        // binary's rows must not hold slots this build drops at hydration),
+        // passes the kinds filter, and is visible to the viewer. Applied
+        // before every cut, including the fallback.
         let visible = match opts.viewer.as_deref() {
-            Some(v) => Some(self.visibility_index(v).await?),
+            Some(v) => Some(self.visibility_index(v, opts.kinds.as_deref()).await?),
             None => None,
         };
-        let allowed = |key: &str| match &visible {
-            Some(ix) => {
-                let (kind, id) = split_key(key);
-                ix.allows(kind, id)
+        let admit = |kind_s: &str, id: &str| -> bool {
+            let Some(kind) = EntityKind::parse(kind_s) else {
+                return false;
+            };
+            if opts.kinds.as_ref().is_some_and(|ks| !ks.contains(&kind)) {
+                return false;
             }
-            None => true,
+            match &visible {
+                Some(ix) => ix.allows(kind_s, id),
+                None => true,
+            }
         };
 
         let items = self.embeddable_items().await?;
@@ -517,34 +573,24 @@ impl Store {
 
         // 1. Vector pass — full cosine over model-matched blobs (model+dim
         // filter so a partial backfill never compares across dimensions). The
-        // kind filter lives in SQL so excluded corpora never even load.
+        // kind filter also lives in SQL so excluded kinds' vectors never load;
+        // admit() stays the guarantee if this query ever changes.
         let owned_query = query.to_string();
         let q = tokio::task::spawn_blocking(move || hive_embed::embed_query(&owned_query)).await?;
-        let rows = match &opts.kinds {
-            Some(kinds) => {
-                let sql = format!(
-                    "SELECT ref_kind, ref_id, vec FROM embeddings WHERE model = ? AND dim = ? \
-                     AND ref_kind IN ({})",
-                    super::placeholders_or_never(kinds.len())
-                );
-                let mut q_db = crate::pgq::query(&sql)
-                    .bind(hive_embed::embed_model())
-                    .bind(q.len() as i64);
-                for k in kinds {
-                    q_db = q_db.bind(k.as_str());
-                }
-                q_db.fetch_all(self.db()).await?
-            }
-            None => {
-                crate::pgq::query(
-                    "SELECT ref_kind, ref_id, vec FROM embeddings WHERE model = ? AND dim = ?",
-                )
-                .bind(hive_embed::embed_model())
-                .bind(q.len() as i64)
-                .fetch_all(self.db())
-                .await?
-            }
+        let kind_clause = match &opts.kinds {
+            Some(ks) => format!(" AND ref_kind IN ({})", placeholders_or_never(ks.len())),
+            None => String::new(),
         };
+        let sql = format!(
+            "SELECT ref_kind, ref_id, vec FROM embeddings WHERE model = ? AND dim = ?{kind_clause}"
+        );
+        let mut q_db = crate::pgq::query(&sql)
+            .bind(hive_embed::embed_model())
+            .bind(q.len() as i64);
+        for k in opts.kinds.as_deref().unwrap_or(&[]) {
+            q_db = q_db.bind(k.as_str());
+        }
+        let rows = q_db.fetch_all(self.db()).await?;
         let mut scored_all: Vec<(String, f64)> = rows
             .iter()
             .map(|r| -> Result<(String, f64)> {
@@ -557,12 +603,14 @@ impl Store {
             })
             .collect::<Result<_>>()?;
         scored_all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        // Scope before the threshold/pool cuts. `scored_all` stays unscoped
-        // only as raw input for the fallback, which re-checks visibility.
-        let passing: Vec<&(String, f64)> = scored_all
-            .iter()
-            .filter(|(k, s)| *s >= threshold && allowed(k))
-            .collect();
+        // Admission applies before ANY cut — the threshold filter, the stage
+        // pools, and the fallback refill all see an already-admitted list.
+        scored_all.retain(|(k, _)| {
+            let (kind, id) = split_key(k);
+            admit(kind, id)
+        });
+        let passing: Vec<&(String, f64)> =
+            scored_all.iter().filter(|(_, s)| *s >= threshold).collect();
         let raw_hit_keys: HashSet<String> = passing.iter().map(|(k, _)| k.clone()).collect();
 
         let mut scores = ScoreMap::default();
@@ -572,13 +620,17 @@ impl Store {
 
         // 2. Keyword pass (FTS) — rank-based score decaying from the top.
         if hybrid {
-            let mut kw = self.search(query, stage2_pool, None).await?;
-            // Same scope/kind discipline as the vector pass: keyword hits are
-            // filtered before they claim pool slots or rank positions.
-            kw.retain(|r| {
-                allowed(&ref_key(r.kind.as_str(), &r.id))
-                    && opts.kinds.as_ref().is_none_or(|ks| ks.contains(&r.kind))
-            });
+            // Over-fetch when a filter will thin the pool (mirrors search()'s
+            // own viewer over-fetch), then admit BEFORE the stage cut, so
+            // hidden or excluded-kind rows can't hold keyword slots.
+            let fetch = if visible.is_some() || opts.kinds.is_some() {
+                stage2_pool * 5
+            } else {
+                stage2_pool
+            };
+            let mut kw = self.search(query, fetch, None).await?;
+            kw.retain(|r| admit(r.kind.as_str(), &r.id));
+            kw.truncate(stage2_pool);
             let total = kw.len().max(1) as f64;
             for (i, r) in kw.iter().enumerate() {
                 let kk = ref_key(r.kind.as_str(), &r.id);
@@ -692,14 +744,11 @@ impl Store {
         }
         ranked.truncate(limit);
 
-        // 6. Fallback — never return empty when visible vectors exist.
+        // 6. Fallback — never return empty when admitted vectors exist
+        // (scored_all was admission-filtered above, so this can't smuggle
+        // hidden or unknown-kind rows back in).
         if ranked.is_empty() && !scored_all.is_empty() {
-            ranked = scored_all
-                .iter()
-                .filter(|(k, _)| allowed(k))
-                .take(limit)
-                .cloned()
-                .collect();
+            ranked = scored_all.iter().take(limit).cloned().collect();
         }
 
         let hits: Vec<SearchHit> = ranked

@@ -91,7 +91,7 @@ async fn recall(
     if identity.is_empty() {
         return Ok(err(StatusCode::BAD_REQUEST, "identity required"));
     }
-    if !can_recall_identity(&s, &ctx, &identity).await? {
+    if !crate::middleware::can_act_for_identity(&s, &ctx, &identity).await? {
         return Ok(err(StatusCode::FORBIDDEN, "not_your_identity"));
     }
     let viewer = if ctx.is_admin() {
@@ -112,21 +112,6 @@ async fn recall(
         )
         .await?;
     Ok(Json(result).into_response())
-}
-
-async fn can_recall_identity(s: &Store, ctx: &AuthCtx, identity: &str) -> anyhow::Result<bool> {
-    if ctx.is_admin() || identity == ctx.actor() {
-        return Ok(true);
-    }
-    if ctx.principal == Some("session") {
-        let owner = ctx.namespace_user();
-        return Ok(s
-            .people_ais_owned_by(owner)
-            .await?
-            .iter()
-            .any(|p| p.slug == identity));
-    }
-    Ok(false)
 }
 
 // dashboard / graph / autocomplete are cross-namespace aggregate views (counts,

@@ -75,18 +75,16 @@ impl Store {
             .collect()
     }
 
-    pub async fn inbox_get(&self, item_id: &str) -> Result<Option<InboxItem>> {
-        let row = crate::pgq::query(
-            r#"SELECT id, recipient, "from", reason, ref_kind, ref_id, entry_id, snippet, created_at, read_at
-               FROM inbox WHERE id = ?"#,
+    /// Recipient of one item, kind-agnostic: the ownership gate must work even
+    /// for rows whose ref_kind this build can't parse (mark-read is a plain
+    /// UPDATE — only display goes through the fail-closed row mapper).
+    pub async fn inbox_recipient(&self, item_id: &str) -> Result<Option<String>> {
+        Ok(
+            crate::pgq::query_scalar("SELECT recipient FROM inbox WHERE id = ?")
+                .bind(item_id)
+                .fetch_optional(self.db())
+                .await?,
         )
-        .bind(item_id)
-        .fetch_optional(self.db())
-        .await?;
-        match row {
-            Some(r) => row_to_inbox(&r),
-            None => Ok(None),
-        }
     }
 
     pub async fn inbox_mark_read(&self, item_id: &str) -> Result<u64> {

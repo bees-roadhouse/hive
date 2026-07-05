@@ -1065,13 +1065,16 @@ async fn dispatch(
             let recipient = a.opt_str("recipient").map(String::from);
             a.finish()?;
             if let Some(id) = id {
-                // Resolve the item's recipient and gate on it — marking another
-                // actor's notifications read is cross-namespace tampering.
-                let Some(item) = store.inbox_get(&id).await? else {
-                    return Ok(ok_content(&json!({"marked": false})));
+                // Gate on the item's recipient (kind-agnostic — the row must
+                // stay markable even when its ref_kind postdates this build).
+                // Missing and foreign ids answer the same {"marked": false} so
+                // the tool doesn't oracle which ids exist in others' inboxes.
+                let allowed = match store.inbox_recipient(&id).await? {
+                    Some(recipient) => can_act_for_identity(store, ctx, &recipient).await?,
+                    None => false,
                 };
-                if !can_act_for_identity(store, ctx, &item.recipient).await? {
-                    return Ok(tool_error("forbidden"));
+                if !allowed {
+                    return Ok(ok_content(&json!({"marked": false})));
                 }
                 let marked = store.inbox_mark_read(&id).await? > 0;
                 return Ok(ok_content(&json!({"marked": marked})));
@@ -1425,26 +1428,13 @@ async fn journal_append(store: &Store, ctx: &AuthCtx, args: &Map<String, Value>)
     ))
 }
 
-/// May `ctx` read/act for `identity`'s private surfaces (recall brief, inbox)?
-/// Admins: anyone. Tokens: only their own actor. Sessions: also the AIs the
-/// logged-in user owns.
+/// One shared identity gate for MCP and HTTP: crate::middleware::can_act_for_identity.
 async fn can_act_for_identity(
     store: &Store,
     ctx: &AuthCtx,
     identity: &str,
 ) -> Result<bool, ToolFailure> {
-    if ctx.is_admin() || identity == ctx.actor() {
-        return Ok(true);
-    }
-    if ctx.principal == Some("session") {
-        let owner = ctx.namespace_user();
-        return Ok(store
-            .people_ais_owned_by(owner)
-            .await?
-            .iter()
-            .any(|p| p.slug == identity));
-    }
-    Ok(false)
+    Ok(crate::middleware::can_act_for_identity(store, ctx, identity).await?)
 }
 
 async fn can_edit_actor_profile(

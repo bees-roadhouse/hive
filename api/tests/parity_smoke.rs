@@ -1131,6 +1131,36 @@ async fn semantic_scope_runs_before_truncation_and_recall_filters_kinds_in_searc
         .journal
         .iter()
         .all(|h| h.hit.kind == hive_shared::EntityKind::Journal));
+
+    // A top-scoring embeddings row of a kind this build doesn't know (written
+    // by a newer binary) must not hold result slots on the UNSCOPED path
+    // either: admission drops it before the cut, so the admin still gets the
+    // best parseable hit instead of an empty result.
+    let alien = hive_embed::embed_query("alpha hive inspection notes");
+    hive_api::pgq::query(
+        "INSERT INTO embeddings (ref_kind, ref_id, model, dim, vec, hash, created_at) \
+         VALUES ('document', 'doc_alien', ?, ?, ?, 'alien', ?)",
+    )
+    .bind(hive_embed::embed_model())
+    .bind(alien.len() as i64)
+    .bind(hive_embed::to_blob(&alien))
+    .bind(hive_api::store::now_iso())
+    .execute(store.db())
+    .await
+    .expect("alien embedding row");
+    let (status, hits, _) = send(
+        &app,
+        get(
+            "/api/search?q=alpha%20hive%20inspection%20notes&mode=semantic&limit=1",
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !hits.as_array().unwrap().is_empty(),
+        "unknown-kind row starved the unscoped result: {hits}"
+    );
 }
 
 #[tokio::test]
