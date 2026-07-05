@@ -78,6 +78,29 @@ pub enum Visibility {
     Namespace(String),
 }
 
+/// May this principal read/act for `identity`'s private surfaces (recall
+/// brief, inbox)? Admins: anyone. Tokens: only their own actor. Sessions:
+/// also the AIs the logged-in user owns. Shared by the MCP tools and the
+/// HTTP routes so the two doors can't drift apart.
+pub async fn can_act_for_identity(
+    store: &Store,
+    ctx: &AuthCtx,
+    identity: &str,
+) -> anyhow::Result<bool> {
+    if ctx.is_admin() || identity == ctx.actor() {
+        return Ok(true);
+    }
+    if ctx.principal == Some("session") {
+        let owner = ctx.namespace_user();
+        return Ok(store
+            .people_ais_owned_by(owner)
+            .await?
+            .iter()
+            .any(|p| p.slug == identity));
+    }
+    Ok(false)
+}
+
 const PUBLIC_PATHS: &[&str] = &[
     "/api/healthz",
     "/api/onboarding/status",

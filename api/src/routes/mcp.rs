@@ -623,6 +623,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inbox_tools_are_viewer_gated() {
+        let (store, _dir) = test_store().await;
+        let item = store
+            .inbox_add(
+                "nate",
+                "maggie",
+                hive_shared::InboxReason::Mention,
+                hive_shared::EntityKind::Journal,
+                "jrnl_secret",
+                None,
+                "private snippet only nate may see",
+            )
+            .await
+            .expect("inbox add")
+            .expect("delivered");
+
+        // Another actor's token can no longer read nate's inbox…
+        let res = handle_request(
+            &store,
+            &ctx_for("pia"),
+            &req(
+                "tools/call",
+                json!({"name": "inbox_list", "arguments": {"recipient": "nate"}}),
+                1,
+            ),
+        )
+        .await;
+        assert_eq!(
+            res["result"]["isError"], true,
+            "cross-actor inbox_list: {res}"
+        );
+        assert_eq!(res["result"]["content"][0]["text"], "forbidden");
+
+        // …nor mark nate's notifications read, by item id (a foreign id
+        // answers exactly like a missing one — no existence oracle) or
+        // wholesale.
+        let res = handle_request(
+            &store,
+            &ctx_for("pia"),
+            &req(
+                "tools/call",
+                json!({"name": "inbox_mark_read", "arguments": {"id": item.id}}),
+                2,
+            ),
+        )
+        .await;
+        assert_eq!(
+            content_text(&res["result"]),
+            json!({"marked": false}),
+            "cross-actor mark by id: {res}"
+        );
+        let res = handle_request(
+            &store,
+            &ctx_for("pia"),
+            &req(
+                "tools/call",
+                json!({"name": "inbox_mark_read", "arguments": {"recipient": "nate"}}),
+                3,
+            ),
+        )
+        .await;
+        assert_eq!(
+            res["result"]["isError"], true,
+            "cross-actor mark all: {res}"
+        );
+        assert_eq!(store.inbox_unread_count("nate").await.unwrap(), 1);
+
+        // The recipient reads their own; an admin token may read anyone's.
+        let res = handle_request(
+            &store,
+            &ctx_for("nate"),
+            &req(
+                "tools/call",
+                json!({"name": "inbox_list", "arguments": {"recipient": "nate"}}),
+                4,
+            ),
+        )
+        .await;
+        let items = content_text(&res["result"]);
+        assert_eq!(items.as_array().map(Vec::len), Some(1), "own inbox: {res}");
+        let res = handle_request(
+            &store,
+            &authed(),
+            &req(
+                "tools/call",
+                json!({"name": "inbox_list", "arguments": {"recipient": "maggie"}}),
+                5,
+            ),
+        )
+        .await;
+        assert!(res["result"]["isError"].is_null(), "admin list: {res}");
+
+        // Own mark-read still works.
+        let res = handle_request(
+            &store,
+            &ctx_for("nate"),
+            &req(
+                "tools/call",
+                json!({"name": "inbox_mark_read", "arguments": {"id": item.id}}),
+                6,
+            ),
+        )
+        .await;
+        assert_eq!(content_text(&res["result"]), json!({"marked": true}));
+    }
+
+    #[tokio::test]
     async fn http_layer_parity() {
         let (store, _dir) = test_store().await;
 

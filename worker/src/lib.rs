@@ -108,6 +108,14 @@ impl Worker {
     /// stored row is missing or has a stale content hash / model; returns how
     /// many were (re)computed.
     async fn backfill_embeddings(&self) -> Result<i64> {
+        // Once the ONNX model latches to the hash fallback, every embed()
+        // would return a 256-dim hash vector still stamped with the ONNX model
+        // tag — pausing beats poisoning the corpus with vectors that never get
+        // re-embedded. The latch clears on restart; retry next cycle.
+        if hive_embed::transformers_latched() {
+            warn!("embedding backfill paused: transformers model unavailable (hash fallback latched)");
+            return Ok(0);
+        }
         let mut n = 0;
         // The api store owns embeddableItems (same source Node's worker imports).
         for it in self.store.embeddable_items().await? {
@@ -116,6 +124,15 @@ impl Worker {
                 .await?
             {
                 n += 1;
+            }
+            // The latch can trip inside any embed() call — stop the cycle
+            // rather than hammer the fallback for the rest of the corpus.
+            if hive_embed::transformers_latched() {
+                warn!(
+                    embedded = n,
+                    "embedding backfill paused mid-cycle: transformers model unavailable"
+                );
+                break;
             }
         }
         Ok(n)
@@ -144,6 +161,13 @@ impl Worker {
         }
         // embed() is sync + potentially slow (ONNX) — keep it off the async runtime.
         let vec = tokio::task::spawn_blocking(move || hive_embed::embed(&embed_text)).await?;
+        // If the model failed (possibly during this very call), `vec` is the
+        // hash fallback but `model` still names the ONNX repo: a row written
+        // now would be wrong-dim, mislabeled, and skipped by every future
+        // backfill. Drop it; the paused backfill picks the item up on restart.
+        if hive_embed::transformers_latched() {
+            return Ok(false);
+        }
         hive_api::pgq::query(
             "INSERT INTO embeddings (ref_kind, ref_id, model, dim, vec, hash, created_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?) \

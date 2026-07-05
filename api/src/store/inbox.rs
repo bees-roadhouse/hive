@@ -70,7 +70,21 @@ impl Store {
             .bind(recipient)
             .fetch_all(self.db())
             .await?;
-        rows.iter().map(row_to_inbox).collect()
+        rows.iter()
+            .filter_map(|r| row_to_inbox(r).transpose())
+            .collect()
+    }
+
+    /// Recipient of one item, kind-agnostic: the ownership gate must work even
+    /// for rows whose ref_kind this build can't parse (mark-read is a plain
+    /// UPDATE — only display goes through the fail-closed row mapper).
+    pub async fn inbox_recipient(&self, item_id: &str) -> Result<Option<String>> {
+        Ok(
+            crate::pgq::query_scalar("SELECT recipient FROM inbox WHERE id = ?")
+                .bind(item_id)
+                .fetch_optional(self.db())
+                .await?,
+        )
     }
 
     pub async fn inbox_mark_read(&self, item_id: &str) -> Result<u64> {
@@ -104,17 +118,23 @@ impl Store {
     }
 }
 
-pub(crate) fn row_to_inbox(r: &sqlx::postgres::PgRow) -> Result<InboxItem> {
-    Ok(InboxItem {
+/// `Ok(None)` = a row referencing a kind this build doesn't know — dropped,
+/// never surfaced as a task notification (fail closed).
+pub(crate) fn row_to_inbox(r: &sqlx::postgres::PgRow) -> Result<Option<InboxItem>> {
+    let ref_kind: String = r.try_get("ref_kind")?;
+    let Some(ref_kind) = EntityKind::parse(&ref_kind) else {
+        return Ok(None);
+    };
+    Ok(Some(InboxItem {
         id: r.try_get("id")?,
         recipient: r.try_get("recipient")?,
         from: r.try_get("from")?,
         reason: InboxReason::from_str_lossy(r.try_get::<String, _>("reason")?.as_str()),
-        ref_kind: EntityKind::from_str_lossy(r.try_get::<String, _>("ref_kind")?.as_str()),
+        ref_kind,
         ref_id: r.try_get("ref_id")?,
         entry_id: r.try_get("entry_id")?,
         snippet: r.try_get("snippet")?,
         created_at: r.try_get("created_at")?,
         read_at: r.try_get("read_at")?,
-    })
+    }))
 }

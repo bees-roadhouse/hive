@@ -1005,6 +1005,165 @@ async fn viewer_acl_scopes_journal() {
 }
 
 #[tokio::test]
+async fn semantic_scope_runs_before_truncation_and_recall_filters_kinds_in_search() {
+    let _guard = env_guard().await;
+    reset_auth_env();
+    let (app, store) = test_app().await;
+    let cookie = onboard(&app).await;
+
+    // maggie: a second, non-admin login.
+    let (status, _, _) = send(
+        &app,
+        post_json(
+            "/api/users",
+            json!({"name": "Maggie", "email": "maggie@example.com", "password": "maggie-secret-1"}),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, _, headers) = send(
+        &app,
+        post_json(
+            "/api/auth/login",
+            json!({"email": "maggie@example.com", "password": "maggie-secret-1"}),
+            None,
+        ),
+    )
+    .await;
+    let maggie_cookie = headers
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // maggie's own note, then nate floods the vector space with three private
+    // entries that match the query exactly (strictly higher cosine than hers).
+    let (status, _, _) = send(
+        &app,
+        post_json(
+            "/api/journal",
+            json!({"body": "alpha hive inspection notes from the west garden"}),
+            Some(&maggie_cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    for _ in 0..3 {
+        let (status, _, _) = send(
+            &app,
+            post_json(
+                "/api/journal",
+                json!({"body": "alpha hive inspection notes"}),
+                Some(&cookie),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+    backfill_embeddings(&store).await;
+
+    // limit=2: before the fix the two top slots were nate's private entries,
+    // scoped away only AFTER the cut — maggie got an empty result back.
+    let (status, hits, _) = send(
+        &app,
+        get(
+            "/api/search?q=alpha%20hive%20inspection%20notes&mode=semantic&limit=2",
+            Some(&maggie_cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let titles: Vec<String> = hits
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["title"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        titles.iter().any(|t| t.starts_with("maggie:")),
+        "viewer-visible hit starved out of the pool: {titles:?}"
+    );
+    assert!(
+        !titles.iter().any(|t| t.starts_with("nate:")),
+        "cross-namespace leak: {titles:?}"
+    );
+
+    // Ten tasks that outscore every journal entry for this query used to fill
+    // semantic_search's 8-hit pool before recall's journal post-filter ran,
+    // emptying the brief (DIRECTION.md D9). The kinds filter now runs inside
+    // the search, so the pool is journal-only from the start.
+    for _ in 0..10 {
+        store
+            .tasks_create(
+                hive_api::store::tasks::TaskCreate {
+                    title: "queen brood frame audit notes".to_string(),
+                    body: "queen brood frame audit notes".to_string(),
+                    assignees: vec!["nate".to_string()],
+                    ..Default::default()
+                },
+                "nate",
+            )
+            .await
+            .expect("task create");
+    }
+    backfill_embeddings(&store).await;
+    let recall = store
+        .recall(
+            "nate",
+            hive_api::store::recall::RecallOptions {
+                query: Some("queen brood frame audit notes".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("recall");
+    assert!(
+        !recall.data.journal.is_empty(),
+        "task noise crowded journal out of the recall brief"
+    );
+    assert!(recall
+        .data
+        .journal
+        .iter()
+        .all(|h| h.hit.kind == hive_shared::EntityKind::Journal));
+
+    // A top-scoring embeddings row of a kind this build doesn't know (written
+    // by a newer binary) must not hold result slots on the UNSCOPED path
+    // either: admission drops it before the cut, so the admin still gets the
+    // best parseable hit instead of an empty result.
+    let alien = hive_embed::embed_query("alpha hive inspection notes");
+    hive_api::pgq::query(
+        "INSERT INTO embeddings (ref_kind, ref_id, model, dim, vec, hash, created_at) \
+         VALUES ('document', 'doc_alien', ?, ?, ?, 'alien', ?)",
+    )
+    .bind(hive_embed::embed_model())
+    .bind(alien.len() as i64)
+    .bind(hive_embed::to_blob(&alien))
+    .bind(hive_api::store::now_iso())
+    .execute(store.db())
+    .await
+    .expect("alien embedding row");
+    let (status, hits, _) = send(
+        &app,
+        get(
+            "/api/search?q=alpha%20hive%20inspection%20notes&mode=semantic&limit=1",
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !hits.as_array().unwrap().is_empty(),
+        "unknown-kind row starved the unscoped result: {hits}"
+    );
+}
+
+#[tokio::test]
 async fn ai_token_memory_is_namespaced_and_mention_shared() {
     let _guard = env_guard().await;
     reset_auth_env();
