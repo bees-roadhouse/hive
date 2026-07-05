@@ -36,6 +36,45 @@ async fn cycle_writes_status_and_node_maintenance_labels() {
 }
 
 #[tokio::test]
+async fn outbox_claim_leaves_foreign_kinds_for_their_own_drainer() {
+    let (pool, _dir) = test_pool().await;
+    let store = Store::new(pool.clone());
+    let worker = hive_worker::Worker::new(pool.clone());
+
+    store
+        .outbox_enqueue("log", serde_json::json!({}), None, "test")
+        .await
+        .expect("enqueue log");
+    store
+        .outbox_enqueue(
+            "mail.send",
+            serde_json::json!({"to": "someone@example.com"}),
+            None,
+            "test",
+        )
+        .await
+        .expect("enqueue mail.send");
+
+    worker.cycle(1).await.expect("cycle drains");
+    let run = store.worker_status().await.unwrap().last_run.unwrap();
+    assert_eq!(run.outbox, 1, "only the worker-owned kind drains");
+
+    let (log_status,): (String,) = sqlx::query_as("SELECT status FROM outbox WHERE kind = 'log'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(log_status, "done");
+    // The foreign kind must stay pending — a completed no-op here would
+    // silently swallow every Phase 2 mail send.
+    let (mail_status,): (String,) =
+        sqlx::query_as("SELECT status FROM outbox WHERE kind = 'mail.send'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(mail_status, "pending");
+}
+
+#[tokio::test]
 async fn backfill_embeds_new_skips_unchanged_reembeds_changed() {
     let (pool, _dir) = test_pool().await;
     let store = Store::new(pool.clone());
