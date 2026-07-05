@@ -1,7 +1,7 @@
 // Per-actor inbox (store.ts `inbox`).
 
 use anyhow::Result;
-use hive_shared::{EntityKind, InboxItem, InboxReason};
+use hive_shared::{InboxItem, InboxReason};
 use serde_json::json;
 use sqlx::Row;
 
@@ -14,7 +14,7 @@ impl Store {
         recipient: &str,
         from: &str,
         reason: InboxReason,
-        ref_kind: EntityKind,
+        ref_kind: &str,
         ref_id: &str,
         entry_id: Option<&str>,
         snippet: &str,
@@ -27,7 +27,7 @@ impl Store {
             recipient: recipient.to_string(),
             from: from.to_string(),
             reason,
-            ref_kind,
+            ref_kind: ref_kind.to_string(),
             ref_id: ref_id.to_string(),
             entry_id: entry_id.map(String::from),
             snippet: snip140(snippet),
@@ -42,7 +42,7 @@ impl Store {
         .bind(&item.recipient)
         .bind(&item.from)
         .bind(item.reason.as_str())
-        .bind(item.ref_kind.as_str())
+        .bind(&item.ref_kind)
         .bind(&item.ref_id)
         .bind(&item.entry_id)
         .bind(&item.snippet)
@@ -110,7 +110,7 @@ pub(crate) fn row_to_inbox(r: &sqlx::postgres::PgRow) -> Result<InboxItem> {
         recipient: r.try_get("recipient")?,
         from: r.try_get("from")?,
         reason: InboxReason::from_str_lossy(r.try_get::<String, _>("reason")?.as_str()),
-        ref_kind: EntityKind::from_str_lossy(r.try_get::<String, _>("ref_kind")?.as_str()),
+        ref_kind: r.try_get("ref_kind")?,
         ref_id: r.try_get("ref_id")?,
         entry_id: r.try_get("entry_id")?,
         snippet: r.try_get("snippet")?,

@@ -229,7 +229,7 @@ impl Store {
             if seen.insert(key.clone()) {
                 nodes.push(GraphNode {
                     id: key.clone(),
-                    kind: EntityKind::from_str_lossy(kind),
+                    kind: kind.to_string(),
                     title: title_of
                         .get(&key)
                         .cloned()

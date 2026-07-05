@@ -143,7 +143,7 @@ impl Store {
         let mut journal_hits: Vec<RecallJournalHit> = Vec::new();
         for h in raw_hits
             .into_iter()
-            .filter(|h| h.kind == hive_shared::EntityKind::Journal)
+            .filter(|h| h.kind == "journal")
         {
             let row =
                 crate::pgq::query("SELECT author, body, created_at FROM journal WHERE id = ?")

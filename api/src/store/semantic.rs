@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
-use hive_shared::{EmbeddingKindCount, EmbeddingModelCount, EmbeddingStats, EntityKind, SearchHit};
+use hive_shared::{EmbeddingKindCount, EmbeddingModelCount, EmbeddingStats, SearchHit};
 use sqlx::Row;
 
 use super::Store;
@@ -161,13 +161,13 @@ impl Store {
             .unwrap_or_default();
         let mut out = Vec::with_capacity(hits.len());
         for h in hits {
-            if h.kind == EntityKind::Journal {
+            if h.kind == "journal" {
                 if visible.contains(&h.id) {
                     out.push(h);
                 }
                 continue;
             }
-            let Some(table) = origin_table(h.kind.as_str()) else {
+            let Some(table) = origin_table(&h.kind) else {
                 continue;
             };
             let origin: Option<Option<String>> = crate::pgq::query_scalar(&format!(
@@ -220,7 +220,7 @@ impl Store {
                 // ts_rank is f32 and higher = better; clamp to a 0..1 score.
                 let rank: f32 = r.try_get("rank")?;
                 Ok(SearchHit {
-                    kind: EntityKind::from_str_lossy(r.try_get::<String, _>("kind")?.as_str()),
+                    kind: r.try_get("kind")?,
                     id: r.try_get("ref_id")?,
                     title: r.try_get("title")?,
                     snippet: r.try_get("snip")?,
@@ -625,7 +625,7 @@ impl Store {
             .map(|(k, score)| {
                 let (kind, id) = split_key(&k);
                 SearchHit {
-                    kind: EntityKind::from_str_lossy(kind),
+                    kind: kind.to_string(),
                     id: id.to_string(),
                     title: title_of.get(&k).cloned().unwrap_or_else(|| id.to_string()),
                     snippet: String::new(),

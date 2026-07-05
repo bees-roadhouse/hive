@@ -108,9 +108,9 @@ impl Store {
                 .execute(self.db())
                 .await?;
                 self.links_create(
-                    EntityKind::Decision,
+                    EntityKind::Decision.as_str(),
                     &d.id,
-                    EntityKind::Decision,
+                    EntityKind::Decision.as_str(),
                     &prior.id,
                     "supersedes",
                 )

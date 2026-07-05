@@ -583,16 +583,21 @@ impl EntityKind {
             EntityKind::Phase => "phase",
         }
     }
-    pub fn from_str_lossy(s: &str) -> Self {
+    /// Fail-closed parse: unknown kind strings are None, never silently Task.
+    /// Seam rows (search/links/inbox/graph) carry kind as a plain String so
+    /// user-defined entity type slugs can flow through them; this parse exists
+    /// for the genuinely closed domains (bracket tokens, autocomplete).
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "decision" => EntityKind::Decision,
-            "event" => EntityKind::Event,
-            "journal" => EntityKind::Journal,
-            "person" => EntityKind::Person,
-            "topic" => EntityKind::Topic,
-            "project" => EntityKind::Project,
-            "phase" => EntityKind::Phase,
-            _ => EntityKind::Task,
+            "task" => Some(EntityKind::Task),
+            "decision" => Some(EntityKind::Decision),
+            "event" => Some(EntityKind::Event),
+            "journal" => Some(EntityKind::Journal),
+            "person" => Some(EntityKind::Person),
+            "topic" => Some(EntityKind::Topic),
+            "project" => Some(EntityKind::Project),
+            "phase" => Some(EntityKind::Phase),
+            _ => None,
         }
     }
 }
@@ -716,7 +721,8 @@ pub struct InboxItem {
     pub recipient: String,
     pub from: String,
     pub reason: InboxReason,
-    pub ref_kind: EntityKind,
+    /// Kind string, not the closed enum: custom entity type slugs flow here.
+    pub ref_kind: String,
     pub ref_id: String,
     pub entry_id: Option<String>,
     pub snippet: String,
@@ -776,9 +782,10 @@ pub struct AutocompleteItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Link {
     pub id: String,
-    pub source_kind: EntityKind,
+    /// Kind strings, not the closed enum: custom entity type slugs flow here.
+    pub source_kind: String,
     pub source_id: String,
-    pub target_kind: EntityKind,
+    pub target_kind: String,
     pub target_id: String,
     pub rel: String,
     pub created_at: String,
@@ -795,7 +802,8 @@ pub struct WireEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchHit {
-    pub kind: EntityKind,
+    /// Kind string, not the closed enum: custom entity type slugs flow here.
+    pub kind: String,
     pub id: String,
     pub title: String,
     pub snippet: String,
@@ -808,7 +816,8 @@ pub struct SearchHit {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphNode {
     pub id: String,
-    pub kind: EntityKind,
+    /// Kind string, not the closed enum: custom entity type slugs flow here.
+    pub kind: String,
     pub title: String,
 }
 

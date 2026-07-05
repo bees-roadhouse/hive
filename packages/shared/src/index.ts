@@ -400,7 +400,8 @@ export interface InboxItem {
   recipient: string;
   from: string;
   reason: InboxReason;
-  ref_kind: EntityKind;
+  /** Kind string, not the closed union: custom entity type slugs flow here. */
+  ref_kind: string;
   ref_id: string;
   entry_id: string | null;
   snippet: string;
@@ -462,9 +463,10 @@ export interface AutocompleteItem {
 
 export interface Link {
   id: string;
-  source_kind: EntityKind;
+  /** Kind strings, not the closed union: custom entity type slugs flow here. */
+  source_kind: string;
   source_id: string;
-  target_kind: EntityKind;
+  target_kind: string;
   target_id: string;
   rel: string;
   created_at: string;
@@ -479,7 +481,8 @@ export interface WireEvent {
 }
 
 export interface SearchHit {
-  kind: EntityKind;
+  /** Kind string, not the closed union: custom entity type slugs flow here. */
+  kind: string;
   id: string;
   title: string;
   snippet: string;
@@ -491,7 +494,8 @@ export interface SearchHit {
 /** A node in the knowledge graph; `id` is the `kind:ref_id` composite key. */
 export interface GraphNode {
   id: string;
-  kind: EntityKind;
+  /** Kind string, not the closed union: custom entity type slugs flow here. */
+  kind: string;
   title: string;
 }
 
