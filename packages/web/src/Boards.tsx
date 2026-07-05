@@ -31,6 +31,8 @@ import { Icon } from "./icons.tsx";
 import { DECISION_GLYPH, highlightSnippet, relTime, SkeletonList, TASK_GLYPH } from "./lib.tsx";
 import { Markdown } from "./markdown.tsx";
 import { EmptyState } from "./primitives.tsx";
+import { KIND } from "./kinds.ts";
+import { EntityList, type EntityListConfig } from "./EntityList.tsx";
 
 // ---- due-date helpers ----
 
@@ -90,28 +92,36 @@ const TaskBody: Component<{ t: Task }> = (props) => (
   </div>
 );
 
+/** The structured ADR prose (context / decision / consequences) — shared by
+ * the drawer body below and the Decisions board rows. */
+const DecisionFields: Component<{ item: Decision }> = (props) => (
+  <>
+    <Show when={props.item.context}>
+      <div class="field">
+        <strong>Context.</strong>
+        <Markdown src={props.item.context} />
+      </div>
+    </Show>
+    <div class="field">
+      <strong>Decision.</strong>
+      <Markdown src={props.item.decision} />
+    </div>
+    <Show when={props.item.consequences}>
+      <div class="field">
+        <strong>Consequences.</strong>
+        <Markdown src={props.item.consequences} />
+      </div>
+    </Show>
+  </>
+);
+
 const DecisionBody: Component<{ d: Decision }> = (props) => (
   <div>
     <h3>
       {DECISION_GLYPH[props.d.status]} {props.d.title}
     </h3>
     <span class="badge">{props.d.status}</span>
-    <Show when={props.d.context}>
-      <div class="field">
-        <strong>Context.</strong>
-        <Markdown src={props.d.context} />
-      </div>
-    </Show>
-    <div class="field">
-      <strong>Decision.</strong>
-      <Markdown src={props.d.decision} />
-    </div>
-    <Show when={props.d.consequences}>
-      <div class="field">
-        <strong>Consequences.</strong>
-        <Markdown src={props.d.consequences} />
-      </div>
-    </Show>
+    <DecisionFields item={props.d} />
   </div>
 );
 
@@ -370,85 +380,35 @@ export const Tasks: Component = () => {
 
 // ---- Decisions ----
 
-export const Decisions: Component = () => {
-  const [decisions] = createResource(() => ({ _r: liveRev() }), () => api.decisions());
-  return (
-    <section>
-      <For
-        each={decisions()}
-        fallback={
-          <EmptyState
-            icon="decisions"
-            title="No decisions yet."
-            hint="Anchor one in a journal entry to start the log."
-          />
-        }
-      >
-        {(d) => (
-          <article class={`decision status-${d.status}`}>
-            <header>
-              <span class="glyph">{DECISION_GLYPH[d.status]}</span>
-              <h3>{d.title}</h3>
-              <span class="badge">{d.status}</span>
-            </header>
-            <Show when={d.context}>
-              <div class="field">
-                <strong>Context.</strong>
-                <Markdown src={d.context} />
-              </div>
-            </Show>
-            <div class="field">
-              <strong>Decision.</strong>
-              <Markdown src={d.decision} />
-            </div>
-            <Show when={d.consequences}>
-              <div class="field">
-                <strong>Consequences.</strong>
-                <Markdown src={d.consequences} />
-              </div>
-            </Show>
-            <Show when={d.anchor_text}>
-              <blockquote class="origin">from journal: "{d.anchor_text}"</blockquote>
-            </Show>
-          </article>
-        )}
-      </For>
-    </section>
-  );
+const decisionsConfig: EntityListConfig<Decision> = {
+  kind: KIND.decision,
+  fetch: () => api.decisions(),
+  row: {
+    title: (d) => d.title,
+    // Status rides a badge (accepted glows honey, the rest stay dim) instead
+    // of the old per-status card classes.
+    badges: (d) => [{ label: d.status, tone: d.status === "accepted" ? "honey" : "dim" }],
+    body: DecisionFields,
+    originQuote: (d) => d.anchor_text ?? null,
+  },
 };
+
+export const Decisions: Component = () => <EntityList config={decisionsConfig} />;
 
 // ---- Events ----
 
-export const Events: Component = () => {
-  const [events] = createResource(() => ({ _r: liveRev() }), () => api.events());
-  return (
-    <section>
-      <For
-        each={events()}
-        fallback={
-          <EmptyState
-            icon="events"
-            title="No events yet."
-            hint="Anchor one in a journal entry to put it on the record."
-          />
-        }
-      >
-        {(e) => (
-          <article class="entry">
-            <h3>◷ {e.title}</h3>
-            <Show when={e.at}>
-              <span class="badge">{e.at}</span>
-            </Show>
-            <Assignees who={e.assignees} />
-            <Show when={e.anchor_text}>
-              <blockquote class="origin">from journal: "{e.anchor_text}"</blockquote>
-            </Show>
-          </article>
-        )}
-      </For>
-    </section>
-  );
+const eventsConfig: EntityListConfig<EventItem> = {
+  kind: KIND.event,
+  fetch: () => api.events(),
+  row: {
+    title: (e) => e.title,
+    badges: (e) => (e.at ? [{ label: e.at }] : []),
+    metas: (e) => e.assignees,
+    originQuote: (e) => e.anchor_text ?? null,
+  },
 };
+
+export const Events: Component = () => <EntityList config={eventsConfig} />;
 
 // ---- Search ----
 
@@ -755,98 +715,65 @@ export const PeopleView: Component = () => {
 
 // ---- Topics view ----
 
-export const TopicsView: Component = () => {
-  const [topics] = createResource(() => ({ _r: liveRev() }), () => api.topics());
-  return (
-    <section>
-      <p class="dim pad">Topics extracted from <code>[topic:…]</code> references in journal entries.</p>
-      <Show when={topics()} fallback={<SkeletonList rows={6} />}>
-        <For
-          each={topics() as Topic[]}
-          fallback={
-            <EmptyState
-              icon="topics"
-              title="No topics yet."
-              hint="Tag #topic in a journal entry to open one."
-            />
-          }
-        >
-          {(t) => (
-            <div class="entity-row">
-              <span class="entity-icon"><Icon name="topic" size={16} /></span>
-              <span class="entity-name">{t.name}</span>
-              <span class="dim sm entity-slug">{t.slug}</span>
-            </div>
-          )}
-        </For>
-      </Show>
-    </section>
-  );
+const topicsConfig: EntityListConfig<Topic> = {
+  kind: KIND.topic,
+  fetch: () => api.topics(),
+  intro: "Topics extracted from [topic:…] references in journal entries.",
+  row: {
+    title: (t) => t.name,
+    metas: (t) => [t.slug],
+  },
 };
+
+export const TopicsView: Component = () => <EntityList config={topicsConfig} />;
 
 // ---- Projects view ----
 
-const ProjectCard: Component<{ p: Project }> = (props) => {
-  const [detail] = createResource(() => api.projectById(props.p.id));
+/** Phases + task-count summary for one project row. Each row keeps its own
+ * projectById sub-resource, exactly as the old ProjectCard did. */
+const ProjectBody: Component<{ item: Project }> = (props) => {
+  const [detail] = createResource(() => props.item.id, (id) => api.projectById(id));
   return (
-    <article class="project-card">
-      <header class="project-header">
-        <span class="entity-icon"><Icon name="project" size={16} /></span>
-        <h3 class="project-name">{props.p.name}</h3>
-        <span class="dim sm project-slug">{props.p.slug}</span>
-      </header>
+    <Show when={detail()}>
+      {(d) => (
+        <>
+          {/* Phases */}
+          <Show when={d().phases.length > 0}>
+            <div class="phases">
+              <For each={d().phases}>
+                {(ph: Phase) => (
+                  <span class="phase-chip">
+                    <Icon name="phase" size={13} />
+                    {ph.name}
+                  </span>
+                )}
+              </For>
+            </div>
+          </Show>
 
-      <Show when={detail()}>
-        {(d) => (
-          <>
-            {/* Phases */}
-            <Show when={d().phases.length > 0}>
-              <div class="phases">
-                <For each={d().phases}>
-                  {(ph: Phase) => (
-                    <span class="phase-chip">
-                      <Icon name="phase" size={13} />
-                      {ph.name}
-                    </span>
-                  )}
-                </For>
-              </div>
-            </Show>
-
-            {/* Task summary */}
-            <Show when={d().tasks.length > 0}>
-              <div class="project-tasks dim sm">
-                {d().tasks.filter((t: Task) => t.status !== "done").length} open ·{" "}
-                {d().tasks.filter((t: Task) => t.status === "done").length} done
-                <span class="dim"> ({d().tasks.length} total)</span>
-              </div>
-            </Show>
-          </>
-        )}
-      </Show>
-    </article>
+          {/* Task summary */}
+          <Show when={d().tasks.length > 0}>
+            <div class="project-tasks dim sm">
+              {d().tasks.filter((t: Task) => t.status !== "done").length} open ·{" "}
+              {d().tasks.filter((t: Task) => t.status === "done").length} done
+              <span class="dim"> ({d().tasks.length} total)</span>
+            </div>
+          </Show>
+        </>
+      )}
+    </Show>
   );
 };
 
-export const ProjectsView: Component = () => {
-  const [projects] = createResource(() => ({ _r: liveRev() }), () => api.projects());
-  return (
-    <section>
-      <p class="dim pad">Projects with their phases and task counts. Projects are created automatically when a task references one.</p>
-      <Show when={projects()} fallback={<SkeletonList rows={4} />}>
-        <For
-          each={projects() as Project[]}
-          fallback={
-            <EmptyState
-              icon="projects"
-              title="No projects yet."
-              hint="Give a task a +project in a journal entry to start one."
-            />
-          }
-        >
-          {(p) => <ProjectCard p={p} />}
-        </For>
-      </Show>
-    </section>
-  );
+const projectsConfig: EntityListConfig<Project> = {
+  kind: KIND.project,
+  fetch: () => api.projects(),
+  intro: "Projects with their phases and task counts. Projects are created automatically when a task references one.",
+  row: {
+    title: (p) => p.name,
+    metas: (p) => [p.slug],
+    body: ProjectBody,
+  },
 };
+
+export const ProjectsView: Component = () => <EntityList config={projectsConfig} />;

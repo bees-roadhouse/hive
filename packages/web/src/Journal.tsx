@@ -40,6 +40,7 @@ import { api, getActor } from "./api.ts";
 import { liveRev } from "./live.ts";
 import { composeReq, consumeComposeRequest } from "./ui.ts";
 import { ANCHOR_GLYPH, relTime } from "./lib.tsx";
+import { KIND } from "./kinds.ts";
 import { Icon } from "./icons.tsx";
 import { JournalBody } from "./markdown.tsx";
 import { EntityCard } from "./Boards.tsx";
@@ -69,14 +70,6 @@ const TRIGGERS: Record<string, string[]> = {
   "+": ["project"],
   "!": ["task"],
   "[": ["person", "topic", "project", "phase", "task"],
-};
-
-const KIND_GLYPH: Record<string, string> = {
-  person: "@",
-  topic: "#",
-  project: "◈",
-  phase: "◷",
-  task: "◻",
 };
 
 /** "Today" / "Yesterday" / "Tuesday, June 2, 2026" for a day header. */
@@ -914,7 +907,7 @@ export const Journal: Component = () => {
                           onMouseDown={(e) => { e.preventDefault(); selectAcItem(item); }}
                           onMouseEnter={() => setAcActive(i())}
                         >
-                          <span class="ac-kind-glyph">{KIND_GLYPH[item.kind] ?? "·"}</span>
+                          <span class="ac-kind-glyph">{KIND[item.kind]?.glyph ?? "·"}</span>
                           <span class="ac-label">{item.label}</span>
                           <span class="ac-kind dim">{item.kind}</span>
                         </li>
@@ -951,7 +944,7 @@ export const Journal: Component = () => {
                           onMouseDown={(e) => { e.preventDefault(); selectAcItem(item); }}
                           onMouseEnter={() => setAcActive(i())}
                         >
-                          <span class="ac-kind-glyph">{KIND_GLYPH[item.kind] ?? "·"}</span>
+                          <span class="ac-kind-glyph">{KIND[item.kind]?.glyph ?? "·"}</span>
                           <span class="ac-label">{item.label}</span>
                           <span class="ac-kind dim">{item.kind}</span>
                         </li>

@@ -281,6 +281,16 @@ blockquote.origin { font-size: var(--fs-sm); }
 .field strong { display: block; font-size: var(--fs-sm); text-transform: uppercase; letter-spacing: 0.04em; color: var(--dim); margin-bottom: 0.15rem; }
 .field .md { margin: 0; }
 
+/* ---- EntityList rows (src/EntityList.tsx) ---- */
+/* One card shape for every flat entity board — sized to match .decision so
+   converted boards land near-pixel-neutral. The glyph carries kind identity;
+   its color is set inline from the kind registry (kinds.ts). */
+.list-card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 1rem; margin-bottom: 0.9rem; }
+.list-card.clickable { cursor: pointer; }
+.list-card-head { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.list-card-head .list-title { flex: 1; font-size: var(--fs-md); }
+.list-glyph { font-size: var(--fs-lg); }
+
 /* ---- decisions / events ---- */
 .decision { background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 1rem; margin-bottom: 0.9rem; }
 .decision.status-accepted { border-left: 4px solid var(--honey); }
@@ -1095,6 +1105,7 @@ button.ghost.danger { background: transparent; color: #d98a8a; }
    don't crawl in. */
 .route-view .card,
 .route-view .decision,
+.route-view .list-card,
 .route-view .inbox-item,
 .route-view .entity-row,
 .route-view .project-card,
@@ -1109,22 +1120,27 @@ button.ghost.danger { background: transparent; color: #d98a8a; }
 .route-view .card:nth-child(1),
 .route-view .inbox-item:nth-child(1),
 .route-view .decision:nth-child(1),
+.route-view .list-card:nth-child(1),
 .route-view .entity-row:nth-child(1) { animation-delay: 0.02s; }
 .route-view .card:nth-child(2),
 .route-view .inbox-item:nth-child(2),
 .route-view .decision:nth-child(2),
+.route-view .list-card:nth-child(2),
 .route-view .entity-row:nth-child(2) { animation-delay: 0.05s; }
 .route-view .card:nth-child(3),
 .route-view .inbox-item:nth-child(3),
 .route-view .decision:nth-child(3),
+.route-view .list-card:nth-child(3),
 .route-view .entity-row:nth-child(3) { animation-delay: 0.08s; }
 .route-view .card:nth-child(4),
 .route-view .inbox-item:nth-child(4),
 .route-view .decision:nth-child(4),
+.route-view .list-card:nth-child(4),
 .route-view .entity-row:nth-child(4) { animation-delay: 0.11s; }
 .route-view .card:nth-child(n+5),
 .route-view .inbox-item:nth-child(n+5),
 .route-view .decision:nth-child(n+5),
+.route-view .list-card:nth-child(n+5),
 .route-view .entity-row:nth-child(n+5) { animation-delay: 0.13s; }
 
 /* ---- micro-interactions ---- */
@@ -1133,7 +1149,7 @@ button.ghost.danger { background: transparent; color: #d98a8a; }
 .card:hover { transform: translateY(-2px); box-shadow: 0 4px 14px rgba(0,0,0,0.3); }
 .card:active { transform: translateY(0); box-shadow: none; }
 
-.decision, .project-card, .inbox-item, .entity-row, .kpi, .panel, .emb, .worker-status, .source-row {
+.decision, .list-card, .project-card, .inbox-item, .entity-row, .kpi, .panel, .emb, .worker-status, .source-row {
   transition: border-color var(--t-base) ease, transform var(--t-base) ease;
 }
 .kpi:hover { transform: translateY(-2px); }
