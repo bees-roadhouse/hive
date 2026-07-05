@@ -605,13 +605,13 @@ button.ghost { background: transparent; color: var(--dim); font-size: var(--fs-s
 .cal-chips { display: flex; flex-direction: column; gap: 2px; }
 .cal-task-chip {
   display: block; font-size: var(--fs-2xs); border-radius: var(--r-xs); padding: 0.05rem 0.28rem;
-  background: rgba(255,210,74,0.12); color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   line-height: 1.4;
 }
 .cal-chip-overdue { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
 .cal-chip-today { background: color-mix(in srgb, var(--honey) 22%, transparent); color: var(--honey); font-weight: 600; }
-.cal-chip-more { background: rgba(169,155,120,0.14); color: var(--dim); }
+.cal-chip-more { background: color-mix(in srgb, var(--dim) 14%, transparent); color: var(--dim); }
 
 /* Calendar legend */
 .cal-legend { display: flex; gap: 0.75rem; margin-top: 0.5rem; flex-wrap: wrap; }
@@ -1027,9 +1027,6 @@ button.ghost { background: transparent; color: var(--dim); font-size: var(--fs-s
 /* ---- account (admin: users + tokens) ---- */
 .account { display: flex; flex-direction: column; gap: 2rem; max-width: 52rem; }
 .account section { display: flex; flex-direction: column; gap: 0.75rem; min-width: 0; overflow-x: auto; }
-.data-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
-.data-table th, .data-table td { text-align: left; padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--line); }
-.data-table th { color: var(--dim); font-weight: 500; }
 .inline-form { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
 .inline-form input, .inline-form select {
   background: var(--panel2);
