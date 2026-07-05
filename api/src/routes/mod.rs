@@ -16,6 +16,7 @@ pub mod auth;
 pub mod custom;
 pub mod entities;
 pub mod journal;
+pub mod mail;
 pub mod mcp;
 pub mod oauth;
 pub mod people;
@@ -32,6 +33,7 @@ pub fn router(store: Store) -> Router {
         .merge(auth::router())
         .merge(people::router())
         .merge(journal::router())
+        .merge(mail::router())
         .merge(entities::router())
         .merge(custom::router())
         .merge(search::router())

@@ -11,6 +11,9 @@ import type {
   InboxItem,
   JournalEntryView,
   JournalWriter,
+  MailAccount,
+  MailMessageSummary,
+  MailThread,
   NewJournalEntry,
   NewShare,
   NewSource,
@@ -124,6 +127,14 @@ export const api = {
 
   search: (query: string, mode: "keyword" | "semantic" | "precision" = "keyword") =>
     req<SearchHit[]>(`/search?q=${encodeURIComponent(query)}&mode=${mode}`),
+  mailAccounts: () => req<MailAccount[]>("/mail/accounts"),
+  mailMessages: (q: { query?: string; account_id?: string } = {}) => {
+    const p = new URLSearchParams();
+    if (q.query) p.set("query", q.query);
+    if (q.account_id) p.set("account_id", q.account_id);
+    return req<MailMessageSummary[]>(`/mail/messages?${p}`);
+  },
+  mailThread: (threadId: string) => req<MailThread>(`/mail/thread/${encodeURIComponent(threadId)}`),
   wire: () => req<WireEvent[]>("/wire"),
   // Trigger an immediate source poll (worker normally polls on a schedule).
   // The backend endpoint may not exist yet — callers should catch and fall
@@ -267,7 +278,7 @@ export const api = {
   // ---- hosted Claude Code workspaces (hive → Claude Code) ----
   workspaces: (limit = 50) => req<CcSession[]>(`/workspaces?limit=${limit}`),
   workspace: (id: string) => req<CcSession>(`/workspaces/${id}`),
-  createWorkspace: (input: { title?: string; model?: string; prompt?: string }) =>
+  createWorkspace: (input: { title?: string; runtime?: RuntimeKind | string; provider?: string; model?: string; prompt?: string; tags?: string[]; project?: string; linked_entities?: Array<{ kind: string; id: string; rel?: string }> }) =>
     req<CcSession>("/workspaces", { method: "POST", body: JSON.stringify(input) }),
   transcript: (id: string, after = 0, limit = 2000) =>
     req<CcMessage[]>(`/workspaces/${id}/messages?after=${after}&limit=${limit}`),
@@ -303,12 +314,14 @@ export const api = {
 
   // per-user Claude Code credentials (secret never returned)
   ccCredentials: () => req<CcCredentialView[]>("/cc-credentials"),
-  saveCcCredential: (input: { kind: string; label?: string; secret: string }) =>
+  saveCcCredential: (input: { kind: string; runtime?: RuntimeKind; provider?: string; label?: string; secret: string }) =>
     req<CcCredentialView>("/cc-credentials", { method: "POST", body: JSON.stringify(input) }),
   deleteCcCredential: (id: string) => req<void>(`/cc-credentials/${id}`, { method: "DELETE" }),
 };
 
 // ---- hosted Claude Code workspace types (kept local; mirror api/src/store) ----
+export type RuntimeKind = "claude_code" | "codex" | "opencode";
+
 export interface CcSession {
   id: string;
   owner: string;
@@ -316,6 +329,7 @@ export interface CcSession {
   title: string;
   workdir: string;
   claude_session_id: string | null;
+  runtime: RuntimeKind | string;
   status: string;
   model: string | null;
   usage: unknown;
@@ -344,6 +358,8 @@ export interface CcCredentialView {
   id: string;
   owner: string;
   kind: string;
+  runtime: RuntimeKind | string;
+  provider: string | null;
   label: string;
   tail: string;
   created_at: string;

@@ -844,10 +844,32 @@ pub struct GraphEdge {
 /// Reserving generously is free; un-reserving later is trivial, while the
 /// reverse is a data migration.
 pub const RESERVED_KIND_SLUGS: &[&str] = &[
-    "task", "decision", "event", "journal", "person", "topic", "project",
-    "phase", "mail", "anchor", "link", "share", "inbox", "wire", "search",
-    "source", "outbox", "user", "profile", "identity", "workspace", "entity",
-    "entity_type", "entities", "blob", "note",
+    "task",
+    "decision",
+    "event",
+    "journal",
+    "person",
+    "topic",
+    "project",
+    "phase",
+    "mail",
+    "anchor",
+    "link",
+    "share",
+    "inbox",
+    "wire",
+    "search",
+    "source",
+    "outbox",
+    "user",
+    "profile",
+    "identity",
+    "workspace",
+    "entity",
+    "entity_type",
+    "entities",
+    "blob",
+    "note",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

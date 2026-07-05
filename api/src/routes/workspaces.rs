@@ -7,13 +7,14 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Router};
+use hive_shared::NewJournalEntry;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::error::{err, forbidden, not_found, ApiResult};
 use crate::middleware::AuthCtx;
 use crate::store::cc_credentials::NewCcCredential;
-use crate::store::workspaces::{NewCcMessage, NewCcSession};
+use crate::store::workspaces::{LinkedEntity, NewCcMessage, NewCcSession};
 use crate::store::Store;
 
 pub fn router() -> Router<Store> {
@@ -67,13 +68,57 @@ async fn create(
     }
     let owner = ctx.namespace_user().to_string();
     let created_by = ctx.actor().to_string();
+    let mut input = input;
     let prompt = input.prompt.clone();
+    let linked_entities = input.linked_entities.clone().unwrap_or_default();
+    let project_link = if let Some(project_name) = input
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let project = s.projects_ensure(project_name).await?;
+        input.project = Some(project.name.clone());
+        Some(project.id)
+    } else {
+        None
+    };
     let session = s.workspace_create(&owner, &created_by, input).await?;
+    let mut prelinked = Vec::new();
+    let has_project_link = project_link.is_some();
+    if let Some(project_id) = project_link {
+        s.links_create(
+            "conversation",
+            &session.id,
+            "project",
+            &project_id,
+            "grouped_in",
+        )
+        .await?;
+        prelinked.push(("project".to_string(), project_id));
+    }
+    link_conversation_entities(
+        &s,
+        &session.id,
+        linked_entities,
+        prelinked,
+        has_project_link,
+    )
+    .await?;
     // Persist the kickoff prompt as the first transcript message so the runner can
     // pick it up and the UI shows it immediately.
     if let Some(text) = prompt.filter(|t| !t.trim().is_empty()) {
         s.workspace_append_message(&session.id, input_message(&text))
             .await?;
+        append_workspace_journal(
+            &s,
+            &created_by,
+            &owner,
+            &session.id,
+            &session.runtime,
+            &text,
+        )
+        .await?;
     }
     Ok((StatusCode::CREATED, Json(session)).into_response())
 }
@@ -128,11 +173,19 @@ async fn ingest(
     if !ctx.is_admin() && ctx.namespace_user() != ws.owner {
         return Ok(forbidden());
     }
-    Ok((
-        StatusCode::CREATED,
-        Json(s.workspace_append_message(&id, input).await?),
-    )
-        .into_response())
+    let msg = s.workspace_append_message(&id, input.clone()).await?;
+    if let Some(body) = journal_body_for_message(&input) {
+        append_workspace_journal(
+            &s,
+            message_author(&input, &ws.runtime),
+            &ws.owner,
+            &id,
+            &ws.runtime,
+            &body,
+        )
+        .await?;
+    }
+    Ok((StatusCode::CREATED, Json(msg)).into_response())
 }
 
 #[derive(Deserialize)]
@@ -153,6 +206,10 @@ async fn send_input(
     let msg = s
         .workspace_append_message(&id, input_message(&body.text))
         .await?;
+    let Some(ws) = s.workspace_get_internal(&id).await? else {
+        return Ok(not_found());
+    };
+    append_workspace_journal(&s, ctx.actor(), &ws.owner, &id, &ws.runtime, &body.text).await?;
     s.emit(
         "workspace.input",
         ctx.actor(),
@@ -208,18 +265,24 @@ async fn runtime_auth(
     let Some(ws) = s.workspace_get_internal(&id).await? else {
         return Ok(not_found());
     };
-    match s.cc_cred_decrypt_for_runtime(&ws.owner).await? {
-        Some((kind, secret)) => Ok(Json(json!({
+    match s
+        .cc_cred_decrypt_for_runtime(&ws.owner, &ws.runtime)
+        .await?
+    {
+        Some((kind, runtime, provider, secret)) => Ok(Json(json!({
             "owner": ws.owner,
+            "runtime": runtime,
+            "provider": provider,
+            "model": ws.model,
             "kind": kind,
             "secret": secret,
             "workdir": ws.workdir,
         }))
         .into_response()),
-        None => Ok(err(
-            StatusCode::FAILED_DEPENDENCY,
-            "owner has no Claude Code credential saved",
-        )),
+        None => {
+            let msg = format!("owner has no {} credential saved", ws.runtime);
+            Ok(err(StatusCode::FAILED_DEPENDENCY, &msg))
+        }
     }
 }
 
@@ -258,6 +321,102 @@ async fn creds_delete(
     } else {
         Ok(not_found())
     }
+}
+
+fn content_str<'a>(content: &'a Value, key: &str) -> Option<&'a str> {
+    content
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn journal_body_for_message(input: &NewCcMessage) -> Option<String> {
+    match (input.role.as_str(), input.kind.as_str()) {
+        ("assistant", "text") | ("assistant", "thinking") => {
+            content_str(&input.content, "text").map(str::to_string)
+        }
+        ("system", "error") => {
+            content_str(&input.content, "error").map(|s| format!("Runtime error: {s}"))
+        }
+        ("system", "result") => content_str(&input.content, "result")
+            .or_else(|| content_str(&input.content, "note"))
+            .map(str::to_string),
+        ("user", "input") => content_str(&input.content, "text").map(str::to_string),
+        _ => None,
+    }
+}
+
+fn message_author<'a>(input: &'a NewCcMessage, runtime: &'a str) -> &'a str {
+    match input.role.as_str() {
+        "user" => "human",
+        "assistant" | "system" => runtime,
+        _ => runtime,
+    }
+}
+
+async fn link_conversation_entities(
+    s: &Store,
+    conversation_id: &str,
+    entities: Vec<LinkedEntity>,
+    prelinked: Vec<(String, String)>,
+    skip_project_entities: bool,
+) -> anyhow::Result<()> {
+    let mut seen: std::collections::HashSet<(String, String)> = prelinked.into_iter().collect();
+    for entity in entities {
+        let kind = entity.kind.trim();
+        let id = entity.id.trim();
+        if kind.is_empty() || id.is_empty() {
+            continue;
+        }
+        if skip_project_entities && kind == "project" {
+            continue;
+        }
+        if !seen.insert((kind.to_string(), id.to_string())) {
+            continue;
+        }
+        let rel = entity.rel.as_deref().unwrap_or("related").trim();
+        s.links_create(
+            "conversation",
+            conversation_id,
+            kind,
+            id,
+            if rel.is_empty() { "related" } else { rel },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn append_workspace_journal(
+    s: &Store,
+    author: &str,
+    owner: &str,
+    session_id: &str,
+    runtime: &str,
+    body: &str,
+) -> anyhow::Result<()> {
+    let body = body.trim();
+    if body.is_empty() {
+        return Ok(());
+    }
+    let tagged = format!("[workspace:{session_id}] {body}");
+    s.journal_append(
+        NewJournalEntry {
+            author: Some(author.to_string()),
+            body: tagged,
+            tags: Some(vec![
+                "workspace".to_string(),
+                runtime.to_string(),
+                session_id.to_string(),
+            ]),
+            anchors: None,
+        },
+        Some(author),
+        Some(owner),
+    )
+    .await?;
+    Ok(())
 }
 
 fn input_message(text: &str) -> NewCcMessage {

@@ -146,6 +146,54 @@ export interface ApiToken {
 export const API_TOKEN_MAX_EXPIRY_DAYS = 365;
 export const API_TOKEN_DEFAULT_EXPIRY_DAYS = 90;
 
+export type RuntimeKind = "claude_code" | "codex" | "opencode";
+
+export interface CcSession {
+  id: string;
+  owner: string;
+  created_by: string;
+  title: string;
+  workdir: string;
+  claude_session_id: string | null;
+  runtime: RuntimeKind | string;
+  status: string;
+  model: string | null;
+  usage: unknown;
+  meta: unknown;
+  repo_url: string | null;
+  repo_ref: string | null;
+  created_at: string;
+  updated_at: string;
+  last_activity_at: string | null;
+}
+
+export interface NewCcSession {
+  runtime?: RuntimeKind | string;
+  title?: string;
+  model?: string;
+  prompt?: string;
+}
+
+export interface CcCredentialView {
+  id: string;
+  owner: string;
+  kind: string;
+  runtime: RuntimeKind | string;
+  provider: string | null;
+  label: string;
+  tail: string;
+  created_at: string;
+  last_used_at: string | null;
+}
+
+export interface NewCcCredential {
+  kind: string;
+  runtime?: RuntimeKind | string;
+  provider?: string;
+  label?: string;
+  secret: string;
+}
+
 /** A dynamically-registered OAuth client (RFC 7591). */
 export interface OAuthClient {
   client_id: string;
@@ -494,6 +542,44 @@ export interface SearchHit {
   title: string;
   snippet: string;
   score: number;
+}
+
+// ---- mail archive (read-only) ----
+
+/** A configured mailbox/account visible to the signed-in viewer. */
+export interface MailAccount {
+  id: string;
+  label: string;
+  address: string;
+  provider?: string | null;
+  last_synced_at?: string | null;
+}
+
+/** Dense row returned by /api/mail/messages for the archive rail. */
+export interface MailMessageSummary {
+  id: string;
+  thread_id: string;
+  account_id: string;
+  /** JMAP keywords rendered as system-wide tags. Folders/mailboxes stay internal to ingest. */
+  labels: string[];
+  from: string;
+  to?: string[];
+  cc?: string[];
+  subject: string;
+  snippet?: string | null;
+  received_at: string;
+  has_attachments?: boolean;
+}
+
+/** Plaintext message body returned in a thread. HTML is intentionally absent. */
+export interface MailThreadMessage extends MailMessageSummary {
+  body_text: string;
+}
+
+export interface MailThread {
+  thread_id: string;
+  subject: string;
+  messages: MailThreadMessage[];
 }
 
 // ---- knowledge graph ----

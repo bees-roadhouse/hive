@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 use super::{new_id, now_iso, Store};
 use crate::middleware::Visibility;
 
-const SESSION_COLS: &str = "id, owner, created_by, title, workdir, claude_session_id, status, \
+const SESSION_COLS: &str =
+    "id, owner, created_by, title, workdir, claude_session_id, runtime, status, \
     model, usage, meta, repo_url, repo_ref, created_at, updated_at, last_activity_at";
 const MESSAGE_COLS: &str =
     "id, session_id, seq, role, kind, content, raw, tokens_in, tokens_out, created_at";
@@ -24,6 +25,7 @@ pub struct CcSession {
     pub title: String,
     pub workdir: String,
     pub claude_session_id: Option<String>,
+    pub runtime: String,
     pub status: String,
     pub model: Option<String>,
     pub usage: Value,
@@ -53,10 +55,27 @@ pub struct CcMessage {
 /// Create-a-workspace request.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewCcSession {
+    /// Runtime backend: claude_code (default), codex, or opencode.
+    pub runtime: Option<String>,
+    /// Provider hint for runtimes that multiplex providers (notably OpenCode).
+    pub provider: Option<String>,
     pub title: Option<String>,
     pub model: Option<String>,
+    /// System-wide tags for grouping and search.
+    pub tags: Option<Vec<String>>,
+    /// Optional project grouping slug/name.
+    pub project: Option<String>,
+    /// Optional typed entities to relate to this conversation.
+    pub linked_entities: Option<Vec<LinkedEntity>>,
     /// Optional first prompt to kick the session off.
     pub prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LinkedEntity {
+    pub kind: String,
+    pub id: String,
+    pub rel: Option<String>,
 }
 
 /// Append-a-message request (runner → API ingest).
@@ -82,6 +101,7 @@ struct SessionRow {
     title: String,
     workdir: String,
     claude_session_id: Option<String>,
+    runtime: String,
     status: String,
     model: Option<String>,
     usage: String,
@@ -102,6 +122,7 @@ impl SessionRow {
             title: self.title,
             workdir: self.workdir,
             claude_session_id: self.claude_session_id,
+            runtime: normalize_runtime(Some(&self.runtime)),
             status: self.status,
             model: self.model,
             usage: serde_json::from_str(&self.usage).unwrap_or(Value::Null),
@@ -161,6 +182,34 @@ fn visible(vis: &Visibility, owner: &str) -> bool {
     }
 }
 
+pub fn normalize_runtime(runtime: Option<&str>) -> String {
+    match runtime.unwrap_or("claude_code").trim() {
+        "" | "claude" | "claude_code" => "claude_code".to_string(),
+        "codex" => "codex".to_string(),
+        "opencode" => "opencode".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn normalize_tags(tags: Option<Vec<String>>) -> Vec<String> {
+    let mut out = Vec::new();
+    for tag in tags.unwrap_or_default() {
+        let t = tag.trim().trim_start_matches('#').to_ascii_lowercase();
+        if !t.is_empty() && !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+fn normalize_project(project: Option<String>) -> Option<String> {
+    project
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 impl Store {
     pub async fn workspace_create(
         &self,
@@ -172,17 +221,36 @@ impl Store {
         let workdir = format!("{}/{}/{}", workspaces_root(), owner, id);
         let ts = now_iso();
         let title = input.title.unwrap_or_default();
+        let runtime = normalize_runtime(input.runtime.as_deref());
+        let provider = input
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let tags = normalize_tags(input.tags);
+        let project = normalize_project(input.project);
+        let meta = json!({
+            "kind": "conversation",
+            "runtime": &runtime,
+            "provider": &provider,
+            "tags": &tags,
+            "project": &project,
+        })
+        .to_string();
         crate::pgq::query(
             "INSERT INTO cc_sessions \
-             (id, owner, created_by, title, workdir, status, model, usage, meta, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, 'provisioning', ?, '{}', '{}', ?, ?)",
+             (id, owner, created_by, title, workdir, runtime, status, model, usage, meta, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, 'provisioning', ?, '{}', ?, ?, ?)",
         )
         .bind(&id)
         .bind(owner)
         .bind(created_by)
         .bind(&title)
         .bind(&workdir)
+        .bind(&runtime)
         .bind(&input.model)
+        .bind(&meta)
         .bind(&ts)
         .bind(&ts)
         .execute(self.db())
@@ -190,7 +258,7 @@ impl Store {
         self.emit(
             "workspace.created",
             created_by,
-            json!({"id": id, "owner": owner, "title": title}),
+            json!({"id": id, "owner": owner, "title": title, "runtime": runtime}),
         )
         .await?;
         self.workspace_get_internal(&id)

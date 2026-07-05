@@ -203,10 +203,9 @@ impl Store {
             if kinds.is_some_and(|ks| !ks.iter().any(|k| k.as_str() == *kind)) {
                 continue;
             }
-            let rows =
-                crate::pgq::query(&format!("SELECT id, origin_entry_id FROM {table}"))
-                    .fetch_all(self.db())
-                    .await?;
+            let rows = crate::pgq::query(&format!("SELECT id, origin_entry_id FROM {table}"))
+                .fetch_all(self.db())
+                .await?;
             for r in &rows {
                 origin_of.insert(
                     ref_key(kind, r.try_get::<String, _>("id")?.as_str()),
@@ -807,15 +806,15 @@ impl Store {
 
         let hits: Vec<SearchHit> = ranked
             .into_iter()
-            .filter_map(|(k, score)| {
+            .map(|(k, score)| {
                 let (kind, id) = split_key(&k);
-                Some(SearchHit {
+                SearchHit {
                     kind: kind.to_string(),
                     id: id.to_string(),
                     title: title_of.get(&k).cloned().unwrap_or_else(|| id.to_string()),
                     snippet: String::new(),
                     score: (score * 1000.0).round() / 1000.0,
-                })
+                }
             })
             .collect();
 

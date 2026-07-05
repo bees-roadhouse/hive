@@ -104,6 +104,15 @@ export const KIND: Record<string, KindPresentation> = {
     color: "dim",
     empty: { title: "No notes yet.", hint: "Capture one in a journal entry." },
   },
+  mail: {
+    slug: "mail",
+    label: "mail",
+    labelPlural: "mail",
+    glyph: "✉",
+    icon: "mail",
+    color: "honey",
+    empty: { title: "No mail yet.", hint: "Connect sync and searchable messages will appear here." },
+  },
 };
 
 /** CSS custom-property reference for a color token: "task" → "var(--task)". */
@@ -123,7 +132,7 @@ const ICON_NAMES: ReadonlySet<string> = new Set([
   "journal", "inbox", "dashboard", "tasks", "decisions", "events", "graph",
   "search", "wire", "admin", "settings", "workspaces", "chats", "hex", "more",
   "person", "account", "people", "topic", "topics", "project", "projects",
-  "phase", "link", "quote", "chev-l", "chev-r",
+  "phase", "link", "quote", "chev-l", "chev-r", "mail",
 ]);
 
 /**

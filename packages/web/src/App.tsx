@@ -12,6 +12,7 @@ import { Admin } from "./Admin.tsx";
 import { Account } from "./Account.tsx";
 import { Graph } from "./Graph.tsx";
 import { Workspaces } from "./Workspaces.tsx";
+import { Mail } from "./Mail.tsx";
 import { Onboarding } from "./Onboarding.tsx";
 import { Login } from "./Login.tsx";
 import { OAuthConsent } from "./OAuthConsent.tsx";
@@ -27,6 +28,7 @@ const TABS = [
   { id: "inbox" },
   { id: "dashboard" },
   { id: "workspaces" },
+  { id: "mail" },
   { id: "tasks" },
   { id: "decisions" },
   { id: "events" },
@@ -47,6 +49,7 @@ const PAGES: Record<Tab, Component> = {
   inbox: Inbox,
   dashboard: Dashboard,
   workspaces: Workspaces,
+  mail: Mail,
   tasks: Tasks,
   decisions: Decisions,
   events: Events,
@@ -61,13 +64,15 @@ const PAGES: Record<Tab, Component> = {
   settings: Settings,
 };
 
-// The three destinations that stay in the sidebar — the pillars: talking to
-// Claude Code, the journal, and the inbox. Search lives in ⌘K (free text there
-// already lands on /search). Chats leads the nav; Today stays the landing page.
+// The destinations that stay in the sidebar — the pillars: talking to
+// Claude Code, the journal, operator inbox, and the read-only mail archive.
+// Search lives in ⌘K (free text there already lands on /search). Conversations lead
+// the nav; Today stays the landing page.
 const PRIMARY: { id: Tab; label: string; icon: string }[] = [
-  { id: "workspaces", label: "Chats", icon: "chats" },
+  { id: "workspaces", label: "Conversations", icon: "chats" },
   { id: "journal", label: "Today", icon: "journal" },
   { id: "inbox", label: "Inbox", icon: "inbox" },
+  { id: "mail", label: "Mail", icon: "mail" },
 ];
 
 // Initials for the footer avatar chip ("Nate Smith" → "NS").

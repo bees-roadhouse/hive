@@ -321,8 +321,7 @@ impl Store {
     ) -> std::result::Result<Map<String, Value>, EntityWriteError> {
         let empty = Map::new();
         let (merged, touched) = merge_fields(current.unwrap_or(&empty), patch);
-        let refs = validate_fields(specs, &merged, &touched)
-            .map_err(EntityWriteError::Issues)?;
+        let refs = validate_fields(specs, &merged, &touched).map_err(EntityWriteError::Issues)?;
         let mut issues = Vec::new();
         for rc in refs {
             if !self.ref_target_exists(&rc.kind, &rc.id).await? {

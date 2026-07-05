@@ -73,10 +73,7 @@ struct TypesListQuery {
     include_archived: Option<String>,
 }
 
-async fn types_list(
-    State(s): State<Store>,
-    Query(q): Query<TypesListQuery>,
-) -> ApiResult {
+async fn types_list(State(s): State<Store>, Query(q): Query<TypesListQuery>) -> ApiResult {
     let include = matches!(q.include_archived.as_deref(), Some("1") | Some("true"));
     Ok(Json(s.entity_types_list(include).await?).into_response())
 }
@@ -91,7 +88,7 @@ async fn types_create(
     }
     match s.entity_types_create(input, ctx.actor()).await {
         Ok(view) => Ok((StatusCode::CREATED, Json(view)).into_response()),
-        Err(e) => type_error(e).map_err(Into::into),
+        Err(e) => type_error(e),
     }
 }
 
@@ -114,7 +111,7 @@ async fn types_update(
     match s.entity_types_update(&id_or_slug, patch, ctx.actor()).await {
         Ok(Some(view)) => Ok(Json(view).into_response()),
         Ok(None) => Ok(not_found()),
-        Err(e) => type_error(e).map_err(Into::into),
+        Err(e) => type_error(e),
     }
 }
 
@@ -164,7 +161,7 @@ async fn entities_list(
     };
     match s.custom_entities_list(&filter, &ctx.visibility()).await {
         Ok(items) => Ok(Json(items).into_response()),
-        Err(e) => entity_error(e).map_err(Into::into),
+        Err(e) => entity_error(e),
     }
 }
 
@@ -181,7 +178,7 @@ async fn entities_create(
         .await
     {
         Ok(e) => Ok((StatusCode::CREATED, Json(e)).into_response()),
-        Err(e) => entity_error(e).map_err(Into::into),
+        Err(e) => entity_error(e),
     }
 }
 
@@ -204,12 +201,18 @@ async fn entities_update(
     Json(patch): Json<CustomEntityPatch>,
 ) -> ApiResult {
     match s
-        .custom_entities_update(&id, patch, ctx.actor(), &ctx.visibility(), ctx.namespace_owner())
+        .custom_entities_update(
+            &id,
+            patch,
+            ctx.actor(),
+            &ctx.visibility(),
+            ctx.namespace_owner(),
+        )
         .await
     {
         Ok(Some(e)) => Ok(Json(e).into_response()),
         Ok(None) => Ok(not_found()),
-        Err(e) => entity_error(e).map_err(Into::into),
+        Err(e) => entity_error(e),
     }
 }
 

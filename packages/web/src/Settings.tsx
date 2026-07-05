@@ -6,7 +6,7 @@ import { liveRev } from "./live.ts";
 import { EmptyState } from "./primitives.tsx";
 
 /** Worker configuration: ingest sources (GUI ⇄ MCP), status, outbound queue,
- * and the Claude Code credentials that power hosted chats. */
+ * and the runtime credentials that power hosted conversations. */
 export const Settings: Component = () => {
   const actor = getActor();
   const [sources, { refetch }] = createResource(() => ({ _r: liveRev() }), () => api.sources(actor));
@@ -14,7 +14,7 @@ export const Settings: Component = () => {
   const [outbox] = createResource(() => ({ _r: liveRev() }), () => api.outbox());
   const [creds, { refetch: refetchCreds }] = createResource(() => ({ _r: liveRev() }), () => api.ccCredentials());
 
-  const [credForm, setCredForm] = createSignal({ kind: "oauth_token", label: "", secret: "" });
+  const [credForm, setCredForm] = createSignal({ kind: "codex_oauth", label: "", secret: "" });
   const saveCred = async (e: Event) => {
     e.preventDefault();
     const f = credForm();
@@ -159,22 +159,31 @@ export const Settings: Component = () => {
         </For>
       </Show>
 
-      <h3 class="sec">Claude Code</h3>
-      <p class="dim sm">Credentials that run your hosted chats. Stored encrypted; the secret is never shown again.</p>
+      <h3 class="sec">Agent runtime sign-in</h3>
+      <p class="dim sm">Credentials for Codex, Claude Code, and OpenCode. Stored encrypted; the secret is never shown again. Use fictional/test values here unless you are connected to your own backend.</p>
 
-      <form class="source-form" onSubmit={saveCred}>
+      <div class="credential-hints">
+        <div><strong>Codex</strong><span>subscription OAuth or token from the Codex CLI sign-in flow</span></div>
+        <div><strong>Claude Code</strong><span>Claude setup token or Anthropic API key</span></div>
+        <div><strong>OpenCode</strong><span>provider API key; set provider/model when starting a run</span></div>
+      </div>
+
+      <form class="source-form runtime-cred-form" onSubmit={saveCred}>
         <select value={credForm().kind} onChange={(e) => setCredForm({ ...credForm(), kind: e.currentTarget.value })}>
-          <option value="oauth_token">Subscription OAuth token (claude setup-token)</option>
-          <option value="api_key">Anthropic API key</option>
+          <option value="codex_oauth">Codex subscription OAuth/token</option>
+          <option value="codex_api_key">Codex API token</option>
+          <option value="claude_oauth">Claude Code subscription OAuth token</option>
+          <option value="anthropic_api_key">Claude Code / Anthropic API key</option>
+          <option value="opencode_provider_key">OpenCode provider API key</option>
         </select>
-        <input placeholder="label (optional)" value={credForm().label} onInput={(e) => setCredForm({ ...credForm(), label: e.currentTarget.value })} />
-        <input class="grow" type="password" placeholder="paste secret" value={credForm().secret} onInput={(e) => setCredForm({ ...credForm(), secret: e.currentTarget.value })} />
+        <input placeholder="label / provider hint (optional)" value={credForm().label} onInput={(e) => setCredForm({ ...credForm(), label: e.currentTarget.value })} />
+        <input class="grow" type="password" placeholder="paste token or API key" value={credForm().secret} onInput={(e) => setCredForm({ ...credForm(), secret: e.currentTarget.value })} />
         <button class="primary" type="submit">save credential</button>
       </form>
 
       <For
         each={creds()}
-        fallback={<EmptyState icon="chats" title="No credentials yet." hint="Chats can't start without one — add a token above." />}
+        fallback={<EmptyState icon="chats" title="No runtime credentials yet." hint="Conversations can't start until a runtime token or provider key is saved." />}
       >
         {(c) => (
           <div class="wire-row">

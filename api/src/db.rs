@@ -337,6 +337,7 @@ const SCHEMA: &str = r#"
       title             TEXT NOT NULL DEFAULT '',
       workdir           TEXT NOT NULL DEFAULT '',
       claude_session_id TEXT,
+      runtime           TEXT NOT NULL DEFAULT 'claude_code',
       status            TEXT NOT NULL DEFAULT 'provisioning',
       model             TEXT,
       usage             TEXT NOT NULL DEFAULT '{}',
@@ -371,6 +372,8 @@ const SCHEMA: &str = r#"
       id           TEXT PRIMARY KEY,
       owner        TEXT NOT NULL,
       kind         TEXT NOT NULL,
+      runtime      TEXT NOT NULL DEFAULT 'claude_code',
+      provider     TEXT,
       label        TEXT NOT NULL DEFAULT '',
       ciphertext   TEXT NOT NULL,
       nonce        TEXT NOT NULL,
@@ -460,6 +463,103 @@ const SCHEMA_SEARCH: &str = r#"
     -- Dormant in v1 (filters run in Rust at household scale); enables ad-hoc
     -- psql @> queries and server-side filtering later without a migration.
     CREATE INDEX IF NOT EXISTS entities_fields_gin ON entities USING GIN (fields jsonb_path_ops);
+
+    -- Phase 1 mail archive skeleton. Sync credentials/state intentionally live
+    -- elsewhere; these tables only hold read-only rows already ingested by a
+    -- future hive-mail process. user_scope follows journal visibility.
+    CREATE TABLE IF NOT EXISTS blobs (
+      hash       TEXT PRIMARY KEY,
+      size       BIGINT NOT NULL DEFAULT 0,
+      mime       TEXT NOT NULL DEFAULT 'application/octet-stream',
+      data       BYTEA,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS mail_accounts (
+      id              TEXT PRIMARY KEY,
+      owner           TEXT NOT NULL,
+      address         TEXT NOT NULL,
+      jmap_url        TEXT NOT NULL DEFAULT '',
+      jmap_account_id TEXT NOT NULL DEFAULT '',
+      cred_id         TEXT,
+      email_state     TEXT,
+      mailbox_state   TEXT,
+      backfill_status TEXT NOT NULL DEFAULT 'pending',
+      backfill_cursor JSONB,
+      attempts        BIGINT NOT NULL DEFAULT 0,
+      next_attempt_at TEXT,
+      last_error      TEXT,
+      last_synced_at  TEXT,
+      last_status     TEXT,
+      enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at      TEXT NOT NULL,
+      updated_at      TEXT NOT NULL,
+      UNIQUE (owner, address)
+    );
+    CREATE INDEX IF NOT EXISTS mail_accounts_owner ON mail_accounts (owner, address);
+
+    CREATE TABLE IF NOT EXISTS mail_mailboxes (
+      id         TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
+      jmap_id    TEXT NOT NULL,
+      name       TEXT NOT NULL,
+      role       TEXT,
+      ingest     BOOLEAN NOT NULL DEFAULT FALSE,
+      sort_order BIGINT NOT NULL DEFAULT 0,
+      UNIQUE (account_id, jmap_id)
+    );
+    CREATE INDEX IF NOT EXISTS mail_mailboxes_account ON mail_mailboxes (account_id, sort_order);
+
+    CREATE TABLE IF NOT EXISTS mail_messages (
+      id               TEXT PRIMARY KEY,
+      account_id       TEXT NOT NULL REFERENCES mail_accounts(id) ON DELETE CASCADE,
+      jmap_id          TEXT NOT NULL,
+      jmap_thread_id   TEXT NOT NULL,
+      message_id_hdr   TEXT,
+      in_reply_to      TEXT,
+      references_json  TEXT NOT NULL DEFAULT '[]',
+      from_addr        TEXT NOT NULL DEFAULT '',
+      from_name        TEXT,
+      to_json          TEXT NOT NULL DEFAULT '[]',
+      cc_json          TEXT NOT NULL DEFAULT '[]',
+      reply_to_json    TEXT NOT NULL DEFAULT '[]',
+      subject          TEXT NOT NULL DEFAULT '',
+      sent_at          TEXT,
+      received_at      TEXT NOT NULL,
+      mailbox_ids_json TEXT NOT NULL DEFAULT '[]',
+      keywords_json    TEXT NOT NULL DEFAULT '{}',
+      body_text        TEXT NOT NULL DEFAULT '',
+      body_source      TEXT NOT NULL DEFAULT 'plain',
+      snippet          TEXT NOT NULL DEFAULT '',
+      size             BIGINT NOT NULL DEFAULT 0,
+      has_attachments  BOOLEAN NOT NULL DEFAULT FALSE,
+      embed_state      TEXT NOT NULL DEFAULT 'pending',
+      user_scope       TEXT NOT NULL,
+      deleted_at       TEXT,
+      created_at       TEXT NOT NULL,
+      updated_at       TEXT NOT NULL,
+      UNIQUE (account_id, jmap_id)
+    );
+    CREATE INDEX IF NOT EXISTS mail_messages_scope_received ON mail_messages (user_scope, received_at DESC);
+    CREATE INDEX IF NOT EXISTS mail_messages_account_thread ON mail_messages (account_id, jmap_thread_id);
+    CREATE INDEX IF NOT EXISTS mail_messages_message_id ON mail_messages (message_id_hdr);
+    CREATE INDEX IF NOT EXISTS mail_messages_subject ON mail_messages (subject);
+
+    CREATE TABLE IF NOT EXISTS mail_attachments (
+      id             TEXT PRIMARY KEY,
+      message_id     TEXT NOT NULL REFERENCES mail_messages(id) ON DELETE CASCADE,
+      blob_hash      TEXT REFERENCES blobs(hash) ON DELETE SET NULL,
+      jmap_blob_id   TEXT NOT NULL DEFAULT '',
+      filename       TEXT NOT NULL DEFAULT '',
+      mime           TEXT NOT NULL DEFAULT 'application/octet-stream',
+      size           BIGINT NOT NULL DEFAULT 0,
+      content_id     TEXT,
+      disposition    TEXT,
+      skipped_reason TEXT,
+      created_at     TEXT NOT NULL,
+      UNIQUE NULLS NOT DISTINCT (message_id, jmap_blob_id, content_id)
+    );
+    CREATE INDEX IF NOT EXISTS mail_attachments_message ON mail_attachments (message_id);
 "#;
 
 pub async fn migrate(pool: &PgPool) -> Result<()> {
@@ -494,6 +594,9 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS expires_at TEXT",
         "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS scope      TEXT",
         "ALTER TABLE oauth_auth_codes ADD COLUMN IF NOT EXISTS token_ttl_secs BIGINT",
+        "ALTER TABLE cc_sessions ADD COLUMN IF NOT EXISTS runtime TEXT NOT NULL DEFAULT 'claude_code'",
+        "ALTER TABLE cc_credentials ADD COLUMN IF NOT EXISTS runtime TEXT NOT NULL DEFAULT 'claude_code'",
+        "ALTER TABLE cc_credentials ADD COLUMN IF NOT EXISTS provider TEXT",
     ] {
         sqlx::raw_sql(ddl).execute(pool).await?;
     }

@@ -12,6 +12,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::workspaces::normalize_runtime;
 use super::{new_id, now_iso, Store};
 
 /// A stored credential, redacted for display — never the secret itself.
@@ -20,6 +21,8 @@ pub struct CcCredentialView {
     pub id: String,
     pub owner: String,
     pub kind: String,
+    pub runtime: String,
+    pub provider: Option<String>,
     pub label: String,
     pub tail: String,
     pub created_at: String,
@@ -30,7 +33,9 @@ pub struct CcCredentialView {
 /// encrypted server-side immediately; it is never persisted in the clear.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewCcCredential {
-    pub kind: String, // "api_key" | "oauth_token"
+    pub kind: String, // e.g. "api_key" | "oauth_token" | "subscription_login" | "provider_config"
+    pub runtime: Option<String>,
+    pub provider: Option<String>,
     pub label: Option<String>,
     pub secret: String,
 }
@@ -40,6 +45,8 @@ struct CredViewRow {
     id: String,
     owner: String,
     kind: String,
+    runtime: String,
+    provider: Option<String>,
     label: String,
     tail: String,
     created_at: String,
@@ -50,6 +57,8 @@ struct CredViewRow {
 struct CredSecretRow {
     id: String,
     kind: String,
+    runtime: String,
+    provider: Option<String>,
     ciphertext: String,
     nonce: String,
 }
@@ -106,15 +115,24 @@ impl Store {
         let (ciphertext, nonce) = encrypt(&input.secret)?;
         let id = new_id("cred");
         let ts = now_iso();
+        let runtime = normalize_runtime(input.runtime.as_deref());
+        let provider = input
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let label = input.label.unwrap_or_default();
         let tail = tail_of(&input.secret);
         crate::pgq::query(
-            "INSERT INTO cc_credentials (id, owner, kind, label, ciphertext, nonce, tail, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO cc_credentials (id, owner, kind, runtime, provider, label, ciphertext, nonce, tail, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(owner)
         .bind(&input.kind)
+        .bind(&runtime)
+        .bind(&provider)
         .bind(&label)
         .bind(&ciphertext)
         .bind(&nonce)
@@ -125,13 +143,15 @@ impl Store {
         self.emit(
             "credential.saved",
             owner,
-            serde_json::json!({"id": id, "kind": input.kind}),
+            serde_json::json!({"id": id, "kind": input.kind, "runtime": runtime, "provider": provider}),
         )
         .await?;
         Ok(CcCredentialView {
             id,
             owner: owner.to_string(),
             kind: input.kind,
+            runtime,
+            provider,
             label,
             tail,
             created_at: ts,
@@ -142,7 +162,7 @@ impl Store {
     /// Redacted list of an owner's credentials.
     pub async fn cc_cred_list(&self, owner: &str) -> Result<Vec<CcCredentialView>> {
         let rows = crate::pgq::query_as::<CredViewRow>(
-            "SELECT id, owner, kind, label, tail, created_at, last_used_at \
+            "SELECT id, owner, kind, runtime, provider, label, tail, created_at, last_used_at \
              FROM cc_credentials WHERE owner = ? ORDER BY created_at DESC",
         )
         .bind(owner)
@@ -154,6 +174,8 @@ impl Store {
                 id: r.id,
                 owner: r.owner,
                 kind: r.kind,
+                runtime: normalize_runtime(Some(&r.runtime)),
+                provider: r.provider,
                 label: r.label,
                 tail: r.tail,
                 created_at: r.created_at,
@@ -171,17 +193,20 @@ impl Store {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Decrypt the owner's most recent credential for the runner (INTERNAL only —
-    /// the only path that ever yields plaintext). Returns `(kind, secret)`.
+    /// Decrypt the owner's most recent credential for the requested runtime (INTERNAL only —
+    /// the only path that ever yields plaintext). Returns `(kind, runtime, provider, secret)`.
     pub async fn cc_cred_decrypt_for_runtime(
         &self,
         owner: &str,
-    ) -> Result<Option<(String, String)>> {
+        runtime: &str,
+    ) -> Result<Option<(String, String, Option<String>, String)>> {
+        let runtime = normalize_runtime(Some(runtime));
         let row = crate::pgq::query_as::<CredSecretRow>(
-            "SELECT id, kind, ciphertext, nonce FROM cc_credentials \
-             WHERE owner = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT id, kind, runtime, provider, ciphertext, nonce FROM cc_credentials \
+             WHERE owner = ? AND runtime = ? ORDER BY created_at DESC LIMIT 1",
         )
         .bind(owner)
+        .bind(&runtime)
         .fetch_optional(self.db())
         .await?;
         let Some(row) = row else { return Ok(None) };
@@ -191,6 +216,11 @@ impl Store {
             .bind(&row.id)
             .execute(self.db())
             .await?;
-        Ok(Some((row.kind, secret)))
+        Ok(Some((
+            row.kind,
+            normalize_runtime(Some(&row.runtime)),
+            row.provider,
+            secret,
+        )))
     }
 }

@@ -12,9 +12,7 @@ use hive_shared::{
 use serde_json::json;
 use sqlx::Row;
 
-use super::entity_validation::{
-    slugify, validate_field_slug, validate_type_slug, FieldIssue,
-};
+use super::entity_validation::{slugify, validate_field_slug, validate_type_slug, FieldIssue};
 use super::{json_vec, new_id, now_iso, to_json, Store};
 
 /// Registry mutations fail with a structured issue list (the same shape
@@ -89,7 +87,11 @@ impl Store {
         };
         validate_type_slug(&slug).map_err(|i| TypeWriteError::Issues(vec![i]))?;
         if self.entity_types_get(&slug).await?.is_some() {
-            return Err(issue("slug", "bad_slug", format!("type '{slug}' already exists")));
+            return Err(issue(
+                "slug",
+                "bad_slug",
+                format!("type '{slug}' already exists"),
+            ));
         }
 
         let ts = now_iso();
@@ -126,8 +128,12 @@ impl Store {
             self.set_board_field(&type_id, Some(bf.clone())).await?;
         }
 
-        self.emit("entity_type.created", actor, json!({"id": type_id, "slug": slug}))
-            .await?;
+        self.emit(
+            "entity_type.created",
+            actor,
+            json!({"id": type_id, "slug": slug}),
+        )
+        .await?;
         let view = self
             .entity_types_get(&type_id)
             .await?
@@ -161,9 +167,11 @@ impl Store {
 
         let base_pos = current.fields.len() as i64;
         for (i, f) in patch.add_fields.iter().enumerate() {
-            if current.fields.iter().any(|ef| {
-                ef.slug == f.slug.clone().unwrap_or_else(|| slugify(&f.label))
-            }) {
+            if current
+                .fields
+                .iter()
+                .any(|ef| ef.slug == f.slug.clone().unwrap_or_else(|| slugify(&f.label)))
+            {
                 return Err(issue(
                     "add_fields",
                     "bad_slug",
@@ -240,10 +248,18 @@ impl Store {
             ));
         };
         if ft == FieldType::Choice && f.options.is_empty() {
-            return Err(issue(&slug, "bad_choice", "choice fields need options".into()));
+            return Err(issue(
+                &slug,
+                "bad_choice",
+                "choice fields need options".into(),
+            ));
         }
         if ft == FieldType::Ref && f.ref_kind.is_none() {
-            return Err(issue(&slug, "bad_ref_kind", "ref fields need ref_kind".into()));
+            return Err(issue(
+                &slug,
+                "bad_ref_kind",
+                "ref fields need ref_kind".into(),
+            ));
         }
         if let Some(rk) = &f.ref_kind {
             let builtin_ok = matches!(rk.as_str(), "person" | "topic" | "project" | "task");
@@ -281,13 +297,11 @@ impl Store {
         type_id: &str,
         fp: &EntityFieldPatch,
     ) -> std::result::Result<(), TypeWriteError> {
-        let row = crate::pgq::query(
-            "SELECT * FROM entity_fields WHERE type_id = ? AND slug = ?",
-        )
-        .bind(type_id)
-        .bind(&fp.slug)
-        .fetch_optional(self.db())
-        .await?;
+        let row = crate::pgq::query("SELECT * FROM entity_fields WHERE type_id = ? AND slug = ?")
+            .bind(type_id)
+            .bind(&fp.slug)
+            .fetch_optional(self.db())
+            .await?;
         let Some(r) = row else {
             return Err(issue(
                 &fp.slug,
@@ -304,7 +318,11 @@ impl Store {
         if FieldType::parse(&field_type) == Some(FieldType::Choice) {
             if let Some(opts) = &fp.options {
                 if opts.is_empty() {
-                    return Err(issue(&fp.slug, "bad_choice", "choice fields need options".into()));
+                    return Err(issue(
+                        &fp.slug,
+                        "bad_choice",
+                        "choice fields need options".into(),
+                    ));
                 }
             }
         }

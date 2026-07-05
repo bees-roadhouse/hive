@@ -24,7 +24,7 @@ import type {
   WireEvent,
 } from "@hive/shared";
 import { TASK_STATUSES } from "@hive/shared";
-import { useSearchParams } from "@solidjs/router";
+import { A, useSearchParams } from "@solidjs/router";
 import { api, getDoneRetentionHours, setDoneRetentionHours } from "./api.ts";
 import { liveRev } from "./live.ts";
 import { Icon } from "./icons.tsx";
@@ -432,8 +432,10 @@ const SearchResults: Component<{ query: string; mode: "keyword" | "semantic" }> 
     >
       {(h) => (
         <div class="hit">
-          <span class="badge">{h.kind}</span>
-          <strong>{h.title}</strong>
+          <ResultKindChip hit={h} />
+          <Show when={h.kind === "mail"} fallback={<strong>{h.title}</strong>}>
+            <A class="hit-title" href={`/mail?thread=${encodeURIComponent(h.id)}`}><strong>{h.title}</strong></A>
+          </Show>
           <Show when={h.snippet} fallback={<span class="snippet">score {h.score}</span>}>
             {/* escape-then-mark: body text is untrusted, only our <mark>s render */}
             <span class="snippet" innerHTML={highlightSnippet(h.snippet)} />
@@ -441,6 +443,19 @@ const SearchResults: Component<{ query: string; mode: "keyword" | "semantic" }> 
         </div>
       )}
     </For>
+  );
+};
+
+const ResultKindChip: Component<{ hit: SearchHit }> = (props) => {
+  const k = () => KIND[props.hit.kind];
+  return (
+    <Show when={k()} fallback={<span class="badge">{props.hit.kind}</span>}>
+      {(kind) => (
+        <span class="kind-chip" classList={{ "mail-chip": props.hit.kind === "mail" }} title={kind().label}>
+          <Icon name={kind().icon} size={12} /> {kind().label}
+        </span>
+      )}
+    </Show>
   );
 };
 
