@@ -1,5 +1,6 @@
 import { createResource, createSignal, For, Show, type Component } from "solid-js";
 import { api } from "./api.ts";
+import { Icon } from "./icons.tsx";
 
 // OAuth consent screen (the "sign in as the AI" step). Reached at /consent after
 // /authorize validated the request. The human is already signed in (App gates
@@ -61,7 +62,7 @@ export const OAuthConsent: Component = () => {
   return (
     <div class="auth-screen">
       <div class="auth-card">
-        <div class="auth-brand"><span class="logo">🐝</span><span class="brand-name">hive</span></div>
+        <div class="auth-brand"><span class="brand-logo"><Icon name="hex" size={28} /></span><span class="brand-name">hive</span></div>
         <Show when={ctx()} fallback={<p class="dim">Loading…</p>}>
           <h1>Authorize access</h1>
           <p>

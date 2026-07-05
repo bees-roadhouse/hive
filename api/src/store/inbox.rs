@@ -1,7 +1,7 @@
 // Per-actor inbox (store.ts `inbox`).
 
 use anyhow::Result;
-use hive_shared::{EntityKind, InboxItem, InboxReason};
+use hive_shared::{InboxItem, InboxReason};
 use serde_json::json;
 use sqlx::Row;
 
@@ -14,7 +14,7 @@ impl Store {
         recipient: &str,
         from: &str,
         reason: InboxReason,
-        ref_kind: EntityKind,
+        ref_kind: &str,
         ref_id: &str,
         entry_id: Option<&str>,
         snippet: &str,
@@ -27,7 +27,7 @@ impl Store {
             recipient: recipient.to_string(),
             from: from.to_string(),
             reason,
-            ref_kind,
+            ref_kind: ref_kind.to_string(),
             ref_id: ref_id.to_string(),
             entry_id: entry_id.map(String::from),
             snippet: snip140(snippet),
@@ -42,7 +42,7 @@ impl Store {
         .bind(&item.recipient)
         .bind(&item.from)
         .bind(item.reason.as_str())
-        .bind(item.ref_kind.as_str())
+        .bind(&item.ref_kind)
         .bind(&item.ref_id)
         .bind(&item.entry_id)
         .bind(&item.snippet)
@@ -70,9 +70,7 @@ impl Store {
             .bind(recipient)
             .fetch_all(self.db())
             .await?;
-        rows.iter()
-            .filter_map(|r| row_to_inbox(r).transpose())
-            .collect()
+        rows.iter().map(row_to_inbox).collect()
     }
 
     /// Recipient of one item, kind-agnostic: the ownership gate must work even
@@ -118,23 +116,20 @@ impl Store {
     }
 }
 
-/// `Ok(None)` = a row referencing a kind this build doesn't know — dropped,
-/// never surfaced as a task notification (fail closed).
-pub(crate) fn row_to_inbox(r: &sqlx::postgres::PgRow) -> Result<Option<InboxItem>> {
-    let ref_kind: String = r.try_get("ref_kind")?;
-    let Some(ref_kind) = EntityKind::parse(&ref_kind) else {
-        return Ok(None);
-    };
-    Ok(Some(InboxItem {
+/// ref_kind passes through as a string: with user-defined entity types an
+/// enum-unknown kind is a valid row, and nothing mislabels without the lossy
+/// default.
+pub(crate) fn row_to_inbox(r: &sqlx::postgres::PgRow) -> Result<InboxItem> {
+    Ok(InboxItem {
         id: r.try_get("id")?,
         recipient: r.try_get("recipient")?,
         from: r.try_get("from")?,
         reason: InboxReason::from_str_lossy(r.try_get::<String, _>("reason")?.as_str()),
-        ref_kind,
+        ref_kind: r.try_get("ref_kind")?,
         ref_id: r.try_get("ref_id")?,
         entry_id: r.try_get("entry_id")?,
         snippet: r.try_get("snippet")?,
         created_at: r.try_get("created_at")?,
         read_at: r.try_get("read_at")?,
-    }))
+    })
 }

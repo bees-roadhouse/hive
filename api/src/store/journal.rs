@@ -171,7 +171,7 @@ impl Store {
                     m,
                     &author,
                     InboxReason::Mention,
-                    EntityKind::Journal,
+                    EntityKind::Journal.as_str(),
                     &entry.id,
                     Some(&entry.id),
                     &input.body,
@@ -325,7 +325,7 @@ impl Store {
         .bind(now_iso())
         .execute(self.db())
         .await?;
-        self.links_create(EntityKind::Journal, &entry.id, ref_kind, &ref_id, "anchors")
+        self.links_create(EntityKind::Journal.as_str(), &entry.id, ref_kind.as_str(), &ref_id, "anchors")
             .await?;
 
         // For inbox delivery use the full assignee list (including author when auto-assigned).
@@ -340,7 +340,7 @@ impl Store {
                 who,
                 author,
                 reason,
-                ref_kind,
+                ref_kind.as_str(),
                 &ref_id,
                 Some(&entry.id),
                 &text,
@@ -395,9 +395,9 @@ impl Store {
                         None => self.people_ensure(&t.name, ActorKind::Human).await?,
                     };
                     self.links_create(
-                        EntityKind::Journal,
+                        EntityKind::Journal.as_str(),
                         &entry.id,
-                        EntityKind::Person,
+                        EntityKind::Person.as_str(),
                         &person.id,
                         "mentions",
                     )
@@ -409,7 +409,7 @@ impl Store {
                             n,
                             author,
                             InboxReason::Mention,
-                            EntityKind::Journal,
+                            EntityKind::Journal.as_str(),
                             &entry.id,
                             Some(&entry.id),
                             &entry.body,
@@ -420,9 +420,9 @@ impl Store {
                 "topic" => {
                     let topic = self.topics_ensure(&t.name).await?;
                     self.links_create(
-                        EntityKind::Journal,
+                        EntityKind::Journal.as_str(),
                         &entry.id,
-                        EntityKind::Topic,
+                        EntityKind::Topic.as_str(),
                         &topic.id,
                         "tagged",
                     )
@@ -431,9 +431,9 @@ impl Store {
                 "project" => {
                     let proj = self.projects_ensure(&t.name).await?;
                     self.links_create(
-                        EntityKind::Journal,
+                        EntityKind::Journal.as_str(),
                         &entry.id,
-                        EntityKind::Project,
+                        EntityKind::Project.as_str(),
                         &proj.id,
                         "about",
                     )
@@ -443,9 +443,9 @@ impl Store {
                     if let Some(pid) = &ctx_project {
                         let ph = self.phases_ensure(pid, &t.name).await?;
                         self.links_create(
-                            EntityKind::Journal,
+                            EntityKind::Journal.as_str(),
                             &entry.id,
-                            EntityKind::Phase,
+                            EntityKind::Phase.as_str(),
                             &ph.id,
                             "about",
                         )
@@ -470,9 +470,9 @@ impl Store {
                         )
                         .await?;
                     self.links_create(
-                        EntityKind::Journal,
+                        EntityKind::Journal.as_str(),
                         &entry.id,
-                        EntityKind::Task,
+                        EntityKind::Task.as_str(),
                         &task.id,
                         "anchors",
                     )
@@ -482,7 +482,7 @@ impl Store {
                         author,
                         author,
                         InboxReason::Assignment,
-                        EntityKind::Task,
+                        EntityKind::Task.as_str(),
                         &task.id,
                         Some(&entry.id),
                         &t.name,

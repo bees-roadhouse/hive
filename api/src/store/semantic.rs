@@ -156,6 +156,9 @@ struct VisibilityIndex {
     visible_entries: HashSet<String>,
     /// `kind:id` → origin_entry_id for task/decision/event rows.
     origin_of: HashMap<String, Option<String>>,
+    /// `slug:id` keys of custom entity rows this viewer may see (scope lives
+    /// on the row itself, not an origin entry).
+    custom_visible: HashSet<String>,
 }
 
 impl VisibilityIndex {
@@ -167,7 +170,10 @@ impl VisibilityIndex {
         }
         match self.origin_of.get(&ref_key(kind, id)) {
             Some(Some(origin)) => self.visible_entries.contains(origin),
-            _ => false,
+            Some(None) => false,
+            // Not an anchored built-in: visible only if it's a custom entity
+            // row this viewer may see — unknown kinds stay invisible.
+            None => self.custom_visible.contains(&ref_key(kind, id)),
         }
     }
 }
@@ -208,9 +214,30 @@ impl Store {
                 );
             }
         }
+        // Custom entity rows carry their scope directly. The typed `kinds`
+        // filter can never name a custom slug, so any restriction excludes
+        // them; only the unrestricted cascade loads this map (dormant until
+        // custom kinds get embeddings).
+        let mut custom_visible: HashSet<String> = HashSet::new();
+        if kinds.is_none() {
+            let rows = crate::pgq::query(
+                "SELECT e.id, t.slug FROM entities e JOIN entity_types t ON t.id = e.type_id \
+                 WHERE e.user_scope IS NULL OR e.user_scope = ?",
+            )
+            .bind(viewer)
+            .fetch_all(self.db())
+            .await?;
+            for r in &rows {
+                custom_visible.insert(ref_key(
+                    r.try_get::<String, _>("slug")?.as_str(),
+                    r.try_get::<String, _>("id")?.as_str(),
+                ));
+            }
+        }
         Ok(VisibilityIndex {
             visible_entries,
             origin_of,
+            custom_visible,
         })
     }
 
@@ -249,9 +276,36 @@ impl Store {
                 );
             }
         }
+        // Hits whose kind is neither journal nor an anchored built-in may be
+        // custom entities — resolve their visibility in one batched query.
+        let mut custom_visible: HashSet<String> = HashSet::new();
+        let custom_ids: Vec<&str> = hits
+            .iter()
+            .filter(|h| h.kind != "journal" && origin_table(&h.kind).is_none())
+            .map(|h| h.id.as_str())
+            .collect();
+        if !custom_ids.is_empty() {
+            let sql = format!(
+                "SELECT e.id, t.slug FROM entities e JOIN entity_types t ON t.id = e.type_id \
+                 WHERE e.id IN ({}) AND (e.user_scope IS NULL OR e.user_scope = ?)",
+                placeholders_or_never(custom_ids.len())
+            );
+            let mut q = crate::pgq::query(&sql);
+            for id in &custom_ids {
+                q = q.bind(*id);
+            }
+            q = q.bind(viewer);
+            for r in &q.fetch_all(self.db()).await? {
+                custom_visible.insert(ref_key(
+                    r.try_get::<String, _>("slug")?.as_str(),
+                    r.try_get::<String, _>("id")?.as_str(),
+                ));
+            }
+        }
         let index = VisibilityIndex {
             visible_entries,
             origin_of,
+            custom_visible,
         };
         Ok(hits
             .into_iter()
@@ -290,24 +344,20 @@ impl Store {
         .bind(fetch as i64)
         .fetch_all(self.db())
         .await?;
-        let mut hits: Vec<SearchHit> = Vec::with_capacity(rows.len());
-        for r in &rows {
-            // Fail closed: skip rows whose kind this build doesn't know (a
-            // newer binary's rows must not surface mislabeled).
-            let kind_s: String = r.try_get("kind")?;
-            let Some(kind) = EntityKind::parse(&kind_s) else {
-                continue;
-            };
-            // ts_rank is f32 and higher = better; clamp to a 0..1 score.
-            let rank: f32 = r.try_get("rank")?;
-            hits.push(SearchHit {
-                kind,
-                id: r.try_get("ref_id")?,
-                title: r.try_get("title")?,
-                snippet: r.try_get("snip")?,
-                score: ((rank.clamp(0.0, 1.0) as f64) * 1000.0).round() / 1000.0,
-            });
-        }
+        let hits: Vec<SearchHit> = rows
+            .iter()
+            .map(|r| -> Result<SearchHit> {
+                // ts_rank is f32 and higher = better; clamp to a 0..1 score.
+                let rank: f32 = r.try_get("rank")?;
+                Ok(SearchHit {
+                    kind: r.try_get("kind")?,
+                    id: r.try_get("ref_id")?,
+                    title: r.try_get("title")?,
+                    snippet: r.try_get("snip")?,
+                    score: ((rank.clamp(0.0, 1.0) as f64) * 1000.0).round() / 1000.0,
+                })
+            })
+            .collect::<Result<_>>()?;
         let mut hits = match viewer {
             Some(v) => self.scope_hits(hits, v).await?,
             None => hits,
@@ -538,11 +588,15 @@ impl Store {
             None => None,
         };
         let admit = |kind_s: &str, id: &str| -> bool {
-            let Some(kind) = EntityKind::parse(kind_s) else {
-                return false;
-            };
-            if opts.kinds.as_ref().is_some_and(|ks| !ks.contains(&kind)) {
-                return false;
+            // The typed filter can only name built-ins, so when it's set it
+            // excludes everything else (custom slugs included). Unrestricted
+            // queries admit whatever the visibility index allows — which
+            // handles custom entity rows by their own scope.
+            if let Some(ks) = opts.kinds.as_ref() {
+                match EntityKind::parse(kind_s) {
+                    Some(kind) if ks.contains(&kind) => {}
+                    _ => return false,
+                }
             }
             match &visible {
                 Some(ix) => ix.allows(kind_s, id),
@@ -755,10 +809,8 @@ impl Store {
             .into_iter()
             .filter_map(|(k, score)| {
                 let (kind, id) = split_key(&k);
-                // Fail closed: drop vectors of kinds this build doesn't know.
-                let kind = EntityKind::parse(kind)?;
                 Some(SearchHit {
-                    kind,
+                    kind: kind.to_string(),
                     id: id.to_string(),
                     title: title_of.get(&k).cloned().unwrap_or_else(|| id.to_string()),
                     snippet: String::new(),

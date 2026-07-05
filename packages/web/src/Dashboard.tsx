@@ -3,19 +3,8 @@ import type { DashboardStats, WireEvent } from "@hive/shared";
 import { ACTORS, DECISION_STATUSES, TASK_STATUSES } from "@hive/shared";
 import { api } from "./api.ts";
 import { liveRev } from "./live.ts";
-import { relTime, TASK_GLYPH, DECISION_GLYPH } from "./lib.tsx";
-
-// ---- kind colour palette (matches spec + existing CSS tokens) ----
-const KIND_COLORS: Record<string, string> = {
-  journal: "#7c9cff",
-  task: "#5ec8a0",
-  decision: "#e0a44a",
-  event: "#c77dff",
-  person: "#ff8fab",
-  topic: "#6ee7d6",
-  project: "#ffd24a",
-  phase: "#ffb86b",
-};
+import { Icon } from "./icons.tsx";
+import { relTime, SkeletonList, TASK_GLYPH, DECISION_GLYPH } from "./lib.tsx";
 
 // Known AI actors (matches ACTORS from shared — kind='ai').
 const AI_ACTORS = new Set(ACTORS.filter((a) => a.kind === "ai").map((a) => a.name));
@@ -55,11 +44,9 @@ function fillDays(raw: { day: string; count: number }[]): { day: string; count: 
 
 const SparkBars: Component<{
   data: { day: string; count: number }[];
-  color?: string;
   height?: number;
 }> = (props) => {
   const h = () => props.height ?? 64;
-  const color = () => props.color ?? "var(--honey)";
   const max = () => Math.max(...props.data.map((d) => d.count), 1);
   const bw = () => 100 / props.data.length;
 
@@ -67,7 +54,8 @@ const SparkBars: Component<{
     <svg
       viewBox={`0 0 100 ${h()}`}
       preserveAspectRatio="none"
-      style={{ width: "100%", height: `${h()}px`, display: "block" }}
+      class="spark-svg"
+      style={{ height: `${h()}px` }}
     >
       <For each={props.data}>
         {(d, i) => {
@@ -82,8 +70,8 @@ const SparkBars: Component<{
               width={bwPx()}
               height={bh()}
               rx="1.5"
-              fill={color()}
-              opacity={d.count > 0 ? 0.82 : 0.08}
+              class="spark-bar"
+              classList={{ "spark-bar-zero": d.count === 0 }}
             >
               <title>{d.day}: {d.count}</title>
             </rect>
@@ -100,15 +88,13 @@ const HBar: Component<{
   label: string;
   value: number;
   max: number;
-  color?: string;
 }> = (props) => {
   const pct = () => (props.max > 0 ? (props.value / props.max) * 100 : 0);
-  const color = () => props.color ?? "var(--honey)";
   return (
     <div class="dash-hbar-row">
       <span class="dash-hbar-label">{props.label}</span>
       <div class="dash-hbar-track">
-        <div class="dash-hbar-fill" style={{ width: `${pct()}%`, background: color() }} />
+        <div class="dash-hbar-fill" style={{ width: `${pct()}%` }} />
       </div>
       <span class="dash-hbar-val">{props.value}</span>
     </div>
@@ -282,15 +268,6 @@ const AgentFeed: Component<{ events: WireEvent[] }> = (props) => {
     seen = new Set(agentEvents().map((e) => e.id));
   });
 
-  const actorColor = (actor: string): string => {
-    const m: Record<string, string> = {
-      pia: KIND_COLORS.journal,
-      apis: KIND_COLORS.task,
-      cera: KIND_COLORS.event,
-    };
-    return m[actor] ?? "#a99b78";
-  };
-
   return (
     <div class="agent-feed">
       <Show when={agentEvents().length === 0}>
@@ -299,12 +276,7 @@ const AgentFeed: Component<{ events: WireEvent[] }> = (props) => {
       <For each={agentEvents()}>
         {(ev) => (
           <div class="agent-row" classList={{ "just-landed": isFresh(ev) }}>
-            <span
-              class="agent-actor"
-              style={{ background: actorColor(ev.actor) + "28", color: actorColor(ev.actor) }}
-            >
-              {ev.actor}
-            </span>
+            <span class="agent-actor kind-ai">{ev.actor}</span>
             <code class="agent-kind">{ev.kind}</code>
             <time class="agent-time">{relTime(ev.created_at)}</time>
           </div>
@@ -316,9 +288,9 @@ const AgentFeed: Component<{ events: WireEvent[] }> = (props) => {
 
 // ---- KPI tile ----
 
-const Kpi: Component<{ n: number; label: string; color?: string }> = (props) => (
+const Kpi: Component<{ n: number; label: string }> = (props) => (
   <div class="kpi">
-    <div class="kpi-n" style={props.color ? { color: props.color } : {}}>{props.n}</div>
+    <div class="kpi-n">{props.n}</div>
     <div class="kpi-l">{props.label}</div>
   </div>
 );
@@ -343,7 +315,7 @@ export const Dashboard: Component = () => {
   };
 
   return (
-    <Show when={stats()} fallback={<p class="dim pad">loading…</p>}>
+    <Show when={stats()} fallback={<SkeletonList rows={3} />}>
       {(s) => {
         const filledDays = () => fillDays(s().entriesByDay);
         const maxDayCount = () => Math.max(...filledDays().map((d) => d.count), 1);
@@ -355,23 +327,23 @@ export const Dashboard: Component = () => {
 
             {/* ---- KPI tiles ---- */}
             <div class="kpis">
-              <Kpi n={s().entries} label="journal entries" color={KIND_COLORS.journal} />
-              <Kpi
-                n={s().tasks.todo + s().tasks.doing + s().tasks.blocked}
-                label="open tasks"
-                color={KIND_COLORS.task}
-              />
-              <Kpi n={s().decisions.total} label="decisions" color={KIND_COLORS.decision} />
-              <Kpi n={s().calloutsByPerson.length} label="people referenced" color={KIND_COLORS.person} />
+              <Kpi n={s().entries} label="journal entries" />
+              <Kpi n={s().tasks.todo + s().tasks.doing + s().tasks.blocked} label="open tasks" />
+              <Kpi n={s().decisions.total} label="decisions" />
+              <Kpi n={s().calloutsByPerson.length} label="people referenced" />
             </div>
 
             {/* ---- Calendar + Upcoming ---- */}
             <div class="dash-cal-row">
               <div class="panel dash-cal-panel">
                 <div class="cal-header">
-                  <button class="x" onClick={prevMonth} title="previous month">‹</button>
-                  <h3 style={{ margin: 0 }}>{monthName(viewMonth())} {viewYear()}</h3>
-                  <button class="x" onClick={nextMonth} title="next month">›</button>
+                  <button class="ghost" onClick={prevMonth} title="previous month" aria-label="previous month">
+                    <Icon name="chev-l" size={14} />
+                  </button>
+                  <h3>{monthName(viewMonth())} {viewYear()}</h3>
+                  <button class="ghost" onClick={nextMonth} title="next month" aria-label="next month">
+                    <Icon name="chev-r" size={14} />
+                  </button>
                 </div>
                 <MonthCalendar
                   year={viewYear()}
@@ -395,7 +367,7 @@ export const Dashboard: Component = () => {
             <div class="dash-charts-row">
               <div class="panel">
                 <h3>Activity · last 30 days</h3>
-                <SparkBars data={filledDays()} color={KIND_COLORS.journal} height={68} />
+                <SparkBars data={filledDays()} height={68} />
                 <div class="spark-axis">
                   <span class="dim sm">{filledDays()[0]?.day?.slice(5)}</span>
                   <span class="dim sm">today</span>
@@ -408,19 +380,7 @@ export const Dashboard: Component = () => {
               <div class="panel">
                 <h3>Entries by author</h3>
                 <For each={s().entriesByAuthor}>
-                  {(a) => (
-                    <HBar
-                      label={a.author}
-                      value={a.count}
-                      max={maxAuthorCount()}
-                      color={
-                        a.author === "pia" ? KIND_COLORS.journal :
-                        a.author === "apis" ? KIND_COLORS.task :
-                        a.author === "cera" ? KIND_COLORS.event :
-                        "var(--honey)"
-                      }
-                    />
-                  )}
+                  {(a) => <HBar label={a.author} value={a.count} max={maxAuthorCount()} />}
                 </For>
                 <Show when={s().entriesByAuthor.length === 0}>
                   <p class="dim sm">no entries yet</p>
@@ -430,9 +390,7 @@ export const Dashboard: Component = () => {
               <div class="panel">
                 <h3>Person callouts</h3>
                 <For each={s().calloutsByPerson}>
-                  {(c) => (
-                    <HBar label={c.name} value={c.count} max={maxCallouts()} color={KIND_COLORS.person} />
-                  )}
+                  {(c) => <HBar label={c.name} value={c.count} max={maxCallouts()} />}
                 </For>
                 <Show when={s().calloutsByPerson.length === 0}>
                   <p class="dim sm">no person references yet</p>
@@ -469,10 +427,7 @@ export const Dashboard: Component = () => {
                       <div class="bar-track">
                         <div
                           class="bar-fill"
-                          style={{
-                            width: `${s().decisions.total ? (s().decisions[st] / s().decisions.total) * 100 : 0}%`,
-                            background: KIND_COLORS.decision,
-                          }}
+                          style={{ width: `${s().decisions.total ? (s().decisions[st] / s().decisions.total) * 100 : 0}%` }}
                         />
                       </div>
                       <span class="bar-val">{s().decisions[st]}</span>

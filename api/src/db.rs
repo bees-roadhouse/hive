@@ -326,6 +326,59 @@ const SCHEMA: &str = r#"
       created_at  TEXT NOT NULL,
       UNIQUE (platform, platform_id)
     );
+
+    -- ===== Hosted Claude Code workspaces (hive → Claude Code) =====
+    -- One row per session hive spins up and drives in an isolated sandbox.
+    -- Separate from the journal; scoped per owner (see Visibility in middleware.rs).
+    CREATE TABLE IF NOT EXISTS cc_sessions (
+      id                TEXT PRIMARY KEY,
+      owner             TEXT NOT NULL,
+      created_by        TEXT NOT NULL,
+      title             TEXT NOT NULL DEFAULT '',
+      workdir           TEXT NOT NULL DEFAULT '',
+      claude_session_id TEXT,
+      status            TEXT NOT NULL DEFAULT 'provisioning',
+      model             TEXT,
+      usage             TEXT NOT NULL DEFAULT '{}',
+      meta              TEXT NOT NULL DEFAULT '{}',
+      repo_url          TEXT,
+      repo_ref          TEXT,
+      created_at        TEXT NOT NULL,
+      updated_at        TEXT NOT NULL,
+      last_activity_at  TEXT
+    );
+    CREATE INDEX IF NOT EXISTS cc_sessions_owner ON cc_sessions (owner);
+
+    -- Complete chat history per session: every Agent-SDK message, lossless.
+    CREATE TABLE IF NOT EXISTS cc_messages (
+      id          TEXT PRIMARY KEY,
+      session_id  TEXT NOT NULL,
+      seq         BIGINT NOT NULL,
+      role        TEXT NOT NULL,
+      kind        TEXT NOT NULL,
+      content     TEXT NOT NULL DEFAULT '{}',
+      raw         TEXT NOT NULL DEFAULT '{}',
+      tokens_in   BIGINT,
+      tokens_out  BIGINT,
+      created_at  TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS cc_messages_session ON cc_messages (session_id, seq);
+
+    -- Per-user Claude Code credentials, encrypted at rest (AES-256-GCM via
+    -- HIVE_CRED_KEY). Reversible (unlike PAT/password hashes): the runner must
+    -- hand the real token to Claude Code. Plaintext never leaves the server.
+    CREATE TABLE IF NOT EXISTS cc_credentials (
+      id           TEXT PRIMARY KEY,
+      owner        TEXT NOT NULL,
+      kind         TEXT NOT NULL,
+      label        TEXT NOT NULL DEFAULT '',
+      ciphertext   TEXT NOT NULL,
+      nonce        TEXT NOT NULL,
+      tail         TEXT NOT NULL DEFAULT '',
+      created_at   TEXT NOT NULL,
+      last_used_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS cc_credentials_owner ON cc_credentials (owner);
 "#;
 
 /// Unified full-text index. Postgres equivalent of the old FTS5 virtual table:
@@ -343,6 +396,70 @@ const SCHEMA_SEARCH: &str = r#"
       PRIMARY KEY (kind, ref_id)
     );
     CREATE INDEX IF NOT EXISTS search_tsv ON search USING GIN (tsv);
+
+    -- ===== User-defined custom entity types =====
+    -- Registry (entity_types + entity_fields) + validated JSONB instances
+    -- (entities). fields is REAL JSONB — a deliberate departure from the
+    -- TEXT-JSON habit: server-side operators/indexes for user-shaped data.
+    -- Rust binds it as TEXT with ?::jsonb casts and reads fields::text
+    -- (workspace sqlx has no 'json' feature; SELECT * would fail to decode),
+    -- so row_to_entity in store/custom_entities.rs is the only read path.
+    -- Kind at the seams (search.kind, links.*_kind) is entity_types.slug;
+    -- instance ids are uniformly 'ent_'.
+    CREATE TABLE IF NOT EXISTS entity_types (
+      id          TEXT PRIMARY KEY,
+      slug        TEXT NOT NULL UNIQUE,
+      name        TEXT NOT NULL,
+      name_plural TEXT NOT NULL DEFAULT '',
+      description TEXT NOT NULL DEFAULT '',
+      icon        TEXT NOT NULL DEFAULT '',
+      color       TEXT NOT NULL DEFAULT '',
+      -- slug of a choice field the generic board groups by; NULL = flat list.
+      board_field TEXT,
+      archived    BOOLEAN NOT NULL DEFAULT FALSE,
+      created_by  TEXT NOT NULL,
+      created_at  TEXT NOT NULL,
+      updated_at  TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS entity_fields (
+      id         TEXT PRIMARY KEY,
+      type_id    TEXT NOT NULL,
+      slug       TEXT NOT NULL,
+      label      TEXT NOT NULL,
+      -- text | number | bool | date | choice | ref (validated in Rust only,
+      -- same enforcement level as tasks.status).
+      field_type TEXT NOT NULL,
+      required   BOOLEAN NOT NULL DEFAULT FALSE,
+      position   BIGINT NOT NULL DEFAULT 0,
+      options    TEXT NOT NULL DEFAULT '[]',
+      -- ref fields: target kind — person|topic|project|task or a custom slug.
+      ref_kind   TEXT,
+      archived   BOOLEAN NOT NULL DEFAULT FALSE,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE (type_id, slug)
+    );
+    CREATE INDEX IF NOT EXISTS entity_fields_type ON entity_fields (type_id, position);
+
+    CREATE TABLE IF NOT EXISTS entities (
+      id              TEXT PRIMARY KEY,
+      type_id         TEXT NOT NULL,
+      title           TEXT NOT NULL,
+      fields          JSONB NOT NULL DEFAULT '{}'::jsonb,
+      -- Visibility: same model as journal.user_scope (NULL = global).
+      user_scope      TEXT,
+      -- v2 journal-emergence provenance; carried now so nothing blocks it.
+      origin_entry_id TEXT,
+      created_by      TEXT NOT NULL,
+      created_at      TEXT NOT NULL,
+      updated_at      TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS entities_type  ON entities (type_id, created_at);
+    CREATE INDEX IF NOT EXISTS entities_scope ON entities (user_scope);
+    -- Dormant in v1 (filters run in Rust at household scale); enables ad-hoc
+    -- psql @> queries and server-side filtering later without a migration.
+    CREATE INDEX IF NOT EXISTS entities_fields_gin ON entities USING GIN (fields jsonb_path_ops);
 "#;
 
 pub async fn migrate(pool: &PgPool) -> Result<()> {

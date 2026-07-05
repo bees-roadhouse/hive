@@ -365,6 +365,7 @@ pub struct ActorDeleteResult {
     pub wire: i64,
     pub sources: i64,
     pub people: i64,
+    pub entities: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -386,6 +387,7 @@ pub struct ActorMergeResult {
     pub people_owner: i64,
     pub profile: i64,
     pub users: i64,
+    pub entities: i64,
 }
 
 /// Public first-run state — the SPA reads this before anything else.
@@ -585,9 +587,12 @@ impl EntityKind {
             EntityKind::Mail => "mail",
         }
     }
-    /// Fail closed: an unknown kind is `None`, never a default. Rows written by
-    /// a newer binary (a kind this build predates) must be dropped by callers,
-    /// not surfaced mislabeled as tasks (DIRECTION.md, Phase 0).
+    /// Fail-closed parse: an unknown kind is `None`, never a default — rows
+    /// written by a newer binary must be dropped by callers, not mislabeled
+    /// (DIRECTION.md Phase 0). Seam rows (search/links/inbox/graph) carry kind
+    /// as a plain String so custom entity type slugs flow through them; this
+    /// parse exists for the genuinely closed domains (bracket tokens,
+    /// autocomplete, mail).
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "task" => Some(EntityKind::Task),
@@ -723,7 +728,8 @@ pub struct InboxItem {
     pub recipient: String,
     pub from: String,
     pub reason: InboxReason,
-    pub ref_kind: EntityKind,
+    /// Kind string, not the closed enum: custom entity type slugs flow here.
+    pub ref_kind: String,
     pub ref_id: String,
     pub entry_id: Option<String>,
     pub snippet: String,
@@ -783,9 +789,10 @@ pub struct AutocompleteItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Link {
     pub id: String,
-    pub source_kind: EntityKind,
+    /// Kind strings, not the closed enum: custom entity type slugs flow here.
+    pub source_kind: String,
     pub source_id: String,
-    pub target_kind: EntityKind,
+    pub target_kind: String,
     pub target_id: String,
     pub rel: String,
     pub created_at: String,
@@ -802,7 +809,8 @@ pub struct WireEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchHit {
-    pub kind: EntityKind,
+    /// Kind string, not the closed enum: custom entity type slugs flow here.
+    pub kind: String,
     pub id: String,
     pub title: String,
     pub snippet: String,
@@ -815,7 +823,8 @@ pub struct SearchHit {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphNode {
     pub id: String,
-    pub kind: EntityKind,
+    /// Kind string, not the closed enum: custom entity type slugs flow here.
+    pub kind: String,
     pub title: String,
 }
 
@@ -825,6 +834,196 @@ pub struct GraphEdge {
     pub source: String,
     pub target: String,
     pub rel: String,
+}
+
+// ---- user-defined custom entity types ----
+
+/// Kind slugs a custom entity type may never claim: every built-in kind,
+/// kinds already promised to planned corpora (mail — DIRECTION.md), and
+/// infrastructure nouns that appear as kind-ish strings at the seams.
+/// Reserving generously is free; un-reserving later is trivial, while the
+/// reverse is a data migration.
+pub const RESERVED_KIND_SLUGS: &[&str] = &[
+    "task", "decision", "event", "journal", "person", "topic", "project",
+    "phase", "mail", "anchor", "link", "share", "inbox", "wire", "search",
+    "source", "outbox", "user", "profile", "identity", "workspace", "entity",
+    "entity_type", "entities", "blob", "note",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldType {
+    Text,
+    Number,
+    Bool,
+    Date,
+    Choice,
+    Ref,
+}
+
+pub const FIELD_TYPES: &[FieldType] = &[
+    FieldType::Text,
+    FieldType::Number,
+    FieldType::Bool,
+    FieldType::Date,
+    FieldType::Choice,
+    FieldType::Ref,
+];
+
+impl FieldType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FieldType::Text => "text",
+            FieldType::Number => "number",
+            FieldType::Bool => "bool",
+            FieldType::Date => "date",
+            FieldType::Choice => "choice",
+            FieldType::Ref => "ref",
+        }
+    }
+    /// Fail-closed; there is deliberately no lossy variant for field types.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "text" => Some(FieldType::Text),
+            "number" => Some(FieldType::Number),
+            "bool" => Some(FieldType::Bool),
+            "date" => Some(FieldType::Date),
+            "choice" => Some(FieldType::Choice),
+            "ref" => Some(FieldType::Ref),
+            _ => None,
+        }
+    }
+}
+
+/// One field spec in a type's registry (a row of entity_fields).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityField {
+    pub id: String,
+    pub slug: String,
+    pub label: String,
+    pub field_type: FieldType,
+    pub required: bool,
+    pub position: i64,
+    /// Non-empty iff field_type == Choice.
+    pub options: Vec<String>,
+    /// Some iff field_type == Ref: person|topic|project|task or a custom slug.
+    pub ref_kind: Option<String>,
+    pub archived: bool,
+}
+
+/// The kind-config contract the web board engine consumes:
+/// a type plus its fields ordered by position.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityTypeView {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    pub name_plural: String,
+    pub description: String,
+    pub icon: String,
+    pub color: String,
+    /// Slug of a non-archived choice field the board groups by; None = flat.
+    pub board_field: Option<String>,
+    pub archived: bool,
+    pub created_by: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub fields: Vec<EntityField>,
+}
+
+/// A custom entity instance. `fields` holds only registry-validated keys;
+/// `type` (the slug) is denormalized in so clients never join.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomEntity {
+    pub id: String,
+    pub type_id: String,
+    #[serde(rename = "type")]
+    pub type_slug: String,
+    pub title: String,
+    pub fields: serde_json::Map<String, serde_json::Value>,
+    pub user_scope: Option<String>,
+    pub origin_entry_id: Option<String>,
+    pub created_by: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewEntityField {
+    pub slug: Option<String>,
+    pub label: String,
+    pub field_type: String,
+    #[serde(default)]
+    pub required: bool,
+    pub position: Option<i64>,
+    #[serde(default)]
+    pub options: Vec<String>,
+    pub ref_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewEntityType {
+    pub slug: Option<String>,
+    pub name: String,
+    pub name_plural: Option<String>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub color: String,
+    pub board_field: Option<String>,
+    #[serde(default)]
+    pub fields: Vec<NewEntityField>,
+}
+
+/// Mutable per-field bits; slug and field_type are immutable (the slug is the
+/// JSON key and the link rel; a retype would silently invalidate stored
+/// values — archive the field and add a new slug instead).
+#[derive(Debug, Clone, Deserialize)]
+pub struct EntityFieldPatch {
+    pub slug: String,
+    pub label: Option<String>,
+    pub position: Option<i64>,
+    pub required: Option<bool>,
+    pub options: Option<Vec<String>>,
+    pub archived: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EntityTypePatch {
+    pub name: Option<String>,
+    pub name_plural: Option<String>,
+    pub description: Option<String>,
+    pub icon: Option<String>,
+    pub color: Option<String>,
+    /// double Option: absent = keep, null = clear the board grouping.
+    #[serde(default, deserialize_with = "double_option")]
+    pub board_field: Option<Option<String>>,
+    pub archived: Option<bool>,
+    #[serde(default)]
+    pub add_fields: Vec<NewEntityField>,
+    #[serde(default)]
+    pub update_fields: Vec<EntityFieldPatch>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct NewCustomEntity {
+    #[serde(rename = "type")]
+    pub type_slug: String,
+    pub title: String,
+    #[serde(default)]
+    pub fields: serde_json::Map<String, serde_json::Value>,
+    /// "global" (default) or "me".
+    pub scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CustomEntityPatch {
+    pub title: Option<String>,
+    /// Shallow merge; a JSON null clears that key.
+    pub fields: Option<serde_json::Map<String, serde_json::Value>>,
+    pub scope: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

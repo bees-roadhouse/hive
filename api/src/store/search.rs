@@ -20,6 +20,16 @@ impl Store {
         let mut conn = self.db().acquire().await?;
         index_entity_conn(&mut conn, kind, ref_id, title, body, tags).await
     }
+
+    /// Drop the FTS row for an entity (deletion must leave search immediately).
+    pub async fn unindex_entity(&self, kind: &str, ref_id: &str) -> Result<()> {
+        crate::pgq::query("DELETE FROM search WHERE kind = ? AND ref_id = ?")
+            .bind(kind)
+            .bind(ref_id)
+            .execute(self.db())
+            .await?;
+        Ok(())
+    }
 }
 
 /// Connection-level variant so indexing can run inside a transaction

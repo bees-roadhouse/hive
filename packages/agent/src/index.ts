@@ -170,8 +170,10 @@ async function sessionStart(args: string[]): Promise<void> {
 async function journalAdd(args: string[]): Promise<void> {
   const f = flags(args);
   const fromArgs = positional(args).join(" ");
-  const fromStdin = await readStdin();
-  const body = str(f, "body", fromArgs || fromStdin)?.trim();
+  // Only block on stdin when no body was supplied via --body or positional prose —
+  // otherwise a non-EOF stdin (hook/agent context, no TTY) hangs the process forever.
+  const provided = str(f, "body", fromArgs.trim() ? fromArgs : undefined);
+  const body = (provided ?? (await readStdin()))?.trim();
   if (!body) throw new Error("journal-add needs --body, positional prose, or stdin.");
   const title = str(f, "title");
   const tags = str(f, "tags")

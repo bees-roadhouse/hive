@@ -309,6 +309,26 @@ async fn remove_in_tx(conn: &mut PgConnection, slug: &str) -> Result<ActorDelete
     )
     .await?;
 
+    // 5b. Custom entities: rows this actor authored or holds privately go,
+    // with their search/embeddings/field-mirror links (kind = the type slug).
+    // Global rows created by OTHERS that merely reference the actor keep
+    // their (now dangling) ref values — the next touch of that field 400s.
+    let ent_rows: Vec<(String, String)> = crate::pgq::query_as::<(String, String)>(
+        "SELECT e.id, t.slug FROM entities e JOIN entity_types t ON t.id = e.type_id \
+         WHERE e.created_by = ? OR e.user_scope = ?",
+    )
+    .bind(slug)
+    .bind(slug)
+    .fetch_all(&mut *conn)
+    .await?;
+    for (ent_id, type_slug) in &ent_rows {
+        let (search, embeddings, links) = purge_entity_indexes(conn, type_slug, ent_id).await?;
+        acc.search += search;
+        acc.embeddings += embeddings;
+        acc.links += links;
+        acc.entities += exec_count(conn, "DELETE FROM entities WHERE id = ?", &[ent_id]).await?;
+    }
+
     // 6. Profile card.
     acc.profile += exec_count(conn, "DELETE FROM profile WHERE actor = ?", &[slug]).await?;
 
@@ -512,6 +532,18 @@ async fn merge_in_tx(conn: &mut PgConnection, from: &str, to: &str) -> Result<Ac
     .await?;
 
     // Wire authorship.
+    acc.entities += exec_count(
+        conn,
+        "UPDATE entities SET created_by = ? WHERE created_by = ?",
+        &[to, from],
+    )
+    .await?;
+    acc.entities += exec_count(
+        conn,
+        "UPDATE entities SET user_scope = ? WHERE user_scope = ?",
+        &[to, from],
+    )
+    .await?;
     acc.wire += exec_count(
         conn,
         "UPDATE wire SET actor = ? WHERE actor = ?",

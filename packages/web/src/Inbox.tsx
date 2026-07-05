@@ -3,6 +3,7 @@ import type { Person } from "@hive/shared";
 import { api, getActor, getCurrentUser } from "./api.ts";
 import { liveRev } from "./live.ts";
 import { Mentions, relTime } from "./lib.tsx";
+import { EmptyState } from "./primitives.tsx";
 
 const REASON_GLYPH: Record<string, string> = {
   mention: "@",
@@ -105,7 +106,13 @@ export const Inbox: Component = () => {
 
       <Show
         when={items()?.length}
-        fallback={<p class="dim pad">📭 nothing {unreadOnly() ? "unread" : "here"} for {who()}.</p>}
+        fallback={
+          <EmptyState
+            icon="inbox"
+            title={unreadOnly() ? "Nothing unread." : "Nothing here yet."}
+            hint={`Mentions, assignments, and updates for ${who()} land here.`}
+          />
+        }
       >
         <For each={items()}>
           {(it) => (

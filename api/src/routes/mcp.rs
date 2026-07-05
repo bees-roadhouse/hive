@@ -463,7 +463,7 @@ mod tests {
         let res = handle_request(&store, &authed(), &req("tools/list", json!({}), 1)).await;
         let tools = res["result"]["tools"].as_array().expect("tools array");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        // Node order, then the Rust-branch identity tools.
+        // Node order, then the Rust-branch identity + workspace tools.
         assert_eq!(
             names,
             vec![
@@ -500,6 +500,17 @@ mod tests {
                 "identity_resolve",
                 "identity_list",
                 "identity_unlink",
+                "workspace_list",
+                "workspace_get",
+                "workspace_transcript",
+                "entity_types_list",
+                "entity_type_create",
+                "entity_type_update",
+                "entities_list",
+                "entity_get",
+                "entity_create",
+                "entity_update",
+                "entity_delete",
             ]
         );
         // Spot-check a schema verbatim against the captured Node output.
@@ -630,7 +641,7 @@ mod tests {
                 "nate",
                 "maggie",
                 hive_shared::InboxReason::Mention,
-                hive_shared::EntityKind::Journal,
+                hive_shared::EntityKind::Journal.as_str(),
                 "jrnl_secret",
                 None,
                 "private snippet only nate may see",

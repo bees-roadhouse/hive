@@ -706,7 +706,7 @@ async fn rest_inbox_routes_are_viewer_gated() {
                 to,
                 from,
                 hive_shared::InboxReason::Mention,
-                hive_shared::EntityKind::Journal,
+                hive_shared::EntityKind::Journal.as_str(),
                 "jrnl_secret",
                 None,
                 &format!("private snippet only {to} may see"),
@@ -1292,7 +1292,7 @@ async fn semantic_scope_runs_before_truncation_and_recall_filters_kinds_in_searc
         .data
         .journal
         .iter()
-        .all(|h| h.hit.kind == hive_shared::EntityKind::Journal));
+        .all(|h| h.hit.kind == "journal"));
 
     // A top-scoring embeddings row of a kind this build doesn't know (written
     // by a newer binary) must not hold result slots on the UNSCOPED path
@@ -1616,4 +1616,373 @@ async fn spa_paths_are_not_gated() {
     let (status, body, _) = send(&app, get("/api/definitely-not-a-route", None)).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"], "onboarding_required");
+}
+
+fn delete_req(path: &str, cookie: Option<&str>) -> Request<Body> {
+    let mut b = Request::delete(path);
+    if let Some(c) = cookie {
+        b = b.header(header::COOKIE, c);
+    }
+    b.body(Body::empty()).unwrap()
+}
+
+#[tokio::test]
+async fn custom_entity_types_full_flow() {
+    let _guard = env_guard().await;
+    reset_auth_env();
+    let (app, _store) = test_app().await;
+    let cookie = onboard(&app).await;
+
+    // A member login for the non-admin side of every gate.
+    let (status, _, _) = send(
+        &app,
+        post_json(
+            "/api/users",
+            json!({"name": "Maggie", "email": "maggie@example.com", "password": "maggie-secret-1"}),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, _, headers) = send(
+        &app,
+        post_json(
+            "/api/auth/login",
+            json!({"email": "maggie@example.com", "password": "maggie-secret-1"}),
+            None,
+        ),
+    )
+    .await;
+    let maggie = headers
+        .get(header::SET_COOKIE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Non-admin type definition is forbidden; reserved + malformed slugs 400.
+    let recipe_type = json!({
+        "name": "Recipe",
+        "slug": "recipe",
+        "description": "Household recipes",
+        "board_field": "status",
+        "fields": [
+            {"label": "Status", "slug": "status", "field_type": "choice", "options": ["idea", "tested", "keeper"]},
+            {"label": "Servings", "slug": "servings", "field_type": "number"},
+            {"label": "Cuisine", "slug": "cuisine", "field_type": "text", "required": true},
+            {"label": "Author", "slug": "author", "field_type": "ref", "ref_kind": "person"},
+        ],
+    });
+    let (status, _, _) = send(&app, post_json("/api/entity-types", recipe_type.clone(), Some(&maggie))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for bad_slug in ["mail", "task", "Bad Slug", "x"] {
+        let (status, body, _) = send(
+            &app,
+            post_json("/api/entity-types", json!({"name": "X", "slug": bad_slug}), Some(&cookie)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "slug {bad_slug}: {body}");
+        assert_eq!(body["issues"][0]["code"], "bad_slug");
+    }
+
+    // Admin creates the type; the kind-config contract holds from birth.
+    let (status, ty, _) = send(&app, post_json("/api/entity-types", recipe_type, Some(&cookie))).await;
+    assert_eq!(status, StatusCode::CREATED, "type create: {ty}");
+    assert_eq!(ty["slug"], "recipe");
+    assert_eq!(ty["board_field"], "status");
+    assert_eq!(ty["fields"].as_array().unwrap().len(), 4);
+    assert_eq!(ty["fields"][0]["slug"], "status");
+    // Duplicate slug refused.
+    let (status, _, _) = send(
+        &app,
+        post_json("/api/entity-types", json!({"name": "Recipe Again", "slug": "recipe"}), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A person for the ref field to point at.
+    let (_, people, _) = send(&app, get("/api/people", Some(&cookie))).await;
+    let person_id = people.as_array().unwrap()[0]["id"].as_str().unwrap().to_string();
+
+    // Member creates a global instance.
+    let (status, sourdough, _) = send(
+        &app,
+        post_json(
+            "/api/entities",
+            json!({"type": "recipe", "title": "Sourdough", "fields": {
+                "status": "keeper", "servings": 4, "cuisine": "bread", "author": person_id
+            }}),
+            Some(&maggie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {sourdough}");
+    assert_eq!(sourdough["type"], "recipe");
+    let sourdough_id = sourdough["id"].as_str().unwrap().to_string();
+    assert!(sourdough_id.starts_with("ent_"));
+
+    // The validation matrix: unknown key, bad choice, wrong type, missing
+    // required, dangling ref — each a structured 400.
+    for (payload, want_code) in [
+        (json!({"type": "recipe", "title": "X", "fields": {"nope": 1, "cuisine": "a"}}), "unknown_field"),
+        (json!({"type": "recipe", "title": "X", "fields": {"status": "meh", "cuisine": "a"}}), "bad_choice"),
+        (json!({"type": "recipe", "title": "X", "fields": {"servings": "four", "cuisine": "a"}}), "wrong_type"),
+        (json!({"type": "recipe", "title": "X", "fields": {"status": "idea"}}), "required"),
+        (json!({"type": "recipe", "title": "X", "fields": {"cuisine": "a", "author": "person_missing"}}), "ref_not_found"),
+    ] {
+        let (status, body, _) = send(&app, post_json("/api/entities", payload, Some(&maggie))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{want_code}: {body}");
+        let codes: Vec<&str> = body["issues"].as_array().unwrap().iter().map(|i| i["code"].as_str().unwrap()).collect();
+        assert!(codes.contains(&want_code), "wanted {want_code} in {codes:?}");
+    }
+    // Unknown type 404s.
+    let (status, _, _) = send(
+        &app,
+        post_json("/api/entities", json!({"type": "gadget", "title": "X"}), Some(&maggie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A second, admin-scoped instance + one more keeper for filtering.
+    let (status, _, _) = send(
+        &app,
+        post_json(
+            "/api/entities",
+            json!({"type": "recipe", "title": "Secret Sauce", "scope": "me", "fields": {"cuisine": "secret"}}),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _, _) = send(
+        &app,
+        post_json(
+            "/api/entities",
+            json!({"type": "recipe", "title": "Pad Thai", "fields": {"status": "keeper", "servings": 2, "cuisine": "thai"}}),
+            Some(&maggie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // List: filter + sort ascending by servings; admin's scoped row is
+    // invisible to maggie in the list...
+    let (status, list, _) = send(
+        &app,
+        get("/api/entities?type=recipe&f.status=keeper&sort=servings&dir=asc", Some(&maggie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let titles: Vec<&str> = list.as_array().unwrap().iter().map(|e| e["title"].as_str().unwrap()).collect();
+    assert_eq!(titles, vec!["Pad Thai", "Sourdough"], "filtered+sorted: {list}");
+    let (_, all_for_maggie, _) = send(&app, get("/api/entities?type=recipe", Some(&maggie))).await;
+    assert!(all_for_maggie.as_array().unwrap().iter().all(|e| e["title"] != "Secret Sauce"));
+    // ...and in keyword search (the scope_hits custom arm), while admin sees it.
+    let (_, hits, _) = send(&app, get("/api/search?q=secret", Some(&maggie))).await;
+    assert!(hits.as_array().unwrap().is_empty(), "scoped hit leaked: {hits}");
+    let (_, hits, _) = send(&app, get("/api/search?q=secret", Some(&cookie))).await;
+    assert!(hits.as_array().unwrap().iter().any(|h| h["kind"] == "recipe"));
+    // Global instances are searchable by field text under the slug kind.
+    let (_, hits, _) = send(&app, get("/api/search?q=thai", Some(&maggie))).await;
+    assert!(hits.as_array().unwrap().iter().any(|h| h["kind"] == "recipe" && h["id"] != "\"\""), "fts: {hits}");
+    // Unknown sort field fails closed.
+    let (status, _, _) = send(&app, get("/api/entities?type=recipe&sort=bogus", Some(&maggie))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Ref mirroring: sourdough carries a field:author link to the person.
+    let (status, links, _) = send(&app, get(&format!("/api/links/{sourdough_id}"), Some(&maggie))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        links.as_array().unwrap().iter().any(|l| l["rel"] == "field:author" && l["source_kind"] == "recipe"),
+        "mirror link missing: {links}"
+    );
+
+    // Patch: null clears a key; the cleared ref's mirror link goes away.
+    let (status, patched, _) = send(
+        &app,
+        patch_json(
+            &format!("/api/entities/{sourdough_id}"),
+            json!({"fields": {"author": null, "servings": 6}}),
+            Some(&maggie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "patch: {patched}");
+    assert!(patched["fields"].get("author").is_none());
+    assert_eq!(patched["fields"]["servings"], 6);
+    let (_, links, _) = send(&app, get(&format!("/api/links/{sourdough_id}"), Some(&maggie))).await;
+    assert!(links.as_array().unwrap().iter().all(|l| l["rel"] != "field:author"));
+
+    // Registry evolution: relabel + archive a field; archived accepted-if-
+    // present, never required.
+    let (status, ty2, _) = send(
+        &app,
+        patch_json(
+            "/api/entity-types/recipe",
+            json!({"update_fields": [{"slug": "cuisine", "archived": true}]}),
+            Some(&cookie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "field archive: {ty2}");
+    let (status, _, _) = send(
+        &app,
+        post_json(
+            "/api/entities",
+            json!({"type": "recipe", "title": "No Cuisine Needed", "fields": {"status": "idea"}}),
+            Some(&maggie),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "archived field must not be required");
+
+    // Type lifecycle: delete-with-instances 409s; archive blocks new creates.
+    let (status, _, _) = send(&app, delete_req("/api/entity-types/recipe", Some(&cookie))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _, _) = send(
+        &app,
+        patch_json("/api/entity-types/recipe", json!({"archived": true}), Some(&cookie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = send(
+        &app,
+        post_json("/api/entities", json!({"type": "recipe", "title": "Too Late"}), Some(&maggie)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Instance delete drops the row and its search presence.
+    let (status, _, _) = send(&app, delete_req(&format!("/api/entities/{sourdough_id}"), Some(&maggie))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, _) = send(&app, get(&format!("/api/entities/{sourdough_id}"), Some(&maggie))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, hits, _) = send(&app, get("/api/search?q=sourdough", Some(&maggie))).await;
+    assert!(hits.as_array().unwrap().iter().all(|h| h["id"] != sourdough_id));
+}
+
+async fn mcp_call(app: &Router, token: &str, name: &str, arguments: Value) -> Value {
+    let (status, body, _) = send(
+        app,
+        Request::post("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                    "id": 1
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "mcp {name}: {body}");
+    body["result"].clone()
+}
+
+#[tokio::test]
+async fn custom_entities_over_mcp() {
+    let _guard = env_guard().await;
+    reset_auth_env();
+    let (app, _store) = test_app().await;
+    let cookie = onboard(&app).await;
+
+    // nate token = admin-capable principal; pia token = AI in nate's
+    // namespace, NOT admin (actor != namespace user).
+    let mint = |actor: &str| json!({"actor": actor, "label": format!("{actor} t"), "neverExpires": true});
+    let (_, minted, _) = send(&app, post_json("/api/tokens", mint("nate"), Some(&cookie))).await;
+    let nate_token = minted["token"].as_str().unwrap().to_string();
+    let (_, minted, _) = send(&app, post_json("/api/tokens", mint("pia"), Some(&cookie))).await;
+    let pia_token = minted["token"].as_str().unwrap().to_string();
+
+    // tools/list carries all eight custom-entity tools.
+    let (status, tools, _) = send(
+        &app,
+        Request::post("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, "application/json, text/event-stream")
+            .header(header::AUTHORIZATION, format!("Bearer {pia_token}"))
+            .body(Body::from(json!({"jsonrpc":"2.0","method":"tools/list","id":1}).to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<&str> = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    for want in [
+        "entity_types_list", "entity_type_create", "entity_type_update",
+        "entities_list", "entity_get", "entity_create", "entity_update", "entity_delete",
+    ] {
+        assert!(names.contains(&want), "missing tool {want}");
+    }
+
+    // Non-admin type definition is forbidden over MCP too.
+    let refused = mcp_call(
+        &app, &pia_token, "entity_type_create",
+        json!({"name": "Plant", "fields": [{"label": "Species", "field_type": "text"}]}),
+    )
+    .await;
+    // House convention: MCP forbidden is error-shaped OK content, not isError.
+    assert!(
+        refused["content"][0]["text"].as_str().unwrap().contains("forbidden"),
+        "{refused}"
+    );
+
+    // Admin defines; AI writes/reads/updates/deletes instances.
+    let created = mcp_call(
+        &app, &nate_token, "entity_type_create",
+        json!({"name": "Plant", "fields": [
+            {"label": "Species", "field_type": "text"},
+            {"label": "Watered", "field_type": "date"}
+        ]}),
+    )
+    .await;
+    assert!(created.get("isError").is_none(), "{created}");
+    let view: Value = serde_json::from_str(created["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(view["slug"], "plant");
+
+    let inst = mcp_call(
+        &app, &pia_token, "entity_create",
+        json!({"type": "plant", "title": "Monstera", "fields": {"species": "M. deliciosa", "watered": "2026-07-01"}}),
+    )
+    .await;
+    assert!(inst.get("isError").is_none(), "{inst}");
+    let monstera: Value = serde_json::from_str(inst["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(monstera["type"], "plant");
+
+    // Validation failures render the structured issue list as tool errors.
+    let bad = mcp_call(
+        &app, &pia_token, "entity_create",
+        json!({"type": "plant", "title": "X", "fields": {"watered": "yesterday"}}),
+    )
+    .await;
+    assert_eq!(bad["isError"], true);
+    assert!(bad["content"][0]["text"].as_str().unwrap().contains("bad_date"));
+
+    let listed = mcp_call(&app, &pia_token, "entities_list", json!({"type": "plant"})).await;
+    let items: Value = serde_json::from_str(listed["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(items.as_array().unwrap().len(), 1);
+
+    let updated = mcp_call(
+        &app, &pia_token, "entity_update",
+        json!({"id": monstera["id"], "fields": {"watered": null}}),
+    )
+    .await;
+    let after: Value = serde_json::from_str(updated["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(after["fields"].get("watered").is_none());
+
+    let deleted = mcp_call(&app, &pia_token, "entity_delete", json!({"id": monstera["id"]})).await;
+    let d: Value = serde_json::from_str(deleted["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(d["deleted"], true);
 }

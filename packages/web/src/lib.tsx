@@ -31,6 +31,21 @@ export function SkeletonList(props: { rows?: number }): JSX.Element {
   );
 }
 
+/**
+ * Search snippets come from Postgres ts_headline with StartSel=[ / StopSel=]
+ * (plain-text markers, see api semantic.rs). The body text itself is untrusted
+ * (journal prose today, ingested content tomorrow), so escape it BEFORE turning
+ * the markers into <mark> — this is the only place snippet HTML is built, and
+ * it must never pass raw body text to innerHTML.
+ */
+export function highlightSnippet(s: string): string {
+  const esc = s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+  return esc.replace(/\[([^\[\]]{1,120}?)\]/g, "<mark>$1</mark>");
+}
+
 export const relTime = (iso: string) => {
   const s = (Date.now() - new Date(iso).getTime()) / 1000;
   if (s < 60) return "just now";

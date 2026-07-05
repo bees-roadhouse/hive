@@ -3,13 +3,26 @@ import { ACTOR_NAMES, SEVERITIES, type Severity, type SourceKind } from "@hive/s
 import { api, getActor } from "./api.ts";
 import { relTime } from "./lib.tsx";
 import { liveRev } from "./live.ts";
+import { EmptyState } from "./primitives.tsx";
 
-/** Worker configuration: ingest sources (GUI ⇄ MCP), status, outbound queue. */
+/** Worker configuration: ingest sources (GUI ⇄ MCP), status, outbound queue,
+ * and the Claude Code credentials that power hosted chats. */
 export const Settings: Component = () => {
   const actor = getActor();
   const [sources, { refetch }] = createResource(() => ({ _r: liveRev() }), () => api.sources(actor));
   const [status, { refetch: refetchStatus }] = createResource(() => ({ _r: liveRev() }), () => api.worker());
   const [outbox] = createResource(() => ({ _r: liveRev() }), () => api.outbox());
+  const [creds, { refetch: refetchCreds }] = createResource(() => ({ _r: liveRev() }), () => api.ccCredentials());
+
+  const [credForm, setCredForm] = createSignal({ kind: "oauth_token", label: "", secret: "" });
+  const saveCred = async (e: Event) => {
+    e.preventDefault();
+    const f = credForm();
+    if (!f.secret.trim()) return;
+    await api.saveCcCredential({ kind: f.kind, label: f.label.trim() || undefined, secret: f.secret.trim() });
+    setCredForm({ kind: f.kind, label: "", secret: "" });
+    refetchCreds();
+  };
   const [form, setForm] = createSignal({
     name: "",
     url: "",
@@ -101,7 +114,10 @@ export const Settings: Component = () => {
         <button class="primary" type="submit">add source</button>
       </form>
 
-      <For each={sources()} fallback={<p class="dim sm pad">no sources yet — add one above.</p>}>
+      <For
+        each={sources()}
+        fallback={<EmptyState icon="wire" title="No sources yet." hint="Add one above to feed the wire." />}
+      >
         {(s) => (
           <div class="source-row" classList={{ off: !s.enabled }}>
             <label class="sw">
@@ -127,7 +143,10 @@ export const Settings: Component = () => {
       </For>
 
       <h3 class="sec">Outbound queue</h3>
-      <Show when={outbox()?.length} fallback={<p class="dim sm">no outbound jobs.</p>}>
+      <Show
+        when={outbox()?.length}
+        fallback={<EmptyState icon="inbox" title="No outbound jobs." hint="Deliveries queue here on their way out." />}
+      >
         <For each={outbox()}>
           {(j) => (
             <div class="wire-row">
@@ -139,6 +158,34 @@ export const Settings: Component = () => {
           )}
         </For>
       </Show>
+
+      <h3 class="sec">Claude Code</h3>
+      <p class="dim sm">Credentials that run your hosted chats. Stored encrypted; the secret is never shown again.</p>
+
+      <form class="source-form" onSubmit={saveCred}>
+        <select value={credForm().kind} onChange={(e) => setCredForm({ ...credForm(), kind: e.currentTarget.value })}>
+          <option value="oauth_token">Subscription OAuth token (claude setup-token)</option>
+          <option value="api_key">Anthropic API key</option>
+        </select>
+        <input placeholder="label (optional)" value={credForm().label} onInput={(e) => setCredForm({ ...credForm(), label: e.currentTarget.value })} />
+        <input class="grow" type="password" placeholder="paste secret" value={credForm().secret} onInput={(e) => setCredForm({ ...credForm(), secret: e.currentTarget.value })} />
+        <button class="primary" type="submit">save credential</button>
+      </form>
+
+      <For
+        each={creds()}
+        fallback={<EmptyState icon="chats" title="No credentials yet." hint="Chats can't start without one — add a token above." />}
+      >
+        {(c) => (
+          <div class="wire-row">
+            <span class="badge">{c.kind}</span>
+            <code>…{c.tail}</code>
+            <span class="dim sm">{c.label}</span>
+            <span class="dim sm">{c.last_used_at ? `used ${relTime(c.last_used_at)}` : `added ${relTime(c.created_at)}`}</span>
+            <button class="x" onClick={() => api.deleteCcCredential(c.id).then(refetchCreds)}>✕</button>
+          </div>
+        )}
+      </For>
     </section>
   );
 };

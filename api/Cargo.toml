@@ -43,6 +43,8 @@ dotenvy = { workspace = true }
 async-stream = "0.3"
 futures = "0.3"
 urlencoding = "2.1"
+# Credential vault: reversible encryption of per-user Claude Code tokens at rest.
+aes-gcm = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

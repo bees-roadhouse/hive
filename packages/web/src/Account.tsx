@@ -2,6 +2,16 @@ import { createResource, createSignal, For, Show, type Component } from "solid-j
 import { ACTORS, API_TOKEN_DEFAULT_EXPIRY_DAYS, type ImportResult, type UserRole } from "@hive/shared";
 import { api, getCurrentUser } from "./api.ts";
 
+// Initials for the user-row avatar chip ("Nate Smith" → "NS") — same shape as
+// the sidebar footer's (App.tsx).
+const initials = (name: string): string =>
+  name
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 2)
+    .map((w) => w[0]!.toUpperCase())
+    .join("") || "?";
+
 // Token expiry presets (days). 0 asks the server for a non-expiring token.
 const EXPIRY_OPTIONS = [
   { label: "30 days", days: 30 },
@@ -133,23 +143,21 @@ export const Account: Component = () => {
     <div class="account">
       <section>
         <h3>Users</h3>
-        <table class="data-table">
-          <thead>
-            <tr><th>Name</th><th>Email</th><th>Actor</th><th>Role</th></tr>
-          </thead>
-          <tbody>
-            <For each={users() ?? []}>
-              {(u) => (
-                <tr>
-                  <td>{u.name}{u.id === me?.id ? " (you)" : ""}</td>
-                  <td>{u.email}</td>
-                  <td>{u.actor}</td>
-                  <td>{u.role}</td>
-                </tr>
-              )}
-            </For>
-          </tbody>
-        </table>
+        <div>
+          <For each={users() ?? []}>
+            {(u) => (
+              <div class="source-row">
+                <span class="avatar">{initials(u.name)}</span>
+                <div class="source-main">
+                  <div class="source-name">{u.name}{u.id === me?.id ? " (you)" : ""}</div>
+                  <div class="dim sm">{u.email}</div>
+                </div>
+                <span class="actor-chip sm">{u.actor}</span>
+                <span class="badge">{u.role}</span>
+              </div>
+            )}
+          </For>
+        </div>
         <form class="inline-form" onSubmit={addUser}>
           <input placeholder="name" value={uName()} onInput={(e) => setUName(e.currentTarget.value)} required />
           <input type="email" placeholder="email" value={uEmail()} onInput={(e) => setUEmail(e.currentTarget.value)} required />
@@ -172,31 +180,31 @@ export const Account: Component = () => {
             <code>{freshToken()}</code>
           </div>
         </Show>
-        <table class="data-table">
-          <thead>
-            <tr><th>Actor</th><th>Label</th><th>Created</th><th>Expires</th><th>Last used</th><th></th></tr>
-          </thead>
-          <tbody>
-            <For each={tokens() ?? []}>
-              {(t) => (
-                <tr classList={{ "row-expired": isExpired(t.expires_at) }}>
-                  <td>{t.actor}</td>
-                  <td>{t.label}</td>
-                  <td>{t.created_at.slice(0, 10)}</td>
-                  <td>
-                    {t.expires_at
-                      ? isExpired(t.expires_at)
-                        ? `expired ${t.expires_at.slice(0, 10)}`
-                        : t.expires_at.slice(0, 10)
-                      : "never"}
-                  </td>
-                  <td>{t.last_used_at ? t.last_used_at.slice(0, 10) : "—"}</td>
-                  <td><button class="danger" onClick={() => revoke(t.id)}>revoke</button></td>
-                </tr>
-              )}
-            </For>
-          </tbody>
-        </table>
+        <div>
+          <For each={tokens() ?? []}>
+            {(t) => (
+              <div class="source-row" classList={{ "row-expired": isExpired(t.expires_at) }}>
+                <span class="actor-chip sm">{t.actor}</span>
+                <div class="source-main">
+                  <div class="source-name">{t.label}</div>
+                  <div class="dim sm">
+                    {`created ${t.created_at.slice(0, 10)} · ${
+                      t.expires_at
+                        ? isExpired(t.expires_at)
+                          ? `expired ${t.expires_at.slice(0, 10)}`
+                          : `expires ${t.expires_at.slice(0, 10)}`
+                        : "never expires"
+                    } · last used ${t.last_used_at ? t.last_used_at.slice(0, 10) : "—"}`}
+                  </div>
+                </div>
+                <Show when={isExpired(t.expires_at)}>
+                  <span class="badge">expired</span>
+                </Show>
+                <button class="ghost danger" onClick={() => revoke(t.id)}>revoke</button>
+              </div>
+            )}
+          </For>
+        </div>
         <form class="inline-form" onSubmit={mintToken}>
           <select value={tActor()} onChange={(e) => setTActor(e.currentTarget.value)}>
             <For each={ACTORS}>{(a) => <option value={a.name}>{a.name} ({a.kind})</option>}</For>
@@ -212,24 +220,23 @@ export const Account: Component = () => {
       <section>
         <h3>Connected apps</h3>
         <p class="dim">OAuth clients that have been granted access via the consent flow. Revoking disconnects the app by deleting all of its tokens.</p>
-        <table class="data-table">
-          <thead>
-            <tr><th>App</th><th>Connected</th><th>Active tokens</th><th>Last used</th><th></th></tr>
-          </thead>
-          <tbody>
-            <For each={apps() ?? []}>
-              {(c) => (
-                <tr>
-                  <td>{c.client_name}</td>
-                  <td>{c.created_at.slice(0, 10)}</td>
-                  <td>{c.active_tokens}</td>
-                  <td>{c.last_used_at ? c.last_used_at.slice(0, 10) : "—"}</td>
-                  <td><button class="danger" onClick={() => revokeApp(c.client_id, c.client_name)}>Revoke app</button></td>
-                </tr>
-              )}
-            </For>
-          </tbody>
-        </table>
+        <div>
+          <For each={apps() ?? []}>
+            {(c) => (
+              <div class="source-row">
+                <div class="source-main">
+                  <div class="source-name">{c.client_name}</div>
+                  <div class="dim sm">
+                    {`connected ${c.created_at.slice(0, 10)} · ${c.active_tokens} active ${
+                      c.active_tokens === 1 ? "token" : "tokens"
+                    } · last used ${c.last_used_at ? c.last_used_at.slice(0, 10) : "—"}`}
+                  </div>
+                </div>
+                <button class="ghost danger" onClick={() => revokeApp(c.client_id, c.client_name)}>Revoke app</button>
+              </div>
+            )}
+          </For>
+        </div>
         <Show when={(apps() ?? []).length === 0}><p class="dim">No apps connected.</p></Show>
       </section>
 
@@ -281,7 +288,7 @@ export const Account: Component = () => {
               </p>
               <Show when={r().warnings.length}>
                 <ul class="dim sm">
-                  <For each={r().warnings}>{(w) => <li>⚠ {w}</li>}</For>
+                  <For each={r().warnings}>{(w) => <li>warning: {w}</li>}</For>
                 </ul>
               </Show>
             </div>
