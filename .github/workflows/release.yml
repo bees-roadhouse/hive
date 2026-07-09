@@ -1,14 +1,16 @@
 name: Build and Release
 
 # PR-driven image builds with retag-on-merge, per the BR DevOps standard
-# (Docker Image Build Workflows). Three images — hive-api, hive-web,
-# hive-worker — build in parallel on PR, get the immutable sha-{full-sha} tag,
-# and are retagged (never rebuilt) on merge: `dev` for development, and
-# `{version}` + `release` + `latest` for release.
+# (Docker Image Build Workflows), adapted to the single-main branch model.
+# Images — hive-rust (all-in-one API+SPA+worker), hive-runner, and
+# hive-session-dev — build on PR with the immutable sha-{head-sha} tag and are
+# retagged (never rebuilt) on merge to `dev` plus a sha-{merge-sha} alias.
+# Releases are tag-driven: pushing v{version} retags the merge commit's images
+# as `{version}` + `latest` and cuts the GitHub Release.
 
 on:
   pull_request:
-    branches: [development, release]
+    branches: [main]
     types: [opened, synchronize, reopened, closed]
   push:
     tags:
@@ -18,8 +20,10 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  # ===== build: Node images (PR open/synchronize/reopen) =====
+  # ===== build: hive-runner (PR open/synchronize/reopen) =====
   # JS isn't compiled, so multi-arch via QEMU is effectively free here.
+  # (The legacy Node-stack images — api, web, worker — stopped publishing in
+  # 0.6.0; the Rust image below is the deployed stack.)
   build:
     if: github.event_name == 'pull_request' && github.event.action != 'closed'
     runs-on: ubuntu-latest
@@ -29,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [api, web, worker, runner]
+        image: [runner]
     steps:
       - uses: actions/checkout@v4
 
@@ -180,7 +184,13 @@ jobs:
           docker buildx imagetools inspect "$TAG"
 
   # ===== promote (PR closed && merged) =====
-  # Retags the existing sha-{full-sha} manifest as the stream tag. No rebuild.
+  # Retags the existing sha-{head-sha} manifest — no rebuild — as:
+  #   dev                    the rolling main stream
+  #   sha-{merge-sha}        alias so a later `git tag vX.Y.Z` (which points at
+  #                          the merge commit, not the PR head) can find the
+  #                          exact image without rebuilding. Load-bearing:
+  #                          squash/merge commits have different SHAs than PR
+  #                          heads, and release-on-tag looks up by merge sha.
   promote:
     if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true
     runs-on: ubuntu-latest
@@ -189,16 +199,50 @@ jobs:
       packages: write
     strategy:
       matrix:
-        image: [api, web, worker, rust, runner, session-dev]
+        image: [rust, runner, session-dev]
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Retag merge as dev + merge-sha alias
+        run: |
+          IMG="${{ env.REGISTRY }}/${{ github.repository_owner }}/hive-${{ matrix.image }}"
+          SRC="${IMG}:sha-${{ github.event.pull_request.head.sha }}"
+          docker buildx imagetools create \
+            --tag "${IMG}:dev" \
+            --tag "${IMG}:sha-${{ github.event.pull_request.merge_commit_sha }}" \
+            "$SRC"
+
+  # ===== release-on-tag (push of v{version}) =====
+  # The release act is deliberate and manual: bump versions in the release PR,
+  # merge it, then `git tag v{version} <merge-sha> && git push origin v{version}`.
+  # This job retags that merge commit's images (built and aliased by promote)
+  # and cuts the GitHub Release. It never rebuilds: if the sha manifest is
+  # missing, tag a commit that merged through a PR instead.
+  release-on-tag:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve version
+      - name: Verify tag matches package.json version
         id: vars
         run: |
-          VERSION=$(jq -r '.version' package.json)
+          VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION=$(jq -r '.version' package.json)
+          if [ "$VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} != package.json version ${PKG_VERSION} — bump versions before tagging"
+            exit 1
+          fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "base_ref=${{ github.event.pull_request.base.ref }}" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -208,64 +252,43 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Retag for development merges
-        if: steps.vars.outputs.base_ref == 'development'
+      - name: Retag {version} + latest from the merge-sha manifests
         run: |
-          IMG="${{ env.REGISTRY }}/${{ github.repository_owner }}/hive-${{ matrix.image }}"
-          SRC="${IMG}:sha-${{ github.event.pull_request.head.sha }}"
-          docker buildx imagetools create --tag "${IMG}:dev" "$SRC"
+          for image in rust runner session-dev; do
+            IMG="${{ env.REGISTRY }}/${{ github.repository_owner }}/hive-${image}"
+            SRC="${IMG}:sha-${{ github.sha }}"
+            if ! docker buildx imagetools inspect "$SRC" >/dev/null 2>&1; then
+              echo "::error::${SRC} not found — tag a commit that merged through a PR (promote creates the sha alias); never rebuild at release time"
+              exit 1
+            fi
+            docker buildx imagetools create \
+              --tag "${IMG}:${{ steps.vars.outputs.version }}" \
+              --tag "${IMG}:latest" \
+              "$SRC"
+          done
 
-      - name: Retag for release merges
-        if: steps.vars.outputs.base_ref == 'release'
-        run: |
-          IMG="${{ env.REGISTRY }}/${{ github.repository_owner }}/hive-${{ matrix.image }}"
-          SRC="${IMG}:sha-${{ github.event.pull_request.head.sha }}"
-          docker buildx imagetools create \
-            --tag "${IMG}:${{ steps.vars.outputs.version }}" \
-            --tag "${IMG}:release" \
-            --tag "${IMG}:latest" \
-            "$SRC"
-
-  # ===== github-release-on-merge (PR merge to release) =====
-  github-release-on-merge:
-    if: github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'release'
-    needs: [promote]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        if: hashFiles('scripts/build-mcpb.sh') != ''
         with:
-          fetch-depth: 0
+          package_json_file: package.json
 
-      - name: Resolve version + tag
-        id: vars
-        run: |
-          VERSION=$(jq -r '.version' package.json)
-          TAG="v${VERSION}"
-          if git ls-remote --tags origin "refs/tags/${TAG}" | grep -q .; then
-            NEEDS_TAG=false
-          else
-            NEEDS_TAG=true
-          fi
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "needs_tag=${NEEDS_TAG}" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@v4
+        if: hashFiles('scripts/build-mcpb.sh') != ''
+        with:
+          node-version: 22
 
-      - name: Create and push tag
-        if: steps.vars.outputs.needs_tag == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "${{ steps.vars.outputs.tag }}" -m "Release ${{ steps.vars.outputs.tag }}"
-          git push origin "${{ steps.vars.outputs.tag }}"
+      - name: Build Claude Desktop bundle (hive.mcpb)
+        if: hashFiles('scripts/build-mcpb.sh') != ''
+        run: ./scripts/build-mcpb.sh
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: hive ${{ steps.vars.outputs.tag }}
-          tag_name: ${{ steps.vars.outputs.tag }}
+          name: hive v${{ steps.vars.outputs.version }}
+          tag_name: ${{ github.ref_name }}
           generate_release_notes: true
+          files: dist/hive.mcpb
+          fail_on_unmatched_files: false
           body: |
             ## Container images
 
@@ -273,8 +296,7 @@ jobs:
             # All-in-one Rust stack (API + SPA + worker from one image):
             podman pull ghcr.io/${{ github.repository_owner }}/hive-rust:${{ steps.vars.outputs.version }}
 
-            # Node stack (api + web + worker):
-            podman pull ghcr.io/${{ github.repository_owner }}/hive-api:${{ steps.vars.outputs.version }}
-            podman pull ghcr.io/${{ github.repository_owner }}/hive-web:${{ steps.vars.outputs.version }}
-            podman pull ghcr.io/${{ github.repository_owner }}/hive-worker:${{ steps.vars.outputs.version }}
+            # Hosted-session runner + full dev toolbox:
+            podman pull ghcr.io/${{ github.repository_owner }}/hive-runner:${{ steps.vars.outputs.version }}
+            podman pull ghcr.io/${{ github.repository_owner }}/hive-session-dev:${{ steps.vars.outputs.version }}
             ```

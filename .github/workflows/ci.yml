@@ -2,9 +2,9 @@ name: ci
 
 on:
   pull_request:
-    branches: [development, release]
+    branches: [main]
   push:
-    branches: [development, release]
+    branches: [main]
   # Manual escape hatch: lets CI run when GitHub webhook delivery drops the
   # pull_request/push event (dispatches go straight to Actions, not via hooks).
   workflow_dispatch:
@@ -28,15 +28,8 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
-      - name: Typecheck + build (shared, api, web, cli, worker)
+      - name: Typecheck + build (shared, web, cli, agent)
         run: pnpm build
-
-      - name: Seed smoke test (exercises the SQLite layer)
-        # Force the hash embedder so CI stays offline + fast — the default
-        # provider (local transformers/BGE) would download a model from the HF hub.
-        env:
-          HIVE_EMBED: hash
-        run: pnpm seed
 
   rust:
     runs-on: ubuntu-latest

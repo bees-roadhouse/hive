@@ -4,12 +4,14 @@
 
 These instructions apply to the whole `bees-roadhouse/hive` repository.
 
-GitHub `development` is canonical. This repo is in a Rust/Postgres transition:
+GitHub `main` is canonical (the old `development`/`release` pair collapsed into
+it on 2026-07-05). This repo is in a Rust/Postgres transition:
 
 - Rust workspace: `api`, `worker`, `shared`, and `embed`.
 - Web UI: Solid.js/Vite under `packages/web`.
-- Legacy/parity Node packages still exist under `packages/*` and are still built
-  by CI, but do not treat the old Node/SQLite README framing as the source of
+- Legacy/parity Node packages still exist under `packages/*` (`@hive/api`,
+  `@hive/worker`) as reference material, but CI no longer builds or ships
+  them. Do not treat the old Node/SQLite README framing as the source of
   truth for new backend work.
 - Postgres is the active datastore for the Rust store layer. SQLite remains for
   legacy import compatibility.
@@ -50,11 +52,12 @@ then update the stale doc in the same change. `README.md` and parts of
 
 ## Branching
 
-- `development` is the default branch.
-- `release` is the stable/production branch.
-- Work branches should start from `development` and use `feature/{slug}`,
-  `bug/{slug}`, `improvement/{slug}`, or `refactor/{slug}`.
-- Do not introduce `main` or `master` as app branches.
+- `main` is the only long-lived branch; it must stay releasable.
+- Work branches start from `main` and use `feature/{slug}`, `bug/{slug}`,
+  `improvement/{slug}`, or `refactor/{slug}`, merging back via PR.
+- Releases are tag-driven: bump versions in a release PR, merge, then push
+  `v{version}` on the merge commit. Never rebuild images at release time —
+  the workflows retag the PR-built `sha-*` manifests.
 
 ## Setup
 
@@ -115,33 +118,28 @@ Node/TypeScript gate:
 
 ```bash
 pnpm build
-HIVE_EMBED=hash pnpm seed
 ```
 
-PowerShell seed equivalent:
-
-```powershell
-$env:HIVE_EMBED = "hash"
-pnpm seed
-Remove-Item Env:\HIVE_EMBED
-```
+(`pnpm seed` still exists for the legacy Node/SQLite stack but is no longer a
+CI gate.)
 
 There is no dedicated lint script today. Do not claim one ran unless you add it
 or verify it exists.
 
 ## CI And Release
 
-`.github/workflows/ci.yml` has two jobs:
+`.github/workflows/ci.yml` has two jobs, triggered on PRs to `main`:
 
-- `check`: installs pnpm deps, runs `pnpm build`, then `HIVE_EMBED=hash pnpm seed`.
+- `check`: installs pnpm deps and runs `pnpm build` (shared, web, cli, agent).
 - `rust`: starts Postgres 17, runs `cargo fmt --all --check`,
   `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo build --workspace --all-targets`, and `HIVE_EMBED=hash cargo test --workspace`.
 
-`.github/workflows/release.yml` still builds Node images for `hive-api`,
-`hive-web`, and `hive-worker`, and also builds the additive all-in-one
-`hive-rust` image. Treat `hive-rust` as the forward backend/runtime path unless
-Nate says otherwise.
+`.github/workflows/release.yml` builds `hive-rust` (the deployed all-in-one
+image), `hive-runner`, and `hive-session-dev` on PRs with immutable `sha-*`
+tags; merges retag to `dev` plus a merge-sha alias; pushing a `v{version}` tag
+retags that merge's images as `{version}` + `latest` and cuts the GitHub
+Release. The legacy Node images stopped publishing in 0.6.0.
 
 ## Rust Code Style
 

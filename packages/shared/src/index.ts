@@ -473,14 +473,6 @@ export interface Project {
   created_at: string;
 }
 
-export interface Person {
-  id: string;
-  name: string;
-  slug: string;
-  kind: "human" | "ai";
-  created_at: string;
-}
-
 export interface Topic {
   id: string;
   name: string;
