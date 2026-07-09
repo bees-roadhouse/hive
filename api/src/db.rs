@@ -191,17 +191,32 @@ const SCHEMA: &str = r#"
     );
     CREATE INDEX IF NOT EXISTS outbox_pending ON outbox (status, run_after);
 
-    -- Local embeddings for semantic search (vec = packed little-endian f32 bytes).
+    -- Local embeddings for semantic search, one row per chunk (reshaped by
+    -- migration 0002 — keep both in sync). `hash` is the ITEM-level content
+    -- hash, identical on every chunk row, so skip logic stays one comparison.
+    -- vec = packed little-endian f32 bytes (brute-force path, dual-written
+    -- for BGE rows until the ANN path soaks); vec_v = native pgvector column
+    -- (384-dim BGE only) behind the HNSW index. The 256-dim hash provider
+    -- (dev/CI) writes vec only. owner = namespace user the row is visible to
+    -- (NULL = global), stamped at insert.
     CREATE TABLE IF NOT EXISTS embeddings (
       ref_kind   TEXT NOT NULL,
       ref_id     TEXT NOT NULL,
+      chunk_idx  INT  NOT NULL DEFAULT 0,
       model      TEXT NOT NULL,
       dim        BIGINT NOT NULL,
-      vec        BYTEA NOT NULL,
+      owner      TEXT,
+      vec        BYTEA,
+      vec_v      public.vector(384),
       hash       TEXT NOT NULL,
       created_at TEXT NOT NULL,
-      PRIMARY KEY (ref_kind, ref_id)
+      PRIMARY KEY (ref_kind, ref_id, chunk_idx),
+      CONSTRAINT embeddings_vec_present CHECK (vec IS NOT NULL OR vec_v IS NOT NULL)
     );
+    CREATE INDEX IF NOT EXISTS embeddings_vec_hnsw ON embeddings
+      USING hnsw (vec_v public.vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+    CREATE INDEX IF NOT EXISTS embeddings_owner ON embeddings (owner);
+    CREATE INDEX IF NOT EXISTS embeddings_kind ON embeddings (ref_kind);
 
     -- Single-row worker heartbeat / last-run stats, surfaced in the GUI.
     CREATE TABLE IF NOT EXISTS worker_status (

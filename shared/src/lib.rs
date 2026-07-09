@@ -1287,6 +1287,12 @@ pub struct WorkerLastRun {
     pub outbox: i64,
     pub embedded: i64,
     pub maintenance: Vec<String>,
+    /// The worker's transformers→hash fallback latch at the end of the cycle:
+    /// true means the ONNX model failed to load and the embedding backfill is
+    /// paused (clears on worker restart). Default so last_run JSON written by
+    /// older workers still parses.
+    #[serde(default)]
+    pub latched: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1315,6 +1321,10 @@ pub struct WorkerStatus {
     pub sources: WorkerSourceCounts,
     pub outbox: WorkerOutboxCounts,
     pub embeddings: WorkerEmbeddingCounts,
+    /// True when the transformers model has latched to the hash fallback in
+    /// the worker (per its last cycle) or in the api process itself — either
+    /// way embeddings are degraded and the backfill is paused.
+    pub latched: bool,
 }
 
 // ---- views (server resolves anchors → their entities for the client) ----

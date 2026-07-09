@@ -2715,6 +2715,9 @@ export function workerStatus(): WorkerStatus {
     sources: { total: all.length, enabled: all.filter((s) => s.enabled).length },
     outbox: outbox.counts(),
     embeddings: { count: embeddings.count(), model: EMBED_MODEL },
+    // The latch is a Rust-side concept (ONNX load failure pauses the worker
+    // backfill); the legacy Node stack has no equivalent state to report.
+    latched: false,
   };
 }
 

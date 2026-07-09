@@ -138,6 +138,14 @@ export const Settings: Component = () => {
               </Show>
             </div>
             <div class="ws-stats">
+              <Show when={s().latched}>
+                <span
+                  class="badge warn"
+                  title="Embedding model failed to load — running on the keyword fallback and the backfill is paused. Restart the worker once the model is fixed."
+                >
+                  embeddings latched
+                </span>
+              </Show>
               <span class="badge">{s().embeddings.count} embeddings</span>
               <span class="badge">{s().embeddings.model}</span>
               <span class="badge">outbox {s().outbox.pending}p/{s().outbox.failed}f</span>

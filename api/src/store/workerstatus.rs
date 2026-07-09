@@ -38,9 +38,16 @@ impl Store {
         let count: i64 = crate::pgq::query_scalar("SELECT count(*) FROM embeddings")
             .fetch_one(self.db())
             .await?;
+        let last_run: Option<WorkerLastRun> =
+            last_run_raw.and_then(|s| serde_json::from_str(&s).ok());
+        // The worker persists its latch per cycle (a separate process — its
+        // in-memory latch is invisible here); OR in this process's own latch
+        // so a query-time model failure surfaces too.
+        let latched =
+            last_run.as_ref().is_some_and(|r| r.latched) || hive_embed::transformers_latched();
         Ok(WorkerStatus {
             heartbeat,
-            last_run: last_run_raw.and_then(|s| serde_json::from_str(&s).ok()),
+            last_run,
             sources: WorkerSourceCounts {
                 total: all.len() as i64,
                 enabled: all.iter().filter(|s| s.enabled).count() as i64,
@@ -50,6 +57,7 @@ impl Store {
                 count,
                 model: hive_embed::embed_model().to_string(),
             },
+            latched,
         })
     }
 }

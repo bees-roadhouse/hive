@@ -113,3 +113,76 @@ async fn backfill_embeds_new_skips_unchanged_reembeds_changed() {
     assert_eq!(model, hive_embed::embed_model());
     assert!(dim > 0);
 }
+
+#[tokio::test]
+async fn backfill_stamps_owner_and_stays_bytea_for_hash_provider() {
+    let (pool, _dir) = test_pool().await;
+    let worker = hive_worker::Worker::new(pool.clone());
+
+    // A scoped journal entry, a task anchored to it, and a free-floating task:
+    // journal rows carry their own user_scope; anchored entities inherit the
+    // origin entry's; no origin means global (owner NULL).
+    sqlx::query(
+        "INSERT INTO journal (id, author, body, user_scope, created_at) \
+         VALUES ('jrnl_scoped', 'nate', 'private brood notes', 'nate', '2026-01-02T00:00:00.000Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO tasks (id, title, origin_entry_id, created_at, updated_at) \
+         VALUES ('task_anchored', 'requeen hive 2', 'jrnl_scoped', '2026-01-02T00:00:00.000Z', '2026-01-02T00:00:00.000Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO tasks (id, title, created_at, updated_at) \
+         VALUES ('task_floating', 'paint supers', '2026-01-02T00:00:00.000Z', '2026-01-02T00:00:00.000Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    worker.cycle(1).await.expect("cycle embeds");
+
+    let owner_of = |kind: &str, id: &str| {
+        let pool = pool.clone();
+        let (kind, id) = (kind.to_string(), id.to_string());
+        async move {
+            let (owner,): (Option<String>,) = sqlx::query_as(
+                "SELECT owner FROM embeddings WHERE ref_kind = $1 AND ref_id = $2 AND chunk_idx = 0",
+            )
+            .bind(kind)
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("embedding row");
+            owner
+        }
+    };
+    assert_eq!(
+        owner_of("journal", "jrnl_scoped").await.as_deref(),
+        Some("nate"),
+        "journal embedding carries the entry's user_scope"
+    );
+    assert_eq!(
+        owner_of("task", "task_anchored").await.as_deref(),
+        Some("nate"),
+        "anchored task inherits its origin entry's scope"
+    );
+    assert_eq!(
+        owner_of("task", "task_floating").await,
+        None,
+        "task without an origin entry stays global"
+    );
+
+    // 256-dim hash provider: BYTEA only — vec populated, vec_v never written
+    // (the vector(384) column is for the BGE model; dual-write is dim-gated).
+    let (bytea_only,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM embeddings WHERE vec IS NULL OR vec_v IS NOT NULL")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(bytea_only, 0, "hash rows must be vec-only");
+}

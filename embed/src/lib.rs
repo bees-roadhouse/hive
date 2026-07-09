@@ -291,6 +291,111 @@ pub fn content_hash(text: &str) -> String {
     format!("{:x}", fnv1a(text))
 }
 
+// ---- chunking -----------------------------------------------------------------
+
+/// Defaults for `chunk_text`. 450 + 60 tokens keeps a worst-case chunk just
+/// under the ONNX encoder's 512-token truncation window.
+pub const CHUNK_TARGET_TOKENS: usize = 450;
+pub const CHUNK_OVERLAP_TOKENS: usize = 60;
+pub const CHUNK_MAX_CHUNKS: usize = 64;
+
+/// Split `text` into overlapping chunks for embedding.
+///
+/// Paragraph-first packing: blank-line paragraphs pack greedily into chunks of
+/// roughly `target_tokens`, estimated as chars/4 — provider-independent and
+/// deterministic (the ONNX 512-token truncation stays the safety net for
+/// underestimates). A single paragraph longer than the target hard-splits into
+/// target-sized windows. Each chunk after the first opens with ~`overlap_tokens`
+/// of the previous chunk's tail (word-aligned) so meaning that straddles a
+/// boundary lands whole in at least one chunk. At most `max_chunks` chunks —
+/// the tail beyond the cap is dropped (still reachable via keyword FTS).
+/// Empty/whitespace-only input yields no chunks.
+pub fn chunk_text(
+    text: &str,
+    target_tokens: usize,
+    overlap_tokens: usize,
+    max_chunks: usize,
+) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() || max_chunks == 0 {
+        return Vec::new();
+    }
+    let target_chars = target_tokens.saturating_mul(4).max(1);
+    // Overlap is context, not content: cap it below half a chunk so packing
+    // always advances.
+    let overlap_chars = overlap_tokens.saturating_mul(4).min(target_chars / 2);
+    if text.chars().count() <= target_chars {
+        return vec![text.to_string()];
+    }
+
+    // Units: paragraphs, with oversized paragraphs hard-split into
+    // target-sized windows (inter-chunk overlap is added at pack time).
+    let mut units: Vec<String> = Vec::new();
+    for para in text.split("\n\n") {
+        let para = para.trim();
+        if para.is_empty() {
+            continue;
+        }
+        let chars: Vec<char> = para.chars().collect();
+        if chars.len() <= target_chars {
+            units.push(para.to_string());
+        } else {
+            let mut start = 0usize;
+            while start < chars.len() {
+                let end = (start + target_chars).min(chars.len());
+                units.push(chars[start..end].iter().collect());
+                start = end;
+            }
+        }
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_chars = 0usize;
+    for unit in units {
+        let unit_chars = unit.chars().count();
+        if !cur.is_empty() && cur_chars + 2 + unit_chars > target_chars {
+            chunks.push(cur);
+            if chunks.len() == max_chunks {
+                return chunks;
+            }
+            cur = overlap_tail(chunks.last().unwrap(), overlap_chars);
+            cur_chars = cur.chars().count();
+        }
+        if !cur.is_empty() {
+            cur.push_str("\n\n");
+            cur_chars += 2;
+        }
+        cur.push_str(&unit);
+        cur_chars += unit_chars;
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+/// Last ~`overlap_chars` characters of `s`, advanced to the next word start so
+/// a chunk never opens mid-word. May return empty (e.g. one unbroken word).
+fn overlap_tail(s: &str, overlap_chars: usize) -> String {
+    if overlap_chars == 0 {
+        return String::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= overlap_chars {
+        return s.to_string();
+    }
+    let mut start = chars.len() - overlap_chars;
+    while start < chars.len() && !chars[start - 1].is_whitespace() {
+        start += 1;
+    }
+    chars[start..]
+        .iter()
+        .collect::<String>()
+        .trim_start()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +456,81 @@ mod tests {
     #[test]
     fn stop_words_and_short_tokens_drop() {
         assert_eq!(tokens("I am the a x ok fine"), vec!["am", "ok", "fine"]);
+    }
+
+    // ---- chunk_text ----
+
+    #[test]
+    fn chunk_empty_input_yields_no_chunks() {
+        assert!(chunk_text("", 450, 60, 64).is_empty());
+        assert!(chunk_text("  \n\n \t ", 450, 60, 64).is_empty());
+        assert!(chunk_text("some text", 450, 60, 0).is_empty());
+    }
+
+    #[test]
+    fn chunk_short_text_is_a_single_untouched_chunk() {
+        let text = "[journal] pia: hive check\n\nQueen spotted on frame 4, brood solid.";
+        assert_eq!(chunk_text(text, 450, 60, 64), vec![text.to_string()]);
+    }
+
+    #[test]
+    fn chunk_long_multi_paragraph_packs_paragraph_first() {
+        // 12 paragraphs of ~170 chars against a 400-char target: paragraphs
+        // must pack ~2 per chunk and never split mid-paragraph.
+        let para = |i: usize| format!("Paragraph {i:02} {}", "inspection notes ".repeat(9));
+        let text = (0..12).map(para).collect::<Vec<_>>().join("\n\n");
+        let chunks = chunk_text(&text, 100, 0, 64);
+        assert!(chunks.len() > 1, "long text must split: {}", chunks.len());
+        assert!(
+            chunks.len() < 12,
+            "paragraphs should pack together, not one chunk each: {}",
+            chunks.len()
+        );
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(
+                c.chars().count() <= 100 * 4 + 60 * 4 + 2,
+                "chunk {i} exceeds target+overlap: {} chars",
+                c.chars().count()
+            );
+        }
+        // Every paragraph survives whole in some chunk (packing, not slicing).
+        // Compare trimmed: the chunker trims each paragraph unit.
+        for i in 0..12 {
+            let p = para(i);
+            let p = p.trim();
+            assert!(
+                chunks.iter().any(|c| c.contains(p)),
+                "paragraph {i} missing or split"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_overlap_carries_previous_tail() {
+        let para = |i: usize| format!("Paragraph {i:02} {}", "overlap continuity ".repeat(10));
+        let text = (0..10).map(para).collect::<Vec<_>>().join("\n\n");
+        let chunks = chunk_text(&text, 100, 15, 64);
+        assert!(chunks.len() > 1);
+        for w in chunks.windows(2) {
+            let tail = overlap_tail(&w[0], 15 * 4);
+            assert!(!tail.is_empty(), "expected a non-empty overlap tail");
+            assert!(
+                w[1].starts_with(&tail),
+                "next chunk must open with the previous tail\ntail: {tail:?}\nnext: {:?}",
+                &w[1][..tail.len().min(w[1].len())]
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_max_chunks_caps_output() {
+        // A paragraph far larger than the target hard-splits into windows;
+        // the cap drops the tail.
+        let text = "word ".repeat(4000);
+        let uncapped = chunk_text(&text, 25, 5, usize::MAX);
+        assert!(uncapped.len() > 8);
+        let capped = chunk_text(&text, 25, 5, 8);
+        assert_eq!(capped.len(), 8);
+        assert_eq!(capped[..], uncapped[..8]);
     }
 }
