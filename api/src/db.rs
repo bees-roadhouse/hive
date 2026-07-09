@@ -576,6 +576,14 @@ const SCHEMA_SEARCH: &str = r#"
 "#;
 
 pub async fn migrate(pool: &PgPool) -> Result<()> {
+    // sqlx-managed reshape migrations run FIRST, before the inline base DDL
+    // below (hybrid convention — see api/migrations/0001_baseline_marker.sql).
+    // The migrator holds a Postgres advisory lock, so api + worker booting at
+    // the same time serialize here instead of racing. A failed migration
+    // aborts init: the binary exits and compose crash-loops loudly — fail
+    // closed rather than run against a half-reshaped schema.
+    sqlx::migrate!("./migrations").run(pool).await?;
+
     // Was this a brand-new database? `journal` is the oldest core table, so its
     // absence before this migrate run means a genuinely fresh install (→ run
     // onboarding); a DB that already has it is treated as already set up.
@@ -677,8 +685,11 @@ pub async fn test_pool() -> PgPool {
 
     // Pin every connection in the pool to the test schema via the libpq
     // `options` startup parameter — cleaner than an after_connect hook.
+    // `public` stays on the path so extension types installed there (e.g.
+    // pgvector) resolve inside test schemas; the test schema is first, so all
+    // created objects (including sqlx's per-schema _sqlx_migrations) land in it.
     let opts: PgConnectOptions = url.parse().expect("parse DATABASE_URL");
-    let opts = opts.options([("search_path", schema.as_str())]);
+    let opts = opts.options([("search_path", format!("{schema},public"))]);
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect_with(opts)
