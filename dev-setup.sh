@@ -24,13 +24,13 @@ if [ -n "$RUNTIME" ]; then
     echo "🐘 starting existing hive-pg container…"
     "$RUNTIME" start hive-pg >/dev/null
   else
-    echo "🐘 creating hive-pg (postgres 17 on :5432)…"
+    echo "🐘 creating hive-pg (pgvector-enabled postgres 17 on :5432)…"
     "$RUNTIME" run -d --name hive-pg \
       -e POSTGRES_USER=hive -e POSTGRES_PASSWORD=hive -e POSTGRES_DB=hive \
-      -p 5432:5432 mirror.gcr.io/library/postgres:17 >/dev/null
+      -p 5432:5432 docker.io/pgvector/pgvector:pg17 >/dev/null
   fi
 else
-  echo "⚠ no container runtime found — set DATABASE_URL to a Postgres 17 instance"
+  echo "⚠ no container runtime found — set DATABASE_URL to a pgvector-capable Postgres 17"
 fi
 
 echo "✅ ready."
