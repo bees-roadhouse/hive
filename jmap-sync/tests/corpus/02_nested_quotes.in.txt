@@ -1,0 +1,11 @@
+Third opinion: just use the pgvector image and stop arguing.
+
+On Mon, Jul 6, 2026 at 2:30 PM Sam <sam@example.test> wrote:
+> I disagree, see below.
+>
+> > On Mon, Jul 6, 2026 at 1:15 PM Alex <alex@example.test> wrote:
+> > We should stay on the stock postgres image and sidecar the extension.
+> >
+> > > Original proposal was pgvector/pgvector:pg17.
+>
+> Sidecars for shared libraries do not work that way.
