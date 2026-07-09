@@ -52,17 +52,20 @@ async fn test_app() -> (Router, hive_api::store::Store) {
 async fn backfill_embeddings(store: &hive_api::store::Store) {
     for it in store.embeddable_items().await.expect("embeddable items") {
         let vec = hive_embed::embed(&it.embed_text);
+        // Single-chunk stand-in for the worker's chunked backfill (the PK is
+        // (ref_kind, ref_id, chunk_idx) now); good enough for query-path tests.
         hive_api::pgq::query(
-            "INSERT INTO embeddings (ref_kind, ref_id, model, dim, vec, hash, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(ref_kind, ref_id) DO UPDATE SET \
-               model=excluded.model, dim=excluded.dim, vec=excluded.vec, \
-               hash=excluded.hash, created_at=excluded.created_at",
+            "INSERT INTO embeddings (ref_kind, ref_id, chunk_idx, model, dim, owner, vec, hash, created_at) \
+             VALUES (?, ?, 0, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(ref_kind, ref_id, chunk_idx) DO UPDATE SET \
+               model=excluded.model, dim=excluded.dim, owner=excluded.owner, \
+               vec=excluded.vec, hash=excluded.hash, created_at=excluded.created_at",
         )
         .bind(&it.kind)
         .bind(&it.id)
         .bind(hive_embed::embed_model())
         .bind(vec.len() as i64)
+        .bind(&it.owner)
         .bind(hive_embed::to_blob(&vec))
         .bind(&it.hash)
         .bind(hive_api::store::now_iso())
