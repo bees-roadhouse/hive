@@ -203,6 +203,44 @@ impl Worker {
         if pruned > 0 {
             did.push(format!("pruned-wire({pruned})"));
         }
+        let swept = self.sweep_conversations().await?;
+        if swept > 0 {
+            did.push(format!("swept-conversations({swept})"));
+        }
         Ok(did)
+    }
+
+    /// Conversation retention: when $HIVE_CONVERSATION_RETENTION_DAYS is set,
+    /// hard-delete archived hosted sessions whose updated_at is older than the
+    /// cutoff (transcript + conversation graph links go too — journal mirrors
+    /// are history and stay). Unset = keep forever, the default.
+    /// TODO: also sweep origin='captured' AND reflected_at IS NOT NULL once the
+    /// conversation-capture columns land.
+    async fn sweep_conversations(&self) -> Result<u64> {
+        let Some(days) = std::env::var("HIVE_CONVERSATION_RETENTION_DAYS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .filter(|d| *d >= 0)
+            .and_then(chrono::Duration::try_days)
+        else {
+            return Ok(0);
+        };
+        // updated_at is ISO-8601 UTC text (now_iso), so string compare == time compare.
+        let cutoff = (chrono::Utc::now() - days)
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        let ids: Vec<String> = hive_api::pgq::query_scalar::<String>(
+            "SELECT id FROM cc_sessions WHERE status = 'archived' AND updated_at < ?",
+        )
+        .bind(&cutoff)
+        .fetch_all(self.db())
+        .await?;
+        let mut swept = 0u64;
+        for id in &ids {
+            if self.store.workspace_delete(id).await? {
+                swept += 1;
+            }
+        }
+        Ok(swept)
     }
 }

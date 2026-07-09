@@ -434,4 +434,34 @@ impl Store {
     pub async fn workspace_archive(&self, id: &str) -> Result<()> {
         self.workspace_set_status(id, "archived").await
     }
+
+    /// Hard-delete a session: its transcript, then the graph links stamped with
+    /// kind `conversation` on its id (both directions), then the row itself.
+    /// Journal mirror entries are history and deliberately stay. Returns whether
+    /// a session row was actually removed.
+    pub async fn workspace_delete(&self, id: &str) -> Result<bool> {
+        crate::pgq::query("DELETE FROM cc_messages WHERE session_id = ?")
+            .bind(id)
+            .execute(self.db())
+            .await?;
+        crate::pgq::query(
+            "DELETE FROM links WHERE (source_kind = 'conversation' AND source_id = ?) \
+             OR (target_kind = 'conversation' AND target_id = ?)",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(self.db())
+        .await?;
+        let deleted = crate::pgq::query("DELETE FROM cc_sessions WHERE id = ?")
+            .bind(id)
+            .execute(self.db())
+            .await?
+            .rows_affected()
+            > 0;
+        if deleted {
+            self.emit("workspace.deleted", "system", json!({ "id": id }))
+                .await?;
+        }
+        Ok(deleted)
+    }
 }

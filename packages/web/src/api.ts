@@ -313,6 +313,9 @@ export const api = {
     req<CcMessage>(`/workspaces/${id}/input`, { method: "POST", body: JSON.stringify({ text }) }),
   archiveWorkspace: (id: string) =>
     req<{ ok: boolean }>(`/workspaces/${id}/archive`, { method: "POST" }),
+  // Hard delete: transcript + conversation links go too; journal mirrors stay.
+  deleteWorkspace: (id: string) =>
+    req<{ ok: boolean }>(`/workspaces/${id}`, { method: "DELETE" }),
 
   // ---- user-defined custom entity types ----
   entityTypes: (includeArchived = false) =>
@@ -358,6 +361,9 @@ export interface CcSession {
   claude_session_id: string | null;
   runtime: RuntimeKind | string;
   status: string;
+  /** 'hosted' (runner-driven) or 'captured' (SessionEnd ingest of a local
+   *  session). Optional: the column lands in a parallel PR — absent = hosted. */
+  origin?: string;
   model: string | null;
   usage: unknown;
   meta: unknown;

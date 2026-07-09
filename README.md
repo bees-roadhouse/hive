@@ -146,6 +146,39 @@ force-directed node-link diagram — every journal entry and the tasks/decisions
 events anchored from it, plus `supersedes` edges — click a node to focus its
 neighborhood.
 
+## Conversations (hosted agent sessions)
+
+The **Conversations** tab (`/api/workspaces`, the `cc_sessions`/`cc_messages`
+tables) turns a prompt into a real agent run: `hive-runner` claims the session,
+provisions a sandbox, drives Claude Code / Codex / OpenCode, and streams every
+turn back as the transcript. Salient turns mirror into the journal as normal
+entries.
+
+**Isolation stance.** The runner executes agent turns with permission prompts
+bypassed. That is safe only because each session runs in a **disposable
+per-session container** (podman/docker) that is torn down on archive. If
+`HIVE_SESSION_ISOLATION=host` (or no container engine is available by choice),
+the same bypass would apply to the host itself, so the runner **refuses to
+start** unless you explicitly set `HIVE_RUNNER_UNSAFE_HOST=1`.
+
+**Runtime sign-in.** Users connect their own runtime credentials in Settings
+(stored encrypted per user, decrypted only for the runner):
+
+- **Claude Code / Codex subscriptions** — OAuth "connect" buttons, enabled by
+  configuring `HIVE_CLAUDE_CODE_OAUTH_*` / `HIVE_CODEX_OAUTH_*` on the API:
+  `_CLIENT_ID`, `_AUTH_URL`, `_TOKEN_URL` (required), plus optional
+  `_CLIENT_SECRET`, `_REDIRECT_URI`, `_SCOPES`, `_PROVIDER`. Unconfigured
+  runtimes return 501 and the UI falls back to token paste.
+- **OpenCode** — manual paste of a provider API key (OpenRouter/Anthropic/
+  OpenAI) in Settings; no OAuth flow.
+
+**Lifecycle.** Archiving a conversation ends it and removes its sandbox; the
+transcript stays. Ended conversations can be **deleted** from the UI
+(`DELETE /api/workspaces/{id}`): the transcript and its graph links go, journal
+mirror entries are history and stay. With `HIVE_CONVERSATION_RETENTION_DAYS`
+set, the worker also hard-deletes archived conversations older than that many
+days each cycle; unset (the default) keeps everything forever.
+
 ## Cloud dev env (GitHub / Claude Code on the web)
 
 `/.claude/settings.json` registers a **SessionStart** hook that runs
@@ -170,6 +203,9 @@ setup is safe.
 | `HIVE_EMBED`   | `transformers`          | api, worker — set `hash` to skip the model download (CI/offline) |
 | `HIVE_EMBED_MODEL` | `Xenova/bge-small-en-v1.5` | api, worker (transformers mode) |
 | `HIVE_RERANK_MODEL` | `Xenova/bge-reranker-base` | api, worker (transformers mode) |
+| `HIVE_CLAUDE_CODE_OAUTH_*` / `HIVE_CODEX_OAUTH_*` | unset (501) | Rust API — runtime subscription sign-in, see [Conversations](#conversations-hosted-agent-sessions) |
+| `HIVE_CONVERSATION_RETENTION_DAYS` | unset (keep forever) | worker — hard-delete archived conversations older than N days |
+| `HIVE_SESSION_ISOLATION` | `container` | runner — `host` refuses to start without `HIVE_RUNNER_UNSAFE_HOST=1` |
 
 ## Branching
 

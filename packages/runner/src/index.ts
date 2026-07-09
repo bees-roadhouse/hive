@@ -163,6 +163,21 @@ function resolveEngine(): "podman" | "docker" | null {
 
 const ENGINE = resolveEngine();
 
+// Safety interlock: without a session container (HIVE_SESSION_ISOLATION=host, or
+// HIVE_CONTAINER_ENGINE=none/host), Claude Code turns run with bypassPermissions
+// DIRECTLY on this machine — full read/write/exec as the runner user, driven by
+// prompts and by whatever untrusted content the session pulls in. Bypass is only
+// safe because sessions normally live in disposable per-session containers.
+// Refuse to start unless the operator explicitly accepts the risk.
+if (!ENGINE && !DRY_RUN && process.env.HIVE_RUNNER_UNSAFE_HOST !== "1") {
+  console.error(
+    "hive-runner: refusing to start — HIVE_SESSION_ISOLATION=host (no session container) would run agent " +
+      "turns with permissions bypassed directly on this machine. Use container isolation (the default, " +
+      "requires podman or docker), or set HIVE_RUNNER_UNSAFE_HOST=1 to accept running unsandboxed.",
+  );
+  process.exit(1);
+}
+
 function engine(args: string[], opts: { input?: string; quiet?: boolean } = {}): string {
   if (!ENGINE) throw new Error("container engine unavailable");
   const r = spawnSync(ENGINE, args, { encoding: "utf8", input: opts.input, stdio: opts.quiet ? "pipe" : "pipe", env: engineEnv(ENGINE) });
