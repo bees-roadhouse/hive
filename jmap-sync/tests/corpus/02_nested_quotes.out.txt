@@ -1,0 +1,1 @@
+Third opinion: just use the pgvector image and stop arguing.

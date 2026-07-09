@@ -1,0 +1,3 @@
+> This whole message is a quote with no new content.
+> Some clients produce these when someone hits send too early.
+> The safety valve must keep the original rather than embed nothing.

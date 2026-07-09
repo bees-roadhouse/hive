@@ -41,6 +41,9 @@ COPY shared ./shared
 COPY embed ./embed
 COPY api ./api
 COPY worker ./worker
+# Workspace member: cargo refuses to load the workspace without it, even
+# though no binary from it ships yet (hive-mail arrives with the daemon PR).
+COPY jmap-sync ./jmap-sync
 # Cache mounts keep the registry + incremental artifacts across builds; the
 # binaries are copied out because the target dir vanishes with the mount.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

@@ -1,0 +1,5 @@
+This week in self-hosting: Stalwart 0.16 ships JMAP quota support, Postgres 18 beta lands incremental sort improvements, and a look at pgvector HNSW tuning in production.
+
+Read the full issue for benchmark tables and config snippets.
+
+You are receiving this because you subscribed at selfhosted.example.

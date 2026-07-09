@@ -1,0 +1,10 @@
+Forwarding this so you have the vendor's exact wording for the ticket.
+
+---------- Forwarded message ---------
+From: Vendor Support <support@vendor.example>
+Date: Tue, Jul 7, 2026 at 4:44 PM
+Subject: Case 88231 resolution
+To: Nate Smith <nate@example.test>
+
+Your replacement unit shipped today under RMA 88231.
+Tracking will arrive in a separate email.
