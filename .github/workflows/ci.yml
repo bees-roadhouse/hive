@@ -37,7 +37,8 @@ jobs:
     # isolated schema against this service (DATABASE_URL below).
     services:
       postgres:
-        image: postgres:17
+        # pgvector-capable Postgres so CREATE EXTENSION vector works in tests.
+        image: pgvector/pgvector:pg17
         env:
           POSTGRES_USER: hive
           POSTGRES_PASSWORD: hive

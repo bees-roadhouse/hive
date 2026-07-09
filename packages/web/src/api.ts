@@ -12,6 +12,8 @@ import type {
   JournalEntryView,
   JournalWriter,
   MailAccount,
+  MailAccountAdminView,
+  MailMailboxView,
   MailMessageSummary,
   MailThread,
   NewJournalEntry,
@@ -135,6 +137,31 @@ export const api = {
     return req<MailMessageSummary[]>(`/mail/messages?${p}`);
   },
   mailThread: (threadId: string) => req<MailThread>(`/mail/thread/${encodeURIComponent(threadId)}`),
+  // Account management (Settings). Connect is admin-only server-side.
+  mailAccountsManage: () => req<MailAccountAdminView[]>("/mail/accounts/manage"),
+  mailAccountConnect: (input: {
+    address: string;
+    jmap_url: string;
+    username?: string;
+    secret: string;
+    owner?: string;
+  }) => req<MailAccountAdminView>("/mail/accounts", { method: "POST", body: JSON.stringify(input) }),
+  mailAccountDelete: (id: string) =>
+    req<{ ok: boolean }>(`/mail/accounts/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  mailAccountSetEnabled: (id: string, enabled: boolean) =>
+    req<{ ok: boolean; enabled: boolean }>(`/mail/accounts/${encodeURIComponent(id)}/enabled`, {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    }),
+  mailAccountResync: (id: string) =>
+    req<{ ok: boolean }>(`/mail/accounts/${encodeURIComponent(id)}/resync`, { method: "POST" }),
+  mailMailboxes: (accountId: string) =>
+    req<MailMailboxView[]>(`/mail/accounts/${encodeURIComponent(accountId)}/mailboxes`),
+  mailMailboxSetIngest: (id: string, ingest: boolean) =>
+    req<{ ok: boolean; ingest: boolean }>(`/mail/mailboxes/${encodeURIComponent(id)}/ingest`, {
+      method: "POST",
+      body: JSON.stringify({ ingest }),
+    }),
   wire: () => req<WireEvent[]>("/wire"),
   // Trigger an immediate source poll (worker normally polls on a schedule).
   // The backend endpoint may not exist yet — callers should catch and fall

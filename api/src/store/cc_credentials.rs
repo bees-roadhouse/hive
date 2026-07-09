@@ -223,4 +223,25 @@ impl Store {
             secret,
         )))
     }
+
+    /// Decrypt one credential by row id (INTERNAL only). Mail accounts name
+    /// their vault row via `mail_accounts.cred_id`, so the most-recent-per-
+    /// runtime picker above would be wrong the moment a second account
+    /// exists.
+    pub async fn cc_cred_decrypt_by_id(&self, id: &str) -> Result<Option<String>> {
+        let row = crate::pgq::query_as::<CredSecretRow>(
+            "SELECT id, kind, runtime, provider, ciphertext, nonce FROM cc_credentials WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(self.db())
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let secret = decrypt(&row.ciphertext, &row.nonce)?;
+        crate::pgq::query("UPDATE cc_credentials SET last_used_at = ? WHERE id = ?")
+            .bind(now_iso())
+            .bind(&row.id)
+            .execute(self.db())
+            .await?;
+        Ok(Some(secret))
+    }
 }

@@ -515,6 +515,8 @@ mod tests {
                 "entity_create",
                 "entity_update",
                 "entity_delete",
+                "artifacts_list",
+                "artifacts_get",
                 "conversation_log",
                 "conversation_list_pending",
                 "conversation_get",

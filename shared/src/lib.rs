@@ -147,6 +147,31 @@ pub struct JournalWriter {
     pub owner: Option<String>,
 }
 
+// ---- identity artifacts (Claude Code skills / agents / commands) ----
+
+/// A Claude Code artifact (skill, agent, or slash-command) stored per AI
+/// identity. The plugin pulls an identity's ENABLED artifacts via the sync
+/// endpoint, keyed on the AI actor (not the per-user memory namespace).
+/// Skills are a single SKILL.md `content` for v1 (multi-file is out of scope).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityArtifact {
+    pub id: String,
+    /// The AI identity (people.slug) this artifact belongs to.
+    pub actor: String,
+    /// 'skill' | 'agent' | 'command'.
+    pub kind: String,
+    /// Artifact name (directory / file basename).
+    pub name: String,
+    /// The markdown body (frontmatter + content): SKILL.md / agent .md / command .md.
+    pub content: String,
+    /// Short description (from frontmatter), for listings.
+    pub description: String,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 // ---- auth, users, onboarding ----
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +289,10 @@ pub struct AuthConfig {
     pub oauth_never_expires: bool,
     #[serde(rename = "instanceName")]
     pub instance_name: Option<String>,
+    /// HIVE_MAIL_ENABLED: gates the Mail tab, the Settings mail-accounts
+    /// section, and every /api/mail route (404 when off).
+    #[serde(rename = "mailEnabled", default)]
+    pub mail_enabled: bool,
 }
 
 // ---- bulk historical import ----
