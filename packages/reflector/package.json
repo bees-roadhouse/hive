@@ -1,0 +1,10 @@
+{
+  "name": "@hive/reflector",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Reflection loop: drains hive's captured-conversation queue, reflects on each transcript with Claude, and writes the result back as owner-scoped journal memory.",
+  "scripts": {
+    "start": "node --experimental-strip-types src/index.ts"
+  }
+}

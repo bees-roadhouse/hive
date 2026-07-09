@@ -1,0 +1,15 @@
+# syntax=docker/dockerfile:1
+
+# hive-reflector — the reflection loop. Drains the captured-conversation queue
+# from hive-api, reflects on each transcript with Claude (Anthropic Messages
+# API over raw fetch), and writes owner-scoped journal memory back.
+#
+# @hive/reflector is zero-dependency (built-in fetch, TypeScript run directly
+# via --experimental-strip-types), so unlike the runner image there is no
+# workspace pnpm-install stage: copy the package source and run it. This is
+# the container equivalent of the package.json start script.
+FROM node:22-alpine
+ENV NODE_ENV=production
+WORKDIR /app
+COPY packages/reflector/ ./packages/reflector/
+CMD ["node", "--experimental-strip-types", "packages/reflector/src/index.ts"]
