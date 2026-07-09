@@ -40,6 +40,10 @@ MCP server (official SDK). Tools: `journal_append` (with anchors), `journal_list
 `inbox_list`/`_mark_read`, `search`, `semantic_search`, `dashboard`,
 `sources_add`/`_list`/`_update`/`_remove`, `outbox_list`, `worker_status`.
 
+Claude Desktop / claude.ai connect as an OAuth **custom connector** or via the
+`hive.mcpb` bearer-token bundle — see
+[integrations/claude-desktop](./integrations/claude-desktop/README.md).
+
 ## Worker
 
 ```bash
