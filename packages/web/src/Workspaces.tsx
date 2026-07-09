@@ -96,7 +96,26 @@ function toTurn(m: CcMessage): Turn {
   return { t: "sys", text: oneLine(text || JSON.stringify(c), 160) };
 }
 
-const ENDED = new Set(["archived", "completed", "failed"]);
+const ENDED = new Set(["archived", "completed", "failed", "captured"]);
+
+// Sessions ingested from a local Claude Code session (SessionEnd capture) are
+// read-only history. The origin column lands in a parallel PR — treat a
+// missing/unknown origin as 'hosted'.
+const isCaptured = (s: CcSession | undefined): boolean =>
+  s?.origin === "captured" || s?.status === "captured";
+
+// The runner ingests {role:"system", kind:"error"} right before it marks a
+// session failed — surface that last error line.
+const lastErrorOf = (ms: CcMessage[]): string | null => {
+  for (let i = ms.length - 1; i >= 0; i--) {
+    const m = ms[i];
+    if (m.role !== "system" || m.kind !== "error") continue;
+    const c = (m.content ?? {}) as Record<string, unknown>;
+    const text = typeof c.error === "string" ? c.error : typeof c.text === "string" ? c.text : "";
+    if (text.trim()) return text.trim();
+  }
+  return null;
+};
 
 export const Workspaces: Component = () => {
   const [selected, setSelected] = createSignal<string | null>(null);
@@ -126,8 +145,31 @@ export const Workspaces: Component = () => {
   const msgs = () => transcript.latest ?? [];
   const canSend = () => {
     const s = current();
-    return !!s && !ENDED.has(s.status);
+    return !!s && !ENDED.has(s.status) && !isCaptured(s);
   };
+
+  // Last runtime error per failed session. The selected session's error comes
+  // from the transcript already loaded; unselected failed rail rows get one
+  // lazy transcript fetch each so the rail can show why they died.
+  const [failErrors, setFailErrors] = createSignal<Record<string, string>>({});
+  const cacheError = (id: string, ms: CcMessage[]) => {
+    const text = lastErrorOf(ms);
+    if (text) setFailErrors((prev) => (prev[id] === text ? prev : { ...prev, [id]: text }));
+  };
+  createEffect(on(transcript, (ms) => {
+    const id = selected();
+    if (id && ms) cacheError(id, ms);
+  }));
+  const errFetched = new Set<string>();
+  createEffect(() => {
+    for (const s of rail()) {
+      if (s.status !== "failed" || failErrors()[s.id] || errFetched.has(s.id)) continue;
+      errFetched.add(s.id);
+      api.transcript(s.id).then((ms) => cacheError(s.id, ms)).catch(() => errFetched.delete(s.id));
+    }
+  });
+  const failErrorFor = (s: CcSession): string | null =>
+    s.status === "failed" ? failErrors()[s.id] ?? null : null;
   const counts = createMemo(() => RUNTIMES.map((r) => ({ ...r, count: rail().filter((s) => runtimeOf(s) === r.id).length })));
   const groupedRail = createMemo(() => {
     const rows = rail();
@@ -189,6 +231,17 @@ export const Workspaces: Component = () => {
   const archive = async (id: string) => {
     try {
       await api.archiveWorkspace(id);
+      setSelected(null);
+      await refetchSessions();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const remove = async (id: string) => {
+    if (!confirm("Delete this conversation? Its transcript and graph links are removed; journal entries it wrote stay.")) return;
+    try {
+      await api.deleteWorkspace(id);
       setSelected(null);
       await refetchSessions();
     } catch (e) {
@@ -293,7 +346,11 @@ export const Workspaces: Component = () => {
                           {runtimeInfo(runtimeOf(s)).label}
                           <StatusDot status={s.status} />
                           {rel(s.last_activity_at ?? s.created_at)}
+                          <Show when={isCaptured(s)}><span class="captured-badge">captured</span></Show>
                         </span>
+                        <Show when={failErrorFor(s)}>
+                          <span class="chat-row-error" title={failErrorFor(s)!}>{oneLine(failErrorFor(s)!, 76)}</span>
+                        </Show>
                         <Show when={projectOf(s) !== "unfiled" || tagsOf(s).length > 0}>
                           <span class="conversation-tags">
                             <Show when={projectOf(s) !== "unfiled"}><b>{projectOf(s)}</b></Show>
@@ -333,16 +390,23 @@ export const Workspaces: Component = () => {
                   <span class="chat-title">{s().title || "Untitled run"}</span>
                   <span class={`runtime-pill rt-${rt()}`}><RuntimeDot runtime={rt()} /> {runtimeInfo(rt()).label}</span>
                   <Show when={s().model}><code class="chat-model">{s().model}</code></Show>
+                  <Show when={isCaptured(s())}><span class="captured-badge">captured</span></Show>
                   <span class="chat-status">
                     <StatusDot status={s().status} />
                     {s().status.replace("_", " ")}
                   </span>
                   <button class="x" onClick={() => archive(s().id)} title="Archive conversation" aria-label="Archive conversation">✕</button>
+                  <Show when={ENDED.has(s().status) || isCaptured(s())}>
+                    <button class="x danger" onClick={() => remove(s().id)} title="Delete conversation" aria-label="Delete conversation">✕</button>
+                  </Show>
                 </div>
                 <div class="chat-status-strip">
                   <span>owner <code>@{s().owner}</code></span>
                   <span>workdir <code>{s().workdir}</code></span>
                   <span>{msgs().length} rows</span>
+                  <Show when={failErrorFor(s())}>
+                    <span class="chat-strip-error" title={failErrorFor(s())!}>{oneLine(failErrorFor(s())!, 120)}</span>
+                  </Show>
                 </div>
                 <div class="chat-scroll terminal-panel" ref={scrollEl}>
                   <Show when={msgs().length > 0} fallback={<p class="dim sm">No transcript yet — runtime is provisioning.</p>}>
@@ -365,7 +429,14 @@ export const Workspaces: Component = () => {
                     </For>
                   </Show>
                 </div>
-                <Show when={canSend()} fallback={<div class="chat-ended">This run has ended.</div>}>
+                <Show
+                  when={canSend()}
+                  fallback={
+                    <div class="chat-ended">
+                      {isCaptured(s()) ? "Captured session — read-only transcript." : "This run has ended."}
+                    </div>
+                  }
+                >
                   {composer(s().status === "waiting_input" ? "Runtime is waiting on you…" : "Reply…")}
                 </Show>
                 <Show when={err()}><div class="chat-err">{err()}</div></Show>

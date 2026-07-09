@@ -24,7 +24,7 @@ use crate::store::{now_iso, Store};
 pub fn router() -> Router<Store> {
     Router::new()
         .route("/api/workspaces", get(list).post(create))
-        .route("/api/workspaces/{id}", get(get_one))
+        .route("/api/workspaces/{id}", get(get_one).delete(delete_one))
         .route(
             "/api/workspaces/{id}/messages",
             get(transcript).post(ingest),
@@ -240,6 +240,24 @@ async fn archive(
         return Ok(not_found());
     }
     s.workspace_archive(&id).await?;
+    Ok(Json(json!({"ok": true})).into_response())
+}
+
+/// Hard-delete a conversation: transcript + `conversation` graph links go with
+/// it; journal mirror entries are history and stay. Owner or admin only (same
+/// gate as ingest/set_status).
+async fn delete_one(
+    State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let Some(ws) = s.workspace_get_internal(&id).await? else {
+        return Ok(not_found());
+    };
+    if !ctx.is_admin() && ctx.namespace_user() != ws.owner {
+        return Ok(forbidden());
+    }
+    s.workspace_delete(&id).await?;
     Ok(Json(json!({"ok": true})).into_response())
 }
 

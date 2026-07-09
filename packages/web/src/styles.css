@@ -1703,6 +1703,14 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
 }
 .chat-row-title { font-size: var(--fs-sm); font-weight: 560; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .chat-row-meta { display: flex; align-items: center; gap: 0.42rem; font-size: var(--fs-2xs); color: var(--dim); }
+.chat-row-error { font-size: var(--fs-2xs); color: var(--danger); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.chat-strip-error { color: var(--danger); }
+.captured-badge {
+  font-size: var(--fs-2xs); font-weight: 650; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--dim); border: 1px solid color-mix(in srgb, var(--chat-line) 82%, transparent);
+  border-radius: 999px; padding: 0.06rem 0.4rem; background: color-mix(in srgb, var(--panel2) 42%, transparent);
+}
+button.x.danger { color: var(--danger); }
 .conversation-group { display: grid; gap: 0.18rem; }
 .conversation-group-title { color: var(--dim); font-size: var(--fs-2xs); font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; padding: 0.45rem 0.28rem 0.1rem; }
 .conversation-tags { display: flex; gap: 0.28rem; flex-wrap: wrap; font-size: var(--fs-2xs); }
@@ -1890,7 +1898,7 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
    single source: blue provisioning, green running, honey waiting on you,
    red failure, dim at rest. */
 .dot, .chat-dot { width: 7px; height: 7px; border-radius: var(--r-pill); background: var(--line); flex: none; display: inline-block; }
-.dot-rest, .chat-dot.st-idle, .chat-dot.st-completed { background: var(--dim); }
+.dot-rest, .chat-dot.st-idle, .chat-dot.st-completed, .chat-dot.st-captured { background: var(--dim); }
 .dot-live, .chat-dot.st-running { background: #56d364; }
 .chat-dot.st-provisioning { background: #58a6ff; }
 .dot-waiting, .chat-dot.st-waiting_input { background: var(--accent); }

@@ -178,6 +178,9 @@ export interface CcSession {
   claude_session_id: string | null;
   runtime: RuntimeKind | string;
   status: string;
+  /** 'hosted' (runner-driven) or 'captured' (SessionEnd ingest of a local
+   *  session). Optional: the column lands in a parallel PR — absent = hosted. */
+  origin?: string;
   model: string | null;
   usage: unknown;
   meta: unknown;
