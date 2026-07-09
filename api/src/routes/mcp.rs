@@ -514,6 +514,8 @@ mod tests {
                 "entity_create",
                 "entity_update",
                 "entity_delete",
+                "artifacts_list",
+                "artifacts_get",
             ]
         );
         // Spot-check a schema verbatim against the captured Node output.
