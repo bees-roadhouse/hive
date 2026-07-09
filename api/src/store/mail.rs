@@ -1617,6 +1617,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mail_token_links_gate_by_scope_and_resolve_subjects() {
+        let store = seeded_store().await;
+        // seeded: msg-alice-1 (user_scope 'alice', subject "Quarterly bees").
+
+        // Alice-scoped entry citing alice's mail → a 'cites' link + a subject chip.
+        let entry = store
+            .journal_append(
+                hive_shared::NewJournalEntry {
+                    author: Some("alice".into()),
+                    body: "Following up on [mail:msg-alice-1] before Thursday.".into(),
+                    tags: None,
+                    anchors: None,
+                },
+                Some("alice"),
+                Some("alice"),
+            )
+            .await
+            .unwrap();
+        let links: i64 = crate::pgq::query_scalar::<i64>(
+            "SELECT COUNT(*) FROM links WHERE source_kind = 'journal' AND source_id = ? \
+             AND target_kind = 'mail' AND target_id = 'msg-alice-1' AND rel = 'cites'",
+        )
+        .bind(&entry.entry.id)
+        .fetch_one(store.db())
+        .await
+        .unwrap();
+        assert_eq!(links, 1);
+        let refs = store.refs_for(&entry.entry.body).await.unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].name, "Quarterly bees");
+        assert_eq!(refs[0].id, "msg-alice-1");
+
+        // Bob-scoped entry citing alice's mail → the token simply doesn't link.
+        let cross = store
+            .journal_append(
+                hive_shared::NewJournalEntry {
+                    author: Some("bob".into()),
+                    body: "Trying to cite [mail:msg-alice-1] across namespaces.".into(),
+                    tags: None,
+                    anchors: None,
+                },
+                Some("bob"),
+                Some("bob"),
+            )
+            .await
+            .unwrap();
+        let cross_links: i64 = crate::pgq::query_scalar::<i64>(
+            "SELECT COUNT(*) FROM links WHERE source_id = ? AND target_kind = 'mail'",
+        )
+        .bind(&cross.entry.id)
+        .fetch_one(store.db())
+        .await
+        .unwrap();
+        assert_eq!(cross_links, 0, "cross-namespace citation must not link");
+
+        // Tombstoned mail stops resolving (the raw token stays visible).
+        crate::pgq::query(
+            "UPDATE mail_messages SET deleted_at = '2026-07-09T00:00:00.000Z' WHERE id = 'msg-alice-1'",
+        )
+        .execute(store.db())
+        .await
+        .unwrap();
+        let dead_refs = store.refs_for(&entry.entry.body).await.unwrap();
+        assert!(dead_refs.is_empty(), "dead citations resolve to nothing");
+    }
+
+    #[tokio::test]
     async fn backoff_disables_after_eight_failures() {
         std::env::set_var("HIVE_CRED_KEY", "mail-store-test-key");
         let pool = db::test_pool().await;

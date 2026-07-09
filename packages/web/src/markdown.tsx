@@ -22,10 +22,16 @@ const MENTION = /@[a-z][a-z0-9_-]*/gi;
 
 /**
  * Reconstruct the raw bracket token for a JournalRef so we can find it as a
- * literal string in the rendered text. Shape: `[kind: name]`.
+ * literal string in the rendered text. Shape: `[kind: name]` — except mail,
+ * which is id-addressed (`[mail:mail_x…]`; the ref's name is the SUBJECT, so
+ * reconstructing from the name would never match the source text).
  */
-function refToken(r: JournalRef): string {
-  return `[${r.kind}: ${r.name}]`;
+function refTokens(r: JournalRef): string[] {
+  if (r.kind === "mail") {
+    // The parser trims, so both spaced and unspaced forms are legal source.
+    return [`[mail:${r.id}]`, `[mail: ${r.id}]`];
+  }
+  return [`[${r.kind}: ${r.name}]`];
 }
 
 /**
@@ -50,12 +56,13 @@ export function JournalBody(props: {
 
     // 1. Replace ref bracket tokens with colored chips.
     for (const r of props.refs ?? []) {
-      const token = refToken(r);
-      wrapFirst(el, token, (span) => {
-        span.className = `ref ref-${r.kind}`;
-        span.textContent = r.name;
-        span.title = `${r.kind}: ${r.name}`;
-      });
+      for (const token of refTokens(r)) {
+        wrapFirst(el, token, (span) => {
+          span.className = `ref ref-${r.kind}`;
+          span.textContent = r.name;
+          span.title = `${r.kind}: ${r.name}`;
+        });
+      }
     }
 
     // 2. Longest-first so a short anchor can't pre-empt a longer overlapping one.
