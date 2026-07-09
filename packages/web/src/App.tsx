@@ -44,12 +44,24 @@ const TABS = [
 ] as const;
 type Tab = (typeof TABS)[number]["id"];
 
+// Mail ships dark until HIVE_MAIL_ENABLED: a direct /mail visit bounces home
+// once the config confirms it's off (still-loading renders, so enabled
+// deployments never flash a redirect).
+const MailGate: Component = () => {
+  const [cfg] = createResource(() => api.authConfig());
+  return (
+    <Show when={!(cfg() && !cfg()!.mailEnabled)} fallback={<Navigate href="/journal" />}>
+      <Mail />
+    </Show>
+  );
+};
+
 const PAGES: Record<Tab, Component> = {
   journal: Journal,
   inbox: Inbox,
   dashboard: Dashboard,
   workspaces: Workspaces,
-  mail: Mail,
+  mail: MailGate,
   tasks: Tasks,
   decisions: Decisions,
   events: Events,
@@ -98,6 +110,12 @@ const Workspace = (props: {
     const location = useLocation();
     connectLive(); // open the SSE stream now that we're authenticated
 
+    // The mail surface ships dark until HIVE_MAIL_ENABLED flips server-side;
+    // the sidebar slot appears only once the config confirms it.
+    const [authCfg] = createResource(() => api.authConfig());
+    const primaryTabs = () =>
+      PRIMARY.filter((t) => t.id !== "mail" || authCfg()?.mailEnabled === true);
+
     const [unread] = createResource(
       () => ({ actor: actor(), _r: liveRev() }),
       (k) => api.inbox(k.actor, true).then((items) => items.length),
@@ -127,7 +145,7 @@ const Workspace = (props: {
           </div>
 
           <nav>
-            <For each={PRIMARY}>
+            <For each={primaryTabs()}>
               {(t) => (
                 <A href={`/${t.id}`} activeClass="active" end>
                   <span class="nav-icon"><Icon name={t.icon} /></span>

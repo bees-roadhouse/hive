@@ -1,18 +1,46 @@
 import { createResource, createSignal, For, Show, type Component } from "solid-js";
 import { ACTOR_NAMES, SEVERITIES, type Severity, type SourceKind } from "@hive/shared";
-import { api, getActor } from "./api.ts";
+import { api, getActor, getCurrentUser } from "./api.ts";
 import { relTime } from "./lib.tsx";
 import { liveRev } from "./live.ts";
 import { EmptyState } from "./primitives.tsx";
 
 /** Worker configuration: ingest sources (GUI ⇄ MCP), status, outbound queue,
- * and the runtime credentials that power hosted conversations. */
+ * the runtime credentials that power hosted conversations, and (when
+ * HIVE_MAIL_ENABLED) the JMAP mail accounts hive-mail keeps in sync. */
 export const Settings: Component = () => {
   const actor = getActor();
+  const isAdmin = getCurrentUser()?.role === "admin";
   const [sources, { refetch }] = createResource(() => ({ _r: liveRev() }), () => api.sources(actor));
   const [status, { refetch: refetchStatus }] = createResource(() => ({ _r: liveRev() }), () => api.worker());
   const [outbox] = createResource(() => ({ _r: liveRev() }), () => api.outbox());
   const [creds, { refetch: refetchCreds }] = createResource(() => ({ _r: liveRev() }), () => api.ccCredentials());
+
+  const [authCfg] = createResource(() => api.authConfig());
+  const [mailAccounts, { refetch: refetchMail }] = createResource(
+    () => ({ _r: liveRev(), on: authCfg()?.mailEnabled === true }),
+    (k) => (k.on ? api.mailAccountsManage() : Promise.resolve([])),
+  );
+  const [mailForm, setMailForm] = createSignal({ address: "", jmap_url: "", username: "", secret: "" });
+  const [mailError, setMailError] = createSignal<string | null>(null);
+  const connectMail = async (e: Event) => {
+    e.preventDefault();
+    const f = mailForm();
+    if (!f.address.trim() || !f.jmap_url.trim() || !f.secret) return;
+    setMailError(null);
+    try {
+      await api.mailAccountConnect({
+        address: f.address.trim(),
+        jmap_url: f.jmap_url.trim(),
+        username: f.username.trim() || undefined,
+        secret: f.secret,
+      });
+      setMailForm({ address: "", jmap_url: "", username: "", secret: "" });
+      refetchMail();
+    } catch (err) {
+      setMailError(err instanceof Error ? err.message : String(err));
+    }
+  };
 
   const [credForm, setCredForm] = createSignal({ kind: "codex_oauth", label: "", secret: "" });
   const [credPanelOpen, setCredPanelOpen] = createSignal(false);
@@ -234,6 +262,122 @@ export const Settings: Component = () => {
           </div>
         )}
       </For>
+
+      <Show when={authCfg()?.mailEnabled}>
+        <h3 class="sec">Mail accounts</h3>
+        <p class="dim sm">
+          JMAP accounts hive-mail keeps in sync. Connecting is admin-only; per-mailbox ingest
+          checkboxes are the spam gate — only opted-in mailboxes are indexed.
+        </p>
+
+        <Show when={isAdmin}>
+          <form class="source-form" onSubmit={connectMail}>
+            <input
+              placeholder="address (you@example.com)"
+              value={mailForm().address}
+              onInput={(e) => setMailForm({ ...mailForm(), address: e.currentTarget.value })}
+            />
+            <input
+              class="grow"
+              placeholder="JMAP URL"
+              value={mailForm().jmap_url}
+              onInput={(e) => setMailForm({ ...mailForm(), jmap_url: e.currentTarget.value })}
+            />
+            <input
+              placeholder="login (if not the address)"
+              value={mailForm().username}
+              onInput={(e) => setMailForm({ ...mailForm(), username: e.currentTarget.value })}
+            />
+            <input
+              type="password"
+              placeholder="app password"
+              value={mailForm().secret}
+              onInput={(e) => setMailForm({ ...mailForm(), secret: e.currentTarget.value })}
+            />
+            <button class="primary" type="submit">connect</button>
+          </form>
+          <Show when={mailError()}>
+            <p class="dim sm mail-connect-error">{mailError()}</p>
+          </Show>
+        </Show>
+
+        <For
+          each={mailAccounts()}
+          fallback={
+            <EmptyState
+              icon="mail"
+              title="No mail accounts connected."
+              hint="Connect a JMAP account and opt mailboxes into ingest to build the archive."
+            />
+          }
+        >
+          {(a) => (
+            <div class="mail-account-row">
+              <div class="wire-row">
+                <span class="badge" classList={{ warn: !a.enabled }}>
+                  {a.enabled ? a.backfill_status : "disabled"}
+                </span>
+                <strong>{a.address}</strong>
+                <span class="dim sm">{a.owner}</span>
+                <span class="dim sm">
+                  {a.last_synced_at ? `synced ${relTime(a.last_synced_at)}` : "never synced"}
+                </span>
+                <button class="x" title={a.enabled ? "pause sync" : "resume sync"}
+                  onClick={() => api.mailAccountSetEnabled(a.id, !a.enabled).then(refetchMail)}>
+                  {a.enabled ? "⏸" : "▶"}
+                </button>
+                <Show when={isAdmin}>
+                  <button class="x" title="force full resync"
+                    onClick={() => api.mailAccountResync(a.id).then(refetchMail)}>⟳</button>
+                </Show>
+                <button class="x" title="disconnect and delete the archive"
+                  onClick={() => {
+                    if (confirm(`Disconnect ${a.address}? Its archived mail, search rows, and stored attachments are deleted.`))
+                      api.mailAccountDelete(a.id).then(refetchMail);
+                  }}>✕</button>
+              </div>
+              <Show when={a.last_error}>
+                <p class="dim sm mail-connect-error">{a.last_error}</p>
+              </Show>
+              <MailboxList accountId={a.id} />
+            </div>
+          )}
+        </For>
+      </Show>
     </section>
+  );
+};
+
+/** Per-mailbox ingest toggles for one account (the spam gate). Loaded lazily
+ *  per account; empty until hive-mail's first mailbox sync lands. */
+const MailboxList: Component<{ accountId: string }> = (props) => {
+  const [boxes, { refetch }] = createResource(
+    () => props.accountId,
+    (id) => api.mailMailboxes(id),
+  );
+  const toggle = async (id: string, ingest: boolean) => {
+    await api.mailMailboxSetIngest(id, ingest);
+    refetch();
+  };
+  return (
+    <Show when={(boxes() ?? []).length > 0}>
+      <div class="mailbox-list">
+        <For each={boxes()}>
+          {(b) => (
+            <label class="mailbox-toggle dim sm">
+              <input
+                type="checkbox"
+                checked={b.ingest}
+                onChange={(e) => toggle(b.id, e.currentTarget.checked)}
+              />
+              {b.name}
+              <Show when={b.role}>
+                <span class="badge">{b.role}</span>
+              </Show>
+            </label>
+          )}
+        </For>
+      </div>
+    </Show>
   );
 };

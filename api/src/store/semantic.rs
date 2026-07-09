@@ -159,14 +159,21 @@ struct VisibilityIndex {
     /// `slug:id` keys of custom entity rows this viewer may see (scope lives
     /// on the row itself, not an origin entry).
     custom_visible: HashSet<String>,
+    /// Mail ids owned by this viewer. Mail scopes by `user_scope` alone —
+    /// owner-only, no share or mention piercing (DIRECTION.md D9).
+    mail_visible: HashSet<String>,
 }
 
 impl VisibilityIndex {
     /// journal ids check the ACL set directly; task/decision/event go through
-    /// their origin entry; anything else is invisible (fail closed).
+    /// their origin entry; mail through its owner set; anything else is
+    /// invisible (fail closed).
     fn allows(&self, kind: &str, id: &str) -> bool {
         if kind == "journal" {
             return self.visible_entries.contains(id);
+        }
+        if kind == "mail" {
+            return self.mail_visible.contains(id);
         }
         match self.origin_of.get(&ref_key(kind, id)) {
             Some(Some(origin)) => self.visible_entries.contains(origin),
@@ -233,10 +240,27 @@ impl Store {
                 ));
             }
         }
+        // Mail scoping is a plain owner check. This full set stays small
+        // until mail vectors exist (the D8 embed gate); the 1.5 retrieval
+        // work moves the filter into the candidate SQL (embeddings.owner)
+        // and this load becomes a safety net rather than the boundary.
+        let mut mail_visible: HashSet<String> = HashSet::new();
+        if kinds.is_none_or(|ks| ks.contains(&EntityKind::Mail)) {
+            let rows = crate::pgq::query(
+                "SELECT id FROM mail_messages WHERE user_scope = ? AND deleted_at IS NULL",
+            )
+            .bind(viewer)
+            .fetch_all(self.db())
+            .await?;
+            for r in &rows {
+                mail_visible.insert(r.try_get::<String, _>("id")?);
+            }
+        }
         Ok(VisibilityIndex {
             visible_entries,
             origin_of,
             custom_visible,
+            mail_visible,
         })
     }
 
@@ -275,12 +299,36 @@ impl Store {
                 );
             }
         }
-        // Hits whose kind is neither journal nor an anchored built-in may be
-        // custom entities — resolve their visibility in one batched query.
+        // Mail hits scope by owner, batched over the bounded candidate list —
+        // never a full mail_messages load (200k rows post-backfill).
+        let mut mail_visible: HashSet<String> = HashSet::new();
+        let mail_ids: Vec<&str> = hits
+            .iter()
+            .filter(|h| h.kind == "mail")
+            .map(|h| h.id.as_str())
+            .collect();
+        if !mail_ids.is_empty() {
+            let sql = format!(
+                "SELECT id FROM mail_messages WHERE id IN ({}) \
+                 AND user_scope = ? AND deleted_at IS NULL",
+                placeholders_or_never(mail_ids.len())
+            );
+            let mut q = crate::pgq::query(&sql);
+            for id in &mail_ids {
+                q = q.bind(*id);
+            }
+            q = q.bind(viewer);
+            for r in &q.fetch_all(self.db()).await? {
+                mail_visible.insert(r.try_get::<String, _>("id")?);
+            }
+        }
+        // Hits whose kind is neither journal, mail, nor an anchored built-in
+        // may be custom entities — resolve their visibility in one batched
+        // query.
         let mut custom_visible: HashSet<String> = HashSet::new();
         let custom_ids: Vec<&str> = hits
             .iter()
-            .filter(|h| h.kind != "journal" && origin_table(&h.kind).is_none())
+            .filter(|h| h.kind != "journal" && h.kind != "mail" && origin_table(&h.kind).is_none())
             .map(|h| h.id.as_str())
             .collect();
         if !custom_ids.is_empty() {
@@ -305,6 +353,7 @@ impl Store {
             visible_entries,
             origin_of,
             custom_visible,
+            mail_visible,
         };
         Ok(hits
             .into_iter()

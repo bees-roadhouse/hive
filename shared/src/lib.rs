@@ -264,6 +264,10 @@ pub struct AuthConfig {
     pub oauth_never_expires: bool,
     #[serde(rename = "instanceName")]
     pub instance_name: Option<String>,
+    /// HIVE_MAIL_ENABLED: gates the Mail tab, the Settings mail-accounts
+    /// section, and every /api/mail route (404 when off).
+    #[serde(rename = "mailEnabled", default)]
+    pub mail_enabled: bool,
 }
 
 // ---- bulk historical import ----

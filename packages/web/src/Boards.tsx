@@ -434,7 +434,9 @@ const SearchResults: Component<{ query: string; mode: "keyword" | "semantic" }> 
         <div class="hit">
           <ResultKindChip hit={h} />
           <Show when={h.kind === "mail"} fallback={<strong>{h.title}</strong>}>
-            <A class="hit-title" href={`/mail?thread=${encodeURIComponent(h.id)}`}><strong>{h.title}</strong></A>
+            {/* FTS mail hits carry MESSAGE ids (search.ref_id), not thread
+                ids — Mail.tsx resolves ?message= to its thread. */}
+            <A class="hit-title" href={`/mail?message=${encodeURIComponent(h.id)}`}><strong>{h.title}</strong></A>
           </Show>
           <Show when={h.snippet} fallback={<span class="snippet">score {h.score}</span>}>
             {/* escape-then-mark: body text is untrusted, only our <mark>s render */}
