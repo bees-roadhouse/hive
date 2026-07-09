@@ -867,6 +867,24 @@ fn build_tools() -> Value {
             "execution": {"taskSupport": FORBIDDEN}
         }
     ));
+    tools.push(json!(
+        {
+            "name":"artifacts_list",
+            "description": "List your Claude Code artifacts (skills, agents, slash-commands) — scoped to the authenticated identity",
+            "inputSchema": {"type": "object", "properties": {}}
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"artifacts_get",
+            "description": "Get one Claude Code artifact by id",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"]
+            }
+        }
+    ));
     Value::Array(tools)
 }
 
@@ -1895,6 +1913,30 @@ async fn dispatch(
             {
                 Some(()) => Ok(ok_content(&json!({"deleted": true}))),
                 None => Ok(ok_content(&json!({"error": "not found"}))),
+            }
+        }
+        // Claude Code artifacts for the authenticated identity (its own skills /
+        // agents / commands) — same keying as the REST sync endpoint.
+        "artifacts_list" => {
+            let a = Args::new("artifacts_list", args);
+            a.finish()?;
+            let items = store.artifacts_list(actor).await?;
+            Ok(ok_content(
+                &json!({"count": items.len(), "artifacts": items}),
+            ))
+        }
+        "artifacts_get" => {
+            let mut a = Args::new("artifacts_get", args);
+            let id = a.req_str("id");
+            a.finish()?;
+            // Identity gate on the row's actor; a foreign id answers exactly
+            // like a missing one so the tool doesn't oracle other identities'
+            // artifact ids (same posture as inbox_mark_read).
+            match store.artifacts_get(id.unwrap()).await? {
+                Some(art) if can_act_for_identity(store, ctx, &art.actor).await? => {
+                    Ok(ok_content(&art))
+                }
+                _ => Ok(ok_content(&json!({"error": "not found"}))),
             }
         }
         _ => Ok(tool_error(&format!(
