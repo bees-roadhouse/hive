@@ -73,6 +73,8 @@ jmap-client = { version = "=0.4.2", default-features = false, features = ["async
 html2text = "0.17"
 async-trait = "0.1"
 futures-util = "0.3"
+# Attachment content addressing (hive-mail hashes bytes before storing blobs).
+blake3 = "1"
 
 # --- Shared workspace crates ---
 hive-shared = { path = "shared" }

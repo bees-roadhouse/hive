@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
-use hive_api::store::mail::MailIngestMessage;
+use hive_api::store::mail::{MailIngestAttachment, MailIngestMessage};
 use hive_api::store::Store;
 use hive_shared::InboxReason;
 use jmap_sync::{
@@ -83,6 +83,18 @@ pub(crate) struct StoreSink {
 }
 
 fn to_ingest(m: NormalizedMessage) -> MailIngestMessage {
+    let attachments: Vec<MailIngestAttachment> = m
+        .attachments
+        .into_iter()
+        .map(|a| MailIngestAttachment {
+            jmap_blob_id: a.jmap_blob_id,
+            filename: a.filename,
+            mime: a.mime,
+            size: a.size as i64,
+            content_id: a.content_id,
+            disposition: a.disposition,
+        })
+        .collect();
     MailIngestMessage {
         references_json: serde_json::to_string(&m.references).unwrap_or_else(|_| "[]".into()),
         to_json: serde_json::to_string(&m.to).unwrap_or_else(|_| "[]".into()),
@@ -105,7 +117,8 @@ fn to_ingest(m: NormalizedMessage) -> MailIngestMessage {
         body_source: m.body_source.as_str().to_string(),
         snippet: m.snippet,
         size: m.size as i64,
-        has_attachments: !m.attachments.is_empty(),
+        has_attachments: !attachments.is_empty(),
+        attachments,
         parse_error: m.parse_error,
     }
 }
