@@ -234,6 +234,37 @@ export interface AuthConfig {
   localAuth: boolean;
   oauthNeverExpires: boolean;
   instanceName: string | null;
+  /** HIVE_MAIL_ENABLED: gates the Mail tab, the Settings mail-accounts
+   *  section, and every /api/mail route (404 when off). */
+  mailEnabled: boolean;
+}
+
+/** Management view of a connected mail account (Settings): sync state and
+ *  error surface, never credentials. */
+export interface MailAccountAdminView {
+  id: string;
+  owner: string;
+  address: string;
+  jmap_url: string;
+  jmap_username: string | null;
+  jmap_account_id: string;
+  backfill_status: string;
+  enabled: boolean;
+  attempts: number;
+  last_error: string | null;
+  last_synced_at: string | null;
+  last_status: string | null;
+  created_at: string;
+}
+
+/** One JMAP mailbox with its per-mailbox ingest opt-in (the spam gate). */
+export interface MailMailboxView {
+  id: string;
+  jmap_id: string;
+  name: string;
+  role: string | null;
+  sort_order: number;
+  ingest: boolean;
 }
 
 /** Bulk historical import (legacy hive.db → this instance). Rows carry their original

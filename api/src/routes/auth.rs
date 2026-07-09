@@ -152,6 +152,7 @@ async fn auth_config(State(s): State<Store>) -> ApiResult {
         local_auth: local_auth_enabled(),
         oauth_never_expires: oauth_never_expires_enabled(),
         instance_name: s.config_get("instance.name").await?,
+        mail_enabled: super::mail::mail_enabled(),
     })
     .into_response())
 }

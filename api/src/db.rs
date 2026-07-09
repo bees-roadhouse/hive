@@ -477,9 +477,10 @@ const SCHEMA_SEARCH: &str = r#"
     -- psql @> queries and server-side filtering later without a migration.
     CREATE INDEX IF NOT EXISTS entities_fields_gin ON entities USING GIN (fields jsonb_path_ops);
 
-    -- Phase 1 mail archive skeleton. Sync credentials/state intentionally live
-    -- elsewhere; these tables only hold read-only rows already ingested by a
-    -- future hive-mail process. user_scope follows journal visibility.
+    -- Phase 1 mail archive. hive-mail writes these; sync state (JMAP state
+    -- strings, backfill cursor, backoff bookkeeping) lives on mail_accounts,
+    -- and the account credential is a cc_credentials row named by cred_id.
+    -- user_scope is NEVER NULL for mail (there is no global mail).
     CREATE TABLE IF NOT EXISTS blobs (
       hash       TEXT PRIMARY KEY,
       size       BIGINT NOT NULL DEFAULT 0,
@@ -493,6 +494,7 @@ const SCHEMA_SEARCH: &str = r#"
       owner           TEXT NOT NULL,
       address         TEXT NOT NULL,
       jmap_url        TEXT NOT NULL DEFAULT '',
+      jmap_username   TEXT,
       jmap_account_id TEXT NOT NULL DEFAULT '',
       cred_id         TEXT,
       email_state     TEXT,
@@ -557,6 +559,11 @@ const SCHEMA_SEARCH: &str = r#"
     CREATE INDEX IF NOT EXISTS mail_messages_account_thread ON mail_messages (account_id, jmap_thread_id);
     CREATE INDEX IF NOT EXISTS mail_messages_message_id ON mail_messages (message_id_hdr);
     CREATE INDEX IF NOT EXISTS mail_messages_subject ON mail_messages (subject);
+    -- The embed-queue scan (drained by the worker once the 1.5 retrieval work
+    -- lands): pending, live rows per account, newest first.
+    CREATE INDEX IF NOT EXISTS mail_messages_embed_pending
+      ON mail_messages (account_id, received_at DESC)
+      WHERE embed_state = 'pending' AND deleted_at IS NULL;
 
     CREATE TABLE IF NOT EXISTS mail_attachments (
       id             TEXT PRIMARY KEY,
@@ -573,6 +580,8 @@ const SCHEMA_SEARCH: &str = r#"
       UNIQUE NULLS NOT DISTINCT (message_id, jmap_blob_id, content_id)
     );
     CREATE INDEX IF NOT EXISTS mail_attachments_message ON mail_attachments (message_id);
+    -- Reverse lookup for the blob refcount GC sweep and cascade orphan cleanup.
+    CREATE INDEX IF NOT EXISTS mail_attachments_blob ON mail_attachments (blob_hash);
 "#;
 
 pub async fn migrate(pool: &PgPool) -> Result<()> {
@@ -620,6 +629,10 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         "ALTER TABLE cc_credentials ADD COLUMN IF NOT EXISTS provider TEXT",
         "CREATE TABLE IF NOT EXISTS runtime_oauth_states (state TEXT PRIMARY KEY, owner TEXT NOT NULL, runtime TEXT NOT NULL, provider TEXT, code_verifier TEXT NOT NULL, return_to TEXT NOT NULL DEFAULT '/settings', created_at TEXT NOT NULL)",
         "CREATE INDEX IF NOT EXISTS runtime_oauth_states_owner ON runtime_oauth_states (owner)",
+        "ALTER TABLE mail_accounts ADD COLUMN IF NOT EXISTS jmap_username TEXT",
+        // Attachment bytes arrive pre-compressed (images, PDFs, zips):
+        // skipping TOAST compression on the BYTEA saves CPU on both sides.
+        "ALTER TABLE blobs ALTER COLUMN data SET STORAGE EXTERNAL",
     ] {
         sqlx::raw_sql(ddl).execute(pool).await?;
     }
