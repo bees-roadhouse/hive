@@ -169,9 +169,14 @@ setup is safe.
 
 ## Branching
 
-[BR canon](https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy):
+Adapted from [BR canon](https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy)
+to a single-branch model (the `development`/`release` pair collapsed into
+`main` on 2026-07-05):
 
-- `development` … default branch.
-- `release` … stable/production branch.
-- `feature/{slug}`, `bug/{slug}`, `improvement/{slug}`, `refactor/{slug}` from
-  development. No `main` / `master`.
+- `main` … the only long-lived branch; always releasable.
+- `feature/{slug}`, `bug/{slug}`, `improvement/{slug}`, `refactor/{slug}`
+  branch from main and merge back via PR. Every PR publishes immutable
+  `sha-{sha}` images; merging retags them `dev` (never rebuilds).
+- Releases are tag-driven: bump versions in a release PR, merge it, then
+  `git tag v{version} && git push origin v{version}` — the workflow retags
+  that merge's images as `{version}` + `latest` and cuts the GitHub Release.

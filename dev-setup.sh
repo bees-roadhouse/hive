@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Idempotent setup for the Node/Solid hive. Run by the SessionStart hook so a
-# fresh Claude Code web container comes up ready to `pnpm dev`. Safe to re-run.
+# Idempotent setup for the hive dev environment (Rust API + Postgres + Solid
+# web). Run by the SessionStart hook so a fresh Claude Code container comes up
+# ready to develop. Safe to re-run.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -11,14 +12,28 @@ corepack enable >/dev/null 2>&1 || true
 # can flag very-recently-published transitives; we don't gate on release age.
 CI=true pnpm install --no-frozen-lockfile --config.minimumReleaseAge=0
 
-# Seed the SQLite db once, so a fresh checkout has something to show.
-if [ ! -f data/hive.db ]; then
-  echo "🌱 seeding fresh database…"
-  pnpm --filter @hive/api seed
+# The store layer is Postgres (the Rust rewrite retired SQLite). Bring up a
+# local dev container when a container runtime is available; otherwise the
+# printed commands rely on whatever DATABASE_URL the environment provides.
+DB_URL="${DATABASE_URL:-postgres://hive:hive@localhost:5432/hive}"
+RUNTIME="$(command -v podman || command -v docker || true)"
+if [ -n "$RUNTIME" ]; then
+  if "$RUNTIME" ps --format '{{.Names}}' 2>/dev/null | grep -qx hive-pg; then
+    echo "✓ hive-pg already running"
+  elif "$RUNTIME" ps -a --format '{{.Names}}' 2>/dev/null | grep -qx hive-pg; then
+    echo "🐘 starting existing hive-pg container…"
+    "$RUNTIME" start hive-pg >/dev/null
+  else
+    echo "🐘 creating hive-pg (postgres 17 on :5432)…"
+    "$RUNTIME" run -d --name hive-pg \
+      -e POSTGRES_USER=hive -e POSTGRES_PASSWORD=hive -e POSTGRES_DB=hive \
+      -p 5432:5432 mirror.gcr.io/library/postgres:17 >/dev/null
+  fi
 else
-  echo "✓ database already present (data/hive.db)"
+  echo "⚠ no container runtime found — set DATABASE_URL to a Postgres 17 instance"
 fi
 
 echo "✅ ready."
-echo "   API + web:  pnpm dev        (api :8787 + web :5173, MCP at /mcp)"
-echo "   worker:     pnpm --filter @hive/worker start   (or: once)"
+echo "   API:    DATABASE_URL=$DB_URL HIVE_EMBED=hash cargo run -p hive-api    (:7878, MCP at /mcp)"
+echo "   web:    pnpm dev:web                                                  (:5173, proxies the API)"
+echo "   worker: cargo run -p hive-worker    (or: worker:once)"
