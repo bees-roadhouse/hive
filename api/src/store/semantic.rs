@@ -42,7 +42,9 @@ pub struct SemanticOptions {
 
 /// Everything worth embedding (store.ts `embeddableItems`). `text` is the
 /// clean body (rerank + display); `embed_text` carries the `[kind] title`
-/// context prefix; `hash` stamps re-embeds.
+/// context prefix; `hash` stamps re-embeds; `owner` is the namespace user the
+/// embedding rows get stamped with (NULL = global) — journal entries carry
+/// their own user_scope, task/decision/event inherit their origin entry's.
 pub struct EmbeddableItem {
     pub kind: String,
     pub id: String,
@@ -50,6 +52,7 @@ pub struct EmbeddableItem {
     pub text: String,
     pub embed_text: String,
     pub hash: String,
+    pub owner: Option<String>,
 }
 
 /// JS `String.prototype.slice(0, n)` — UTF-16 code units, not chars.
@@ -418,21 +421,23 @@ impl Store {
     /// worker's backfill iterates this exactly like Node's worker does.
     pub async fn embeddable_items(&self) -> Result<Vec<EmbeddableItem>> {
         let mut out: Vec<EmbeddableItem> = Vec::new();
-        let mut push = |kind: &str, id: String, title: String, text: String| {
-            let embed_text = format!("[{kind}] {title}\n\n{text}");
-            let hash = hive_embed::content_hash(&embed_text);
-            out.push(EmbeddableItem {
-                kind: kind.to_string(),
-                id,
-                title,
-                text,
-                embed_text,
-                hash,
-            });
-        };
+        let mut push =
+            |kind: &str, id: String, title: String, text: String, owner: Option<String>| {
+                let embed_text = format!("[{kind}] {title}\n\n{text}");
+                let hash = hive_embed::content_hash(&embed_text);
+                out.push(EmbeddableItem {
+                    kind: kind.to_string(),
+                    id,
+                    title,
+                    text,
+                    embed_text,
+                    hash,
+                    owner,
+                });
+            };
 
         let journal = crate::pgq::query(
-            "SELECT id, author, body FROM journal ORDER BY created_at DESC LIMIT 1000",
+            "SELECT id, author, body, user_scope FROM journal ORDER BY created_at DESC LIMIT 1000",
         )
         .fetch_all(self.db())
         .await?;
@@ -440,16 +445,23 @@ impl Store {
             let id: String = r.try_get("id")?;
             let author: String = r.try_get("author")?;
             let body: String = r.try_get("body")?;
+            let owner: Option<String> = r.try_get("user_scope")?;
             push(
                 "journal",
                 id,
                 format!("{author}: {}", js_slice(&body, 40)),
                 body,
+                owner,
             );
         }
 
+        // Anchored entities inherit their origin entry's scope — resolved in
+        // the same query (one LEFT JOIN per table, no per-item lookups).
+        // Rows without an origin entry (or with a global one) stay global.
         let tasks = crate::pgq::query(
-            "SELECT id, title, body FROM tasks ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC",
+            "SELECT t.id, t.title, t.body, j.user_scope AS owner FROM tasks t \
+             LEFT JOIN journal j ON j.id = t.origin_entry_id \
+             ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, t.created_at DESC",
         )
         .fetch_all(self.db())
         .await?;
@@ -457,12 +469,15 @@ impl Store {
             let id: String = r.try_get("id")?;
             let title: String = r.try_get("title")?;
             let body: String = r.try_get("body")?;
+            let owner: Option<String> = r.try_get("owner")?;
             let text = format!("{title} {body}");
-            push("task", id, title, text);
+            push("task", id, title, text, owner);
         }
 
         let decisions = crate::pgq::query(
-            "SELECT id, title, context, decision, consequences FROM decisions ORDER BY created_at DESC",
+            "SELECT d.id, d.title, d.context, d.decision, d.consequences, j.user_scope AS owner \
+             FROM decisions d LEFT JOIN journal j ON j.id = d.origin_entry_id \
+             ORDER BY d.created_at DESC",
         )
         .fetch_all(self.db())
         .await?;
@@ -472,12 +487,15 @@ impl Store {
             let context: String = r.try_get("context")?;
             let decision: String = r.try_get("decision")?;
             let consequences: String = r.try_get("consequences")?;
+            let owner: Option<String> = r.try_get("owner")?;
             let text = format!("{title} {context} {decision} {consequences}");
-            push("decision", id, title, text);
+            push("decision", id, title, text, owner);
         }
 
         let events = crate::pgq::query(
-            "SELECT id, title, body FROM events ORDER BY COALESCE(at, created_at) DESC",
+            "SELECT e.id, e.title, e.body, j.user_scope AS owner FROM events e \
+             LEFT JOIN journal j ON j.id = e.origin_entry_id \
+             ORDER BY COALESCE(e.at, e.created_at) DESC",
         )
         .fetch_all(self.db())
         .await?;
@@ -485,8 +503,9 @@ impl Store {
             let id: String = r.try_get("id")?;
             let title: String = r.try_get("title")?;
             let body: String = r.try_get("body")?;
+            let owner: Option<String> = r.try_get("owner")?;
             let text = format!("{title} {body}");
-            push("event", id, title, text);
+            push("event", id, title, text, owner);
         }
 
         Ok(out)
@@ -683,8 +702,13 @@ impl Store {
             Some(ks) => format!(" AND ref_kind IN ({})", placeholders_or_never(ks.len())),
             None => String::new(),
         };
+        // vec IS NOT NULL: the column is nullable since the 0002 reshape
+        // (dual-write keeps it populated everywhere today, but this read
+        // decodes it as NOT NULL — don't let a vec_v-only row error the whole
+        // search). The ANN rewrite (plan B5) replaces this scan.
         let sql = format!(
-            "SELECT ref_kind, ref_id, vec FROM embeddings WHERE model = ? AND dim = ?{kind_clause}"
+            "SELECT ref_kind, ref_id, vec FROM embeddings \
+             WHERE model = ? AND dim = ? AND vec IS NOT NULL{kind_clause}"
         );
         let mut q_db = crate::pgq::query(&sql)
             .bind(hive_embed::embed_model())
@@ -705,6 +729,15 @@ impl Store {
             })
             .collect::<Result<_>>()?;
         scored_all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Chunked rows share one `kind:id` key — collapse to the item's
+        // best-scoring chunk (first after the sort) so pool slots, the
+        // fallback, and the final hit list stay one-entry-per-item. The real
+        // ANN-side collapse lands with the query rewrite (plan B5); this keeps
+        // the brute-force path correct meanwhile.
+        {
+            let mut seen: HashSet<String> = HashSet::new();
+            scored_all.retain(|(k, _)| seen.insert(k.clone()));
+        }
         // Admission applies before ANY cut — the threshold filter, the stage
         // pools, and the fallback refill all see an already-admitted list.
         scored_all.retain(|(k, _)| {

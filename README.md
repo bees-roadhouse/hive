@@ -92,7 +92,7 @@ rows whose stored model no longer matches, so the worker recomputes on the next 
 pnpm install
 podman run --rm -d --name hive-dev-pg \
   -e POSTGRES_USER=hive -e POSTGRES_PASSWORD=hive -e POSTGRES_DB=hive \
-  -p 5432:5432 postgres:17
+  -p 5432:5432 docker.io/pgvector/pgvector:pg17
 
 $env:DATABASE_URL="postgres://hive:hive@localhost:5432/hive"
 $env:CARGO_TARGET_DIR="$env:USERPROFILE\.cargo-target\hive"
@@ -203,6 +203,7 @@ setup is safe.
 | `HIVE_EMBED`   | `transformers`          | api, worker — set `hash` to skip the model download (CI/offline) |
 | `HIVE_EMBED_MODEL` | `Xenova/bge-small-en-v1.5` | api, worker (transformers mode) |
 | `HIVE_RERANK_MODEL` | `Xenova/bge-reranker-base` | api, worker (transformers mode) |
+| `HIVE_EMBED_STAGE_BUDGET_SECS` | `20` | worker — wall-clock budget per embedding backfill stage; stale items past it defer to the next cycle |
 | `HIVE_CLAUDE_CODE_OAUTH_*` / `HIVE_CODEX_OAUTH_*` | unset (501) | Rust API — runtime subscription sign-in, see [Conversations](#conversations-hosted-agent-sessions) |
 | `HIVE_CONVERSATION_RETENTION_DAYS` | unset (keep forever) | worker — hard-delete archived conversations older than N days |
 | `HIVE_SESSION_ISOLATION` | `container` | runner — `host` refuses to start without `HIVE_RUNNER_UNSAFE_HOST=1` |

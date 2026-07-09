@@ -816,10 +816,18 @@ export interface WorkerStatus {
     outbox: number;
     embedded: number;
     maintenance: string[];
+    /** Worker-side transformers→hash fallback latch at the end of that cycle. */
+    latched?: boolean;
   } | null;
   sources: { total: number; enabled: number };
   outbox: { pending: number; failed: number; done: number };
   embeddings: { count: number; model: string };
+  /**
+   * True when the transformers embedding model has latched to the hash
+   * fallback (worker's last cycle, or the api process itself): embeddings are
+   * degraded and the backfill is paused until the process restarts cleanly.
+   */
+  latched: boolean;
 }
 
 // ---- views (server resolves anchors → their entities for the client) ----
