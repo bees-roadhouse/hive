@@ -16,6 +16,9 @@ data/*.db-shm
 data/*.db-wal
 *.tsbuildinfo
 
+# Claude Desktop bundle build output (scripts/build-mcpb.sh)
+/dist/
+
 # agent worktrees (managed by the Agent tool)
 .claude/worktrees/
 
