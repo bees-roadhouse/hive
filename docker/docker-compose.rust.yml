@@ -78,6 +78,9 @@ services:
       - DATABASE_URL=postgres://hive:hive@postgres:5432/hive
       - HIVE_MODEL_CACHE=/models
       - HIVE_WORKER_TICK=30
+      # Per-account newest-N mail embed window (D8 gate) — the embed drain and
+      # the reaper must see the same value.
+      - HIVE_MAIL_EMBED_LIMIT=${HIVE_MAIL_EMBED_LIMIT:-5000}
       - RUST_LOG=hive_worker=info
     restart: unless-stopped
     networks:

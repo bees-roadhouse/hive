@@ -139,7 +139,16 @@ impl ScoreMap {
     }
 }
 
-const ORIGIN_TABLE: &[(&str, &str)] = &[
+/// Journal embedding window: only the newest N entries are embeddable
+/// (`embeddable_items` below) and the reaper (store/maintenance.rs) deletes
+/// vectors for anything beyond it. Both sides MUST share this constant — if
+/// they diverge, the backfill re-embeds rows the reaper just deleted (or the
+/// reaper leaks rows the backfill stopped refreshing), every cycle, forever.
+pub(crate) const JOURNAL_EMBED_WINDOW: i64 = 1000;
+
+/// kind → table for the anchored built-ins. Shared with the reaper so its
+/// orphan sweeps cover exactly the kinds embedded here.
+pub(crate) const ORIGIN_TABLE: &[(&str, &str)] = &[
     ("task", "tasks"),
     ("decision", "decisions"),
     ("event", "events"),
@@ -436,9 +445,13 @@ impl Store {
                 });
             };
 
+        // Window + `id` tiebreak match the reaper's journal sweep exactly
+        // (store/maintenance.rs) — a nondeterministic boundary row would
+        // churn embed/reap forever.
         let journal = crate::pgq::query(
-            "SELECT id, author, body, user_scope FROM journal ORDER BY created_at DESC LIMIT 1000",
+            "SELECT id, author, body, user_scope FROM journal ORDER BY created_at DESC, id DESC LIMIT ?",
         )
+        .bind(JOURNAL_EMBED_WINDOW)
         .fetch_all(self.db())
         .await?;
         for r in &journal {

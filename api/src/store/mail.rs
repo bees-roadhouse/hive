@@ -690,6 +690,47 @@ pub fn fts_clip(body: &str, max_bytes: usize) -> &str {
 
 const FTS_CLIP_BYTES: usize = 200_000;
 
+/// THE mail embed-eligibility predicate — the single contract between the
+/// embed drain (which embeds rows matching it) and the reaper (which deletes
+/// embedding rows NOT matching it). Both sides MUST use this exact SQL: if
+/// the two ever diverge, the drain embeds a row the reaper considers
+/// ineligible (or vice versa) and they fight forever — embed, reap, re-embed,
+/// every cycle, silently burning the whole embed budget. Never inline a
+/// variant of this predicate anywhere else.
+///
+/// A message is embed-eligible iff ALL of:
+///   1. live — `deleted_at IS NULL` (tombstones/redactions leave retrieval);
+///   2. in at least one ingest-enabled mailbox of its account — the same
+///      quoted-id `mailbox_ids_json LIKE '%"<jmap_id>"%'` containment match
+///      `mail_mailbox_set_ingest`'s OFF-path uses (jmap ids are server-issued
+///      and never substrings of each other in practice);
+///   3. not junk — `keywords_json NOT LIKE '%"$junk"%'`;
+///   4. within the newest-N window of its account (`HIVE_MAIL_EMBED_LIMIT`,
+///      default 5000 — the DIRECTION.md D8 gate), ranked by `received_at`
+///      over the *otherwise-eligible* rows only, so junk/tombstoned/
+///      non-ingest mail never consumes a window slot. Newest-N is a moving
+///      predicate: new mail arriving pushes old mail out with no event fired,
+///      which is why the reaper sweep is the ONLY aging mechanism.
+///
+/// Usage contract: the `mail_messages` row under test must be aliased `m`,
+/// and the fragment takes exactly ONE bind — the per-account window limit N
+/// (as an i64; N <= 0 means an empty window, i.e. nothing is eligible).
+pub const MAIL_EMBED_ELIGIBLE_SQL: &str = "m.deleted_at IS NULL \
+     AND m.keywords_json NOT LIKE '%\"$junk\"%' \
+     AND EXISTS (SELECT 1 FROM mail_mailboxes gate \
+         WHERE gate.account_id = m.account_id AND gate.ingest \
+         AND m.mailbox_ids_json LIKE ('%\"' || gate.jmap_id || '\"%')) \
+     AND m.id IN (SELECT win.id FROM ( \
+         SELECT i.id, ROW_NUMBER() OVER ( \
+             PARTITION BY i.account_id ORDER BY i.received_at DESC, i.id DESC) AS rn \
+         FROM mail_messages i \
+         WHERE i.deleted_at IS NULL \
+           AND i.keywords_json NOT LIKE '%\"$junk\"%' \
+           AND EXISTS (SELECT 1 FROM mail_mailboxes wgate \
+               WHERE wgate.account_id = i.account_id AND wgate.ingest \
+               AND i.mailbox_ids_json LIKE ('%\"' || wgate.jmap_id || '\"%')) \
+         ) win WHERE win.rn <= ?)";
+
 impl Store {
     /// Enabled accounts whose backoff window has elapsed.
     pub async fn mail_accounts_due(&self) -> Result<Vec<MailAccountSync>> {
