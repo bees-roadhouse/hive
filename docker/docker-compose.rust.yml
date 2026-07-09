@@ -147,6 +147,31 @@ services:
       hive-api:
         condition: service_healthy
 
+  reflector:
+    profiles: ["reflector"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.reflector
+    image: beesroadhouse/hive-reflector:latest
+    environment:
+      - HIVE_API_URL=http://hive-api:7878
+      # The AI identity's hive PAT — NOT an admin service token: the token's
+      # namespace is where reflection memory lands, and the reflector refuses
+      # to start if it resolves to no principal. (The runner profile reads the
+      # same variable; if you run both, give the reflector its own env file.)
+      - HIVE_API_TOKEN=${HIVE_API_TOKEN:?set the AI identity's Hive API token for the reflector}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?set an Anthropic API key for reflection (per-token billing)}
+      # off | suggest | auto — suggest (default) proposes in prose, no anchors,
+      # so nothing is auto-created while the mail corpus is new/untrusted.
+      - REFLECTION_MODE=${REFLECTION_MODE:-suggest}
+      - REFLECTION_INTERVAL_SECS=${REFLECTION_INTERVAL_SECS:-300}
+    restart: unless-stopped
+    networks:
+      - hive
+    depends_on:
+      hive-api:
+        condition: service_healthy
+
 volumes:
   hive-pgdata:
   hive-models:

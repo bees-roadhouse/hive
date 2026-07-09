@@ -2,9 +2,9 @@ name: Build and Release
 
 # PR-driven image builds with retag-on-merge, per the BR DevOps standard
 # (Docker Image Build Workflows), adapted to the single-main branch model.
-# Images — hive-rust (all-in-one API+SPA+worker), hive-runner, and
-# hive-session-dev — build on PR with the immutable sha-{head-sha} tag and are
-# retagged (never rebuilt) on merge to `dev` plus a sha-{merge-sha} alias.
+# Images — hive-rust (all-in-one API+SPA+worker), hive-runner, hive-reflector,
+# and hive-session-dev — build on PR with the immutable sha-{head-sha} tag and
+# are retagged (never rebuilt) on merge to `dev` plus a sha-{merge-sha} alias.
 # Releases are tag-driven: pushing v{version} retags the merge commit's images
 # as `{version}` + `latest` and cuts the GitHub Release.
 
@@ -20,7 +20,7 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  # ===== build: hive-runner (PR open/synchronize/reopen) =====
+  # ===== build: hive-runner + hive-reflector (PR open/synchronize/reopen) =====
   # JS isn't compiled, so multi-arch via QEMU is effectively free here.
   # (The legacy Node-stack images — api, web, worker — stopped publishing in
   # 0.6.0; the Rust image below is the deployed stack.)
@@ -33,7 +33,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        image: [runner]
+        image: [runner, reflector]
     steps:
       - uses: actions/checkout@v4
 
@@ -199,7 +199,7 @@ jobs:
       packages: write
     strategy:
       matrix:
-        image: [rust, runner, session-dev]
+        image: [rust, runner, reflector, session-dev]
     steps:
       - uses: docker/setup-buildx-action@v3
 
@@ -254,7 +254,7 @@ jobs:
 
       - name: Retag {version} + latest from the merge-sha manifests
         run: |
-          for image in rust runner session-dev; do
+          for image in rust runner reflector session-dev; do
             IMG="${{ env.REGISTRY }}/${{ github.repository_owner }}/hive-${image}"
             SRC="${IMG}:sha-${{ github.sha }}"
             if ! docker buildx imagetools inspect "$SRC" >/dev/null 2>&1; then
@@ -299,4 +299,7 @@ jobs:
             # Hosted-session runner + full dev toolbox:
             podman pull ghcr.io/${{ github.repository_owner }}/hive-runner:${{ steps.vars.outputs.version }}
             podman pull ghcr.io/${{ github.repository_owner }}/hive-session-dev:${{ steps.vars.outputs.version }}
+
+            # Reflection loop (compose `reflector` profile):
+            podman pull ghcr.io/${{ github.repository_owner }}/hive-reflector:${{ steps.vars.outputs.version }}
             ```
