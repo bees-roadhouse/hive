@@ -1304,6 +1304,106 @@ pub struct JournalEntryView {
     pub refs: Vec<JournalRef>,
 }
 
+// ---- conversation capture (SessionEnd ingest of local agent sessions) ----
+
+/// Idempotent capture upsert: one captured conversation per (runtime,
+/// external_id). `external_id` is the app's own session id (Claude Code's
+/// session UUID) — a resumed local session re-fires SessionEnd onto the same
+/// row. Owner/namespace come from the authenticated principal, never the body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewCapturedConversation {
+    /// Runtime backend the session ran on: claude_code (default) | codex | ….
+    pub runtime: Option<String>,
+    /// The app's own session id — the idempotent capture key with `runtime`.
+    pub external_id: String,
+    pub title: Option<String>,
+    pub summary: Option<String>,
+}
+
+/// One captured transcript turn. Mirrors the hosted ingest message shape
+/// (role/kind/content/raw/token fields); `kind` defaults to "text".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewConversationMessage {
+    pub role: String,
+    #[serde(default = "conversation_message_kind_default")]
+    pub kind: String,
+    #[serde(default)]
+    pub content: serde_json::Value,
+    #[serde(default)]
+    pub raw: serde_json::Value,
+    pub tokens_in: Option<i64>,
+    pub tokens_out: Option<i64>,
+}
+
+fn conversation_message_kind_default() -> String {
+    "text".to_string()
+}
+
+/// Transcript write for a captured conversation. `replace: true` swaps the
+/// whole stored transcript for `messages` (a resumed session re-fires
+/// SessionEnd with the FULL transcript — appending would duplicate every
+/// turn); false appends after the current max seq.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewConversationMessages {
+    #[serde(default)]
+    pub messages: Vec<NewConversationMessage>,
+    #[serde(default)]
+    pub replace: bool,
+}
+
+/// Mark-reflected request: stamps the reflection cursor, optionally storing
+/// the rolling summary reflection produced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationReflected {
+    pub summary: Option<String>,
+}
+
+/// A conversation (a cc_sessions row) as the conversations API serves it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Conversation {
+    pub id: String,
+    /// The human whose namespace this conversation belongs to.
+    pub owner: String,
+    pub created_by: String,
+    pub title: String,
+    /// claude_code | codex | opencode | ….
+    pub runtime: String,
+    /// 'hosted' (runner-driven workspace) | 'captured' (SessionEnd ingest).
+    pub origin: String,
+    /// Lifecycle status. Captured rows are always 'captured' — never
+    /// 'provisioning', so the runner claim loop cannot pick them up.
+    pub status: String,
+    /// The app's own session id (the capture key together with `runtime`).
+    pub claude_session_id: Option<String>,
+    /// Rolling summary maintained by reflection (or supplied at capture).
+    pub summary: String,
+    /// Reflection cursor: None = queued for reflection.
+    pub reflected_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_activity_at: Option<String>,
+}
+
+/// One transcript turn with `content` flattened to plain text (the reflector
+/// consumes content as a string).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationMessageFlat {
+    pub id: String,
+    pub seq: i64,
+    pub role: String,
+    pub kind: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+/// A conversation plus its flattened transcript (the get view).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationView {
+    #[serde(flatten)]
+    pub conversation: Conversation,
+    pub messages: Vec<ConversationMessageFlat>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskCounts {
     pub total: i64,

@@ -11,6 +11,7 @@ use tokio::sync::broadcast;
 pub mod actors;
 pub mod cc_credentials;
 pub mod config;
+pub mod conversations;
 pub mod custom_entities;
 pub mod dashboard;
 pub mod decisions;

@@ -174,6 +174,98 @@ export interface NewCcSession {
   prompt?: string;
 }
 
+// ---- conversation capture (SessionEnd ingest of local agent sessions) ----
+// Captured conversations ride the same cc_sessions/cc_messages tables as the
+// hosted workspaces, marked origin='captured'; status is always 'captured'
+// (never 'provisioning', so the runner claim loop can't pick them up).
+
+/**
+ * Idempotent capture upsert: one captured conversation per (runtime,
+ * external_id). external_id is the app's own session id — a resumed local
+ * session re-fires SessionEnd onto the same row. Owner/namespace come from
+ * the authenticated principal, never the body. POST /api/conversations → {id}.
+ */
+export interface NewCapturedConversation {
+  /** Runtime backend the session ran on: claude_code (default) | codex | …. */
+  runtime?: RuntimeKind | string;
+  /** The app's own session id — the idempotent capture key with runtime. */
+  external_id: string;
+  title?: string;
+  summary?: string;
+}
+
+/**
+ * One captured transcript turn. Mirrors the hosted ingest message shape
+ * (role/kind/content/raw/token fields); kind defaults to "text". A bare
+ * string content is stored as {text: …} to match hosted transcripts.
+ */
+export interface NewConversationMessage {
+  role: string;
+  kind?: string;
+  content?: unknown;
+  raw?: unknown;
+  tokens_in?: number | null;
+  tokens_out?: number | null;
+}
+
+/**
+ * Transcript write for a captured conversation (POST
+ * /api/conversations/{id}/messages → {appended, replaced}). replace: true
+ * swaps the whole stored transcript (a resumed session re-fires SessionEnd
+ * with the FULL transcript — appending would duplicate every turn); false
+ * appends. Any write re-queues the conversation for reflection.
+ */
+export interface NewConversationMessages {
+  messages?: NewConversationMessage[];
+  replace?: boolean;
+}
+
+/** Mark-reflected request (POST /api/conversations/{id}/reflected). */
+export interface ConversationReflected {
+  summary?: string | null;
+}
+
+/** A conversation (a cc_sessions row) as the conversations API serves it. */
+export interface Conversation {
+  id: string;
+  /** The human whose namespace this conversation belongs to. */
+  owner: string;
+  created_by: string;
+  title: string;
+  runtime: RuntimeKind | string;
+  /** 'hosted' (runner-driven workspace) | 'captured' (SessionEnd ingest). */
+  origin: string;
+  /** Lifecycle status; captured rows are always 'captured'. */
+  status: string;
+  /** The app's own session id (the capture key together with runtime). */
+  claude_session_id: string | null;
+  /** Rolling summary maintained by reflection (or supplied at capture). */
+  summary: string;
+  /** Reflection cursor: null = queued for reflection. */
+  reflected_at: string | null;
+  created_at: string;
+  updated_at: string;
+  last_activity_at: string | null;
+}
+
+/**
+ * One transcript turn with content flattened to plain text (the reflector
+ * consumes content as a string).
+ */
+export interface ConversationMessageFlat {
+  id: string;
+  seq: number;
+  role: string;
+  kind: string;
+  content: string;
+  created_at: string;
+}
+
+/** A conversation plus its flattened transcript (GET /api/conversations/{id}). */
+export interface ConversationView extends Conversation {
+  messages: ConversationMessageFlat[];
+}
+
 export interface CcCredentialView {
   id: string;
   owner: string;

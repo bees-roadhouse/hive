@@ -463,7 +463,8 @@ mod tests {
         let res = handle_request(&store, &authed(), &req("tools/list", json!({}), 1)).await;
         let tools = res["result"]["tools"].as_array().expect("tools array");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        // Node order, then the Rust-branch identity + workspace tools.
+        // Node order, then the Rust-branch identity + workspace + entity +
+        // conversation-capture tools.
         assert_eq!(
             names,
             vec![
@@ -514,6 +515,10 @@ mod tests {
                 "entity_create",
                 "entity_update",
                 "entity_delete",
+                "conversation_log",
+                "conversation_list_pending",
+                "conversation_get",
+                "conversation_mark_reflected",
             ]
         );
         // Spot-check a schema verbatim against the captured Node output.
