@@ -220,7 +220,29 @@ impl RawClient {
             .inner
             .email_changes(since_state, Some(max))
             .await
-            .map_err(map_err)?;
+            .map_err(|e| match e {
+                // Stalwart (verified against v0.15.5 in the CI e2e) rejects a
+                // state string its tokenizer can't even parse at the REQUEST
+                // layer — HTTP 400 urn:ietf:params:jmap:error:notRequest —
+                // rather than answering a method-level cannotCalculateChanges.
+                // The state string is the only caller-variable part of this
+                // request, so a parse reject means the stored state is garbage
+                // (e.g. the deliberate 'force-resync' sentinel), and the
+                // recovery is the same: full reconciliation. Without this
+                // mapping a poisoned state would loop through backoff and
+                // disable the account instead of resyncing.
+                JmapError::Problem(ref p)
+                    if matches!(
+                        p.error(),
+                        jmap_client::core::error::ProblemType::JMAP(
+                            jmap_client::core::error::JMAPError::NotRequest
+                        )
+                    ) =>
+                {
+                    SyncError::CannotCalculateChanges
+                }
+                other => map_err(other),
+            })?;
         Ok(ChangeSet {
             created: resp.take_created(),
             updated: resp.take_updated(),

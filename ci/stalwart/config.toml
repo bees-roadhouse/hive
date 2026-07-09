@@ -1,0 +1,59 @@
+# Minimal single-node Stalwart config for the CI mail e2e
+# (.github/workflows/ci.yml `mail-e2e` + mail/tests/stalwart_e2e.rs).
+#
+# Image pin lives in ci.yml: docker.io/stalwartlabs/stalwart:v0.15.5.
+# Keep that pin tracking the version deployed at mail.beesroadhouse.com —
+# the e2e exists to catch that server's behavior (state-string invalidation
+# after upgrades/compactions, /api/principal shapes), so testing a different
+# version defeats the point. NOTE: v0.15.5 is the last release that boots
+# from a declarative config file; v0.16.0+ moved all settings into a
+# database-backed registry provisioned through the /admin web API, so when
+# the production box moves past v0.15 this harness (config + provision.sh)
+# needs a rework, not just a tag bump.
+#
+# CI-only posture, deliberate: plaintext admin secret, no TLS, no SMTP —
+# the e2e speaks JMAP + the management API over HTTP :8080 and seeds mail
+# via Email/set, so mail ports would only add listeners to go wrong.
+
+# localhost, not mail.example.test: the JMAP session response advertises
+# apiUrl/downloadUrl/eventSourceUrl built from this hostname, and the test
+# process (jmap-client + the raw seeding helper) follows those URLs — they
+# must resolve from the runner. Mail accounts still live under the
+# example.test domain (provision.sh creates it).
+[server]
+hostname = "localhost"
+
+# One listener: JMAP session/API/EventSource + the /api management surface
+# share the http protocol in Stalwart.
+[server.listener.http]
+protocol = "http"
+bind = "[::]:8080"
+
+[storage]
+data = "rocksdb"
+fts = "rocksdb"
+blob = "rocksdb"
+lookup = "rocksdb"
+directory = "internal"
+
+[store.rocksdb]
+type = "rocksdb"
+path = "/opt/stalwart/data"
+compression = "lz4"
+
+[directory.internal]
+type = "internal"
+store = "rocksdb"
+
+[tracer.stdout]
+type = "stdout"
+level = "info"
+ansi = false
+enable = true
+
+# Superuser for provision.sh (creates the example.test domain + the
+# mailtest account over /api/principal). Plaintext is fine here: this
+# server lives for one CI job on a loopback port and holds fixture mail.
+[authentication.fallback-admin]
+user = "admin"
+secret = "ci-admin-pass"

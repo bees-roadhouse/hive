@@ -86,3 +86,78 @@ jobs:
         env:
           HIVE_EMBED: hash
         run: cargo test --workspace
+
+  # The DIRECTION.md mail milestone against a REAL Stalwart server: multi-page
+  # backfill → delta (create + destroy) → forced resync → backfill re-run from
+  # zero with zero duplicates (mail/tests/stalwart_e2e.rs — the same test
+  # self-skips in the plain `rust` job where HIVE_TEST_STALWART_URL is unset).
+  mail-e2e:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: hive
+          POSTGRES_PASSWORD: hive
+          POSTGRES_DB: hive
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hive -d hive"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://hive:hive@localhost:5432/hive
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev libsqlite3-dev cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: hive-rust
+
+      # Stalwart runs via `docker run` rather than a service container because
+      # services start before checkout and can't mount repo files — the whole
+      # point is booting from the checked-in ci/stalwart/config.toml. The image
+      # writes local keys back into its config, so the read-only checked-in
+      # file is staged to the path the image's entrypoint expects.
+      #
+      # PIN: keep this tag tracking the Stalwart version deployed at
+      # mail.beesroadhouse.com (the e2e exists to catch THAT server's
+      # behavior). v0.15.5 is also the last release bootable from a
+      # declarative config file — v0.16.0+ keeps settings in a DB-backed
+      # registry provisioned interactively, so moving past v0.15 means
+      # reworking ci/stalwart/, not just bumping this tag.
+      - name: Start Stalwart
+        run: |
+          docker run -d --name stalwart -p 8080:8080 \
+            -v "$PWD/ci/stalwart/config.toml:/config.toml:ro" \
+            --entrypoint sh docker.io/stalwartlabs/stalwart:v0.15.5 \
+            -c 'mkdir -p /opt/stalwart/etc && cp /config.toml /opt/stalwart/etc/config.toml \
+                && exec /usr/local/bin/stalwart --config /opt/stalwart/etc/config.toml'
+
+      - name: Provision mail domain + account
+        run: ./ci/stalwart/provision.sh
+
+      - name: Stalwart e2e
+        env:
+          HIVE_EMBED: hash
+          HIVE_CRED_KEY: ci-test-key
+          HIVE_TEST_STALWART_URL: http://localhost:8080
+          HIVE_TEST_STALWART_USER: mailtest@example.test
+          HIVE_TEST_STALWART_PASS: mailtest-pass
+        run: cargo test -p hive-mail --test stalwart_e2e -- --nocapture
+
+      - name: Stalwart logs (on failure)
+        if: failure()
+        run: docker logs stalwart
