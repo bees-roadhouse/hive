@@ -149,7 +149,15 @@ Release. The legacy Node images stopped publishing in 0.6.0.
   helpers.
 - Use sqlx with explicit queries that match the existing style.
 - Migrations in `api/src/db.rs` must be idempotent and safe for API/worker race
-  at startup.
+  at startup. Schema management is hybrid: the inline DDL constants in
+  `api/src/db.rs` are the base schema, and `api/migrations/` holds sqlx
+  migrations reserved for reshapes the inline style cannot express. `migrate()`
+  runs the sqlx migrator first, so every migration must tolerate both a fresh
+  database (inline DDL has not run yet — guard with `IF EXISTS` or
+  `information_schema` probes qualified by `table_schema = current_schema()`)
+  and an existing database on the old shape. The PR that adds a reshape
+  migration also updates the inline constants to the final shape. Never edit an
+  applied migration (sqlx checksums them); add a new file instead.
 - Preserve Node wire/API compatibility unless intentionally changing the public
   contract.
 - Add comments only for non-obvious reasons, invariants, or security-sensitive
