@@ -15,7 +15,7 @@ impl Syncer {
     /// one unit (upserts + tombstones + its new state string), so a crash
     /// mid-drain replays only the uncommitted tail.
     pub async fn run_delta(
-        &self,
+        &mut self,
         cursor_store: &dyn CursorStore,
         sink: &dyn MailSink,
     ) -> Result<DeltaOutcome, SyncError> {
@@ -98,7 +98,7 @@ impl Syncer {
     ///   get fetched and upserted. Ids in `known_jmap_ids` are never
     ///   re-fetched, which is also what keeps admin-redacted rows redacted.
     pub async fn reconcile(
-        &self,
+        &mut self,
         cursor_store: &dyn CursorStore,
         sink: &dyn MailSink,
     ) -> Result<DeltaOutcome, SyncError> {
@@ -110,7 +110,7 @@ impl Syncer {
 
         let server_all = self.collect_ids(None).await?;
         let to_fetch: Vec<String> = self
-            .collect_ids(Some(&self.cfg.ingest_mailbox_ids))
+            .collect_ids(Some(&self.cfg.ingest_mailbox_ids.clone()))
             .await?
             .into_iter()
             .filter(|id| !known.contains(id))
@@ -163,7 +163,7 @@ impl Syncer {
     }
 
     async fn collect_ids(
-        &self,
+        &mut self,
         mailbox_ids: Option<&[String]>,
     ) -> Result<HashSet<String>, SyncError> {
         let mailbox_ids = match mailbox_ids {

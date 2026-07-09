@@ -479,7 +479,7 @@ export interface EventItem {
 
 // ---- inbox (per actor, humans + AIs) ----
 
-export type InboxReason = "mention" | "assignment" | "decision" | "event";
+export type InboxReason = "mention" | "assignment" | "decision" | "event" | "mail";
 
 export interface InboxItem {
   id: string;

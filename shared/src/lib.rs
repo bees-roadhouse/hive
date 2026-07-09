@@ -705,6 +705,7 @@ pub enum InboxReason {
     Assignment,
     Decision,
     Event,
+    Mail,
 }
 
 impl InboxReason {
@@ -714,6 +715,7 @@ impl InboxReason {
             InboxReason::Assignment => "assignment",
             InboxReason::Decision => "decision",
             InboxReason::Event => "event",
+            InboxReason::Mail => "mail",
         }
     }
     pub fn from_str_lossy(s: &str) -> Self {
@@ -721,6 +723,7 @@ impl InboxReason {
             "assignment" => InboxReason::Assignment,
             "decision" => InboxReason::Decision,
             "event" => InboxReason::Event,
+            "mail" => InboxReason::Mail,
             _ => InboxReason::Mention,
         }
     }

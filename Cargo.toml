@@ -1,5 +1,5 @@
 [workspace]
-members = ["shared", "embed", "api", "worker", "jmap-sync"]
+members = ["shared", "embed", "api", "worker", "jmap-sync", "mail"]
 resolver = "2"
 
 [workspace.package]

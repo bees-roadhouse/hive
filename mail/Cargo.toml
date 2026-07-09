@@ -1,0 +1,26 @@
+[package]
+name = "hive-mail"
+description = "JMAP mail sync daemon: drives jmap-sync's backfill/delta/reconcile loops over the hive store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "hive-mail"
+path = "src/main.rs"
+
+[dependencies]
+hive-api = { path = "../api" }
+hive-shared = { workspace = true }
+jmap-sync = { path = "../jmap-sync" }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dotenvy = { workspace = true }
+async-trait = { workspace = true }
+sqlx = { workspace = true }

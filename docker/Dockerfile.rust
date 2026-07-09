@@ -41,16 +41,15 @@ COPY shared ./shared
 COPY embed ./embed
 COPY api ./api
 COPY worker ./worker
-# Workspace member: cargo refuses to load the workspace without it, even
-# though no binary from it ships yet (hive-mail arrives with the daemon PR).
 COPY jmap-sync ./jmap-sync
+COPY mail ./mail
 # Cache mounts keep the registry + incremental artifacts across builds; the
 # binaries are copied out because the target dir vanishes with the mount.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p hive-api -p hive-worker \
+    cargo build --release -p hive-api -p hive-worker -p hive-mail \
  && mkdir -p /out \
- && cp target/release/hive-api target/release/hive-worker /out/
+ && cp target/release/hive-api target/release/hive-worker target/release/hive-mail /out/
 
 # ----- runtime: slim debian, both binaries + the web dist -----
 # trixie-slim to match the build stage's glibc (the binaries link 2.38+ symbols).
