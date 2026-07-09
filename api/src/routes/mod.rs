@@ -14,6 +14,7 @@ use crate::store::Store;
 pub mod admin;
 pub mod artifacts;
 pub mod auth;
+pub mod conversations;
 pub mod custom;
 pub mod entities;
 pub mod journal;
@@ -34,6 +35,7 @@ pub fn router(store: Store) -> Router {
         .merge(auth::router())
         .merge(people::router())
         .merge(journal::router())
+        .merge(conversations::router())
         .merge(mail::router())
         .merge(entities::router())
         .merge(custom::router())

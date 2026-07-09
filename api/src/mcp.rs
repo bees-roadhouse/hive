@@ -885,6 +885,87 @@ fn build_tools() -> Value {
             }
         }
     ));
+    // ---- Rust-branch additions (conversation capture + reflection queue) ----
+    // Local agent sessions captured at SessionEnd onto cc_sessions
+    // (origin='captured'); reflection drains the reflected_at IS NULL queue.
+    let conversation_message_schema = json!({
+        "type": "object",
+        "properties": {
+            "role": {"type": "string", "description": "user | assistant | tool | system"},
+            "kind": {"type": "string", "description": "message kind (defaults to 'text')"},
+            "content": {"description": "message payload; a bare string is stored as {text}"},
+            "raw": {"description": "lossless original payload (optional)"},
+            "tokens_in": {"type": "integer"},
+            "tokens_out": {"type": "integer"}
+        },
+        "required": ["role"],
+        "additionalProperties": false
+    });
+    tools.push(json!(
+        {
+            "name": "conversation_log",
+            "title": "Capture a session transcript",
+            "description": "Capture a local agent session into hive (Rust-branch addition; not in the Node toolset). Upserts the conversation by (runtime, external_id) — idempotent re-ingest — and writes the supplied turns; pass replace:true to swap the stored transcript (a resumed session re-fires with the FULL transcript). Owner/namespace come from your token. Captured conversations queue for reflection; nothing is journaled directly.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "external_id": {"type": "string", "description": "the app's own session id (idempotent capture key)"},
+                    "runtime": {"type": "string", "description": "claude_code (default) | codex | opencode | …"},
+                    "title": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "replace": {"type": "boolean", "description": "replace the stored transcript instead of appending"},
+                    "messages": {"type": "array", "items": conversation_message_schema}
+                },
+                "required": ["external_id"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            }
+        }
+    ));
+    tools.push(json!(
+        {
+            "name": "conversation_list_pending",
+            "title": "List conversations pending reflection",
+            "description": "The reflection queue: captured conversations not yet reflected (reflected_at IS NULL), namespace-scoped, oldest first (Rust-branch addition; not in the Node toolset).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 200}},
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            }
+        }
+    ));
+    tools.push(json!(
+        {
+            "name": "conversation_get",
+            "title": "Get a conversation transcript",
+            "description": "A captured conversation plus its transcript with content flattened to plain text, namespace-checked (Rust-branch addition; not in the Node toolset).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            }
+        }
+    ));
+    tools.push(json!(
+        {
+            "name": "conversation_mark_reflected",
+            "title": "Mark a conversation reflected",
+            "description": "Stamp a captured conversation's reflection cursor and optionally store the rolling summary, draining it from the reflection queue (Rust-branch addition; not in the Node toolset).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "summary": {"type": "string", "description": "the rolling summary reflection produced"}
+                },
+                "required": ["id"],
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            }
+        }
+    ));
     Value::Array(tools)
 }
 
@@ -1939,6 +2020,51 @@ async fn dispatch(
                 _ => Ok(ok_content(&json!({"error": "not found"}))),
             }
         }
+        // ---- conversation capture + reflection queue ----
+        "conversation_log" => conversation_log(store, ctx, args).await,
+        "conversation_list_pending" => {
+            let mut a = Args::new("conversation_list_pending", args);
+            let limit = a.opt_int("limit", Some(1), Some(200));
+            a.finish()?;
+            Ok(ok_content(
+                &store
+                    .conversations_pending(&ctx.visibility(), limit.unwrap_or(50))
+                    .await?,
+            ))
+        }
+        "conversation_get" => {
+            let mut a = Args::new("conversation_get", args);
+            let id = a.req_str("id");
+            a.finish()?;
+            match store
+                .conversation_get_flat(&ctx.visibility(), id.unwrap())
+                .await?
+            {
+                Some(view) => Ok(ok_content(&view)),
+                None => Ok(ok_content(&json!({"error": "not found"}))),
+            }
+        }
+        "conversation_mark_reflected" => {
+            let mut a = Args::new("conversation_mark_reflected", args);
+            let id = a.req_str("id").map(String::from);
+            let summary = a.opt_str("summary").map(String::from);
+            a.finish()?;
+            let id = id.unwrap();
+            // Owner-or-admin, the same write gate as the REST route.
+            let Some(conv) = store.conversation_get_captured(&id).await? else {
+                return Ok(ok_content(&json!({"error": "not found"})));
+            };
+            if !ctx.is_admin() && ctx.namespace_user() != conv.owner {
+                return Ok(tool_error("forbidden"));
+            }
+            match store
+                .conversation_mark_reflected(&id, summary.as_deref())
+                .await?
+            {
+                Some(c) => Ok(ok_content(&c)),
+                None => Ok(ok_content(&json!({"error": "not found"}))),
+            }
+        }
         _ => Ok(tool_error(&format!(
             "MCP error -32602: Tool {name} not found"
         ))),
@@ -1962,6 +2088,55 @@ async fn journal_append(store: &Store, ctx: &AuthCtx, args: &Map<String, Value>)
             .journal_append(input, Some(&actor), ctx.namespace_owner())
             .await?,
     ))
+}
+
+/// conversation_log: capture upsert (by runtime/external_id) + transcript
+/// write in one call — what an agent's SessionEnd hook fires. Owner/namespace
+/// come from the token's ctx. Deliberately NO journal mirroring (reflection
+/// summarizes into the journal later).
+async fn conversation_log(store: &Store, ctx: &AuthCtx, args: &Map<String, Value>) -> ToolResult {
+    let mut a = Args::new("conversation_log", args);
+    let external_id = a.req_str("external_id").map(String::from);
+    let runtime = a.opt_str("runtime").map(String::from);
+    let title = a.opt_str("title").map(String::from);
+    let summary = a.opt_str("summary").map(String::from);
+    let replace = a.opt_bool("replace").unwrap_or(false);
+    a.finish()?;
+    // messages via serde — nested failures report the serde message inside
+    // the SDK's "Input validation error" wrapper (journal_append precedent).
+    let messages: Vec<hive_shared::NewConversationMessage> = match args.get("messages") {
+        None => Vec::new(),
+        Some(v) => serde_json::from_value(v.clone())
+            .map_err(|e| invalid_args("conversation_log", &e.to_string()))?,
+    };
+    let external_id = external_id.unwrap();
+    if external_id.trim().is_empty() {
+        return Ok(tool_error("external_id required"));
+    }
+    let owner = ctx.namespace_user().to_string();
+    let input = hive_shared::NewCapturedConversation {
+        runtime,
+        external_id,
+        title,
+        summary,
+    };
+    let Some(id) = store
+        .conversation_upsert_captured(&owner, ctx.actor(), input)
+        .await?
+    else {
+        // The capture key belongs to a different owner's session.
+        return Ok(tool_error("forbidden"));
+    };
+    // A metadata-only refresh (no turns, no replace) must not dirty the
+    // reflection queue, so skip the transcript write entirely.
+    let appended = if messages.is_empty() && !replace {
+        0
+    } else {
+        store
+            .conversation_replace_messages(&id, &messages, replace)
+            .await?
+    };
+    Ok(ok_content(&json!({"id": id, "appended": appended})))
 }
 
 /// One shared identity gate for MCP and HTTP: crate::middleware::can_act_for_identity.

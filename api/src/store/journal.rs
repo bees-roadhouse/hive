@@ -120,13 +120,44 @@ impl Store {
             .or_else(|| input.author.clone())
             .ok_or_else(|| anyhow!("author required"))?;
         let mentions = parse_mentions(&input.body);
+
+        // Mail-scope guard — the benign-exfiltration-loop fix (DIRECTION.md
+        // "Risks and tar pits"; open question 1 decided: downgrade-not-refuse).
+        // The sanctioned dreaming pattern has agents summarize what they read
+        // into journal prose, and a global (user_scope = NULL) entry is
+        // visible to everyone — so an agent journaling a mail summary would
+        // publish private correspondence globally. When a non-human author
+        // writes a GLOBAL entry that cites mail ("[mail:" token), downgrade
+        // it to the author's owner namespace and tag it 'scoped-by-policy' so
+        // the rewrite is visible, never silent. A non-human author with no
+        // owner has no scope to land in → refuse. Human-authored global mail
+        // references pass untouched; authors with no people row are treated
+        // as non-human (fail closed — only mail-citing global writes hit this).
+        let mut tags = input.tags.clone().unwrap_or_default();
+        let mut user_scope = user_scope.map(String::from);
+        if user_scope.is_none() && input.body.contains("[mail:") {
+            let person = self.people_get(&author).await?;
+            let human = person.as_ref().is_some_and(|p| p.kind == ActorKind::Human);
+            if !human {
+                match person.and_then(|p| p.owner) {
+                    Some(owner) => {
+                        if !tags.iter().any(|t| t == "scoped-by-policy") {
+                            tags.push("scoped-by-policy".to_string());
+                        }
+                        user_scope = Some(owner);
+                    }
+                    None => return Err(anyhow!("mail-derived memory needs an owner scope")),
+                }
+            }
+        }
+
         let entry = JournalEntry {
             id: new_id("jrnl"),
             author: author.clone(),
             body: input.body.clone(),
-            tags: input.tags.clone().unwrap_or_default(),
+            tags,
             mentions: mentions.clone(),
-            user_scope: user_scope.map(String::from),
+            user_scope,
             created_at: now_iso(),
         };
         // Namespace owner: the human the writing principal acts for (None = a
@@ -140,7 +171,7 @@ impl Store {
         .bind(&entry.body)
         .bind(to_json(&entry.tags))
         .bind(to_json(&entry.mentions))
-        .bind(user_scope)
+        .bind(&entry.user_scope)
         .bind(&entry.created_at)
         .execute(self.db())
         .await?;

@@ -645,6 +645,19 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS scope      TEXT",
         "ALTER TABLE oauth_auth_codes ADD COLUMN IF NOT EXISTS token_ttl_secs BIGINT",
         "ALTER TABLE cc_sessions ADD COLUMN IF NOT EXISTS runtime TEXT NOT NULL DEFAULT 'claude_code'",
+        // Conversation capture (SessionEnd ingest of local Claude Code sessions)
+        // rides the cc_sessions table: origin marks how a row got here
+        // ('hosted' = runner-driven, 'captured' = local-session ingest),
+        // summary + reflected_at are the reflection loop's rolling summary and
+        // cursor (NULL reflected_at = queued for reflection).
+        "ALTER TABLE cc_sessions ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'hosted'",
+        "ALTER TABLE cc_sessions ADD COLUMN IF NOT EXISTS summary TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE cc_sessions ADD COLUMN IF NOT EXISTS reflected_at TEXT",
+        // Idempotent capture key: a resumed local session re-fires SessionEnd
+        // with the same app session id — one captured row per (runtime,
+        // claude_session_id). Partial: hosted rows are exempt (their
+        // claude_session_id arrives late and isn't a dedup key).
+        "CREATE UNIQUE INDEX IF NOT EXISTS cc_sessions_captured_ext ON cc_sessions (runtime, claude_session_id) WHERE origin = 'captured'",
         "ALTER TABLE cc_credentials ADD COLUMN IF NOT EXISTS runtime TEXT NOT NULL DEFAULT 'claude_code'",
         "ALTER TABLE cc_credentials ADD COLUMN IF NOT EXISTS provider TEXT",
         "CREATE TABLE IF NOT EXISTS runtime_oauth_states (state TEXT PRIMARY KEY, owner TEXT NOT NULL, runtime TEXT NOT NULL, provider TEXT, code_verifier TEXT NOT NULL, return_to TEXT NOT NULL DEFAULT '/settings', created_at TEXT NOT NULL)",
