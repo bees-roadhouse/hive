@@ -9,8 +9,12 @@
 
 services:
   postgres:
-    # Mirror of Docker Hub's official image — avoids the anonymous pull rate limit.
-    image: mirror.gcr.io/library/postgres:17
+    # pgvector/pgvector:pg17 = the official postgres:17 + the vector extension
+    # .so (same PG major, same data dir — an in-place restart on hive-pgdata).
+    # Community image: NOT on the gcr mirror, so it pulls from docker.io;
+    # digest-pinned to keep the retag-not-rebuild story honest. Take a pg_dump
+    # + volume snapshot before the first swap (docker/README runbook).
+    image: docker.io/pgvector/pgvector:pg17@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0
     environment:
       - POSTGRES_USER=hive
       - POSTGRES_PASSWORD=hive
