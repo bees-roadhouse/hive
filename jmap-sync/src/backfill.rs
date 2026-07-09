@@ -16,7 +16,7 @@ impl Syncer {
     /// [`BackfillOutcome::Complete`] when the query runs dry (or nothing is
     /// opted into ingest).
     pub async fn run_backfill(
-        &self,
+        &mut self,
         cursor_store: &dyn CursorStore,
         sink: &dyn MailSink,
     ) -> Result<BackfillOutcome, SyncError> {
@@ -42,8 +42,8 @@ impl Syncer {
             cursor_store.save(&cursor).await?;
         }
 
-        let ingest = &self.cfg.ingest_mailbox_ids;
-        let page = self.query_page(&cursor, ingest).await?;
+        let ingest = self.cfg.ingest_mailbox_ids.clone();
+        let page = self.query_page(&cursor, &ingest).await?;
 
         if page.ids.is_empty() {
             let next = SyncCursor {
@@ -102,7 +102,7 @@ impl Syncer {
     /// Query the next page: anchor-resume when a cursor exists, falling back
     /// to a `before:` filter when the anchor message no longer exists.
     async fn query_page(
-        &self,
+        &mut self,
         cursor: &SyncCursor,
         ingest: &[String],
     ) -> Result<QueryPage, SyncError> {

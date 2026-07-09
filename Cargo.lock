@@ -1137,6 +1137,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "hive-mail"
+version = "0.5.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "dotenvy",
+ "hive-api",
+ "hive-shared",
+ "jmap-sync",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "hive-shared"
 version = "0.5.0"
 dependencies = [

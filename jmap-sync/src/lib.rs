@@ -283,13 +283,13 @@ impl Syncer {
     }
 
     /// All mailboxes plus the Mailbox state string they correspond to.
-    pub async fn list_mailboxes(&self) -> Result<(Vec<MailboxInfo>, String), SyncError> {
+    pub async fn list_mailboxes(&mut self) -> Result<(Vec<MailboxInfo>, String), SyncError> {
         self.raw.list_mailboxes().await
     }
 
     /// Download a blob, refusing anything over `cap` bytes (`Ok(None)`).
     pub async fn fetch_blob(
-        &self,
+        &mut self,
         blob_id: &str,
         cap: usize,
     ) -> Result<Option<Vec<u8>>, SyncError> {

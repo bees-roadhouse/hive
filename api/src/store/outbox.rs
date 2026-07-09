@@ -175,7 +175,9 @@ impl Store {
     }
 }
 
-fn backoff_secs(attempts: i64) -> i64 {
+/// Shared by the outbox drainer and the mail account scheduler (DIRECTION.md
+/// D5 reuses this exact arithmetic).
+pub(crate) fn backoff_secs(attempts: i64) -> i64 {
     let exp = 2i64
         .checked_pow(attempts.clamp(0, 30) as u32)
         .unwrap_or(i64::MAX);

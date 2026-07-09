@@ -46,6 +46,13 @@ services:
       - HIVE_WEB_DIST=/app/web
       - PORT=7878
       - RUST_LOG=hive_api=info,tower_http=info
+      # Hard-required since 0.6.0: the AES-GCM credential vault (runtime
+      # sign-ins, mail account secrets). Generate a long random string and
+      # BACK IT UP SEPARATELY from the database — losing it orphans every
+      # stored credential. An unencrypted pg_dump is now a copy of the
+      # mailbox; encrypt backups accordingly.
+      - HIVE_CRED_KEY=${HIVE_CRED_KEY:?generate a long random string; back it up separately from the DB}
+      - HIVE_MAIL_ENABLED=${HIVE_MAIL_ENABLED:-0}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:7878/api/healthz"]
       interval: 30s
@@ -72,6 +79,30 @@ services:
       - HIVE_MODEL_CACHE=/models
       - HIVE_WORKER_TICK=30
       - RUST_LOG=hive_worker=info
+    restart: unless-stopped
+    networks:
+      - hive
+    depends_on:
+      postgres:
+        condition: service_healthy
+      hive-api:
+        condition: service_healthy
+
+  hive-mail:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.rust
+    image: beesroadhouse/hive-rust:latest
+    command: ["/app/hive-mail"]
+    environment:
+      - DATABASE_URL=postgres://hive:hive@postgres:5432/hive
+      # Off by default: the daemon idles (service stays green) until the
+      # operator flips this — enabling mail is an env flip + restart.
+      - HIVE_MAIL_ENABLED=${HIVE_MAIL_ENABLED:-0}
+      - HIVE_MAIL_TICK=${HIVE_MAIL_TICK:-15}
+      - HIVE_MAIL_POLL_SECS=${HIVE_MAIL_POLL_SECS:-300}
+      - HIVE_CRED_KEY=${HIVE_CRED_KEY:?generate a long random string; back it up separately from the DB}
+      - RUST_LOG=hive_mail=info,hive_api=info
     restart: unless-stopped
     networks:
       - hive
