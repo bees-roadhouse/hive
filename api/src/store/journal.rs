@@ -495,6 +495,39 @@ impl Store {
                     )
                     .await?;
                 }
+                "mail" => {
+                    // [mail:<id>] cites an archived message: a links row only —
+                    // no entity emerges, no anchor (anchors stay journal spans;
+                    // a task cites the ENTRY, never the email), no inbox fan.
+                    // Write-time scope gate: you can only cite mail whose owner
+                    // matches the entry's effective scope (its user_scope, or
+                    // the author's namespace for global entries) — a token
+                    // naming someone else's mail simply doesn't link (D9:
+                    // owner-only, no piercing).
+                    let token = t.name.trim();
+                    let effective_scope = entry
+                        .user_scope
+                        .clone()
+                        .unwrap_or_else(|| author.to_string());
+                    let visible: Option<String> = crate::pgq::query_scalar::<String>(
+                        "SELECT id FROM mail_messages \
+                         WHERE id = ? AND user_scope = ? AND deleted_at IS NULL",
+                    )
+                    .bind(token)
+                    .bind(&effective_scope)
+                    .fetch_optional(self.db())
+                    .await?;
+                    if let Some(mail_id) = visible {
+                        self.links_create(
+                            EntityKind::Journal.as_str(),
+                            &entry.id,
+                            EntityKind::Mail.as_str(),
+                            &mail_id,
+                            "cites",
+                        )
+                        .await?;
+                    }
+                }
                 _ => {}
             }
         }
@@ -586,6 +619,30 @@ impl Store {
                         Some(r) => {
                             let name: String = r.try_get("name")?;
                             Some((r.try_get("id")?, slugify(&name), name))
+                        }
+                        None => None,
+                    }
+                }
+                // mail — id-addressed; the chip renders the subject. Live
+                // rows only (tombstoned/redacted mail resolves to nothing and
+                // the raw token stays visible — honest about a dead citation).
+                "mail" => {
+                    let row = crate::pgq::query(
+                        "SELECT id, subject FROM mail_messages WHERE id = ? AND deleted_at IS NULL",
+                    )
+                    .bind(t.name.trim())
+                    .fetch_optional(self.db())
+                    .await?;
+                    match row {
+                        Some(r) => {
+                            let id: String = r.try_get("id")?;
+                            let subject: String = r.try_get("subject")?;
+                            let name = if subject.trim().is_empty() {
+                                "(no subject)".to_string()
+                            } else {
+                                subject
+                            };
+                            Some((id.clone(), id, name))
                         }
                         None => None,
                     }
@@ -1052,9 +1109,10 @@ struct BracketToken {
     end_byte: usize,
 }
 
-const TOKEN_KINDS: &[&str] = &["person", "topic", "project", "phase", "task"];
+const TOKEN_KINDS: &[&str] = &["person", "topic", "project", "phase", "task", "mail"];
 
-/// Node TOKEN_RE: /\[(person|topic|project|phase|task):([^\]]+)\]/g
+/// Node TOKEN_RE, plus the Rust-side `mail` addition (id-addressed):
+/// /\[(person|topic|project|phase|task|mail):([^\]]+)\]/g
 fn scan_tokens(body: &str) -> Vec<BracketToken> {
     let bytes = body.as_bytes();
     let mut out = Vec::new();
