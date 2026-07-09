@@ -19,6 +19,12 @@ const oneLine = (s: string | null | undefined, max = 110): string => {
 
 const names = (xs: string[] | undefined): string => (xs && xs.length ? xs.join(", ") : "—");
 
+const fmtBytes = (n: number): string => {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+};
+
 const AccountLabel: Component<{ id: string; accounts: MailAccount[] }> = (props) => {
   const acct = () => props.accounts.find((a) => a.id === props.id);
   return <span>{acct()?.label ?? acct()?.address ?? props.id}</span>;
@@ -34,6 +40,32 @@ const MailBody: Component<{ message: MailThreadMessage }> = (props) => (
       <time class="dim sm">{shortDate(props.message.received_at)}</time>
     </header>
     <pre class="mail-plain">{props.message.body_text || "(no plaintext body)"}</pre>
+    <Show when={props.message.attachments?.length}>
+      <div class="mail-atts">
+        <For each={props.message.attachments}>
+          {(a) =>
+            a.stored ? (
+              <a
+                class="mail-label mail-att"
+                href={`/api/mail/attachments/${encodeURIComponent(a.id)}`}
+                target="_blank"
+                rel="noopener"
+                title={`${a.mime} · ${fmtBytes(a.size)}`}
+              >
+                {a.filename || "(unnamed)"} <span class="mail-att-size">{fmtBytes(a.size)}</span>
+              </a>
+            ) : (
+              <span
+                class="mail-label mail-att mail-att-missing"
+                title={`${a.mime} · ${fmtBytes(a.size)} — bytes not stored (oversize or missing on the server)`}
+              >
+                {a.filename || "(unnamed)"} <span class="mail-att-size">{fmtBytes(a.size)}</span>
+              </span>
+            )
+          }
+        </For>
+      </div>
+    </Show>
   </article>
 );
 

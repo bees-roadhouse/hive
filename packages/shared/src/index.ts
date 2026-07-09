@@ -445,6 +445,12 @@ export interface ActorDeleteResult {
   wire: number;
   sources: number;
   people: number;
+  entities: number;
+  mail_accounts: number;
+  /** Deleted via the accounts' FK cascade, counted explicitly. */
+  mail_messages: number;
+  /** Attachment blobs left orphaned by the cascade. */
+  blobs: number;
 }
 
 /** Per-table counts from folding `from` into `to` (reassignment, not deletion;
@@ -710,9 +716,20 @@ export interface MailMessageSummary {
   has_attachments?: boolean;
 }
 
+/** One attachment chip on a thread message. `stored: false` (oversize/missing/
+ *  pending bytes) renders dimmed — the serving route would answer 404. */
+export interface MailAttachmentChip {
+  id: string;
+  filename: string;
+  mime: string;
+  size: number;
+  stored: boolean;
+}
+
 /** Plaintext message body returned in a thread. HTML is intentionally absent. */
 export interface MailThreadMessage extends MailMessageSummary {
   body_text: string;
+  attachments: MailAttachmentChip[];
 }
 
 export interface MailThread {
@@ -855,6 +872,19 @@ export interface DashboardStats {
   entriesByAuthor: { author: string; count: number }[];
   /** How often each person is referenced via links (target_kind='person'), most to least. */
   calloutsByPerson: { name: string; slug: string; count: number }[];
+  /** Mail archive totals (all zero while HIVE_MAIL_ENABLED is off). */
+  mail: MailDashboardStats;
+}
+
+/** Dashboard's mail corpus card: archive size vs what retrieval can see. */
+export interface MailDashboardStats {
+  /** Live (non-tombstoned) messages in the archive. */
+  messages: number;
+  accounts: number;
+  /** Bytes of stored attachment blobs. */
+  blobBytes: number;
+  /** FTS rows kind='mail' — the searchable subset. */
+  search: number;
 }
 
 // ---- profile (the mutable per-actor card; humans + AIs) ----

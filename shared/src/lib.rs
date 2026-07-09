@@ -395,6 +395,11 @@ pub struct ActorDeleteResult {
     pub sources: i64,
     pub people: i64,
     pub entities: i64,
+    pub mail_accounts: i64,
+    /// Deleted via the accounts' FK cascade, counted explicitly.
+    pub mail_messages: i64,
+    /// Attachment blobs left orphaned by the cascade.
+    pub blobs: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1524,6 +1529,21 @@ pub struct DashboardStats {
     pub entries_by_author: Vec<AuthorEntryCount>,
     #[serde(rename = "calloutsByPerson")]
     pub callouts_by_person: Vec<PersonCallout>,
+    /// Mail archive totals (all zero while HIVE_MAIL_ENABLED is off).
+    pub mail: MailDashboardStats,
+}
+
+/// Dashboard's mail corpus card: archive size vs what retrieval can see.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MailDashboardStats {
+    /// Live (non-tombstoned) messages in the archive.
+    pub messages: i64,
+    pub accounts: i64,
+    /// Bytes of stored attachment blobs.
+    #[serde(rename = "blobBytes")]
+    pub blob_bytes: i64,
+    /// FTS rows kind='mail' — the searchable subset.
+    pub search: i64,
 }
 
 // ---- profile (the mutable per-actor card; humans + AIs) ----

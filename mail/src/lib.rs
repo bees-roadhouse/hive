@@ -7,6 +7,7 @@
 //! Single daemon instance per deployment (matching the outbox single-writer
 //! assumption); one task per due account, re-spawned each tick.
 
+mod attachments;
 mod sink;
 
 use std::collections::HashMap;
@@ -25,7 +26,7 @@ pub fn mail_enabled() -> bool {
         .unwrap_or(false)
 }
 
-fn env_u64(name: &str, default: u64) -> u64 {
+pub(crate) fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
         .and_then(|v| v.trim().parse().ok())
@@ -67,6 +68,7 @@ impl MailDaemon {
                 }
                 Err(e) => tracing::warn!(error = %format!("{e:#}"), "account scan failed"),
             }
+            maybe_blob_gc(&self.store).await;
             tokio::time::sleep(tick).await;
         }
     }
@@ -139,6 +141,38 @@ async fn account_task(store: Store, acct: MailAccountSync) {
                 }
             }
         }
+    }
+}
+
+/// Weekly refcount blob GC (plan A6), gated by a config-key timestamp so a
+/// restart doesn't re-run it. The daemon owns it (not the worker): blobs are
+/// mail-lifecycle state, and this keeps all blob writes+deletes in one
+/// process. The slot is claimed BEFORE the sweep — a failed sweep waits a
+/// week rather than warn-spamming every tick.
+async fn maybe_blob_gc(store: &Store) {
+    const GC_KEY: &str = "mail.blob_gc.last_run";
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(7))
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    match store.config_get(GC_KEY).await {
+        // ISO strings: lexicographic order is chronological.
+        Ok(Some(last)) if last.as_str() >= cutoff.as_str() => return,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "blob GC gate read failed");
+            return;
+        }
+    }
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    if let Err(e) = store.config_set(GC_KEY, &now).await {
+        tracing::warn!(error = %format!("{e:#}"), "blob GC gate write failed");
+        return;
+    }
+    match store.mail_blobs_gc().await {
+        Ok(n) => tracing::info!(deleted = n, "weekly blob GC swept"),
+        Err(e) => tracing::warn!(error = %format!("{e:#}"), "blob GC sweep failed"),
     }
 }
 
@@ -239,6 +273,9 @@ async fn sync_account(store: &Store, acct: MailAccountSync) -> Result<()> {
                     }
                     if pages >= PAGE_BUDGET {
                         // Cursor is committed per page — resume next tick.
+                        // Drain this budget's attachment bytes first so blobs
+                        // trail the backfill instead of waiting for its end.
+                        attachments::fetch_pending(store, &mut syncer, &acct.id).await?;
                         return Ok(());
                     }
                     tokio::time::sleep(page_sleep).await;
@@ -251,6 +288,11 @@ async fn sync_account(store: &Store, acct: MailAccountSync) -> Result<()> {
     if outcome.resynced {
         tracing::info!(account = %acct.id, created = outcome.created, destroyed = outcome.destroyed, "full reconciliation ran");
     }
+
+    // Once per cycle regardless of what the delta brought: the pending scan
+    // re-selects anything a previous cycle deferred (transient fetch errors,
+    // fresh backfill leftovers) — the pipeline is self-healing by retry.
+    attachments::fetch_pending(store, &mut syncer, &acct.id).await?;
 
     let poll = Duration::from_secs(env_u64("HIVE_MAIL_POLL_SECS", 300));
     if syncer.wait_doorbell(poll).await == DoorbellWake::Change {

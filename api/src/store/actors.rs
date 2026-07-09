@@ -368,7 +368,67 @@ async fn remove_in_tx(conn: &mut PgConnection, slug: &str) -> Result<ActorDelete
     )
     .await?;
 
-    // 10. people.owner pointers (AIs this actor owned) → null, then the row itself.
+    // 10. Mail: derived rows for the owner's messages (search/embeddings/
+    //     inbox/links), the vault credentials their accounts name, then the
+    //     accounts themselves — messages and attachments die via FK cascade —
+    //     and finally any blobs nothing points at anymore (no 24h grace here:
+    //     inside one transaction there is no racing fetch to protect).
+    const OWNED_MAIL: &str =
+        "(SELECT m.id FROM mail_messages m JOIN mail_accounts a ON a.id = m.account_id WHERE a.owner = ?)";
+    acc.search += exec_count(
+        conn,
+        &format!("DELETE FROM search WHERE kind = 'mail' AND ref_id IN {OWNED_MAIL}"),
+        &[slug],
+    )
+    .await?;
+    acc.embeddings += exec_count(
+        conn,
+        &format!("DELETE FROM embeddings WHERE ref_kind = 'mail' AND ref_id IN {OWNED_MAIL}"),
+        &[slug],
+    )
+    .await?;
+    acc.inbox += exec_count(
+        conn,
+        &format!("DELETE FROM inbox WHERE ref_kind = 'mail' AND ref_id IN {OWNED_MAIL}"),
+        &[slug],
+    )
+    .await?;
+    acc.links += exec_count(
+        conn,
+        &format!(
+            "DELETE FROM links WHERE (source_kind = 'mail' AND source_id IN {OWNED_MAIL}) \
+             OR (target_kind = 'mail' AND target_id IN {OWNED_MAIL})"
+        ),
+        &[slug, slug],
+    )
+    .await?;
+    exec_count(
+        conn,
+        "DELETE FROM cc_credentials WHERE id IN \
+         (SELECT cred_id FROM mail_accounts WHERE owner = ? AND cred_id IS NOT NULL)",
+        &[slug],
+    )
+    .await?;
+    // Counted up front: the rows themselves go via FK cascade below, whose
+    // rows_affected only reports the accounts.
+    acc.mail_messages += crate::pgq::query_scalar::<i64>(
+        "SELECT COUNT(*) FROM mail_messages m \
+         JOIN mail_accounts a ON a.id = m.account_id WHERE a.owner = ?",
+    )
+    .bind(slug)
+    .fetch_one(&mut *conn)
+    .await?;
+    acc.mail_accounts +=
+        exec_count(conn, "DELETE FROM mail_accounts WHERE owner = ?", &[slug]).await?;
+    acc.blobs += exec_count(
+        conn,
+        "DELETE FROM blobs b WHERE NOT EXISTS \
+         (SELECT 1 FROM mail_attachments a WHERE a.blob_hash = b.hash)",
+        &[],
+    )
+    .await?;
+
+    // 11. people.owner pointers (AIs this actor owned) → null, then the row itself.
     exec_count(
         conn,
         "UPDATE people SET owner = NULL WHERE owner = ?",
@@ -631,6 +691,147 @@ mod tests {
             Some(r#"["apis"]"#)
         );
         assert_eq!(without_slug(r#"["apis"]"#, "pia"), None);
+    }
+
+    /// Actor delete must cascade the whole mail footprint: accounts,
+    /// messages, attachments, blobs, vault credentials, and every derived
+    /// row (search/embeddings/inbox/links) — and the preview must report the
+    /// same counts without deleting anything.
+    #[tokio::test]
+    async fn remove_cascades_mail_with_zero_orphans() {
+        std::env::set_var("HIVE_CRED_KEY", "actors-cascade-test-key");
+        let pool = crate::db::test_pool().await;
+        let store = Store::new(pool);
+        let now = "2026-07-09T00:00:00.000Z";
+
+        let view = store
+            .mail_account_create(
+                "casc-alice",
+                "casc@example.test",
+                "https://mail.example.test",
+                None,
+                "jmap-casc",
+                "hunter2",
+            )
+            .await
+            .unwrap();
+        let cred_id: String =
+            crate::pgq::query_scalar::<String>("SELECT cred_id FROM mail_accounts WHERE id = ?")
+                .bind(&view.id)
+                .fetch_one(store.db())
+                .await
+                .unwrap();
+        crate::pgq::query(
+            "INSERT INTO mail_messages (id, account_id, user_scope, jmap_thread_id, jmap_id, subject, from_addr, to_json, cc_json, received_at, snippet, body_text, has_attachments, created_at, updated_at) \
+             VALUES ('msg-casc', ?, 'casc-alice', 't1', 'j1', 'cascade subject', 'a@b.test', '[]', '[]', ?, '', 'cascade body', TRUE, ?, ?)",
+        )
+        .bind(&view.id)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(store.db())
+        .await
+        .unwrap();
+        store
+            .index_entity("mail", "msg-casc", "cascade subject", "cascade body", &[])
+            .await
+            .unwrap();
+        crate::pgq::query(
+            "INSERT INTO embeddings (ref_kind, ref_id, model, dim, vec, hash, created_at) \
+             VALUES ('mail', 'msg-casc', 'hash', 4, ?, 'h', ?)",
+        )
+        .bind(vec![0u8; 16])
+        .bind(now)
+        .execute(store.db())
+        .await
+        .unwrap();
+        crate::pgq::query(
+            "INSERT INTO inbox (id, recipient, \"from\", reason, ref_kind, ref_id, snippet, created_at) \
+             VALUES ('inb-casc', 'someone-else', 'hive-mail', 'mail', 'mail', 'msg-casc', 's', ?)",
+        )
+        .bind(now)
+        .execute(store.db())
+        .await
+        .unwrap();
+        crate::pgq::query(
+            "INSERT INTO links (id, source_kind, source_id, target_kind, target_id, rel, created_at) \
+             VALUES ('lnk-casc', 'journal', 'entry-x', 'mail', 'msg-casc', 'cites', ?)",
+        )
+        .bind(now)
+        .execute(store.db())
+        .await
+        .unwrap();
+        crate::pgq::query(
+            "INSERT INTO blobs (hash, size, mime, data, created_at) VALUES ('blob-casc', 1, 'text/plain', ?, ?)",
+        )
+        .bind(vec![0u8])
+        .bind(now)
+        .execute(store.db())
+        .await
+        .unwrap();
+        crate::pgq::query(
+            "INSERT INTO mail_attachments (id, message_id, blob_hash, jmap_blob_id, created_at) \
+             VALUES ('att-casc', 'msg-casc', 'blob-casc', 'b1', ?)",
+        )
+        .bind(now)
+        .execute(store.db())
+        .await
+        .unwrap();
+
+        // Dry run first: counts flow, nothing deletes.
+        let preview = store.actors_remove_preview("casc-alice").await.unwrap();
+        assert!(preview.dry_run);
+        assert_eq!(preview.mail_accounts, 1);
+        assert_eq!(preview.mail_messages, 1);
+        assert_eq!(preview.blobs, 1);
+        let still: i64 = crate::pgq::query_scalar::<i64>("SELECT COUNT(*) FROM mail_accounts")
+            .fetch_one(store.db())
+            .await
+            .unwrap();
+        assert_eq!(still, 1, "preview must not delete");
+
+        let acc = store.actors_remove("casc-alice").await.unwrap();
+        assert!(!acc.dry_run);
+        assert_eq!(acc.mail_accounts, 1);
+        assert_eq!(acc.mail_messages, 1);
+        assert_eq!(acc.blobs, 1);
+
+        for (what, sql) in [
+            ("mail_accounts", "SELECT COUNT(*) FROM mail_accounts"),
+            ("mail_messages", "SELECT COUNT(*) FROM mail_messages"),
+            ("mail_attachments", "SELECT COUNT(*) FROM mail_attachments"),
+            ("blobs", "SELECT COUNT(*) FROM blobs"),
+            (
+                "cc_credentials",
+                "SELECT COUNT(*) FROM cc_credentials WHERE kind = 'password'",
+            ),
+            ("search", "SELECT COUNT(*) FROM search WHERE kind = 'mail'"),
+            (
+                "embeddings",
+                "SELECT COUNT(*) FROM embeddings WHERE ref_kind = 'mail'",
+            ),
+            (
+                "inbox",
+                "SELECT COUNT(*) FROM inbox WHERE ref_kind = 'mail'",
+            ),
+            (
+                "links",
+                "SELECT COUNT(*) FROM links WHERE source_kind = 'mail' OR target_kind = 'mail'",
+            ),
+        ] {
+            let n: i64 = crate::pgq::query_scalar::<i64>(sql)
+                .fetch_one(store.db())
+                .await
+                .unwrap();
+            assert_eq!(n, 0, "{what} rows survived the actor cascade");
+        }
+        let cred: i64 =
+            crate::pgq::query_scalar::<i64>("SELECT COUNT(*) FROM cc_credentials WHERE id = ?")
+                .bind(&cred_id)
+                .fetch_one(store.db())
+                .await
+                .unwrap();
+        assert_eq!(cred, 0, "vault credential survived the actor cascade");
     }
 
     #[test]
