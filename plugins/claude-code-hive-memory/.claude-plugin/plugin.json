@@ -1,8 +1,8 @@
 {
   "name": "hive-memory",
   "displayName": "Hive Memory",
-  "version": "0.1.0",
-  "description": "Injects Hive recall at Claude Code session start, exposes Hive MCP, and teaches Claude to save durable memory as Hive journal prose.",
+  "version": "0.6.0",
+  "description": "Boots Claude Code as a known Hive identity: injects a recall brief (profile, open tasks, inbox, relevant journal) at session start, syncs the identity's skills/agents/commands into .claude, exposes Hive tools over MCP, and captures the transcript into Hive Conversations for reflection at session end.",
   "author": {
     "name": "Bee's Roadhouse",
     "url": "https://github.com/bees-roadhouse/hive"
@@ -10,7 +10,7 @@
   "homepage": "https://github.com/bees-roadhouse/hive",
   "repository": "https://github.com/bees-roadhouse/hive",
   "license": "MIT",
-  "keywords": ["hive", "memory", "journal", "recall", "mcp"],
+  "keywords": ["hive", "memory", "journal", "recall", "identity", "conversations", "mcp"],
   "hooks": "./hooks/hooks.json",
   "mcpServers": "./.mcp.json"
 }

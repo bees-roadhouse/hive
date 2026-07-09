@@ -1,0 +1,14 @@
+{
+  "name": "bees-roadhouse",
+  "owner": {
+    "name": "Bee's Roadhouse",
+    "url": "https://github.com/bees-roadhouse"
+  },
+  "plugins": [
+    {
+      "name": "hive-memory",
+      "source": "./plugins/claude-code-hive-memory",
+      "description": "Boot Claude Code as a known Hive identity: recall brief at session start, identity skills/agents/commands sync, Hive MCP tools, and transcript capture into Conversations for reflection."
+    }
+  ]
+}

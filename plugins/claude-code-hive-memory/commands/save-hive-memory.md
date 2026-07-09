@@ -3,14 +3,17 @@ description: Save a durable Hive journal memory
 argument-hint: "<memory prose>"
 ---
 
-Save the user's supplied prose as a Hive journal memory.
+Save the supplied prose as a durable Hive journal memory.
 
-Use the checked-out Hive repo and run:
+Call the Hive MCP tool `journal_append` with:
 
-```bash
-pnpm --dir "$HIVE_REPO_PATH" --filter @hive/agent start -- journal-add --tags=session "$ARGUMENTS"
-```
+- `body`: the memory as first-person Markdown prose. Write prose, not terse
+  facts. Preserve concrete names, dates, decisions, and why the memory should
+  matter later.
+- `tags`: include `session`, plus anything topical.
 
-If `HIVE_REPO_PATH` is unset, first use the repo that contains `packages/agent`.
-Write prose, not terse facts. Preserve concrete names, dates, decisions, and why
-the memory should matter later.
+Mention actors with `@name` when the memory should fan out to their inbox.
+If the memory cites archived mail, reference messages as `[mail:<id>]` and
+never write mail-derived content into a globally-scoped entry.
+
+Memory to save: $ARGUMENTS
