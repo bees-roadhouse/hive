@@ -13,13 +13,11 @@ use dioxus::prelude::*;
 fn main() {
     dioxus::LaunchBuilder::desktop()
         .with_cfg(
-            Config::new()
-                .with_menu(None)
-                .with_window(
-                    WindowBuilder::new()
-                        .with_title("hive")
-                        .with_inner_size(LogicalSize::new(760.0, 520.0)),
-                ),
+            Config::new().with_menu(None).with_window(
+                WindowBuilder::new()
+                    .with_title("hive")
+                    .with_inner_size(LogicalSize::new(760.0, 520.0)),
+            ),
         )
         .launch(app);
 }
