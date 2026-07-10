@@ -6,22 +6,40 @@
 // window reports build status instead of data.
 
 use dioxus::desktop::tao::dpi::LogicalSize;
-use dioxus::desktop::{Config, WindowBuilder};
+use dioxus::desktop::tao::event::{Event, WindowEvent};
+use dioxus::desktop::{use_wry_event_handler, Config, WindowBuilder};
 use dioxus::prelude::*;
 
 fn main() {
     dioxus::LaunchBuilder::desktop()
         .with_cfg(
-            Config::new().with_window(
-                WindowBuilder::new()
-                    .with_title("hive")
-                    .with_inner_size(LogicalSize::new(760.0, 520.0)),
-            ),
+            Config::new()
+                .with_menu(None)
+                .with_window(
+                    WindowBuilder::new()
+                        .with_title("hive")
+                        .with_inner_size(LogicalSize::new(760.0, 520.0)),
+                ),
         )
         .launch(app);
 }
 
 fn app() -> Element {
+    // The titlebar close button must actually quit: dioxus 0.6's default close
+    // handling doesn't exit this single-window app reliably, so handle the
+    // CloseRequested window event explicitly.
+    use_wry_event_handler(|event, _| {
+        if matches!(
+            event,
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            }
+        ) {
+            std::process::exit(0);
+        }
+    });
+
     let version = env!("CARGO_PKG_VERSION");
     rsx! {
         div {
