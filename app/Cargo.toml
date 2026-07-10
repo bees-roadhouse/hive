@@ -9,8 +9,12 @@ repository.workspace = true
 
 [dependencies]
 # The desktop shell (DIRECTION.md D17): Dioxus on the system webview now,
-# Blitz native rendering later. hive-core wires in at the PR 1.6 cutover.
+# Blitz native rendering later; RSX handlers call hive-core in-process.
 # Pinned to 0.6: dioxus 0.7.9 desktop renders a blank page on WebKitGTK 2.5x
 # under plain cargo builds (verified by screenshot A/B on 2026-07-10);
 # revisit the pin when upstream fixes it.
 dioxus = { version = "0.6", features = ["desktop"] }
+hive-core = { path = "../core" }
+hive-shared = { workspace = true }
+hive-embed = { workspace = true }
+anyhow = { workspace = true }

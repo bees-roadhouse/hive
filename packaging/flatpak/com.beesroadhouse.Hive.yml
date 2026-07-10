@@ -23,8 +23,12 @@ finish-args:
   - --socket=x11
   - --device=dri
   - --share=ipc
-  # Phase 3+ will add scoped filesystem/network/keyring holes as modules land;
-  # keep this list minimal until then (DIRECTION.md D27).
+  # The master key lives in the OS keychain (kwallet/gnome-keyring): the
+  # keyring crate speaks the Secret Service API on the session bus directly,
+  # not through the portal, so it needs the bus name.
+  - --talk-name=org.freedesktop.secrets
+  # Phase 3+ will add scoped filesystem/network holes as modules land; note
+  # there is deliberately NO --share=network in this build (DIRECTION.md D27).
 modules:
   # dioxus-desktop links libxdo (input simulation via the xdo crate); the GNOME
   # runtime doesn't ship it, so build it from the pinned xdotool release. All

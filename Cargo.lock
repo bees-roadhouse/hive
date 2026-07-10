@@ -2583,7 +2583,11 @@ dependencies = [
 name = "hive-app"
 version = "0.7.0"
 dependencies = [
+ "anyhow",
  "dioxus",
+ "hive-core",
+ "hive-embed",
+ "hive-shared",
 ]
 
 [[package]]
