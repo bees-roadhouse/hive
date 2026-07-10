@@ -375,11 +375,12 @@ impl Store {
         Ok(q.bind(limit).fetch_all(self.db()).await?)
     }
 
-    // ---- account management (the connect surface; hive-mail owns sync) ----
+    // ---- account management (the connect surface; the mail sync driver —
+    // a Phase 3 module — owns sync) ----
 
     /// Register a mail account: the credential lands in the AES-GCM vault
     /// (which hard-requires HIVE_CRED_KEY) and the account row starts
-    /// 'pending' for hive-mail to pick up. The caller (route) has already
+    /// 'pending' for mail sync to pick up. The caller (route) has already
     /// validated the credential against the server via session discovery and
     /// captured `jmap_account_id`.
     #[allow(clippy::too_many_arguments)]
@@ -536,7 +537,7 @@ impl Store {
         Ok(true)
     }
 
-    /// Enabling clears the backoff so hive-mail picks the account up on its
+    /// Enabling clears the backoff so mail sync picks the account up on its
     /// next tick instead of waiting out a stale next_attempt_at.
     pub async fn mail_account_set_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
         let n = crate::pgq::query(
@@ -664,14 +665,15 @@ fn mail_message_select(suffix: &str) -> String {
     )
 }
 
-// ---- ingest (the hive-mail sink; DIRECTION.md D6/D10) --------------------
+// ---- ingest (the mail-sync sink; DIRECTION.md D6/D10) --------------------
 //
-// hive-mail implements jmap-sync's MailSink/CursorStore by delegating here, so
-// every write stays in the store layer (and under test_pool). The api crate
+// The mail sync driver (the retired daemon, then the Phase 3 module)
+// implements jmap-sync's MailSink/CursorStore by delegating here, so every
+// write stays in the store layer (and under test_pool). The api crate
 // deliberately does NOT depend on jmap-sync — MailIngestMessage mirrors its
 // NormalizedMessage as plain fields.
 
-/// Attachment metadata as hive-mail hands it over (mirrors jmap-sync's
+/// Attachment metadata as mail sync hands it over (mirrors jmap-sync's
 /// AttachmentMeta). Bytes come later via the fetch pipeline; the jmap blob id
 /// keeps the server as the byte source of record for oversize parts.
 #[derive(Debug, Clone)]
@@ -684,8 +686,8 @@ pub struct MailIngestAttachment {
     pub disposition: Option<String>,
 }
 
-/// One message as hive-mail hands it to the store. JSON-typed fields arrive
-/// pre-serialized (the daemon owns the address/keyword shapes).
+/// One message as mail sync hands it to the store. JSON-typed fields arrive
+/// pre-serialized (the sync driver owns the address/keyword shapes).
 #[derive(Debug, Clone)]
 pub struct MailIngestMessage {
     pub jmap_id: String,
@@ -1374,7 +1376,7 @@ impl Store {
         Ok(Some(owner))
     }
 
-    /// Refcount blob GC (hive-mail runs it weekly): delete blobs no
+    /// Refcount blob GC (mail sync runs it weekly): delete blobs no
     /// attachment points at, but only ones older than 24h — the grace window
     /// covers a fetch pipeline that has inserted the blob but not yet
     /// committed the attachment pointer in a racing transaction.
@@ -2394,9 +2396,9 @@ mod tests {
         );
     }
 
-    /// blake3 lives in hive-mail (bytes are hashed before they reach the
-    /// store), so tests hash with a tiny fixed stand-in — the store treats
-    /// hashes as opaque content addresses.
+    /// blake3 lives with the mail sync driver (bytes are hashed before they
+    /// reach the store), so tests hash with a tiny fixed stand-in — the store
+    /// treats hashes as opaque content addresses.
     fn blake3_hex_for_tests(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         let mut h = Sha256::new();

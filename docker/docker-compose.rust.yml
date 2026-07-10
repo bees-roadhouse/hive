@@ -1,8 +1,6 @@
-# Hive v0.2.0 — all-Rust deployment (additive path; the Node compose files
-# still work). One image, two services: hive-api serves the API AND the Solid
-# SPA itself (no nginx web container), hive-worker is the out-of-band loop.
-# Both connect to the same Postgres (DATABASE_URL); the model cache is shared
-# on the hive-models volume.
+# Hive — all-Rust deployment: hive-api (API + MCP) over Postgres. The worker
+# and mail daemons were retired in the P2P pivot (docs/DIRECTION.md D16); the
+# model cache lives on the hive-models volume.
 #
 # Run from the repo root:
 #   docker compose -f docker/docker-compose.rust.yml up --build
@@ -43,7 +41,6 @@ services:
     environment:
       - DATABASE_URL=postgres://hive:hive@postgres:5432/hive
       - HIVE_MODEL_CACHE=/models
-      - HIVE_WEB_DIST=/app/web
       - PORT=7878
       - RUST_LOG=hive_api=info,tower_http=info
       # Hard-required since 0.6.0: the AES-GCM credential vault (runtime
@@ -66,119 +63,9 @@ services:
       postgres:
         condition: service_healthy
 
-  hive-worker:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.rust
-    image: beesroadhouse/hive-rust:latest
-    command: ["/app/hive-worker"]
-    volumes:
-      - hive-models:/models
-    environment:
-      - DATABASE_URL=postgres://hive:hive@postgres:5432/hive
-      - HIVE_MODEL_CACHE=/models
-      - HIVE_WORKER_TICK=30
-      # Per-account newest-N mail embed window (D8 gate) — the embed drain and
-      # the reaper must see the same value.
-      - HIVE_MAIL_EMBED_LIMIT=${HIVE_MAIL_EMBED_LIMIT:-5000}
-      - RUST_LOG=hive_worker=info
-    restart: unless-stopped
-    networks:
-      - hive
-    depends_on:
-      postgres:
-        condition: service_healthy
-      hive-api:
-        condition: service_healthy
-
-  hive-mail:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.rust
-    image: beesroadhouse/hive-rust:latest
-    command: ["/app/hive-mail"]
-    environment:
-      - DATABASE_URL=postgres://hive:hive@postgres:5432/hive
-      # Off by default: the daemon idles (service stays green) until the
-      # operator flips this — enabling mail is an env flip + restart.
-      - HIVE_MAIL_ENABLED=${HIVE_MAIL_ENABLED:-0}
-      - HIVE_MAIL_TICK=${HIVE_MAIL_TICK:-15}
-      - HIVE_MAIL_POLL_SECS=${HIVE_MAIL_POLL_SECS:-300}
-      - HIVE_CRED_KEY=${HIVE_CRED_KEY:?generate a long random string; back it up separately from the DB}
-      - RUST_LOG=hive_mail=info,hive_api=info
-    restart: unless-stopped
-    networks:
-      - hive
-    depends_on:
-      postgres:
-        condition: service_healthy
-      hive-api:
-        condition: service_healthy
-
-  hive-runner:
-    profiles: ["runner"]
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.runner
-    image: beesroadhouse/hive-runner:latest
-    environment:
-      - HIVE_API_URL=http://hive-api:7878
-      - HIVE_API_TOKEN=${HIVE_API_TOKEN:?set an admin/service Hive API token for hive-runner}
-      - HIVE_CONTAINER_ENGINE=${HIVE_CONTAINER_ENGINE:-podman}
-      - HIVE_SESSION_ISOLATION=container
-      - HIVE_SESSION_IMAGE=${HIVE_SESSION_IMAGE:-beesroadhouse/hive-session-dev:latest}
-      - HIVE_SESSION_NETWORK=${HIVE_SESSION_NETWORK:-hive_hive}
-      - HIVE_USER_VOLUME_PREFIX=${HIVE_USER_VOLUME_PREFIX:-hive-user}
-      - HIVE_SESSION_CONTAINER_PREFIX=${HIVE_SESSION_CONTAINER_PREFIX:-hive-session}
-      - HIVE_PROPAGATE_ENGINE_SOCKET=${HIVE_PROPAGATE_ENGINE_SOCKET:-0}
-      - HIVE_SESSION_GUI=${HIVE_SESSION_GUI:-1}
-      - HIVE_SESSION_VNC=${HIVE_SESSION_VNC:-0}
-      - HIVE_SESSION_VNC_PORT=${HIVE_SESSION_VNC_PORT:-5900}
-      - HIVE_SESSION_NOVNC_PORT=${HIVE_SESSION_NOVNC_PORT:-6080}
-      - HIVE_RUNNER_POLL_MS=2000
-    volumes:
-      - type: bind
-        source: ${HIVE_CONTAINER_SOCKET:-/run/podman/podman.sock}
-        target: ${HIVE_CONTAINER_SOCKET_TARGET:-/run/podman/podman.sock}
-        bind:
-          create_host_path: false
-      - hive-runner-workspaces:/workspaces
-    restart: unless-stopped
-    networks:
-      - hive
-    depends_on:
-      hive-api:
-        condition: service_healthy
-
-  reflector:
-    profiles: ["reflector"]
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.reflector
-    image: beesroadhouse/hive-reflector:latest
-    environment:
-      - HIVE_API_URL=http://hive-api:7878
-      # The AI identity's hive PAT — NOT an admin service token: the token's
-      # namespace is where reflection memory lands, and the reflector refuses
-      # to start if it resolves to no principal. (The runner profile reads the
-      # same variable; if you run both, give the reflector its own env file.)
-      - HIVE_API_TOKEN=${HIVE_API_TOKEN:?set the AI identity's Hive API token for the reflector}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?set an Anthropic API key for reflection (per-token billing)}
-      # off | suggest | auto — suggest (default) proposes in prose, no anchors,
-      # so nothing is auto-created while the mail corpus is new/untrusted.
-      - REFLECTION_MODE=${REFLECTION_MODE:-suggest}
-      - REFLECTION_INTERVAL_SECS=${REFLECTION_INTERVAL_SECS:-300}
-    restart: unless-stopped
-    networks:
-      - hive
-    depends_on:
-      hive-api:
-        condition: service_healthy
-
 volumes:
   hive-pgdata:
   hive-models:
-  hive-runner-workspaces:
 
 networks:
   hive:

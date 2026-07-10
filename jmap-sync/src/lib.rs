@@ -4,8 +4,9 @@
 //!
 //! Everything flows through two traits the consumer implements —
 //! [`CursorStore`] (sync-state persistence) and [`MailSink`] (message
-//! storage). The crate has no Hive types and no database dependency; hive-mail
-//! implements both traits over its store. The at-least-once contract: a cursor
+//! storage). The crate has no Hive types and no database dependency; the mail
+//! sync driver (a Phase 3 module) implements both traits over the hive store.
+//! The at-least-once contract: a cursor
 //! is saved only after the sink call it corresponds to returned `Ok`, so a
 //! crash between the two replays the batch, and sinks must make replays no-ops
 //! (unique-key upserts).

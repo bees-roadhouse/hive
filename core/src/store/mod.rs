@@ -16,6 +16,7 @@ pub mod conversations;
 pub mod custom_entities;
 pub mod dashboard;
 pub mod decisions;
+pub mod embed_backfill;
 pub mod entity_types;
 pub mod entity_validation;
 pub mod events;

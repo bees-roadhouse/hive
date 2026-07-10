@@ -747,7 +747,7 @@ mod tests {
         .unwrap();
         crate::pgq::query(
             "INSERT INTO inbox (id, recipient, \"from\", reason, ref_kind, ref_id, snippet, created_at) \
-             VALUES ('inb-casc', 'someone-else', 'hive-mail', 'mail', 'mail', 'msg-casc', 's', ?)",
+             VALUES ('inb-casc', 'someone-else', 'mail-sync', 'mail', 'mail', 'msg-casc', 's', ?)",
         )
         .bind(now)
         .execute(store.db())
