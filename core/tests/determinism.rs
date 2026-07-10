@@ -2,7 +2,11 @@
 // deterministic. core/src/oplog and core/src/blockstore never read clocks,
 // environment, or randomness — ts/seq/lc arrive from callers, key material
 // arrives through the keys::KeySource seam, and every nonce/segment key is
-// derived, not sampled (the modules document each derivation).
+// derived, not sampled (the modules document each derivation). PR 1.5 puts
+// core/src/fold and core/src/index behind the same fence: the fold reads
+// nothing but (tx, record) — replay must be byte-identical — and the index
+// takes keys via KeySource and timestamps from callers. The fold fence also
+// bans id-minting (the nanoid helper): every id comes from the record.
 //
 // keys.rs is deliberately OUTSIDE this fence: generating a fresh master key
 // and Argon2 salts is exactly the place OS randomness belongs.
@@ -14,7 +18,8 @@ use std::path::{Path, PathBuf};
 
 /// Substrings that must not appear anywhere (code or comments) in the
 /// fenced modules. The first five are the canonical set from PLAN.md/PR 1.4;
-/// the rest close the equivalent side doors.
+/// the rest close the equivalent side doors (nanoid per the PR 1.5 line in
+/// PLAN.md: the fold must not mint ids).
 const FORBIDDEN: &[&str] = &[
     "SystemTime",
     "now_iso",
@@ -26,10 +31,11 @@ const FORBIDDEN: &[&str] = &[
     "Instant::now",
     "std::env",
     "env::var",
+    "nanoid",
 ];
 
 /// Modules under the determinism fence, relative to core/src/.
-const FENCED: &[&str] = &["oplog", "blockstore"];
+const FENCED: &[&str] = &["oplog", "blockstore", "fold", "index"];
 
 fn rust_files(dir: &Path, acc: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
@@ -44,7 +50,7 @@ fn rust_files(dir: &Path, acc: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn oplog_and_blockstore_are_clock_env_and_randomness_free() {
+fn durable_and_derived_layers_are_clock_env_and_randomness_free() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     for module in FENCED {

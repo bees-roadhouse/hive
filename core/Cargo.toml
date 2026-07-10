@@ -44,9 +44,11 @@ argon2 = { workspace = true }
 keyring = { workspace = true }
 data-encoding = { workspace = true }
 
+# Derived index (PR 1.5): the SQLCipher-encrypted SQLite projection (fold +
+# FTS5 + ANN) the 1.6 cutover moves the Store onto. Graduated from
+# dev-dependency (the 1.4 spike) to a real one.
+rusqlite = { workspace = true }
+
 [dev-dependencies]
 # Hermetic tempdir stores for the oplog/blockstore/keys tests.
 tempfile = { workspace = true }
-# SQLCipher spike (see core/tests/sqlcipher_spike.rs): de-risks the PR 1.5
-# fold target ahead of the 1.6 cutover.
-rusqlite = { workspace = true }
