@@ -1,0 +1,13 @@
+[package]
+name = "hive-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The desktop shell (DIRECTION.md D17): Dioxus on the system webview now,
+# Blitz native rendering later. hive-core wires in at the PR 1.6 cutover.
+dioxus = { version = "0.7.9", features = ["desktop"] }
