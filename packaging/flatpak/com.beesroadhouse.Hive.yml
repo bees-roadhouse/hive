@@ -1,0 +1,53 @@
+# hive flatpak manifest (Phase 2.5 grows this into the release pipeline).
+#
+# The binary is built OUTSIDE the sandbox (cargo build --release -p hive-app)
+# and packaged with the "simple" buildsystem; the GNOME runtime supplies
+# WebKitGTK 4.1 + GTK3 at runtime (the freedesktop runtime does not ship
+# webkit, which is why the runtime is org.gnome.*). Build + install:
+#
+#   cargo build --release -p hive-app
+#   flatpak run org.flatpak.Builder --user --install --force-clean \
+#       packaging/flatpak/build-dir packaging/flatpak/com.beesroadhouse.Hive.yml
+#   flatpak run com.beesroadhouse.Hive
+app-id: com.beesroadhouse.Hive
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+command: hive-app
+finish-args:
+  # Wayland for display, but a REAL x11 socket too (not fallback-x11): dioxus
+  # 0.6's desktop layer opens an X connection via libxdo at startup even under
+  # Wayland, and fallback-x11 exposes no X socket in a Wayland session — the
+  # null display then segfaults in libX11 (verified via coredumpctl).
+  - --socket=wayland
+  - --socket=x11
+  - --device=dri
+  - --share=ipc
+  # Phase 3+ will add scoped filesystem/network/keyring holes as modules land;
+  # keep this list minimal until then (DIRECTION.md D27).
+modules:
+  # dioxus-desktop links libxdo (input simulation via the xdo crate); the GNOME
+  # runtime doesn't ship it, so build it from the pinned xdotool release. All
+  # other NEEDED libs (webkit2gtk-4.1, gtk3, soup3, javascriptcore) come from
+  # the runtime.
+  - name: libxdo
+    buildsystem: simple
+    build-commands:
+      - make PREFIX=/app installlib
+    sources:
+      - type: archive
+        url: https://github.com/jordansissel/xdotool/releases/download/v3.20211022.1/xdotool-3.20211022.1.tar.gz
+        sha256: 96f0facfde6d78eacad35b91b0f46fecd0b35e474c03e00e30da3fdd345f9ada
+  - name: hive-app
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 hive-app /app/bin/hive-app
+      - install -Dm644 com.beesroadhouse.Hive.desktop /app/share/applications/com.beesroadhouse.Hive.desktop
+      - install -Dm644 com.beesroadhouse.Hive.svg /app/share/icons/hicolor/scalable/apps/com.beesroadhouse.Hive.svg
+    sources:
+      - type: file
+        path: ../../target/release/hive-app
+      - type: file
+        path: com.beesroadhouse.Hive.desktop
+      - type: file
+        path: com.beesroadhouse.Hive.svg

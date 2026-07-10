@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=hive
+Comment=Personal, local-first, peer-to-peer journal, mail, calendar, and contacts
+Exec=hive-app
+Icon=com.beesroadhouse.Hive
+Terminal=false
+Type=Application
+Categories=Office;Calendar;ContactManagement;
+Keywords=journal;notes;mail;calendar;contacts;tasks;

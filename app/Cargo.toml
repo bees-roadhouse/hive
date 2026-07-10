@@ -1,0 +1,16 @@
+[package]
+name = "hive-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The desktop shell (DIRECTION.md D17): Dioxus on the system webview now,
+# Blitz native rendering later. hive-core wires in at the PR 1.6 cutover.
+# Pinned to 0.6: dioxus 0.7.9 desktop renders a blank page on WebKitGTK 2.5x
+# under plain cargo builds (verified by screenshot A/B on 2026-07-10);
+# revisit the pin when upstream fixes it.
+dioxus = { version = "0.6", features = ["desktop"] }
