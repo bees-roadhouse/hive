@@ -294,11 +294,26 @@ impl Worker {
         Ok(true)
     }
 
-    /// Worker `maintain()`: prune the wire log to the newest 2000 rows. On
-    /// Postgres the SQLite-era housekeeping is handled by the server — WAL
+    /// Embedding-reaper cadence: every 20th cycle ≈ 10 min at the 30s tick.
+    const REAP_EVERY_CYCLES: u64 = 20;
+
+    /// Per-account newest-N mail embed window: $HIVE_MAIL_EMBED_LIMIT, default
+    /// 5000 (the DIRECTION.md D8 gate). Read per reap so ops can tune it live;
+    /// the SAME value must gate the embed drain, or drain and reaper fight.
+    fn mail_embed_limit() -> i64 {
+        std::env::var("HIVE_MAIL_EMBED_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000)
+    }
+
+    /// Worker `maintain()`: prune the wire log to the newest 2000 rows, and
+    /// every 20th cycle run the embedding reaper (orphans, the journal embed
+    /// window, mail eligibility — see api store/maintenance.rs). On Postgres
+    /// the SQLite-era housekeeping is handled by the server — WAL
     /// checkpointing is automatic, the GIN full-text index self-maintains (no
     /// FTS5 `optimize`), and autovacuum reclaims space (no manual `VACUUM`).
-    async fn maintain(&self, _cycle_n: u64) -> Result<Vec<String>> {
+    async fn maintain(&self, cycle_n: u64) -> Result<Vec<String>> {
         let db = self.db();
         let mut did: Vec<String> = Vec::new();
         let pruned = hive_api::pgq::query(
@@ -313,6 +328,24 @@ impl Worker {
         let swept = self.sweep_conversations().await?;
         if swept > 0 {
             did.push(format!("swept-conversations({swept})"));
+        }
+        // The reaper is the safety net behind hive-mail's synchronous deletes
+        // and the ONLY aging mechanism for the moving newest-N windows —
+        // nothing "events" a message (or journal entry) out of its window.
+        if cycle_n % Self::REAP_EVERY_CYCLES == 0 {
+            let mut total: u64 = 0;
+            for (label, n) in self.store.embeddings_reap(Self::mail_embed_limit()).await? {
+                total += n;
+                if n > 0 {
+                    did.push(format!("reaped-{label}({n})"));
+                }
+            }
+            // Silence marker: shows the reaper RAN and found nothing, so a
+            // quiet maintenance vec is distinguishable from a reaper that
+            // never fired.
+            if total == 0 {
+                did.push("reaped-total(0)".to_string());
+            }
         }
         Ok(did)
     }

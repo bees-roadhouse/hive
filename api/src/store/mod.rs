@@ -25,6 +25,7 @@ pub mod inbox;
 pub mod journal;
 pub mod links;
 pub mod mail;
+pub mod maintenance;
 pub mod oauth;
 pub mod outbox;
 pub mod people;

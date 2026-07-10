@@ -201,6 +201,49 @@ async fn backfill_embeds_new_skips_unchanged_reembeds_changed() {
 }
 
 #[tokio::test]
+async fn reaper_fires_every_20th_cycle_and_reports_silence() {
+    let (pool, _dir) = test_pool().await;
+    let store = Store::new(pool.clone());
+    let worker = hive_worker::Worker::new(pool.clone());
+
+    // An orphaned task vector (no tasks row) — reap fodder.
+    sqlx::query(
+        "INSERT INTO embeddings (ref_kind, ref_id, chunk_idx, model, dim, vec, hash, created_at) \
+         VALUES ('task', 't-ghost', 0, 'test-model', 4, $1, 'h', '2026-07-09T00:00:00.000Z')",
+    )
+    .bind(vec![0u8; 16])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Off-cadence cycle: the orphan survives and nothing reap-ish is reported.
+    worker.cycle(19).await.expect("cycle 19");
+    let run = store.worker_status().await.unwrap().last_run.unwrap();
+    assert!(
+        !run.maintenance.iter().any(|m| m.starts_with("reaped-")),
+        "no reap off-cadence: {:?}",
+        run.maintenance
+    );
+
+    worker.cycle(20).await.expect("cycle 20");
+    let run = store.worker_status().await.unwrap().last_run.unwrap();
+    assert!(
+        run.maintenance.contains(&"reaped-task(1)".to_string()),
+        "20th cycle reaps the orphan: {:?}",
+        run.maintenance
+    );
+
+    // Next reap cycle finds nothing → the silence marker.
+    worker.cycle(40).await.expect("cycle 40");
+    let run = store.worker_status().await.unwrap().last_run.unwrap();
+    assert!(
+        run.maintenance.contains(&"reaped-total(0)".to_string()),
+        "clean reap reports silence: {:?}",
+        run.maintenance
+    );
+}
+
+#[tokio::test]
 async fn backfill_stamps_owner_and_stays_bytea_for_hash_provider() {
     let (pool, _dir) = test_pool().await;
     let worker = hive_worker::Worker::new(pool.clone());
