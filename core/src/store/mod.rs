@@ -45,7 +45,14 @@ pub mod users;
 pub mod workerstatus;
 pub mod workspaces;
 
-pub use crate::auth::now_iso;
+/// Current instant in the exact shape JS `new Date().toISOString()` produces —
+/// millisecond precision, trailing `Z` — so rows sort lexicographically next to
+/// rows written by the Node API.
+pub fn now_iso() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
 
 #[derive(Clone)]
 pub struct Store {
@@ -156,4 +163,18 @@ pub fn json_vec(s: &str) -> Vec<String> {
 
 pub fn to_json<T: serde::Serialize>(v: &T) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "null".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::now_iso;
+
+    #[test]
+    fn iso_format_matches_js() {
+        let s = now_iso();
+        assert_eq!(s.len(), 24);
+        assert!(s.ends_with('Z'));
+        assert_eq!(&s[10..11], "T");
+        assert_eq!(&s[19..20], ".");
+    }
 }

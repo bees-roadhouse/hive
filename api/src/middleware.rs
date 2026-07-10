@@ -69,14 +69,9 @@ impl AuthCtx {
     }
 }
 
-/// Per-user namespace visibility: admins see everything; everyone else sees
-/// global (NULL-scoped) entries plus their own namespace (plus explicit
-/// shares/@mentions, applied separately).
-#[derive(Clone, Debug)]
-pub enum Visibility {
-    All,
-    Namespace(String),
-}
+// The Visibility enum moved to hive-core (the store's scope filters take it);
+// re-exported so `crate::middleware::Visibility` paths keep resolving.
+pub use hive_core::Visibility;
 
 /// May this principal read/act for `identity`'s private surfaces (recall
 /// brief, inbox)? Admins: anyone. Tokens: only their own actor. Sessions:

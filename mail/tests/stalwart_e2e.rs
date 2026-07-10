@@ -28,7 +28,7 @@
 use serde_json::{json, Map, Value};
 use sqlx::PgPool;
 
-use hive_api::store::Store;
+use hive_core::store::Store;
 use hive_mail::MailDaemon;
 
 const ADDRESS: &str = "mailtest@example.test";
@@ -190,7 +190,7 @@ impl Jmap {
 }
 
 async fn scalar_i64(pool: &PgPool, sql: &str, bind: &str) -> i64 {
-    hive_api::pgq::query_scalar::<i64>(sql)
+    hive_core::pgq::query_scalar::<i64>(sql)
         .bind(bind)
         .fetch_one(pool)
         .await
@@ -238,7 +238,7 @@ async fn counts(pool: &PgPool, account_id: &str) -> Counts {
 }
 
 async fn backfill_status(pool: &PgPool, account_id: &str) -> String {
-    hive_api::pgq::query_scalar::<String>("SELECT backfill_status FROM mail_accounts WHERE id = ?")
+    hive_core::pgq::query_scalar::<String>("SELECT backfill_status FROM mail_accounts WHERE id = ?")
         .bind(account_id)
         .fetch_one(pool)
         .await
@@ -246,7 +246,7 @@ async fn backfill_status(pool: &PgPool, account_id: &str) -> String {
 }
 
 async fn email_state(pool: &PgPool, account_id: &str) -> Option<String> {
-    hive_api::pgq::query_scalar::<String>("SELECT email_state FROM mail_accounts WHERE id = ?")
+    hive_core::pgq::query_scalar::<String>("SELECT email_state FROM mail_accounts WHERE id = ?")
         .bind(account_id)
         .fetch_optional(pool)
         .await
@@ -262,7 +262,7 @@ async fn run_cycle(daemon: &MailDaemon, pool: &PgPool, account_id: &str, what: &
         .run_account_once(account_id)
         .await
         .unwrap_or_else(|e| panic!("{what}: {e:#}"));
-    let status = hive_api::pgq::query_scalar::<String>(
+    let status = hive_core::pgq::query_scalar::<String>(
         "SELECT COALESCE(last_status, '') FROM mail_accounts WHERE id = ?",
     )
     .bind(account_id)
@@ -270,7 +270,7 @@ async fn run_cycle(daemon: &MailDaemon, pool: &PgPool, account_id: &str, what: &
     .await
     .expect("last_status");
     if status != "ok" {
-        let err = hive_api::pgq::query_scalar::<String>(
+        let err = hive_core::pgq::query_scalar::<String>(
             "SELECT COALESCE(last_error, '') FROM mail_accounts WHERE id = ?",
         )
         .bind(account_id)
@@ -319,7 +319,7 @@ async fn backfill_delta_forced_resync_and_rerun_produce_zero_duplicates() {
     std::env::set_var("HIVE_MAIL_PAGE_SIZE", "10");
     std::env::set_var("HIVE_MAIL_POLL_SECS", "1");
 
-    let pool = hive_api::db::test_pool().await;
+    let pool = hive_core::db::test_pool().await;
     let store = Store::new(pool.clone());
     let daemon = MailDaemon::new(pool.clone());
 
@@ -379,7 +379,7 @@ async fn backfill_delta_forced_resync_and_rerun_produce_zero_duplicates() {
         "the destroyed message left search in the same cycle"
     );
     assert_eq!(c.duplicates, 0);
-    let dead_id = hive_api::pgq::query_scalar::<String>(
+    let dead_id = hive_core::pgq::query_scalar::<String>(
         "SELECT id FROM mail_messages WHERE account_id = ? AND jmap_id = ? AND deleted_at IS NOT NULL",
     )
     .bind(&acct.id)
@@ -424,7 +424,7 @@ async fn backfill_delta_forced_resync_and_rerun_produce_zero_duplicates() {
 
     // The DIRECTION milestone, verbatim: re-running backfill from zero over
     // an already-synced account produces zero duplicates.
-    hive_api::pgq::query(
+    hive_core::pgq::query(
         "UPDATE mail_accounts SET backfill_status = 'pending', backfill_cursor = NULL WHERE id = ?",
     )
     .bind(&acct.id)

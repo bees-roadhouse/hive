@@ -292,9 +292,7 @@ impl Store {
         // unscoped — the route passes viewer=None). The visible set is already
         // namespace-gated inside visible_entry_ids.
         let visible_entries = self
-            .visible_entry_ids(&crate::middleware::Visibility::Namespace(
-                viewer.to_string(),
-            ))
+            .visible_entry_ids(&crate::Visibility::Namespace(viewer.to_string()))
             .await?
             .unwrap_or_default();
         let mut origin_of: HashMap<String, Option<String>> = HashMap::new();
@@ -367,9 +365,7 @@ impl Store {
     /// IN query per kind present instead of full-table scans.
     async fn scope_hits(&self, hits: Vec<SearchHit>, viewer: &str) -> Result<Vec<SearchHit>> {
         let visible_entries = self
-            .visible_entry_ids(&crate::middleware::Visibility::Namespace(
-                viewer.to_string(),
-            ))
+            .visible_entry_ids(&crate::Visibility::Namespace(viewer.to_string()))
             .await?
             .unwrap_or_default();
         let mut origin_of: HashMap<String, Option<String>> = HashMap::new();

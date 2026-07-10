@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use hive_api::store::mail::MailAccountSync;
-use hive_api::store::Store;
+use hive_core::store::mail::MailAccountSync;
+use hive_core::store::Store;
 use hive_shared::InboxReason;
 use jmap_sync::{BackfillOutcome, BackfillState, CursorStore, DoorbellWake, SyncConfig, Syncer};
 use sink::{StoreCursor, StoreSink};

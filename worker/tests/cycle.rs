@@ -2,14 +2,14 @@
 // maintenance labels (Node's exact strings + vacuum cadence), and embeddings
 // backfill with hash/model dedup.
 
-use hive_api::store::Store;
+use hive_core::store::Store;
 
 async fn test_pool() -> (sqlx::PgPool, ()) {
     // Hash embedder: deterministic + offline (set before any embed call; the
     // provider choice is latched once per process).
     std::env::set_var("HIVE_EMBED", "hash");
     // Isolated Postgres schema per test (uses DATABASE_URL / local dev default).
-    let pool = hive_api::db::test_pool().await;
+    let pool = hive_core::db::test_pool().await;
     (pool, ())
 }
 

@@ -5,8 +5,8 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
-use hive_api::store::mail::{MailIngestAttachment, MailIngestMessage};
-use hive_api::store::Store;
+use hive_core::store::mail::{MailIngestAttachment, MailIngestMessage};
+use hive_core::store::Store;
 use hive_shared::InboxReason;
 use jmap_sync::{
     BackfillState, CursorStore, MailSink, MailboxInfo, NormalizedMessage, SyncCursor, SyncError,

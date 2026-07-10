@@ -3,13 +3,13 @@
 // file: the env var is process-global, so this must not run beside tests that
 // expect the default budget.
 
-use hive_api::store::Store;
+use hive_core::store::Store;
 
 #[tokio::test]
 async fn zero_budget_defers_items_to_the_next_cycle() {
     std::env::set_var("HIVE_EMBED", "hash");
     std::env::set_var("HIVE_EMBED_STAGE_BUDGET_SECS", "0");
-    let pool = hive_api::db::test_pool().await;
+    let pool = hive_core::db::test_pool().await;
     let store = Store::new(pool.clone());
     let worker = hive_worker::Worker::new(pool.clone());
 

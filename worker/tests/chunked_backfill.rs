@@ -8,7 +8,7 @@
 // the engine are latched once per process, so this must not share a binary
 // with the hash-provider tests.
 
-use hive_api::store::Store;
+use hive_core::store::Store;
 
 struct Mock384;
 impl hive_embed::OnnxProvider for Mock384 {
@@ -33,7 +33,7 @@ async fn test_setup() -> (sqlx::PgPool, Store, hive_worker::Worker) {
     // engine (real model download) from ever wiring itself in.
     std::env::set_var("HIVE_EMBED", "transformers");
     hive_embed::set_onnx_provider(Box::new(Mock384));
-    let pool = hive_api::db::test_pool().await;
+    let pool = hive_core::db::test_pool().await;
     (
         pool.clone(),
         Store::new(pool.clone()),
