@@ -39,6 +39,7 @@ WORKDIR /src
 COPY rust-toolchain.toml Cargo.toml Cargo.lock ./
 COPY shared ./shared
 COPY embed ./embed
+COPY core ./core
 COPY api ./api
 COPY worker ./worker
 COPY jmap-sync ./jmap-sync

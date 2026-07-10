@@ -11,7 +11,7 @@
 //!   the pipeline runs every sync cycle, so it is self-healing by retry.
 
 use anyhow::Result;
-use hive_api::store::Store;
+use hive_core::store::Store;
 use jmap_sync::{SyncError, Syncer};
 
 /// D8 default: 15 MiB per attachment.

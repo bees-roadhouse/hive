@@ -13,7 +13,7 @@ use hive_shared::{
 use serde_json::json;
 use sqlx::Row;
 
-use crate::middleware::Visibility;
+use crate::Visibility;
 
 use super::decisions::DecisionCreate;
 use super::events::EventCreate;

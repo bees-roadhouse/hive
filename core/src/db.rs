@@ -14,7 +14,7 @@ use hive_shared::APP_VERSION;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 
-use crate::auth::now_iso;
+use crate::store::now_iso;
 
 /// Resolve the Postgres connection string from `DATABASE_URL`. Falls back to a
 /// local dev instance so tests + local runs work without extra config.
@@ -621,7 +621,7 @@ const SCHEMA_SEARCH: &str = r#"
 
 pub async fn migrate(pool: &PgPool) -> Result<()> {
     // sqlx-managed reshape migrations run FIRST, before the inline base DDL
-    // below (hybrid convention — see api/migrations/0001_baseline_marker.sql).
+    // below (hybrid convention — see core/migrations/0001_baseline_marker.sql).
     // The migrator holds a Postgres advisory lock, so api + worker booting at
     // the same time serialize here instead of racing. A failed migration
     // aborts init: the binary exits and compose crash-loops loudly — fail

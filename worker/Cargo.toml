@@ -19,7 +19,7 @@ dotenvy = { workspace = true }
 
 hive-shared = { workspace = true }
 hive-embed = { workspace = true }
-hive-api = { path = "../api" }
+hive-core = { path = "../core" }
 
 [dev-dependencies]
 tempfile = "3"

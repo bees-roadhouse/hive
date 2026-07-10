@@ -5,8 +5,8 @@
 // and db maintenance live here because the api store doesn't expose them.
 
 use anyhow::Result;
-use hive_api::store::semantic::EmbeddableItem;
-use hive_api::store::Store;
+use hive_core::store::semantic::EmbeddableItem;
+use hive_core::store::Store;
 use hive_shared::WorkerLastRun;
 use serde_json::json;
 use sqlx::PgPool;
@@ -142,7 +142,7 @@ impl Worker {
         // chunk_idx = 0 stands for the whole item — every chunk row carries
         // the same item-level hash. Model-filtered in SQL, so rows written
         // under another $HIVE_EMBED provider don't count as fresh.
-        let stored: HashMap<String, String> = hive_api::pgq::query_as::<(String, String, String)>(
+        let stored: HashMap<String, String> = hive_core::pgq::query_as::<(String, String, String)>(
             "SELECT ref_kind, ref_id, hash FROM embeddings WHERE chunk_idx = 0 AND model = ?",
         )
         .bind(model)
@@ -248,7 +248,7 @@ impl Worker {
 
         let now = now_iso();
         let mut tx = self.db().begin().await?;
-        hive_api::pgq::query("DELETE FROM embeddings WHERE ref_kind = ? AND ref_id = ?")
+        hive_core::pgq::query("DELETE FROM embeddings WHERE ref_kind = ? AND ref_id = ?")
             .bind(&it.kind)
             .bind(&it.id)
             .execute(&mut *tx)
@@ -256,7 +256,7 @@ impl Worker {
         for (idx, v) in vecs.iter().enumerate() {
             let blob = hive_embed::to_blob(v);
             if write_vec_v {
-                hive_api::pgq::query(
+                hive_core::pgq::query(
                     "INSERT INTO embeddings (ref_kind, ref_id, chunk_idx, model, dim, owner, vec, vec_v, hash, created_at) \
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
@@ -273,7 +273,7 @@ impl Worker {
                 .execute(&mut *tx)
                 .await?;
             } else {
-                hive_api::pgq::query(
+                hive_core::pgq::query(
                     "INSERT INTO embeddings (ref_kind, ref_id, chunk_idx, model, dim, owner, vec, hash, created_at) \
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 )
@@ -316,7 +316,7 @@ impl Worker {
     async fn maintain(&self, cycle_n: u64) -> Result<Vec<String>> {
         let db = self.db();
         let mut did: Vec<String> = Vec::new();
-        let pruned = hive_api::pgq::query(
+        let pruned = hive_core::pgq::query(
             "DELETE FROM wire WHERE id NOT IN (SELECT id FROM wire ORDER BY created_at DESC LIMIT 2000)",
         )
         .execute(db)
@@ -369,7 +369,7 @@ impl Worker {
         let cutoff = (chrono::Utc::now() - days)
             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
             .to_string();
-        let ids: Vec<String> = hive_api::pgq::query_scalar::<String>(
+        let ids: Vec<String> = hive_core::pgq::query_scalar::<String>(
             "SELECT id FROM cc_sessions WHERE status = 'archived' AND updated_at < ?",
         )
         .bind(&cutoff)

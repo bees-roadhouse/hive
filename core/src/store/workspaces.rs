@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{new_id, now_iso, Store};
-use crate::middleware::Visibility;
+use crate::Visibility;
 
 const SESSION_COLS: &str =
     "id, owner, created_by, title, workdir, claude_session_id, runtime, status, \

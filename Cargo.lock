@@ -1129,7 +1129,6 @@ dependencies = [
 name = "hive-api"
 version = "0.7.0"
 dependencies = [
- "aes-gcm",
  "anyhow",
  "async-stream",
  "axum",
@@ -1138,6 +1137,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "hex",
+ "hive-core",
  "hive-embed",
  "hive-shared",
  "jsonwebtoken",
@@ -1145,8 +1145,6 @@ dependencies = [
  "pgvector",
  "rand 0.8.6",
  "reqwest 0.12.28",
- "rss",
- "scrypt",
  "serde",
  "serde_json",
  "sha2",
@@ -1160,6 +1158,33 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "urlencoding",
+ "uuid",
+]
+
+[[package]]
+name = "hive-core"
+version = "0.7.0"
+dependencies = [
+ "aes-gcm",
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "hex",
+ "hive-embed",
+ "hive-shared",
+ "nanoid",
+ "pgvector",
+ "rand 0.8.6",
+ "reqwest 0.12.28",
+ "rss",
+ "scrypt",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlx",
+ "subtle",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -1187,7 +1212,7 @@ dependencies = [
  "blake3",
  "chrono",
  "dotenvy",
- "hive-api",
+ "hive-core",
  "hive-shared",
  "jmap-sync",
  "reqwest 0.12.28",
@@ -1213,7 +1238,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dotenvy",
- "hive-api",
+ "hive-core",
  "hive-embed",
  "hive-shared",
  "pgvector",

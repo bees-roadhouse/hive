@@ -8,7 +8,7 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "hive_mail=info,hive_api=info".into()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "hive_mail=info,hive_core=info".into()),
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();
@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
     }
 
     // Same open path as api/worker (DATABASE_URL + schema migrate).
-    let pool = hive_api::db::init().await?;
+    let pool = hive_core::db::init().await?;
     let daemon = MailDaemon::new(pool);
     if std::env::args().any(|a| a == "--once" || a == "once") {
         daemon.run_once().await?;

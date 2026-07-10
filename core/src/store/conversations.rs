@@ -24,7 +24,7 @@ use hive_shared::{
 use serde_json::{json, Value};
 
 use super::{new_id, now_iso, Store};
-use crate::middleware::Visibility;
+use crate::Visibility;
 
 const CONV_COLS: &str = "id, owner, created_by, title, runtime, origin, status, \
     claude_session_id, summary, reflected_at, created_at, updated_at, last_activity_at";

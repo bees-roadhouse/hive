@@ -12,7 +12,7 @@ use sqlx::Row;
 
 use super::entity_validation::{merge_fields, searchable_text, validate_fields, FieldIssue};
 use super::{new_id, now_iso, Store};
-use crate::middleware::Visibility;
+use crate::Visibility;
 
 pub enum EntityWriteError {
     /// Structured validation failures → 400 with the issues array.

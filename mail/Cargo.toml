@@ -13,7 +13,7 @@ name = "hive-mail"
 path = "src/main.rs"
 
 [dependencies]
-hive-api = { path = "../api" }
+hive-core = { path = "../core" }
 hive-shared = { workspace = true }
 jmap-sync = { path = "../jmap-sync" }
 tokio = { workspace = true }
