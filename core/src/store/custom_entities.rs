@@ -12,7 +12,6 @@ use sqlx::Row;
 
 use super::entity_validation::{merge_fields, searchable_text, validate_fields, FieldIssue};
 use super::{new_id, now_iso, Store};
-use crate::Visibility;
 
 pub enum EntityWriteError {
     /// Structured validation failures → 400 with the issues array.
@@ -46,7 +45,6 @@ impl Store {
     pub async fn custom_entities_list(
         &self,
         filter: &EntityFilter,
-        vis: &Visibility,
     ) -> std::result::Result<Vec<CustomEntity>, EntityWriteError> {
         let Some(ty) = self.entity_types_get(&filter.type_slug).await? else {
             return Err(EntityWriteError::UnknownType);
@@ -65,31 +63,15 @@ impl Store {
         }
 
         let limit = filter.limit.clamp(1, 500);
-        let rows = match vis {
-            Visibility::All => {
-                crate::pgq::query(
-                    "SELECT id, type_id, title, fields::text AS fields, user_scope, origin_entry_id, created_by, created_at, updated_at \
-                     FROM entities WHERE type_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                )
-                .bind(&ty.id)
-                .bind(limit)
-                .bind(filter.offset)
-                .fetch_all(self.db())
-                .await?
-            }
-            Visibility::Namespace(u) => {
-                crate::pgq::query(
-                    "SELECT id, type_id, title, fields::text AS fields, user_scope, origin_entry_id, created_by, created_at, updated_at \
-                     FROM entities WHERE type_id = ? AND (user_scope IS NULL OR user_scope = ?) ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                )
-                .bind(&ty.id)
-                .bind(u)
-                .bind(limit)
-                .bind(filter.offset)
-                .fetch_all(self.db())
-                .await?
-            }
-        };
+        let rows = crate::pgq::query(
+            "SELECT id, type_id, title, fields::text AS fields, user_scope, origin_entry_id, created_by, created_at, updated_at \
+             FROM entities WHERE type_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        )
+        .bind(&ty.id)
+        .bind(limit)
+        .bind(filter.offset)
+        .fetch_all(self.db())
+        .await?;
         let mut items: Vec<CustomEntity> = rows
             .iter()
             .map(|r| row_to_entity(r, &ty.slug))
@@ -133,11 +115,7 @@ impl Store {
         Ok(items)
     }
 
-    pub async fn custom_entities_get(
-        &self,
-        id: &str,
-        vis: &Visibility,
-    ) -> Result<Option<CustomEntity>> {
+    pub async fn custom_entities_get(&self, id: &str) -> Result<Option<CustomEntity>> {
         let row = crate::pgq::query(
             "SELECT e.id, e.type_id, e.title, e.fields::text AS fields, e.user_scope, e.origin_entry_id, e.created_by, e.created_at, e.updated_at, t.slug AS type_slug \
              FROM entities e JOIN entity_types t ON t.id = e.type_id WHERE e.id = ?",
@@ -147,16 +125,7 @@ impl Store {
         .await?;
         let Some(r) = row else { return Ok(None) };
         let slug: String = r.try_get("type_slug")?;
-        let e = row_to_entity(&r, &slug)?;
-        // Invisible reads 404, not 403 — no existence leak across namespaces.
-        match vis {
-            Visibility::All => Ok(Some(e)),
-            Visibility::Namespace(u) => Ok(match &e.user_scope {
-                None => Some(e),
-                Some(scope) if scope == u => Some(e),
-                Some(_) => None,
-            }),
-        }
+        Ok(Some(row_to_entity(&r, &slug)?))
     }
 
     pub async fn custom_entities_create(
@@ -227,10 +196,9 @@ impl Store {
         id: &str,
         patch: CustomEntityPatch,
         actor: &str,
-        vis: &Visibility,
         namespace_owner: Option<&str>,
     ) -> std::result::Result<Option<CustomEntity>, EntityWriteError> {
-        let Some(current) = self.custom_entities_get(id, vis).await? else {
+        let Some(current) = self.custom_entities_get(id).await? else {
             return Ok(None);
         };
         let ty = self
@@ -279,13 +247,8 @@ impl Store {
         Ok(Some(next))
     }
 
-    pub async fn custom_entities_delete(
-        &self,
-        id: &str,
-        actor: &str,
-        vis: &Visibility,
-    ) -> Result<Option<()>> {
-        let Some(current) = self.custom_entities_get(id, vis).await? else {
+    pub async fn custom_entities_delete(&self, id: &str, actor: &str) -> Result<Option<()>> {
+        let Some(current) = self.custom_entities_get(id).await? else {
             return Ok(None);
         };
         crate::pgq::query("DELETE FROM entities WHERE id = ?")

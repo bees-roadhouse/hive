@@ -12,7 +12,6 @@ pub mod actors;
 pub mod artifacts;
 pub mod cc_credentials;
 pub mod config;
-pub mod conversations;
 pub mod custom_entities;
 pub mod dashboard;
 pub mod decisions;
@@ -21,13 +20,11 @@ pub mod entity_types;
 pub mod entity_validation;
 pub mod events;
 pub mod identities;
-pub mod import;
 pub mod inbox;
 pub mod journal;
 pub mod links;
 pub mod mail;
 pub mod maintenance;
-pub mod oauth;
 pub mod outbox;
 pub mod people;
 pub mod phases;
@@ -36,15 +33,10 @@ pub mod projects;
 pub mod recall;
 pub mod search;
 pub mod semantic;
-pub mod sessions;
-pub mod shares;
 pub mod sources;
 pub mod tasks;
-pub mod tokens;
 pub mod topics;
-pub mod users;
 pub mod workerstatus;
-pub mod workspaces;
 
 /// Current instant in the exact shape JS `new Date().toISOString()` produces —
 /// millisecond precision, trailing `Z` — so rows sort lexicographically next to

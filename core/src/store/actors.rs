@@ -3,14 +3,14 @@
 // Previews run the SAME mutating code and then roll the transaction back
 // (Node's RollbackPreview), so the counts match the live run exactly.
 //
-// Decoupling: journal/tasks/decisions/events/shares live in concurrently-built
+// Decoupling: journal/tasks/decisions/events live in concurrently-built
 // modules, so everything here is raw SQL on the transaction connection — which
 // is what Node does anyway (one big SQL transaction).
 
 use anyhow::Result;
 use hive_shared::{ActorDeleteResult, ActorMergeResult};
 use serde_json::json;
-use sqlx::{PgConnection, Row};
+use sqlx::PgConnection;
 
 use super::Store;
 
@@ -56,7 +56,7 @@ impl Store {
     }
 
     /// Fold `from` into `into`: reassign all authorship/ownership/refs, then
-    /// remove the `from` people/profile/users rows. Transactional.
+    /// remove the `from` people/profile rows. Transactional.
     pub async fn actors_merge(&self, from: &str, into: &str) -> Result<ActorMergeResult> {
         let mut tx = self.db().begin().await?;
         let acc = merge_in_tx(&mut tx, from, into).await?;
@@ -225,12 +225,6 @@ async fn delete_journal_entry(
         &[entry_id, entry_id],
     )
     .await?;
-    acc.shares += exec_count(
-        conn,
-        "DELETE FROM shares WHERE scope = 'entry' AND ref = ?",
-        &[entry_id],
-    )
-    .await?;
     let (search, embeddings, links) = purge_entity_indexes(conn, "journal", entry_id).await?;
     acc.search += search;
     acc.embeddings += embeddings;
@@ -301,15 +295,7 @@ async fn remove_in_tx(conn: &mut PgConnection, slug: &str) -> Result<ActorDelete
     )
     .await?;
 
-    // 5. Shares: as viewer, or journal-scoped shares OF this author's stream.
-    acc.shares += exec_count(
-        conn,
-        "DELETE FROM shares WHERE viewer = ? OR (scope = 'journal' AND ref = ?)",
-        &[slug, slug],
-    )
-    .await?;
-
-    // 5b. Custom entities: rows this actor authored or holds privately go,
+    // 5. Custom entities: rows this actor authored or holds privately go,
     // with their search/embeddings/field-mirror links (kind = the type slug).
     // Global rows created by OTHERS that merely reference the actor keep
     // their (now dangling) ref values — the next touch of that field 400s.
@@ -332,34 +318,10 @@ async fn remove_in_tx(conn: &mut PgConnection, slug: &str) -> Result<ActorDelete
     // 6. Profile card.
     acc.profile += exec_count(conn, "DELETE FROM profile WHERE actor = ?", &[slug]).await?;
 
-    // 7. Login + credentials. Sessions hang off the user row (user_id), so reap
-    //    them first, then the user, then any bearer tokens for this actor.
-    let usr_rows: Vec<(String,)> = crate::pgq::query_as("SELECT id FROM users WHERE actor = ?")
-        .bind(slug)
-        .fetch_all(&mut *conn)
-        .await?;
-    for (user_id,) in &usr_rows {
-        acc.sessions +=
-            exec_count(conn, "DELETE FROM sessions WHERE user_id = ?", &[user_id]).await?;
-    }
-    acc.users += exec_count(conn, "DELETE FROM users WHERE actor = ?", &[slug]).await?;
-    acc.api_tokens += exec_count(
-        conn,
-        "DELETE FROM api_tokens WHERE actor = ? OR created_by = ? OR granted_by = ?",
-        &[slug, slug, slug],
-    )
-    .await?;
-    acc.oauth_codes += exec_count(
-        conn,
-        "DELETE FROM oauth_auth_codes WHERE ai_actor = ? OR granted_by = ?",
-        &[slug, slug],
-    )
-    .await?;
-
-    // 8. Wire events authored by the actor.
+    // 7. Wire events authored by the actor.
     acc.wire += exec_count(conn, "DELETE FROM wire WHERE actor = ?", &[slug]).await?;
 
-    // 9. Sources the actor owns; null out a `notify` that pointed at them.
+    // 8. Sources the actor owns; null out a `notify` that pointed at them.
     acc.sources += exec_count(conn, "DELETE FROM sources WHERE owner = ?", &[slug]).await?;
     exec_count(
         conn,
@@ -368,7 +330,7 @@ async fn remove_in_tx(conn: &mut PgConnection, slug: &str) -> Result<ActorDelete
     )
     .await?;
 
-    // 10. Mail: derived rows for the owner's messages (search/embeddings/
+    // 9. Mail: derived rows for the owner's messages (search/embeddings/
     //     inbox/links), the vault credentials their accounts name, then the
     //     accounts themselves — messages and attachments die via FK cascade —
     //     and finally any blobs nothing points at anymore (no 24h grace here:
@@ -428,7 +390,7 @@ async fn remove_in_tx(conn: &mut PgConnection, slug: &str) -> Result<ActorDelete
     )
     .await?;
 
-    // 11. people.owner pointers (AIs this actor owned) → null, then the row itself.
+    // 10. people.owner pointers (AIs this actor owned) → null, then the row itself.
     exec_count(
         conn,
         "UPDATE people SET owner = NULL WHERE owner = ?",
@@ -516,81 +478,6 @@ async fn merge_in_tx(conn: &mut PgConnection, from: &str, to: &str) -> Result<Ac
     // Drop any now-self-addressed items the move created (recipient === from).
     exec_count(conn, r#"DELETE FROM inbox WHERE recipient = "from""#, &[]).await?;
 
-    // Shares: viewer + journal-scoped ref. A move can collide with an existing
-    // (scope,ref,viewer) row (unique index), so reassign only where no twin exists,
-    // and delete the leftover duplicates.
-    for (col, where_sql) in [
-        ("viewer", "viewer = ?"),
-        ("ref", "scope = 'journal' AND ref = ?"),
-    ] {
-        let rows = crate::pgq::query(&format!(
-            "SELECT id, scope, ref, viewer FROM shares WHERE {where_sql}"
-        ))
-        .bind(from)
-        .fetch_all(&mut *conn)
-        .await?;
-        for r in &rows {
-            let id: String = r.try_get("id")?;
-            let scope: String = r.try_get("scope")?;
-            let s_ref: String = r.try_get("ref")?;
-            let viewer: String = r.try_get("viewer")?;
-            let next_ref = if col == "ref" { to } else { s_ref.as_str() };
-            let next_viewer = if col == "viewer" { to } else { viewer.as_str() };
-            let twin = crate::pgq::query(
-                "SELECT 1 FROM shares WHERE scope = ? AND ref = ? AND viewer = ? AND id != ?",
-            )
-            .bind(&scope)
-            .bind(next_ref)
-            .bind(next_viewer)
-            .bind(&id)
-            .fetch_optional(&mut *conn)
-            .await?;
-            if twin.is_some() {
-                exec_count(conn, "DELETE FROM shares WHERE id = ?", &[&id]).await?;
-            } else {
-                exec_count(
-                    conn,
-                    &format!("UPDATE shares SET {col} = ? WHERE id = ?"),
-                    &[to, &id],
-                )
-                .await?;
-                acc.shares += 1;
-            }
-        }
-    }
-
-    // Tokens + oauth codes: re-point actor + the granting/creating columns.
-    acc.api_tokens += exec_count(
-        conn,
-        "UPDATE api_tokens SET actor = ? WHERE actor = ?",
-        &[to, from],
-    )
-    .await?;
-    exec_count(
-        conn,
-        "UPDATE api_tokens SET created_by = ? WHERE created_by = ?",
-        &[to, from],
-    )
-    .await?;
-    exec_count(
-        conn,
-        "UPDATE api_tokens SET granted_by = ? WHERE granted_by = ?",
-        &[to, from],
-    )
-    .await?;
-    acc.oauth_codes += exec_count(
-        conn,
-        "UPDATE oauth_auth_codes SET ai_actor = ? WHERE ai_actor = ?",
-        &[to, from],
-    )
-    .await?;
-    exec_count(
-        conn,
-        "UPDATE oauth_auth_codes SET granted_by = ? WHERE granted_by = ?",
-        &[to, from],
-    )
-    .await?;
-
     // Wire authorship.
     acc.entities += exec_count(
         conn,
@@ -633,8 +520,8 @@ async fn merge_in_tx(conn: &mut PgConnection, from: &str, to: &str) -> Result<Ac
     )
     .await?;
 
-    // Profile/identity + login: the `to` card/account wins. Move the `from` card
-    // only if `to` has none, else drop the `from` card; same for the user account.
+    // Profile card: the `to` card wins. Move the `from` card only if `to` has
+    // none, else drop the `from` card.
     let to_has_profile = crate::pgq::query("SELECT 1 FROM profile WHERE actor = ?")
         .bind(to)
         .fetch_optional(&mut *conn)
@@ -646,29 +533,6 @@ async fn merge_in_tx(conn: &mut PgConnection, from: &str, to: &str) -> Result<Ac
         acc.profile += exec_count(
             conn,
             "UPDATE profile SET actor = ? WHERE actor = ?",
-            &[to, from],
-        )
-        .await?;
-    }
-    let to_has_user = crate::pgq::query("SELECT 1 FROM users WHERE actor = ?")
-        .bind(to)
-        .fetch_optional(&mut *conn)
-        .await?
-        .is_some();
-    if to_has_user {
-        // `to` already logs in; drop the `from` account + its sessions.
-        let usr_rows: Vec<(String,)> = crate::pgq::query_as("SELECT id FROM users WHERE actor = ?")
-            .bind(from)
-            .fetch_all(&mut *conn)
-            .await?;
-        for (user_id,) in &usr_rows {
-            exec_count(conn, "DELETE FROM sessions WHERE user_id = ?", &[user_id]).await?;
-        }
-        acc.users += exec_count(conn, "DELETE FROM users WHERE actor = ?", &[from]).await?;
-    } else {
-        acc.users += exec_count(
-            conn,
-            "UPDATE users SET actor = ? WHERE actor = ?",
             &[to, from],
         )
         .await?;

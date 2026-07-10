@@ -1,8 +1,9 @@
-// Per-user Claude Code credentials, encrypted at rest. The runner needs the real
-// token to launch Claude Code, so this is *reversible* (AES-256-GCM) — unlike PATs
-// and passwords, which are hashed. The key derives from HIVE_CRED_KEY (any string;
-// SHA-256 → 32-byte key). Plaintext is returned ONLY to the internal runtime-auth
-// path (cc_cred_decrypt_for_runtime), never to a public route.
+// The credential vault, encrypted at rest — today its ONLY consumer is mail
+// account credentials (mail_accounts.cred_id names a row here; store/mail.rs
+// writes and decrypts through it). Reversible (AES-256-GCM) because the mail
+// sync driver needs the real secret. The key derives from HIVE_CRED_KEY (any
+// string; SHA-256 → 32-byte key). Named cc_credentials for hosted-era
+// reasons; Phase 3 replaces it with the OS keychain.
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
@@ -12,8 +13,15 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::workspaces::normalize_runtime;
 use super::{new_id, now_iso, Store};
+
+/// Canonical runtime names (inherited shape; mail rows use "jmap").
+fn normalize_runtime(runtime: Option<&str>) -> String {
+    match runtime.unwrap_or("claude_code").trim() {
+        "" | "claude" | "claude_code" => "claude_code".to_string(),
+        other => other.to_string(),
+    }
+}
 
 /// A stored credential, redacted for display — never the secret itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,24 +49,8 @@ pub struct NewCcCredential {
 }
 
 #[derive(sqlx::FromRow)]
-struct CredViewRow {
-    id: String,
-    owner: String,
-    kind: String,
-    runtime: String,
-    provider: Option<String>,
-    label: String,
-    tail: String,
-    created_at: String,
-    last_used_at: Option<String>,
-}
-
-#[derive(sqlx::FromRow)]
 struct CredSecretRow {
     id: String,
-    kind: String,
-    runtime: String,
-    provider: Option<String>,
     ciphertext: String,
     nonce: String,
 }
@@ -159,78 +151,13 @@ impl Store {
         })
     }
 
-    /// Redacted list of an owner's credentials.
-    pub async fn cc_cred_list(&self, owner: &str) -> Result<Vec<CcCredentialView>> {
-        let rows = crate::pgq::query_as::<CredViewRow>(
-            "SELECT id, owner, kind, runtime, provider, label, tail, created_at, last_used_at \
-             FROM cc_credentials WHERE owner = ? ORDER BY created_at DESC",
-        )
-        .bind(owner)
-        .fetch_all(self.db())
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| CcCredentialView {
-                id: r.id,
-                owner: r.owner,
-                kind: r.kind,
-                runtime: normalize_runtime(Some(&r.runtime)),
-                provider: r.provider,
-                label: r.label,
-                tail: r.tail,
-                created_at: r.created_at,
-                last_used_at: r.last_used_at,
-            })
-            .collect())
-    }
-
-    pub async fn cc_cred_delete(&self, owner: &str, id: &str) -> Result<bool> {
-        let res = crate::pgq::query("DELETE FROM cc_credentials WHERE id = ? AND owner = ?")
-            .bind(id)
-            .bind(owner)
-            .execute(self.db())
-            .await?;
-        Ok(res.rows_affected() > 0)
-    }
-
-    /// Decrypt the owner's most recent credential for the requested runtime (INTERNAL only —
-    /// the only path that ever yields plaintext). Returns `(kind, runtime, provider, secret)`.
-    pub async fn cc_cred_decrypt_for_runtime(
-        &self,
-        owner: &str,
-        runtime: &str,
-    ) -> Result<Option<(String, String, Option<String>, String)>> {
-        let runtime = normalize_runtime(Some(runtime));
-        let row = crate::pgq::query_as::<CredSecretRow>(
-            "SELECT id, kind, runtime, provider, ciphertext, nonce FROM cc_credentials \
-             WHERE owner = ? AND runtime = ? ORDER BY created_at DESC LIMIT 1",
-        )
-        .bind(owner)
-        .bind(&runtime)
-        .fetch_optional(self.db())
-        .await?;
-        let Some(row) = row else { return Ok(None) };
-        let secret = decrypt(&row.ciphertext, &row.nonce)?;
-        crate::pgq::query("UPDATE cc_credentials SET last_used_at = ? WHERE id = ?")
-            .bind(now_iso())
-            .bind(&row.id)
-            .execute(self.db())
-            .await?;
-        Ok(Some((
-            row.kind,
-            normalize_runtime(Some(&row.runtime)),
-            row.provider,
-            secret,
-        )))
-    }
-
     /// Decrypt one credential by row id (INTERNAL only). Mail accounts name
     /// their vault row via `mail_accounts.cred_id`, so the most-recent-per-
     /// runtime picker above would be wrong the moment a second account
     /// exists.
     pub async fn cc_cred_decrypt_by_id(&self, id: &str) -> Result<Option<String>> {
         let row = crate::pgq::query_as::<CredSecretRow>(
-            "SELECT id, kind, runtime, provider, ciphertext, nonce FROM cc_credentials WHERE id = ?",
+            "SELECT id, ciphertext, nonce FROM cc_credentials WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(self.db())

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Idempotent setup for the hive dev environment (Rust API + Postgres). Run by
-# the SessionStart hook so a fresh Claude Code container comes up ready to
-# develop. Safe to re-run.
+# Idempotent setup for the hive dev environment (Rust workspace + Postgres).
+# Run by the SessionStart hook so a fresh Claude Code container comes up ready
+# to develop. Safe to re-run.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -28,4 +28,4 @@ else
 fi
 
 echo "✅ ready."
-echo "   API: DATABASE_URL=$DB_URL HIVE_EMBED=hash cargo run -p hive-api    (:7878, MCP at /mcp)"
+echo "   Tests: DATABASE_URL=$DB_URL HIVE_EMBED=hash cargo test --workspace"

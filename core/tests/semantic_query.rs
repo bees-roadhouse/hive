@@ -1,13 +1,18 @@
 // Query-path functional tests for the B5 rewrite, hash-provider flavor: the
-// brute-force BYTEA path must enforce SQL owner filtering, chunk collapse,
-// keyed hydration (drop-on-miss), per-kind rank weights, and the diversified
-// stage-1 fill — the same cascade the ANN path runs (vector_perf.rs covers
-// that side), so CI keeps exercising all of it without ONNX.
+// brute-force BYTEA path must enforce chunk collapse, keyed hydration
+// (drop-on-miss, incl. tombstoned mail), per-kind rank weights, and the
+// diversified stage-1 fill — the same cascade the ANN path runs
+// (vector_perf.rs covers that side), so CI keeps exercising all of it without
+// ONNX. The owner-FILTER assertions died with the viewer ACL in PR 1.3;
+// `embeddings.owner` is still written and carried through these fixtures so
+// the storage shape stays exercised.
+
+mod common;
 
 use std::sync::OnceLock;
 
-use hive_api::store::semantic::SemanticOptions;
-use hive_api::store::Store;
+use hive_core::store::semantic::SemanticOptions;
+use hive_core::store::Store;
 
 const QUERY: &str = "alpha hive inspection notes";
 
@@ -21,7 +26,7 @@ fn hash_setup() {
 
 async fn test_store() -> Store {
     hash_setup();
-    Store::new(hive_api::db::test_pool().await)
+    common::test_store().await
 }
 
 /// A deterministic vector whose cosine similarity to `q` is ~`sim`:
@@ -59,7 +64,7 @@ async fn insert_embedding(
     owner: Option<&str>,
     vec: &[f32],
 ) {
-    hive_api::pgq::query(
+    hive_core::pgq::query(
         "INSERT INTO embeddings (ref_kind, ref_id, chunk_idx, model, dim, owner, vec, hash, created_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, 'h', ?)",
     )
@@ -70,44 +75,44 @@ async fn insert_embedding(
     .bind(vec.len() as i64)
     .bind(owner)
     .bind(hive_embed::to_blob(vec))
-    .bind(hive_api::store::now_iso())
+    .bind(hive_core::store::now_iso())
     .execute(store.db())
     .await
     .expect("embedding insert");
 }
 
 async fn insert_journal(store: &Store, id: &str, author: &str, scope: Option<&str>, body: &str) {
-    hive_api::pgq::query(
+    hive_core::pgq::query(
         "INSERT INTO journal (id, author, body, user_scope, created_at) VALUES (?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(author)
     .bind(body)
     .bind(scope)
-    .bind(hive_api::store::now_iso())
+    .bind(hive_core::store::now_iso())
     .execute(store.db())
     .await
     .expect("journal insert");
 }
 
 async fn insert_mail_account(store: &Store, id: &str, owner: &str) {
-    hive_api::pgq::query(
+    hive_core::pgq::query(
         "INSERT INTO mail_accounts (id, owner, address, created_at, updated_at) \
          VALUES (?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(owner)
     .bind(format!("{owner}@example.test"))
-    .bind(hive_api::store::now_iso())
-    .bind(hive_api::store::now_iso())
+    .bind(hive_core::store::now_iso())
+    .bind(hive_core::store::now_iso())
     .execute(store.db())
     .await
     .expect("mail account insert");
 }
 
 async fn insert_mail(store: &Store, id: &str, account: &str, owner: &str, deleted: bool) {
-    let now = hive_api::store::now_iso();
-    hive_api::pgq::query(
+    let now = hive_core::store::now_iso();
+    hive_core::pgq::query(
         "INSERT INTO mail_messages (id, account_id, jmap_id, jmap_thread_id, received_at, \
            subject, from_addr, snippet, body_text, user_scope, deleted_at, created_at, updated_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -130,19 +135,18 @@ async fn insert_mail(store: &Store, id: &str, account: &str, owner: &str, delete
     .expect("mail insert");
 }
 
-fn opts(viewer: Option<&str>, limit: usize) -> SemanticOptions {
+fn opts(limit: usize) -> SemanticOptions {
     SemanticOptions {
         limit: Some(limit),
         // Pure vector ranking: no FTS blend so crafted similarities decide
         // order deterministically (links are empty, so blanket is inert).
         hybrid: Some(false),
-        viewer: viewer.map(String::from),
         ..Default::default()
     }
 }
 
 #[tokio::test]
-async fn brute_owner_filter_and_batched_mail_visibility() {
+async fn reads_span_owners_and_tombstoned_mail_never_hydrates() {
     let store = test_store().await;
     let q = hive_embed::embed_query(QUERY);
 
@@ -190,8 +194,8 @@ async fn brute_owner_filter_and_batched_mail_visibility() {
         &vec_with_sim(&q, 0.93, 4),
     )
     .await;
-    // Tombstoned mail whose embeddings row lingers (reaper hasn't swept): the
-    // SQL owner filter passes it, the batched mail-visibility arm must not.
+    // Tombstoned mail whose embeddings row lingers (reaper hasn't swept):
+    // keyed hydration must refuse it.
     insert_embedding(
         &store,
         "mail",
@@ -202,38 +206,16 @@ async fn brute_owner_filter_and_batched_mail_visibility() {
     )
     .await;
 
+    // Single-user reads span every stored owner; only deletion gates.
     let hits = store
-        .semantic_search(QUERY, opts(Some("maggie"), 10))
+        .semantic_search(QUERY, opts(10))
         .await
-        .expect("scoped search");
+        .expect("search");
     let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
-    assert!(
-        ids.contains(&"jrnl_global"),
-        "global journal visible: {ids:?}"
-    );
-    assert!(ids.contains(&"mail_maggie"), "own mail visible: {ids:?}");
-    assert!(
-        !ids.contains(&"jrnl_nate"),
-        "foreign journal leaked: {ids:?}"
-    );
-    assert!(!ids.contains(&"mail_nate"), "foreign mail leaked: {ids:?}");
-    assert!(
-        !ids.contains(&"mail_maggie_del"),
-        "tombstoned mail leaked past the visibility arm: {ids:?}"
-    );
-
-    // Unscoped (admin) search skips the owner filter but hydration still
-    // refuses deleted mail.
-    let hits = store
-        .semantic_search(QUERY, opts(None, 10))
-        .await
-        .expect("admin search");
-    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
-    assert!(ids.contains(&"mail_nate"), "admin sees all owners: {ids:?}");
-    assert!(
-        ids.contains(&"mail_maggie"),
-        "admin sees all owners: {ids:?}"
-    );
+    assert!(ids.contains(&"jrnl_global"), "global visible: {ids:?}");
+    assert!(ids.contains(&"jrnl_nate"), "scoped rows readable: {ids:?}");
+    assert!(ids.contains(&"mail_nate"), "all owners readable: {ids:?}");
+    assert!(ids.contains(&"mail_maggie"), "all owners readable: {ids:?}");
     assert!(
         !ids.contains(&"mail_maggie_del"),
         "deleted mail must never hydrate: {ids:?}"
@@ -279,7 +261,7 @@ async fn chunk_collapse_scores_parent_by_best_chunk() {
     .await;
 
     let hits = store
-        .semantic_search(QUERY, opts(None, 10))
+        .semantic_search(QUERY, opts(10))
         .await
         .expect("search");
     let chunky: Vec<_> = hits.iter().filter(|h| h.id == "jrnl_chunky").collect();
@@ -318,10 +300,7 @@ async fn hydration_misses_drop_without_starving_results() {
     )
     .await;
 
-    let hits = store
-        .semantic_search(QUERY, opts(None, 1))
-        .await
-        .expect("search");
+    let hits = store.semantic_search(QUERY, opts(1)).await.expect("search");
     assert_eq!(
         hits.len(),
         1,
@@ -365,10 +344,7 @@ async fn kind_weights_demote_mail_and_config_overrides() {
     )
     .await;
 
-    let hits = store
-        .semantic_search(QUERY, opts(None, 2))
-        .await
-        .expect("search");
+    let hits = store.semantic_search(QUERY, opts(2)).await.expect("search");
     assert_eq!(
         hits[0].id, "jrnl_w",
         "default mail weight 0.85 must demote mail below journal: {hits:?}"
@@ -380,10 +356,7 @@ async fn kind_weights_demote_mail_and_config_overrides() {
         .config_set("search.kind_weights", r#"{"mail": 1.0}"#)
         .await
         .expect("config set");
-    let hits = store
-        .semantic_search(QUERY, opts(None, 2))
-        .await
-        .expect("search");
+    let hits = store.semantic_search(QUERY, opts(2)).await.expect("search");
     assert_eq!(
         hits[0].id, "mail_w",
         "weight 1.0 restores sim order: {hits:?}"
@@ -427,10 +400,7 @@ async fn diversified_pool_guarantees_journal_under_mail_flood() {
     )
     .await;
 
-    let hits = store
-        .semantic_search(QUERY, opts(None, 5))
-        .await
-        .expect("search");
+    let hits = store.semantic_search(QUERY, opts(5)).await.expect("search");
     assert!(
         hits.iter().any(|h| h.id == "jrnl_f"),
         "mail flood evicted journal from the pool: {hits:?}"

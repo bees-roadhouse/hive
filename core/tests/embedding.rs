@@ -11,6 +11,8 @@
 // serialize on ENV_LOCK — the budget test's zero-budget window must never
 // overlap another test's backfill call.
 
+mod common;
+
 use hive_core::store::Store;
 use tokio::sync::Mutex;
 
@@ -39,8 +41,8 @@ async fn test_setup() -> (sqlx::PgPool, Store) {
     // engine (real model download) from ever wiring itself in.
     std::env::set_var("HIVE_EMBED", "transformers");
     hive_embed::set_onnx_provider(Box::new(Mock384));
-    let pool = hive_core::db::test_pool().await;
-    (pool.clone(), Store::new(pool))
+    let store = common::test_store().await;
+    (store.db().clone(), store)
 }
 
 #[tokio::test]

@@ -1,13 +1,15 @@
-// PostgreSQL is the datastore. The api and worker both connect to the same
-// Postgres (via DATABASE_URL), which is what lets them share state without the
-// single-writer / file-ownership friction of the old shared-SQLite-file setup.
+// PostgreSQL is the datastore until the Phase 1 SQLite cutover (PR 1.6).
 //
 // Schema is created idempotently at boot (CREATE TABLE IF NOT EXISTS + ADD
-// COLUMN IF NOT EXISTS), so both binaries can race the migrate path safely.
-// Full-text search uses a generated `tsvector` column + GIN index in place of
-// SQLite's FTS5 virtual table. Existing SQLite data migrates in via the import
-// endpoint (api/src/legacy_import.rs reads the uploaded .db; this store writes
-// it through the normal insert path).
+// COLUMN IF NOT EXISTS), so concurrent processes can race the migrate path
+// safely. Full-text search uses a generated `tsvector` column + GIN index.
+//
+// Teardown note (PR 1.3): the hosted-era tables (users, sessions, api_tokens,
+// oauth_*, shares, cc_sessions/cc_messages, runtime_oauth_states) are no
+// longer created or read. init() stays idempotent against an EXISTING
+// old-shape database — orphan tables in old instances are harmless and are
+// deliberately NOT dropped (the PR 1.7 importer reads old instances with its
+// own queries).
 
 use anyhow::Result;
 use hive_shared::APP_VERSION;
@@ -39,9 +41,9 @@ const SCHEMA: &str = r#"
       body       TEXT NOT NULL,
       tags       TEXT NOT NULL DEFAULT '[]',
       mentions   TEXT NOT NULL DEFAULT '[]',
-      -- Namespace owner: the human user this entry belongs to. NULL = global /
-      -- "continuous" history visible to everyone. Non-NULL = visible only to
-      -- that user (+ admins). See the Visibility model in middleware.rs.
+      -- Namespace owner the entry was written into (NULL = global/continuous
+      -- history). Retained for storage-shape stability across the 1.6 cutover
+      -- and the 1.7 importer; single-user reads no longer filter on it.
       user_scope TEXT,
       created_at TEXT NOT NULL
     );
@@ -237,88 +239,12 @@ const SCHEMA: &str = r#"
       created_at TEXT NOT NULL
     );
 
-    -- Shares: explicit visibility grants.
-    CREATE TABLE IF NOT EXISTS shares (
-      id         TEXT PRIMARY KEY,
-      scope      TEXT NOT NULL,
-      ref        TEXT NOT NULL,
-      viewer     TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS shares_viewer ON shares (viewer, scope);
-    CREATE UNIQUE INDEX IF NOT EXISTS shares_uniq ON shares (scope, ref, viewer);
-
     -- Key/value instance config.
     CREATE TABLE IF NOT EXISTS config (
       key        TEXT PRIMARY KEY,
       value      TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
-
-    -- Login accounts. actor is the people.slug this user authenticates as.
-    CREATE TABLE IF NOT EXISTS users (
-      id            TEXT PRIMARY KEY,
-      actor         TEXT NOT NULL UNIQUE,
-      email         TEXT NOT NULL UNIQUE,
-      name          TEXT NOT NULL,
-      role          TEXT NOT NULL DEFAULT 'member',
-      password_hash TEXT NOT NULL,
-      created_at    TEXT NOT NULL,
-      last_login_at TEXT
-    );
-
-    -- Browser sessions (cookie auth). token_hash = sha256(plaintext cookie value).
-    CREATE TABLE IF NOT EXISTS sessions (
-      id         TEXT PRIMARY KEY,
-      token_hash TEXT NOT NULL UNIQUE,
-      user_id    TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      last_seen  TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS sessions_user ON sessions (user_id);
-
-    -- Bearer tokens for programmatic clients (CLI, MCP, AI agents).
-    CREATE TABLE IF NOT EXISTS api_tokens (
-      id           TEXT PRIMARY KEY,
-      token_hash   TEXT NOT NULL UNIQUE,
-      actor        TEXT NOT NULL,
-      label        TEXT NOT NULL,
-      created_by   TEXT NOT NULL,
-      created_at   TEXT NOT NULL,
-      last_used_at TEXT,
-      kind         TEXT,
-      client_id    TEXT,
-      granted_by   TEXT,
-      expires_at   TEXT,
-      scope        TEXT
-    );
-
-    -- OAuth 2.1 dynamic client registration (RFC 7591).
-    CREATE TABLE IF NOT EXISTS oauth_clients (
-      client_id     TEXT PRIMARY KEY,
-      client_name   TEXT NOT NULL,
-      redirect_uris TEXT NOT NULL,
-      grant_types   TEXT NOT NULL,
-      created_at    TEXT NOT NULL
-    );
-
-    -- OAuth authorization codes: single-use, short TTL, hashed at rest.
-    CREATE TABLE IF NOT EXISTS oauth_auth_codes (
-      code_hash      TEXT PRIMARY KEY,
-      client_id      TEXT NOT NULL,
-      redirect_uri   TEXT NOT NULL,
-      code_challenge TEXT NOT NULL,
-      ai_actor       TEXT NOT NULL,
-      granted_by     TEXT NOT NULL,
-      scope          TEXT NOT NULL,
-      created_at     TEXT NOT NULL,
-      expires_at     TEXT NOT NULL,
-      used_at        TEXT,
-      -- Requested access-token lifetime (seconds) carried from consent; NULL = default.
-      token_ttl_secs BIGINT
-    );
-    CREATE INDEX IF NOT EXISTS oauth_codes_expiry ON oauth_auth_codes (expires_at);
 
     -- Mutable per-actor card (humans + AIs).
     CREATE TABLE IF NOT EXISTS profile (
@@ -362,47 +288,11 @@ const SCHEMA: &str = r#"
     );
     CREATE INDEX IF NOT EXISTS identity_artifacts_actor ON identity_artifacts (actor);
 
-    -- ===== Hosted Claude Code workspaces (hive → Claude Code) =====
-    -- One row per session hive spins up and drives in an isolated sandbox.
-    -- Separate from the journal; scoped per owner (see Visibility in middleware.rs).
-    CREATE TABLE IF NOT EXISTS cc_sessions (
-      id                TEXT PRIMARY KEY,
-      owner             TEXT NOT NULL,
-      created_by        TEXT NOT NULL,
-      title             TEXT NOT NULL DEFAULT '',
-      workdir           TEXT NOT NULL DEFAULT '',
-      claude_session_id TEXT,
-      runtime           TEXT NOT NULL DEFAULT 'claude_code',
-      status            TEXT NOT NULL DEFAULT 'provisioning',
-      model             TEXT,
-      usage             TEXT NOT NULL DEFAULT '{}',
-      meta              TEXT NOT NULL DEFAULT '{}',
-      repo_url          TEXT,
-      repo_ref          TEXT,
-      created_at        TEXT NOT NULL,
-      updated_at        TEXT NOT NULL,
-      last_activity_at  TEXT
-    );
-    CREATE INDEX IF NOT EXISTS cc_sessions_owner ON cc_sessions (owner);
-
-    -- Complete chat history per session: every Agent-SDK message, lossless.
-    CREATE TABLE IF NOT EXISTS cc_messages (
-      id          TEXT PRIMARY KEY,
-      session_id  TEXT NOT NULL,
-      seq         BIGINT NOT NULL,
-      role        TEXT NOT NULL,
-      kind        TEXT NOT NULL,
-      content     TEXT NOT NULL DEFAULT '{}',
-      raw         TEXT NOT NULL DEFAULT '{}',
-      tokens_in   BIGINT,
-      tokens_out  BIGINT,
-      created_at  TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS cc_messages_session ON cc_messages (session_id, seq);
-
-    -- Per-user Claude Code credentials, encrypted at rest (AES-256-GCM via
-    -- HIVE_CRED_KEY). Reversible (unlike PAT/password hashes): the runner must
-    -- hand the real token to Claude Code. Plaintext never leaves the server.
+    -- The credential vault, encrypted at rest (AES-256-GCM via HIVE_CRED_KEY).
+    -- Reversible (unlike a hash): the mail sync driver needs the real secret.
+    -- Named cc_credentials for hosted-era reasons; today its ONLY consumer is
+    -- mail account credentials (mail_accounts.cred_id). Phase 3 replaces it
+    -- with the OS keychain.
     CREATE TABLE IF NOT EXISTS cc_credentials (
       id           TEXT PRIMARY KEY,
       owner        TEXT NOT NULL,
@@ -417,19 +307,6 @@ const SCHEMA: &str = r#"
       last_used_at TEXT
     );
     CREATE INDEX IF NOT EXISTS cc_credentials_owner ON cc_credentials (owner);
-
-    -- Browser-based OAuth handshakes for hosted agent runtimes. State rows are
-    -- short-lived and redeemed exactly once by /api/runtime-oauth/:runtime/callback.
-    CREATE TABLE IF NOT EXISTS runtime_oauth_states (
-      state         TEXT PRIMARY KEY,
-      owner         TEXT NOT NULL,
-      runtime       TEXT NOT NULL,
-      provider      TEXT,
-      code_verifier TEXT NOT NULL,
-      return_to     TEXT NOT NULL DEFAULT '/settings',
-      created_at    TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS runtime_oauth_states_owner ON runtime_oauth_states (owner);
 "#;
 
 /// Unified full-text index. Postgres equivalent of the old FTS5 virtual table:
@@ -498,7 +375,8 @@ const SCHEMA_SEARCH: &str = r#"
       type_id         TEXT NOT NULL,
       title           TEXT NOT NULL,
       fields          JSONB NOT NULL DEFAULT '{}'::jsonb,
-      -- Visibility: same model as journal.user_scope (NULL = global).
+      -- Same model as journal.user_scope (NULL = global); kept for storage-
+      -- shape stability, no longer filtered on.
       user_scope      TEXT,
       -- v2 journal-emergence provenance; carried now so nothing blocks it.
       origin_entry_id TEXT,
@@ -623,22 +501,11 @@ const SCHEMA_SEARCH: &str = r#"
 pub async fn migrate(pool: &PgPool) -> Result<()> {
     // sqlx-managed reshape migrations run FIRST, before the inline base DDL
     // below (hybrid convention — see core/migrations/0001_baseline_marker.sql).
-    // The migrator holds a Postgres advisory lock, so api + worker booting at
-    // the same time serialize here instead of racing. A failed migration
-    // aborts init: the binary exits and compose crash-loops loudly — fail
-    // closed rather than run against a half-reshaped schema.
+    // The migrator holds a Postgres advisory lock, so concurrent processes
+    // booting at the same time serialize here instead of racing. A failed
+    // migration aborts init — fail closed rather than run against a
+    // half-reshaped schema.
     sqlx::migrate!("./migrations").run(pool).await?;
-
-    // Was this a brand-new database? `journal` is the oldest core table, so its
-    // absence before this migrate run means a genuinely fresh install (→ run
-    // onboarding); a DB that already has it is treated as already set up.
-    let fresh = sqlx::query_scalar::<_, i32>(
-        "SELECT 1 FROM information_schema.tables \
-         WHERE table_schema = current_schema() AND table_name = 'journal'",
-    )
-    .fetch_optional(pool)
-    .await?
-    .is_none();
 
     sqlx::raw_sql(SCHEMA).execute(pool).await?;
     sqlx::raw_sql(SCHEMA_SEARCH).execute(pool).await?;
@@ -654,30 +521,8 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         "ALTER TABLE people     ADD COLUMN IF NOT EXISTS owner      TEXT",
         "ALTER TABLE people     ADD COLUMN IF NOT EXISTS bio        TEXT",
         "ALTER TABLE people     ADD COLUMN IF NOT EXISTS role       TEXT",
-        "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS kind       TEXT",
-        "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS client_id  TEXT",
-        "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS granted_by TEXT",
-        "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS expires_at TEXT",
-        "ALTER TABLE api_tokens ADD COLUMN IF NOT EXISTS scope      TEXT",
-        "ALTER TABLE oauth_auth_codes ADD COLUMN IF NOT EXISTS token_ttl_secs BIGINT",
-        "ALTER TABLE cc_sessions ADD COLUMN IF NOT EXISTS runtime TEXT NOT NULL DEFAULT 'claude_code'",
-        // Conversation capture (SessionEnd ingest of local Claude Code sessions)
-        // rides the cc_sessions table: origin marks how a row got here
-        // ('hosted' = runner-driven, 'captured' = local-session ingest),
-        // summary + reflected_at are the reflection loop's rolling summary and
-        // cursor (NULL reflected_at = queued for reflection).
-        "ALTER TABLE cc_sessions ADD COLUMN IF NOT EXISTS origin TEXT NOT NULL DEFAULT 'hosted'",
-        "ALTER TABLE cc_sessions ADD COLUMN IF NOT EXISTS summary TEXT NOT NULL DEFAULT ''",
-        "ALTER TABLE cc_sessions ADD COLUMN IF NOT EXISTS reflected_at TEXT",
-        // Idempotent capture key: a resumed local session re-fires SessionEnd
-        // with the same app session id — one captured row per (runtime,
-        // claude_session_id). Partial: hosted rows are exempt (their
-        // claude_session_id arrives late and isn't a dedup key).
-        "CREATE UNIQUE INDEX IF NOT EXISTS cc_sessions_captured_ext ON cc_sessions (runtime, claude_session_id) WHERE origin = 'captured'",
         "ALTER TABLE cc_credentials ADD COLUMN IF NOT EXISTS runtime TEXT NOT NULL DEFAULT 'claude_code'",
         "ALTER TABLE cc_credentials ADD COLUMN IF NOT EXISTS provider TEXT",
-        "CREATE TABLE IF NOT EXISTS runtime_oauth_states (state TEXT PRIMARY KEY, owner TEXT NOT NULL, runtime TEXT NOT NULL, provider TEXT, code_verifier TEXT NOT NULL, return_to TEXT NOT NULL DEFAULT '/settings', created_at TEXT NOT NULL)",
-        "CREATE INDEX IF NOT EXISTS runtime_oauth_states_owner ON runtime_oauth_states (owner)",
         "ALTER TABLE mail_accounts ADD COLUMN IF NOT EXISTS jmap_username TEXT",
         // Attachment bytes arrive pre-compressed (images, PDFs, zips):
         // skipping TOAST compression on the BYTEA saves CPU on both sides.
@@ -686,20 +531,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         sqlx::raw_sql(ddl).execute(pool).await?;
     }
 
-    // Onboarding gate: stamp the app version once; a fresh DB needs the wizard,
-    // an existing DB is treated as already set up.
+    // Stamp the app version once (first boot).
     let has_version: Option<String> =
         crate::pgq::query_scalar::<String>("SELECT value FROM config WHERE key = 'app.version'")
             .fetch_optional(pool)
             .await?;
     if has_version.is_none() {
         set_config(pool, "app.version", APP_VERSION).await?;
-        set_config(
-            pool,
-            "onboarding.completed",
-            if fresh { "false" } else { "true" },
-        )
-        .await?;
     }
 
     Ok(())
@@ -718,7 +556,7 @@ async fn set_config(pool: &PgPool, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-/// Open + migrate in one call (the boot path for both api and worker).
+/// Open + migrate in one call (the boot path).
 pub async fn init() -> Result<PgPool> {
     let url = database_url();
     let pool = open(&url).await?;
