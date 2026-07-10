@@ -1466,6 +1466,11 @@ a.news-title:hover { color: var(--honey); text-decoration: underline; }
 .mail-msg-head { display: flex; justify-content: space-between; gap: 1rem; padding-bottom: 0.55rem; border-bottom: 1px solid var(--line); }
 .mail-recipients { margin-top: 0.1rem; }
 .mail-plain { white-space: pre-wrap; word-break: break-word; margin: 0.75rem 0 0; color: var(--ink); font: 0.92rem/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: transparent; }
+.mail-atts { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.7rem; padding-top: 0.55rem; border-top: 1px dashed var(--line); }
+.mail-att { gap: 0.3rem; text-decoration: none; max-width: 22rem; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+a.mail-att:hover { border-color: var(--honey); }
+.mail-att-size { color: var(--dim); font-variant-numeric: tabular-nums; }
+.mail-att-missing { opacity: 0.55; border-style: dashed; cursor: default; }
 .mail-empty { margin: auto; text-align: center; color: var(--dim); }
 .mail-empty svg { color: var(--honey); }
 

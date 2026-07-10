@@ -74,11 +74,24 @@ pub struct MailMessageSummary {
     pub has_attachments: bool,
 }
 
+/// Lightweight attachment row for thread payloads: enough for the SPA to
+/// render a chip and link the serving route. `stored` = bytes are in the
+/// local blob store (false = oversize/missing/pending — link would 404).
+#[derive(Debug, Clone, Serialize)]
+pub struct MailAttachmentChip {
+    pub id: String,
+    pub filename: String,
+    pub mime: String,
+    pub size: i64,
+    pub stored: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MailThreadMessage {
     #[serde(flatten)]
     pub summary: MailMessageSummary,
     pub body_text: String,
+    pub attachments: Vec<MailAttachmentChip>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -115,6 +128,7 @@ impl From<MailMessageRow> for MailThreadMessage {
         Self {
             summary,
             body_text: row.body_text,
+            attachments: Vec::new(),
         }
     }
 }
@@ -259,8 +273,9 @@ impl Store {
                     .await?
                 }
             };
-        let messages: Vec<MailThreadMessage> =
+        let mut messages: Vec<MailThreadMessage> =
             rows.into_iter().map(MailThreadMessage::from).collect();
+        self.attach_chips(&mut messages).await?;
         let subject = messages
             .first()
             .map(|m| m.summary.subject.clone())
@@ -270,6 +285,42 @@ impl Store {
             subject,
             messages,
         })
+    }
+
+    /// Fill the attachment chips for a set of thread messages (one query).
+    async fn attach_chips(&self, messages: &mut [MailThreadMessage]) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        #[derive(sqlx::FromRow)]
+        struct ChipRow {
+            id: String,
+            message_id: String,
+            filename: String,
+            mime: String,
+            size: i64,
+            stored: bool,
+        }
+        let ids: Vec<String> = messages.iter().map(|m| m.summary.id.clone()).collect();
+        let rows = crate::pgq::query_as::<ChipRow>(
+            "SELECT id, message_id, filename, mime, size, (blob_hash IS NOT NULL) AS stored \
+             FROM mail_attachments WHERE message_id = ANY(?) ORDER BY created_at ASC, id ASC",
+        )
+        .bind(&ids)
+        .fetch_all(self.db())
+        .await?;
+        for row in rows {
+            if let Some(m) = messages.iter_mut().find(|m| m.summary.id == row.message_id) {
+                m.attachments.push(MailAttachmentChip {
+                    id: row.id,
+                    filename: row.filename,
+                    mime: row.mime,
+                    size: row.size,
+                    stored: row.stored,
+                });
+            }
+        }
+        Ok(())
     }
 
     async fn mail_message_rows(
@@ -620,6 +671,19 @@ fn mail_message_select(suffix: &str) -> String {
 // deliberately does NOT depend on jmap-sync — MailIngestMessage mirrors its
 // NormalizedMessage as plain fields.
 
+/// Attachment metadata as hive-mail hands it over (mirrors jmap-sync's
+/// AttachmentMeta). Bytes come later via the fetch pipeline; the jmap blob id
+/// keeps the server as the byte source of record for oversize parts.
+#[derive(Debug, Clone)]
+pub struct MailIngestAttachment {
+    pub jmap_blob_id: String,
+    pub filename: String,
+    pub mime: String,
+    pub size: i64,
+    pub content_id: Option<String>,
+    pub disposition: Option<String>,
+}
+
 /// One message as hive-mail hands it to the store. JSON-typed fields arrive
 /// pre-serialized (the daemon owns the address/keyword shapes).
 #[derive(Debug, Clone)]
@@ -646,6 +710,7 @@ pub struct MailIngestMessage {
     pub snippet: String,
     pub size: i64,
     pub has_attachments: bool,
+    pub attachments: Vec<MailIngestAttachment>,
     pub parse_error: Option<String>,
 }
 
@@ -986,6 +1051,34 @@ impl Store {
             .await?;
             let live_eligible = eligible && deleted.is_none();
 
+            // Attachment metadata rows; blob_hash stays NULL (= bytes
+            // pending) until the fetch pipeline stores them. Replays land on
+            // DO NOTHING via the NULLS-NOT-DISTINCT unique key. Tombstoned
+            // rows (incl. admin-redacted ones, whose attachment rows were
+            // deleted) get nothing back — otherwise a metadata replay would
+            // re-queue redacted bytes for download.
+            if deleted.is_none() {
+                for att in &m.attachments {
+                    crate::pgq::query(
+                        "INSERT INTO mail_attachments (id, message_id, jmap_blob_id, filename, \
+                         mime, size, content_id, disposition, created_at) \
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                         ON CONFLICT (message_id, jmap_blob_id, content_id) DO NOTHING",
+                    )
+                    .bind(new_id("matt"))
+                    .bind(&row.id)
+                    .bind(&att.jmap_blob_id)
+                    .bind(&att.filename)
+                    .bind(&att.mime)
+                    .bind(att.size)
+                    .bind(&att.content_id)
+                    .bind(&att.disposition)
+                    .bind(now_iso())
+                    .execute(&mut *tx)
+                    .await?;
+                }
+            }
+
             if live_eligible {
                 let title = if m.subject.trim().is_empty() {
                     "(no subject)"
@@ -1073,6 +1166,189 @@ impl Store {
         }
         tx.commit().await?;
         Ok(n)
+    }
+}
+
+// ---- attachments (byte pipeline + serving + GC; plan A6) ------------------
+
+/// One attachment awaiting bytes, as the fetch pipeline consumes it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MailAttachmentPending {
+    pub id: String,
+    pub jmap_blob_id: String,
+    pub mime: String,
+    /// Declared (server-reported) size — the pre-download oversize check.
+    pub size: i64,
+}
+
+/// Everything the serving route needs, resolved in one query. `data` rides
+/// along because household-scale attachments are ≤ the fetch cap anyway.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MailAttachmentServe {
+    pub user_scope: String,
+    pub filename: String,
+    pub mime: String,
+    pub blob_hash: Option<String>,
+    pub data: Option<Vec<u8>>,
+}
+
+impl Store {
+    /// Attachments still awaiting bytes for one account: blob not stored, not
+    /// skipped, message still live. Oldest first so a big backlog drains in
+    /// arrival order.
+    pub async fn mail_attachments_pending(
+        &self,
+        account_id: &str,
+        limit: i64,
+    ) -> Result<Vec<MailAttachmentPending>> {
+        Ok(crate::pgq::query_as::<MailAttachmentPending>(
+            "SELECT t.id, t.jmap_blob_id, t.mime, t.size FROM mail_attachments t \
+             JOIN mail_messages m ON m.id = t.message_id \
+             WHERE m.account_id = ? AND m.deleted_at IS NULL \
+             AND t.blob_hash IS NULL AND t.skipped_reason IS NULL \
+             ORDER BY t.created_at ASC, t.id ASC LIMIT ?",
+        )
+        .bind(account_id)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(self.db())
+        .await?)
+    }
+
+    /// Permanently park an attachment ('oversize' | 'missing'); it leaves the
+    /// pending queue and its chip renders dimmed. Never overwrites stored
+    /// bytes.
+    pub async fn mail_attachment_mark_skipped(&self, att_id: &str, reason: &str) -> Result<()> {
+        crate::pgq::query(
+            "UPDATE mail_attachments SET skipped_reason = ? WHERE id = ? AND blob_hash IS NULL",
+        )
+        .bind(reason)
+        .bind(att_id)
+        .execute(self.db())
+        .await?;
+        Ok(())
+    }
+
+    /// Store fetched bytes content-addressed: blob insert dedups on hash
+    /// (identical attachments across messages share one row), then the
+    /// attachment points at it. One transaction so a crash can't leave the
+    /// pointer without the bytes.
+    pub async fn mail_attachment_store_blob(
+        &self,
+        att_id: &str,
+        hash: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let mut tx = self.db().begin().await?;
+        crate::pgq::query(
+            "INSERT INTO blobs (hash, size, mime, data, created_at) VALUES (?, ?, ?, ?, ?) \
+             ON CONFLICT (hash) DO NOTHING",
+        )
+        .bind(hash)
+        .bind(bytes.len() as i64)
+        .bind(mime)
+        .bind(bytes)
+        .bind(now_iso())
+        .execute(&mut *tx)
+        .await?;
+        crate::pgq::query(
+            "UPDATE mail_attachments SET blob_hash = ?, skipped_reason = NULL WHERE id = ?",
+        )
+        .bind(hash)
+        .bind(att_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The serving route's lookup: attachment joined to its owning message
+    /// for the user_scope ACL, bytes left-joined (NULL = not stored). By id
+    /// only — blobs are NEVER addressable by hash from the outside.
+    pub async fn mail_attachment_serve(&self, att_id: &str) -> Result<Option<MailAttachmentServe>> {
+        Ok(crate::pgq::query_as::<MailAttachmentServe>(
+            "SELECT m.user_scope, t.filename, t.mime, t.blob_hash, b.data \
+             FROM mail_attachments t \
+             JOIN mail_messages m ON m.id = t.message_id \
+             LEFT JOIN blobs b ON b.hash = t.blob_hash \
+             WHERE t.id = ?",
+        )
+        .bind(att_id)
+        .fetch_optional(self.db())
+        .await?)
+    }
+
+    /// Admin redaction (plan A6): scrub the body columns, tombstone, and drop
+    /// every derived row (search, embeddings, attachments, now-orphaned
+    /// blobs) in one transaction. Durability is guaranteed by the ingest
+    /// conflict arm (metadata-only — body columns never rewritten), the
+    /// tombstone check gating attachment re-inserts, and reconcile never
+    /// re-fetching known jmap ids. Returns the owning namespace for the
+    /// caller's post-commit wire event; None = no such message.
+    pub async fn mail_message_redact(&self, id: &str) -> Result<Option<String>> {
+        let mut tx = self.db().begin().await?;
+        let ts = now_iso();
+        let Some(owner) = crate::pgq::query_scalar::<String>(
+            "UPDATE mail_messages SET body_text = '', snippet = '', subject = '[redacted]', \
+             has_attachments = FALSE, deleted_at = ?, embed_state = 'skip', updated_at = ? \
+             WHERE id = ? RETURNING user_scope",
+        )
+        .bind(&ts)
+        .bind(&ts)
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Ok(None);
+        };
+        crate::pgq::query("DELETE FROM search WHERE kind = 'mail' AND ref_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        crate::pgq::query("DELETE FROM embeddings WHERE ref_kind = 'mail' AND ref_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let hashes: Vec<String> = crate::pgq::query_scalar::<String>(
+            "SELECT DISTINCT blob_hash FROM mail_attachments \
+             WHERE message_id = ? AND blob_hash IS NOT NULL",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        crate::pgq::query("DELETE FROM mail_attachments WHERE message_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for hash in &hashes {
+            crate::pgq::query(
+                "DELETE FROM blobs b WHERE b.hash = ? AND NOT EXISTS \
+                 (SELECT 1 FROM mail_attachments a WHERE a.blob_hash = b.hash)",
+            )
+            .bind(hash)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(Some(owner))
+    }
+
+    /// Refcount blob GC (hive-mail runs it weekly): delete blobs no
+    /// attachment points at, but only ones older than 24h — the grace window
+    /// covers a fetch pipeline that has inserted the blob but not yet
+    /// committed the attachment pointer in a racing transaction.
+    pub async fn mail_blobs_gc(&self) -> Result<u64> {
+        let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24))
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        Ok(crate::pgq::query(
+            "DELETE FROM blobs b WHERE b.created_at < ? AND NOT EXISTS \
+             (SELECT 1 FROM mail_attachments a WHERE a.blob_hash = b.hash)",
+        )
+        .bind(cutoff)
+        .execute(self.db())
+        .await?
+        .rows_affected())
     }
 }
 
@@ -1441,7 +1717,19 @@ mod tests {
             snippet: "snippet".into(),
             size: 100,
             has_attachments: false,
+            attachments: Vec::new(),
             parse_error: None,
+        }
+    }
+
+    fn ingest_att(blob_id: &str, filename: &str, size: i64) -> MailIngestAttachment {
+        MailIngestAttachment {
+            jmap_blob_id: blob_id.to_string(),
+            filename: filename.to_string(),
+            mime: "application/pdf".into(),
+            size,
+            content_id: None,
+            disposition: Some("attachment".into()),
         }
     }
 
@@ -1718,5 +2006,360 @@ mod tests {
             !due.iter().any(|a| a.id == view.id),
             "disabled accounts never come due"
         );
+    }
+
+    #[tokio::test]
+    async fn ingest_writes_attachment_metadata_idempotently() {
+        let store = seeded_store().await;
+        crate::pgq::query("UPDATE mail_mailboxes SET ingest = TRUE WHERE id = 'mbox-alice-inbox'")
+            .execute(store.db())
+            .await
+            .unwrap();
+        let (ingest, inbox) = store.mail_mailbox_sets("acct-alice").await.unwrap();
+
+        let mut msg = ingest_msg("j-att-1", "inbox", &[]);
+        msg.attachments = vec![
+            ingest_att("blob-a", "report.pdf", 1000),
+            ingest_att("blob-b", "photo.jpg", 2000),
+        ];
+        msg.has_attachments = true;
+        store
+            .mail_ingest_batch("acct-alice", "alice", &ingest, &inbox, vec![msg.clone()])
+            .await
+            .unwrap();
+
+        let rows: i64 = crate::pgq::query_scalar::<i64>(
+            "SELECT COUNT(*) FROM mail_attachments WHERE blob_hash IS NULL AND skipped_reason IS NULL",
+        )
+        .fetch_one(store.db())
+        .await
+        .unwrap();
+        assert_eq!(rows, 2, "metadata rows land with bytes pending");
+
+        // Replay: the unique key absorbs it — no duplicate rows.
+        store
+            .mail_ingest_batch("acct-alice", "alice", &ingest, &inbox, vec![msg])
+            .await
+            .unwrap();
+        let rows_after: i64 =
+            crate::pgq::query_scalar::<i64>("SELECT COUNT(*) FROM mail_attachments")
+                .fetch_one(store.db())
+                .await
+                .unwrap();
+        assert_eq!(rows_after, 2, "replay must not duplicate attachment rows");
+    }
+
+    #[tokio::test]
+    async fn attachments_pending_excludes_skipped_stored_and_deleted() {
+        let store = seeded_store().await;
+        crate::pgq::query("UPDATE mail_mailboxes SET ingest = TRUE WHERE id = 'mbox-alice-inbox'")
+            .execute(store.db())
+            .await
+            .unwrap();
+        let (ingest, inbox) = store.mail_mailbox_sets("acct-alice").await.unwrap();
+        let mut msg = ingest_msg("j-pend", "inbox", &[]);
+        msg.attachments = vec![
+            ingest_att("blob-pending", "pending.pdf", 100),
+            ingest_att("blob-oversize", "huge.iso", 100),
+            ingest_att("blob-stored", "done.pdf", 100),
+        ];
+        store
+            .mail_ingest_batch("acct-alice", "alice", &ingest, &inbox, vec![msg])
+            .await
+            .unwrap();
+
+        let att_id = |blob: &str| {
+            let store = store.clone();
+            let blob = blob.to_string();
+            async move {
+                crate::pgq::query_scalar::<String>(
+                    "SELECT id FROM mail_attachments WHERE jmap_blob_id = ?",
+                )
+                .bind(blob)
+                .fetch_one(store.db())
+                .await
+                .unwrap()
+            }
+        };
+        store
+            .mail_attachment_mark_skipped(&att_id("blob-oversize").await, "oversize")
+            .await
+            .unwrap();
+        store
+            .mail_attachment_store_blob(&att_id("blob-stored").await, "hash-1", "text/plain", b"x")
+            .await
+            .unwrap();
+
+        let pending = store
+            .mail_attachments_pending("acct-alice", 50)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "skipped + stored rows leave the queue");
+        assert_eq!(pending[0].jmap_blob_id, "blob-pending");
+
+        // Tombstoning the message drops its attachments out of the queue too.
+        store
+            .mail_tombstone_batch("acct-alice", &["j-pend".to_string()])
+            .await
+            .unwrap();
+        assert!(store
+            .mail_attachments_pending("acct-alice", 50)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn attachment_store_blob_dedups_by_hash() {
+        let store = seeded_store().await;
+        let now = "2026-07-09T00:00:00.000Z";
+        for (att, blob) in [("att-d1", "b1"), ("att-d2", "b2")] {
+            crate::pgq::query(
+                "INSERT INTO mail_attachments (id, message_id, jmap_blob_id, created_at) \
+                 VALUES (?, 'msg-alice-1', ?, ?)",
+            )
+            .bind(att)
+            .bind(blob)
+            .bind(now)
+            .execute(store.db())
+            .await
+            .unwrap();
+        }
+
+        // Same bytes fetched twice (e.g. the same PDF on two messages).
+        let bytes = b"identical attachment bytes";
+        let hash = blake3_hex_for_tests(bytes);
+        store
+            .mail_attachment_store_blob("att-d1", &hash, "application/pdf", bytes)
+            .await
+            .unwrap();
+        store
+            .mail_attachment_store_blob("att-d2", &hash, "application/pdf", bytes)
+            .await
+            .unwrap();
+
+        let blobs: i64 = crate::pgq::query_scalar::<i64>("SELECT COUNT(*) FROM blobs")
+            .fetch_one(store.db())
+            .await
+            .unwrap();
+        assert_eq!(blobs, 1, "identical bytes share one blob row");
+        let pointed: i64 = crate::pgq::query_scalar::<i64>(
+            "SELECT COUNT(*) FROM mail_attachments WHERE blob_hash = ?",
+        )
+        .bind(&hash)
+        .fetch_one(store.db())
+        .await
+        .unwrap();
+        assert_eq!(pointed, 2, "both attachments point at the shared blob");
+
+        // The thread payload now reports them stored.
+        let thread = store
+            .mail_thread_get("thread-shared", Some("alice"))
+            .await
+            .unwrap();
+        let atts = &thread.messages[0].attachments;
+        assert_eq!(atts.len(), 2);
+        assert!(atts.iter().all(|a| a.stored));
+    }
+
+    /// THE redaction invariant (plan A6): after mail_message_redact, a full
+    /// ingest replay of the same jmap_id (reconcile/delta metadata update)
+    /// must not resurrect body, subject, search, or attachment rows.
+    #[tokio::test]
+    async fn redact_scrubs_everything_and_replay_cannot_resurrect() {
+        let store = seeded_store().await;
+        crate::pgq::query("UPDATE mail_mailboxes SET ingest = TRUE WHERE id = 'mbox-alice-inbox'")
+            .execute(store.db())
+            .await
+            .unwrap();
+        let (ingest, inbox) = store.mail_mailbox_sets("acct-alice").await.unwrap();
+        let mut msg = ingest_msg("j-redact", "inbox", &[]);
+        msg.attachments = vec![ingest_att("blob-r", "secret.pdf", 10)];
+        msg.has_attachments = true;
+        store
+            .mail_ingest_batch("acct-alice", "alice", &ingest, &inbox, vec![msg.clone()])
+            .await
+            .unwrap();
+        let mail_id: String = crate::pgq::query_scalar::<String>(
+            "SELECT id FROM mail_messages WHERE jmap_id = 'j-redact'",
+        )
+        .fetch_one(store.db())
+        .await
+        .unwrap();
+        let att_id: String = crate::pgq::query_scalar::<String>(
+            "SELECT id FROM mail_attachments WHERE message_id = ?",
+        )
+        .bind(&mail_id)
+        .fetch_one(store.db())
+        .await
+        .unwrap();
+        store
+            .mail_attachment_store_blob(&att_id, "redact-hash", "application/pdf", b"secret")
+            .await
+            .unwrap();
+        crate::pgq::query(
+            "INSERT INTO embeddings (ref_kind, ref_id, model, dim, vec, hash, created_at) \
+             VALUES ('mail', ?, 'hash', 4, ?, 'h', '2026-07-09T00:00:00.000Z')",
+        )
+        .bind(&mail_id)
+        .bind(vec![0u8; 16])
+        .execute(store.db())
+        .await
+        .unwrap();
+
+        let owner = store.mail_message_redact(&mail_id).await.unwrap();
+        assert_eq!(owner.as_deref(), Some("alice"));
+
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            body_text: String,
+            snippet: String,
+            subject: String,
+            has_attachments: bool,
+            deleted_at: Option<String>,
+            embed_state: String,
+        }
+        let row = crate::pgq::query_as::<Row>(
+            "SELECT body_text, snippet, subject, has_attachments, deleted_at, embed_state \
+             FROM mail_messages WHERE id = ?",
+        )
+        .bind(&mail_id)
+        .fetch_one(store.db())
+        .await
+        .unwrap();
+        assert_eq!(row.body_text, "");
+        assert_eq!(row.snippet, "");
+        assert_eq!(row.subject, "[redacted]");
+        assert!(!row.has_attachments);
+        assert!(row.deleted_at.is_some());
+        assert_eq!(row.embed_state, "skip");
+        for (what, sql) in [
+            (
+                "search",
+                "SELECT COUNT(*) FROM search WHERE kind = 'mail' AND ref_id = ?",
+            ),
+            (
+                "embeddings",
+                "SELECT COUNT(*) FROM embeddings WHERE ref_kind = 'mail' AND ref_id = ?",
+            ),
+            (
+                "attachments",
+                "SELECT COUNT(*) FROM mail_attachments WHERE message_id = ?",
+            ),
+        ] {
+            let n: i64 = crate::pgq::query_scalar::<i64>(sql)
+                .bind(&mail_id)
+                .fetch_one(store.db())
+                .await
+                .unwrap();
+            assert_eq!(n, 0, "{what} rows survived redaction");
+        }
+        let blobs: i64 = crate::pgq::query_scalar::<i64>("SELECT COUNT(*) FROM blobs")
+            .fetch_one(store.db())
+            .await
+            .unwrap();
+        assert_eq!(blobs, 0, "orphaned blob survived redaction");
+
+        // The replay: same jmap_id, hostile body + attachments. The conflict
+        // arm is metadata-only and the tombstone gates attachments, so
+        // nothing comes back.
+        let mut replay = msg;
+        replay.body_text = "RESURRECTED BODY".into();
+        replay.subject = "resurrected subject".into();
+        store
+            .mail_ingest_batch("acct-alice", "alice", &ingest, &inbox, vec![replay])
+            .await
+            .unwrap();
+        let after = crate::pgq::query_as::<Row>(
+            "SELECT body_text, snippet, subject, has_attachments, deleted_at, embed_state \
+             FROM mail_messages WHERE id = ?",
+        )
+        .bind(&mail_id)
+        .fetch_one(store.db())
+        .await
+        .unwrap();
+        assert_eq!(after.body_text, "", "replay must not restore the body");
+        assert_eq!(
+            after.subject, "[redacted]",
+            "replay must not restore the subject"
+        );
+        assert!(
+            after.deleted_at.is_some(),
+            "replay must not clear the tombstone"
+        );
+        let search: i64 = crate::pgq::query_scalar::<i64>(
+            "SELECT COUNT(*) FROM search WHERE kind = 'mail' AND ref_id = ?",
+        )
+        .bind(&mail_id)
+        .fetch_one(store.db())
+        .await
+        .unwrap();
+        assert_eq!(search, 0, "replay must not re-index a redacted row");
+        let atts: i64 = crate::pgq::query_scalar::<i64>(
+            "SELECT COUNT(*) FROM mail_attachments WHERE message_id = ?",
+        )
+        .bind(&mail_id)
+        .fetch_one(store.db())
+        .await
+        .unwrap();
+        assert_eq!(atts, 0, "replay must not re-queue redacted attachments");
+    }
+
+    #[tokio::test]
+    async fn blob_gc_deletes_only_unreferenced_aged_blobs() {
+        let store = seeded_store().await;
+        let old = "2020-01-01T00:00:00.000Z";
+        let fresh = (chrono::Utc::now())
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        for (hash, created) in [
+            ("gc-old-orphan", old),
+            ("gc-old-referenced", old),
+            ("gc-fresh-orphan", fresh.as_str()),
+        ] {
+            crate::pgq::query(
+                "INSERT INTO blobs (hash, size, mime, data, created_at) VALUES (?, 1, 'text/plain', ?, ?)",
+            )
+            .bind(hash)
+            .bind(vec![0u8])
+            .bind(created)
+            .execute(store.db())
+            .await
+            .unwrap();
+        }
+        crate::pgq::query(
+            "INSERT INTO mail_attachments (id, message_id, blob_hash, jmap_blob_id, created_at) \
+             VALUES ('att-gc', 'msg-alice-1', 'gc-old-referenced', 'bgc', ?)",
+        )
+        .bind(old)
+        .execute(store.db())
+        .await
+        .unwrap();
+
+        let swept = store.mail_blobs_gc().await.unwrap();
+        assert_eq!(swept, 1, "exactly the aged orphan goes");
+        let left: Vec<String> =
+            crate::pgq::query_scalar::<String>("SELECT hash FROM blobs ORDER BY hash")
+                .fetch_all(store.db())
+                .await
+                .unwrap();
+        assert_eq!(
+            left,
+            vec![
+                "gc-fresh-orphan".to_string(),
+                "gc-old-referenced".to_string()
+            ],
+            "referenced + in-grace blobs survive"
+        );
+    }
+
+    /// blake3 lives in hive-mail (bytes are hashed before they reach the
+    /// store), so tests hash with a tiny fixed stand-in — the store treats
+    /// hashes as opaque content addresses.
+    fn blake3_hex_for_tests(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        format!("{:x}", h.finalize())
     }
 }

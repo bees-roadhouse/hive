@@ -295,11 +295,20 @@ const Kpi: Component<{ n: number; label: string }> = (props) => (
   </div>
 );
 
+const fmtBytes = (n: number): string => {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+};
+
 // ---- Main dashboard export ----
 
 export const Dashboard: Component = () => {
   const [stats] = createResource(() => ({ _r: liveRev() }), () => api.dashboard());
   const [wireEvents] = createResource(() => ({ _r: liveRev() }), () => api.wire());
+  // Mail ships dark until HIVE_MAIL_ENABLED — hide the archive card with it.
+  const [authCfg] = createResource(() => api.authConfig());
 
   const now = new Date();
   const [viewYear, setViewYear] = createSignal(now.getFullYear());
@@ -457,6 +466,34 @@ export const Dashboard: Component = () => {
                   </For>
                 </table>
               </div>
+
+              <Show when={authCfg()?.mailEnabled === true && s().mail}>
+                {(m) => (
+                  <div class="panel">
+                    <h3>Mail archive</h3>
+                    <table class="mini">
+                      <tbody>
+                        <tr>
+                          <td>messages</td>
+                          <td class="num">{m().messages}</td>
+                        </tr>
+                        <tr>
+                          <td>accounts</td>
+                          <td class="num">{m().accounts}</td>
+                        </tr>
+                        <tr>
+                          <td>searchable</td>
+                          <td class="num">{m().search}</td>
+                        </tr>
+                        <tr>
+                          <td>attachment storage</td>
+                          <td class="num">{fmtBytes(m().blobBytes)}</td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </Show>
 
               {/* Agent live feed — full width */}
               <div class="panel wide">

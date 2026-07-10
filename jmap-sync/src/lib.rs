@@ -45,6 +45,11 @@ pub enum SyncError {
     /// fallback also fails.
     #[error("backfill anchor lost: {0}")]
     AnchorLost(String),
+    /// HTTP 404 — the resource (a blob, typically) is permanently gone from
+    /// the server. Callers must not retry; [`Syncer::fetch_blob`] consumers
+    /// use this to mark attachments 'missing' instead of retrying forever.
+    #[error("not found: {0}")]
+    NotFound(String),
     #[error("sink: {0}")]
     Sink(String),
     #[error("cursor store: {0}")]

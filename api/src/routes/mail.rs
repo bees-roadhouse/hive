@@ -1,4 +1,5 @@
 use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Router};
@@ -25,6 +26,8 @@ pub fn router() -> Router<Store> {
         .route("/api/mail/messages", get(list))
         .route("/api/mail/search", get(search))
         .route("/api/mail/thread/{thread_id}", get(thread))
+        .route("/api/mail/attachments/{att_id}", get(attachment_serve))
+        .route("/api/mail/messages/{id}/redact", post(message_redact))
         .route("/api/mail/accounts", get(accounts).post(account_create))
         .route("/api/mail/accounts/manage", get(accounts_manage))
         .route("/api/mail/accounts/{id}", delete(account_delete))
@@ -118,6 +121,114 @@ async fn accounts(State(s): State<Store>, Extension(ctx): Extension<AuthCtx>) ->
         return Ok(resp);
     }
     Ok(Json(s.mail_accounts_list(viewer(&ctx)).await?).into_response())
+}
+
+// ---- attachments (serving + admin redaction) ----
+
+/// Content-Disposition filename sanitizer: quotes, control chars, and path
+/// separators go; empty results fall back to a constant. The value stays
+/// inside a quoted-string, so this is what keeps the header un-injectable.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '"' | '/' | '\\'))
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "attachment".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Serve stored attachment bytes. Uniform 404 for "doesn't exist" AND "not
+/// yours" — the route must not be an existence oracle — and lookups are by
+/// attachment id only, never by blob hash. Bytes are immutable once stored
+/// (content-addressed), hence the aggressive private cache + blake3 ETag.
+async fn attachment_serve(
+    State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
+    Path(att_id): Path<String>,
+    req_headers: HeaderMap,
+) -> ApiResult {
+    if let Some(resp) = gate() {
+        return Ok(resp);
+    }
+    let Some(att) = s.mail_attachment_serve(&att_id).await? else {
+        return Ok(not_found());
+    };
+    if !(ctx.is_admin() || ctx.namespace_user() == att.user_scope) {
+        return Ok(not_found());
+    }
+    let (Some(hash), Some(data)) = (att.blob_hash, att.data) else {
+        // Metadata exists but the bytes were never stored (pending, oversize,
+        // or missing on the server). The viewer already passed the ACL, so
+        // this 404 leaks nothing new.
+        return Ok(err(StatusCode::NOT_FOUND, "not stored"));
+    };
+
+    let etag = format!("\"{hash}\"");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag).unwrap_or(HeaderValue::from_static("\"invalid\"")),
+    );
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=31536000, immutable"),
+    );
+    if let Some(inm) = req_headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        if inm.trim() == "*"
+            || inm
+                .split(',')
+                .any(|t| t.trim().trim_start_matches("W/") == etag)
+        {
+            return Ok((StatusCode::NOT_MODIFIED, headers).into_response());
+        }
+    }
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(att.mime.trim())
+            .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    let disposition = format!(
+        "attachment; filename=\"{}\"",
+        sanitize_filename(&att.filename)
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&disposition).unwrap_or(HeaderValue::from_static("attachment")),
+    );
+    Ok((StatusCode::OK, headers, data).into_response())
+}
+
+/// Admin-only redaction: scrub body/subject/snippet + every derived row.
+/// The store guarantees a later sync replay cannot re-hydrate the message.
+async fn message_redact(
+    State(s): State<Store>,
+    Extension(ctx): Extension<AuthCtx>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    if let Some(resp) = gate() {
+        return Ok(resp);
+    }
+    if !ctx.is_admin() {
+        return Ok(forbidden());
+    }
+    let Some(owner) = s.mail_message_redact(&id).await? else {
+        return Ok(not_found());
+    };
+    // ids only on the wire (globally readable).
+    s.emit("mail.redacted", &owner, serde_json::json!({"id": id}))
+        .await?;
+    Ok(Json(serde_json::json!({"ok": true})).into_response())
 }
 
 // ---- account management (the connect surface) ----
@@ -348,4 +459,21 @@ async fn mailbox_set_ingest(
     }
     s.mail_mailbox_set_ingest(&id, body.ingest).await?;
     Ok(Json(serde_json::json!({"ok": true, "ingest": body.ingest})).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_filename;
+
+    #[test]
+    fn filename_sanitizer_strips_header_hostile_chars() {
+        assert_eq!(sanitize_filename("report.pdf"), "report.pdf");
+        assert_eq!(
+            sanitize_filename("..\\..\\evil\"; x=\"/etc/passwd"),
+            "....evil; x=etcpasswd"
+        );
+        assert_eq!(sanitize_filename("a\r\nSet-Cookie: b"), "aSet-Cookie: b");
+        assert_eq!(sanitize_filename("\"\""), "attachment");
+        assert_eq!(sanitize_filename("   "), "attachment");
+    }
 }

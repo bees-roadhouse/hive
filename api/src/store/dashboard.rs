@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use anyhow::Result;
 use hive_shared::{
     slugify, AuthorCount, AuthorEntryCount, AutocompleteItem, DashboardStats, DayCount,
-    DecisionCounts, EntityKind, GraphData, GraphEdge, GraphNode, InboxStat, PersonCallout,
-    TaskCounts, TaskStatus, TaskWithDue, ACTORS,
+    DecisionCounts, EntityKind, GraphData, GraphEdge, GraphNode, InboxStat, MailDashboardStats,
+    PersonCallout, TaskCounts, TaskStatus, TaskWithDue, ACTORS,
 };
 use sqlx::Row;
 
@@ -171,6 +171,14 @@ impl Store {
             }
         }
 
+        // Mail archive totals — cheap COUNT/SUM scans, all zero pre-mail.
+        let mail = MailDashboardStats {
+            messages: count("SELECT count(*) FROM mail_messages WHERE deleted_at IS NULL").await?,
+            accounts: count("SELECT count(*) FROM mail_accounts").await?,
+            blob_bytes: count("SELECT COALESCE(SUM(size), 0)::BIGINT FROM blobs").await?,
+            search: count("SELECT count(*) FROM search WHERE kind = 'mail'").await?,
+        };
+
         Ok(DashboardStats {
             entries: count("SELECT count(*) FROM journal").await?,
             events: count("SELECT count(*) FROM events").await?,
@@ -183,6 +191,7 @@ impl Store {
             entries_by_day,
             entries_by_author,
             callouts_by_person,
+            mail,
         })
     }
 

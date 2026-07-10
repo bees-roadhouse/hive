@@ -71,14 +71,19 @@ fn map_err(e: JmapError) -> SyncError {
         },
         JmapError::Transport(t) => SyncError::Http(t.to_string()),
         JmapError::Problem(p) => {
-            // 401/403 problem responses are how bad credentials surface.
+            // 401/403 problem responses are how bad credentials surface;
+            // 404 is a permanently-gone resource (blob downloads).
             let text = format!("{p:?}");
-            if text.contains("401") || text.to_lowercase().contains("unauthorized") {
+            if p.status() == Some(404) {
+                SyncError::NotFound(text)
+            } else if text.contains("401") || text.to_lowercase().contains("unauthorized") {
                 SyncError::Auth(text)
             } else {
                 SyncError::Protocol(text)
             }
         }
+        // Non-problem+json error statuses arrive as Server("404 Not Found").
+        JmapError::Server(s) if s.starts_with("404") => SyncError::NotFound(s),
         other => SyncError::Protocol(format!("{other:?}")),
     }
 }
