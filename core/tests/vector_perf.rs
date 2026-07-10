@@ -3,17 +3,20 @@
 // with zero network/model downloads — every test in this binary shares that
 // provider (the choice latches once per process).
 //
-// Non-ignored tests: small-scale ANN functional coverage (SQL owner filter,
-// chunk collapse, double-probe diversification). The #[ignore]d test is the
-// B8 perf gate at 200k vectors:
+// Non-ignored tests: small-scale ANN functional coverage (chunk collapse,
+// tombstone hydration drop, double-probe diversification — the owner-filter
+// halves died with the viewer ACL in PR 1.3). The #[ignore]d test is the B8
+// perf gate at 200k vectors:
 //
-//   cargo test -p hive-api --test vector_perf -- --ignored --nocapture
+//   cargo test -p hive-core --test vector_perf -- --ignored --nocapture
+
+mod common;
 
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use hive_api::store::semantic::SemanticOptions;
-use hive_api::store::Store;
+use hive_core::store::semantic::SemanticOptions;
+use hive_core::store::Store;
 use sqlx::PgPool;
 
 const QUERY: &str = "hive inspection scheduling and honey harvest";
@@ -65,7 +68,7 @@ fn ann_setup() {
 
 async fn test_store() -> Store {
     ann_setup();
-    Store::new(hive_api::db::test_pool().await)
+    common::test_store().await
 }
 
 /// Deterministic vector with cosine ~`sim` to `q` (component along q̂ plus an
@@ -112,44 +115,44 @@ async fn insert_embedding_v(
     .bind(hive_embed::embed_model())
     .bind(owner)
     .bind(pgvector::Vector::from(vec))
-    .bind(hive_api::store::now_iso())
+    .bind(hive_core::store::now_iso())
     .execute(store.db())
     .await
     .expect("vec_v embedding insert");
 }
 
 async fn insert_journal(store: &Store, id: &str, author: &str, scope: Option<&str>, body: &str) {
-    hive_api::pgq::query(
+    hive_core::pgq::query(
         "INSERT INTO journal (id, author, body, user_scope, created_at) VALUES (?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(author)
     .bind(body)
     .bind(scope)
-    .bind(hive_api::store::now_iso())
+    .bind(hive_core::store::now_iso())
     .execute(store.db())
     .await
     .expect("journal insert");
 }
 
 async fn insert_mail_account(store: &Store, id: &str, owner: &str) {
-    hive_api::pgq::query(
+    hive_core::pgq::query(
         "INSERT INTO mail_accounts (id, owner, address, created_at, updated_at) \
          VALUES (?, ?, ?, ?, ?)",
     )
     .bind(id)
     .bind(owner)
     .bind(format!("{owner}@example.test"))
-    .bind(hive_api::store::now_iso())
-    .bind(hive_api::store::now_iso())
+    .bind(hive_core::store::now_iso())
+    .bind(hive_core::store::now_iso())
     .execute(store.db())
     .await
     .expect("mail account insert");
 }
 
 async fn insert_mail(store: &Store, id: &str, account: &str, owner: &str, deleted: bool) {
-    let now = hive_api::store::now_iso();
-    hive_api::pgq::query(
+    let now = hive_core::store::now_iso();
+    hive_core::pgq::query(
         "INSERT INTO mail_messages (id, account_id, jmap_id, jmap_thread_id, received_at, \
            subject, from_addr, snippet, body_text, user_scope, deleted_at, created_at, updated_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -172,11 +175,10 @@ async fn insert_mail(store: &Store, id: &str, account: &str, owner: &str, delete
     .expect("mail insert");
 }
 
-fn opts(viewer: Option<&str>, limit: usize) -> SemanticOptions {
+fn opts(limit: usize) -> SemanticOptions {
     SemanticOptions {
         limit: Some(limit),
         hybrid: Some(false),
-        viewer: viewer.map(String::from),
         ..Default::default()
     }
 }
@@ -184,7 +186,7 @@ fn opts(viewer: Option<&str>, limit: usize) -> SemanticOptions {
 // ---- non-ignored: small-scale ANN functional coverage ------------------------
 
 #[tokio::test]
-async fn ann_owner_filter_and_chunk_collapse() {
+async fn ann_chunk_collapse_and_tombstone_drop() {
     let store = test_store().await;
     let q = hive_embed::embed_query(QUERY);
 
@@ -263,23 +265,21 @@ async fn ann_owner_filter_and_chunk_collapse() {
     .await;
 
     let hits = store
-        .semantic_search(QUERY, opts(Some("maggie"), 10))
+        .semantic_search(QUERY, opts(10))
         .await
-        .expect("scoped ANN search");
+        .expect("ANN search");
     let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
     assert!(
         ids.contains(&"jrnl_global"),
         "global journal visible: {ids:?}"
     );
-    assert!(ids.contains(&"mail_maggie"), "own mail visible: {ids:?}");
     assert!(
-        !ids.contains(&"jrnl_nate"),
-        "foreign journal leaked: {ids:?}"
+        ids.contains(&"jrnl_nate") && ids.contains(&"mail_nate") && ids.contains(&"mail_maggie"),
+        "single-user reads span every stored owner: {ids:?}"
     );
-    assert!(!ids.contains(&"mail_nate"), "foreign mail leaked: {ids:?}");
     assert!(
         !ids.contains(&"mail_maggie_del"),
-        "tombstoned mail leaked: {ids:?}"
+        "tombstoned mail must never hydrate: {ids:?}"
     );
 
     let chunky: Vec<_> = hits.iter().filter(|h| h.id == "jrnl_global").collect();
@@ -326,7 +326,7 @@ async fn ann_double_probe_rescues_journal_from_mail_flood() {
     .await;
 
     let hits = store
-        .semantic_search(QUERY, opts(None, 5))
+        .semantic_search(QUERY, opts(5))
         .await
         .expect("ANN flood search");
     assert!(
@@ -412,7 +412,7 @@ const CLUSTERED_VEC: &str = "(SELECT array_agg(x + (random() - 0.5) ORDER BY ord
      FROM unnest(c.arr) WITH ORDINALITY AS u(x, ord))::public.vector";
 
 async fn bulk_mail(pool: &PgPool, owner: &str, account: &str, n: i64) {
-    let now = hive_api::store::now_iso();
+    let now = hive_core::store::now_iso();
     sqlx::query(
         "INSERT INTO mail_messages (id, account_id, jmap_id, jmap_thread_id, received_at, \
            subject, from_addr, snippet, body_text, user_scope, created_at, updated_at) \
@@ -443,7 +443,7 @@ async fn bulk_mail(pool: &PgPool, owner: &str, account: &str, n: i64) {
 }
 
 async fn bulk_journal(pool: &PgPool, author: &str, prefix: &str, n: i64) {
-    let now = hive_api::store::now_iso();
+    let now = hive_core::store::now_iso();
     sqlx::query(
         "INSERT INTO journal (id, author, body, created_at) \
          SELECT $1::text || g, $2, 'perf journal body ' || g, $3 FROM generate_series(1, $4) AS g",
@@ -476,13 +476,9 @@ fn p95(samples: &mut [f64]) -> f64 {
     samples[idx.min(samples.len() - 1)]
 }
 
-/// 50 warm hybrid searches (rerank off) as `viewer`; returns per-search ms
-/// and the last result set.
-async fn timed_searches(
-    store: &Store,
-    viewer: &str,
-    n: usize,
-) -> (Vec<f64>, Vec<hive_shared::SearchHit>) {
+/// 50 warm hybrid searches (rerank off); returns per-search ms and the last
+/// result set.
+async fn timed_searches(store: &Store, n: usize) -> (Vec<f64>, Vec<hive_shared::SearchHit>) {
     let mut times = Vec::with_capacity(n);
     let mut last = Vec::new();
     for i in 0..n {
@@ -494,7 +490,6 @@ async fn timed_searches(
                 SemanticOptions {
                     limit: Some(10),
                     rerank: Some(false),
-                    viewer: Some(viewer.to_string()),
                     ..Default::default()
                 },
             )
@@ -533,34 +528,13 @@ async fn top10(pool: &PgPool, qv: &pgvector::Vector, exact: bool) -> Vec<String>
 
 #[tokio::test]
 #[ignore = "B8 perf gate: 200k synthetic vectors, minutes of setup — run explicitly"]
-async fn ann_perf_200k_hybrid_p95_owner_isolation_and_recall() {
+async fn ann_perf_200k_hybrid_p95_and_recall() {
     ann_setup();
 
-    // Baseline: maggie's corpus WITHOUT nate's 200k rows.
-    let base_pool = hive_api::db::test_pool().await;
-    let base_store = Store::new(base_pool.clone());
-    println!("[perf] building baseline schema (10k maggie mail + 1k journal)…");
-    insert_mail_account(&base_store, "acct_maggie", "maggie").await;
-    drop_hnsw(&base_pool).await;
-    create_centroids(&base_pool).await;
-    bulk_mail(&base_pool, "maggie", "acct_maggie", 10_000).await;
-    bulk_journal(&base_pool, "nate", "perfj_n_", 500).await;
-    bulk_journal(&base_pool, "maggie", "perfj_m_", 500).await;
-    let t = Instant::now();
-    create_hnsw(&base_pool).await;
-    println!(
-        "[perf] baseline HNSW build: {:.1}s",
-        t.elapsed().as_secs_f64()
-    );
-    let (_, _) = timed_searches(&base_store, "maggie", 10).await; // warm
-    let (mut base_times, _) = timed_searches(&base_store, "maggie", 50).await;
-    let p95_maggie_base = p95(&mut base_times);
-    println!("[perf] maggie p95 baseline (nate rows absent): {p95_maggie_base:.1}ms");
-
     // Full corpus: 200k nate mail + 10k maggie mail + 1k journal.
-    let pool = hive_api::db::test_pool().await;
-    let store = Store::new(pool.clone());
-    println!("[perf] building full schema (200k nate + 10k maggie mail + 1k journal)…");
+    let store = common::test_store().await;
+    let pool = store.db().clone();
+    println!("[perf] building full schema (200k + 10k mail + 1k journal)…");
     insert_mail_account(&store, "acct_nate", "nate").await;
     insert_mail_account(&store, "acct_maggie", "maggie").await;
     drop_hnsw(&pool).await;
@@ -588,12 +562,11 @@ async fn ann_perf_200k_hybrid_p95_owner_isolation_and_recall() {
     let plan: serde_json::Value = sqlx::query_scalar(
         "EXPLAIN (FORMAT JSON) \
          SELECT ref_kind, ref_id, 1 - (vec_v <=> $1) AS sim FROM embeddings \
-         WHERE model = $2 AND vec_v IS NOT NULL AND (owner IS NULL OR owner = $3) \
+         WHERE model = $2 AND vec_v IS NOT NULL \
          ORDER BY vec_v <=> $1 LIMIT 80",
     )
     .bind(&qv)
     .bind(hive_embed::embed_model())
-    .bind("nate")
     .fetch_one(&mut *tx)
     .await
     .expect("explain");
@@ -604,51 +577,19 @@ async fn ann_perf_200k_hybrid_p95_owner_isolation_and_recall() {
     );
     println!("[perf] EXPLAIN uses embeddings_vec_hnsw: ok");
 
-    // 2. p95 < 100ms over 50 warm hybrid searches (rerank off), heavy owner.
-    let (_, _) = timed_searches(&store, "nate", 10).await; // warm
-    let (mut nate_times, nate_hits) = timed_searches(&store, "nate", 50).await;
-    let p95_nate = p95(&mut nate_times);
+    // 2. p95 < 100ms over 50 warm hybrid searches (rerank off).
+    let (_, _) = timed_searches(&store, 10).await; // warm
+    let (mut times, hits) = timed_searches(&store, 50).await;
+    let p95_all = p95(&mut times);
     println!(
-        "[perf] nate p95 over 50 warm hybrid searches: {p95_nate:.1}ms (min {:.1} max {:.1})",
-        nate_times.first().unwrap(),
-        nate_times.last().unwrap()
+        "[perf] p95 over 50 warm hybrid searches: {p95_all:.1}ms (min {:.1} max {:.1})",
+        times.first().unwrap(),
+        times.last().unwrap()
     );
-    assert!(!nate_hits.is_empty(), "nate searches must return hits");
-    assert!(p95_nate < 100.0, "p95 {p95_nate:.1}ms ≥ 100ms budget");
+    assert!(!hits.is_empty(), "searches must return hits");
+    assert!(p95_all < 100.0, "p95 {p95_all:.1}ms ≥ 100ms budget");
 
-    // 3. Owner isolation: maggie's hits stay hers/global, and her latency is
-    // within ~2x of the nate-rows-absent baseline.
-    let (mut maggie_times, maggie_hits) = timed_searches(&store, "maggie", 50).await;
-    let p95_maggie = p95(&mut maggie_times);
-    println!("[perf] maggie p95 with 200k foreign rows: {p95_maggie:.1}ms");
-    assert!(!maggie_hits.is_empty(), "maggie searches must return hits");
-    for h in &maggie_hits {
-        let owner: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT owner FROM embeddings WHERE ref_kind = $1 AND ref_id = $2 LIMIT 1",
-        )
-        .bind(&h.kind)
-        .bind(&h.id)
-        .fetch_optional(&pool)
-        .await
-        .expect("owner lookup");
-        let owner = owner.flatten();
-        assert!(
-            owner.is_none() || owner.as_deref() == Some("maggie"),
-            "maggie hit {}:{} has owner {owner:?}",
-            h.kind,
-            h.id
-        );
-        assert!(
-            !h.id.starts_with("perf_nate_"),
-            "nate row leaked into maggie's results: {h:?}"
-        );
-    }
-    assert!(
-        p95_maggie <= p95_maggie_base * 2.0 + 10.0,
-        "maggie p95 {p95_maggie:.1}ms vs baseline {p95_maggie_base:.1}ms exceeds ~2x isolation budget"
-    );
-
-    // 4. ANN recall: top-10 overlap vs exact brute force ≥ 9/10 at ef=80.
+    // 3. ANN recall: top-10 overlap vs exact brute force ≥ 9/10 at ef=80.
     // Probes are stored vectors — on-manifold queries, like a real BGE query
     // vector landing near the corpus it was trained with.
     let probe_ids = [

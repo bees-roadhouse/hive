@@ -1,28 +1,36 @@
-// MCP tool surface — parity port of packages/api/src/mcp.ts (every tool name,
-// title, description, inputSchema, and result shape as the Node SDK serves
-// them; ground truth captured from @modelcontextprotocol/sdk 1.29.0), plus the
-// Rust-branch identity_* tools (cross-platform identity mapping — an
-// intentional addition, marked in their descriptions; not in the Node toolset).
-//
-// The JSON-RPC / HTTP layer lives in routes/mcp.rs; this module owns
-// tools/list and tools/call dispatch. The authenticated actor pins authorship:
-// journal_append writes as the token's actor, identity_update edits the
-// caller's own card, admin tools gate on the actor's user role.
+// MCP tool surface — the tool layer over hive-core, pure and transport-free:
+// requests and responses are serde_json values, no HTTP/router types. The
+// stdio bridge (PR 1.8) is its transport; the Dioxus shell embeds it
+// in-process in Phase 2. Tool names/titles/descriptions/inputSchemas remain
+// the Node-SDK-parity shapes (ground truth @modelcontextprotocol/sdk 1.29.0)
+// minus the hosted-era auth/workspace/share/conversation surface, which died
+// in the Phase 1 teardown (single user, full access — no scopes, no admin
+// gates). `LocalCtx` replaces the old authenticated `AuthCtx`: callers supply
+// the acting identity (tests pass fixture actors; the bridge passes the
+// configured owner), which pins authorship and the `user_scope`/owner values
+// writes stamp.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use hive_shared::{
-    actor_names, ActorKind, NewIdentity, NewJournalEntry, NewShare, NewSource, ProfilePatch,
-    Severity, ShareScope, SourcePatch, TaskPatch, TaskStatus, UserRole,
+    actor_names, ActorKind, NewIdentity, NewJournalEntry, NewSource, ProfilePatch, Severity,
+    SourcePatch, TaskPatch, TaskStatus,
 };
 use serde_json::{json, Map, Value};
 
-use crate::middleware::AuthCtx;
 use crate::store::recall::RecallOptions;
 use crate::store::semantic::SemanticOptions;
 use crate::store::tasks::TaskFilter;
 use crate::store::Store;
+
+/// The acting identity for a tool call — the single-user replacement for the
+/// hosted era's authenticated `AuthCtx`. The actor pins journal authorship,
+/// artifact/inbox defaults, and the owner value writes stamp.
+#[derive(Clone, Debug)]
+pub struct LocalCtx {
+    pub actor: String,
+}
 
 // ---- protocol constants (SDK 1.29.0 types.js) ----
 
@@ -44,7 +52,7 @@ pub fn instructions() -> String {
         "hive is journal-first. Write prose with journal_append; attach `anchors` \
          (char-offset spans of the body) to emerge tasks/decisions/events anchored \
          to the exact text. @mention actors ({}) to notify their inbox. \
-         Read with the *_list / *_get / search / dashboard tools. Household record kinds beyond the built-ins are the custom entity registry: entity_types_list shows what exists, entity_create / entities_list write and read typed instances (admins define types with entity_type_create). \
+         Read with the *_list / *_get / search / dashboard tools. Household record kinds beyond the built-ins are the custom entity registry: entity_types_list shows what exists, entity_create / entities_list write and read typed instances (define types with entity_type_create). \
          For relevance retrieval prefer semantic_search with `mode: \"precision\"` (the \
          four-stage cross-encoder cascade) — it's the recommended high-quality path; drop \
          to `mode: \"standard\"` only for a broader sweep.",
@@ -110,7 +118,7 @@ fn build_tools() -> Value {
         {
             "name": "journal_append",
             "title": "Append a journal entry",
-            "description": "Write an immutable prose entry. Optionally attach anchors: each is a {start,end} char span of `body` that materialises a task/decision/event anchored to that text. @mentions notify inboxes. Inline bracket tokens also emerge entities: [person: Name], [topic: Name], [project: Name], [phase: Name], [task: Title]. A [task: Title] in the entry auto-assigns to the author. A [person: X] that matches a known actor also fans to their inbox. You write as your authenticated identity — authorship is taken from your token, not a parameter.",
+            "description": "Write an immutable prose entry. Optionally attach anchors: each is a {start,end} char span of `body` that materialises a task/decision/event anchored to that text. @mentions notify inboxes. Inline bracket tokens also emerge entities: [person: Name], [topic: Name], [project: Name], [phase: Name], [task: Title]. A [task: Title] in the entry auto-assigns to the author. A [person: X] that matches a known actor also fans to their inbox. You write as the acting identity — authorship is not a parameter.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -157,7 +165,7 @@ fn build_tools() -> Value {
         {
             "name":"identity_update",
             "title": "Update your identity (bio/role)",
-            "description": "Keep your own identity current — set your bio and/or role. Writes sections.bio / sections.role on your own profile card (your authenticated identity; you can't edit anyone else's).",
+            "description": "Keep your own identity current — set your bio and/or role. Writes sections.bio / sections.role on the acting identity's own profile card.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"bio": {"type": "string"}, "role": {"type": "string"}},
@@ -224,7 +232,7 @@ fn build_tools() -> Value {
         {
             "name":"inbox_list",
             "title": "List an actor's inbox",
-            "description": "Unread-by-default notifications for a recipient (human or AI). Viewer-gated: your own inbox (admins: any; sessions: also AIs you own).",
+            "description": "Unread-by-default notifications for a recipient (human or AI).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -242,7 +250,7 @@ fn build_tools() -> Value {
         {
             "name":"inbox_mark_read",
             "title": "Mark inbox item(s) read",
-            "description": "Pass an item `id`, or a `recipient` to clear all their unread. Same viewer gate as inbox_list.",
+            "description": "Pass an item `id`, or a `recipient` to clear all their unread.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"id": {"type": "string"}, "recipient": {"type": "string"}},
@@ -271,7 +279,7 @@ fn build_tools() -> Value {
         {
             "name":"mail_search",
             "title": "Search mail archive",
-            "description": "Search stored mail messages. Viewer-gated to the authenticated namespace; admins see all stored mail.",
+            "description": "Search stored mail messages.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"q": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 200}},
@@ -286,7 +294,7 @@ fn build_tools() -> Value {
         {
             "name":"mail_thread_get",
             "title": "Get a mail thread",
-            "description": "Return stored messages for a mail thread, viewer-gated from day one.",
+            "description": "Return stored messages for a mail thread.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"thread_id": {"type": "string"}},
@@ -301,7 +309,7 @@ fn build_tools() -> Value {
         {
             "name":"mail_accounts_list",
             "title": "List mail accounts",
-            "description": "List stored mail accounts visible to the authenticated viewer.",
+            "description": "List stored mail accounts.",
             "inputSchema": empty_schema.clone(),
             "execution": {"taskSupport": FORBIDDEN}
         }
@@ -534,32 +542,9 @@ fn build_tools() -> Value {
     ));
     tools.push(json!(
         {
-            "name":"share_entry",
-            "title": "Share a journal entry or author's journal",
-            "description": "Grant a viewer visibility into a specific entry (scope='entry', ref=entry_id) or an author's entire journal stream (scope='journal', ref=author_slug). Idempotent — safe to call multiple times.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "scope": {
-                        "type": "string",
-                        "enum": ["entry", "journal"],
-                        "description": "'entry' for a single entry; 'journal' for all entries by an author"
-                    },
-                    "ref": {"type": "string", "description": "journal entry id (scope=entry) or author slug (scope=journal)"},
-                    "viewer": {"type": "string", "enum": actors.clone(), "description": "the actor who gains visibility"}
-                },
-                "required": ["scope", "ref", "viewer"],
-                "additionalProperties": false,
-                "$schema": "http://json-schema.org/draft-07/schema#"
-            },
-            "execution": {"taskSupport": FORBIDDEN}
-        }
-    ));
-    tools.push(json!(
-        {
             "name":"actor_delete",
             "title": "Delete an actor and cascade all their data",
-            "description": "DESTRUCTIVE, admin-only. Removes the actor (people/users/sessions/tokens/profile) and cascades everything they authored: journal entries AND the tasks/decisions/events anchored to those entries, plus embeddings/search/links/inbox/shares so nothing is orphaned. Pass dry_run:true to preview per-table counts without mutating.",
+            "description": "DESTRUCTIVE. Removes the actor (people/profile) and cascades everything they authored: journal entries AND the tasks/decisions/events anchored to those entries, plus embeddings/search/links/inbox so nothing is orphaned. Pass dry_run:true to preview per-table counts without mutating.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"slug": {"type": "string"}, "dry_run": {"type": "boolean"}},
@@ -574,7 +559,7 @@ fn build_tools() -> Value {
         {
             "name":"actor_merge",
             "title": "Merge one actor into another",
-            "description": "DESTRUCTIVE, admin-only. Folds `from` into `into`: reassigns journal authorship/mentions, task/decision/event assignees, inbox, shares, tokens, oauth grants, wire, sources, people.owner pointers, profile + login, then removes the `from` people row. Use to consolidate duplicate actors. Pass dry_run:true to preview counts.",
+            "description": "DESTRUCTIVE. Folds `from` into `into`: reassigns journal authorship/mentions, task/decision/event assignees, inbox, wire, sources, people.owner pointers, and profile, then removes the `from` people row. Use to consolidate duplicate actors. Pass dry_run:true to preview counts.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -641,42 +626,6 @@ fn build_tools() -> Value {
     ));
     tools.push(json!(
         {
-            "name": "workspace_list",
-            "description": "List hosted Claude Code workspaces (sessions) visible to you. Each is a sandboxed Claude Code session hive runs; use workspace_transcript to read one's full chat history.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 500}}
-            }
-        }
-    ));
-    tools.push(json!(
-        {
-            "name": "workspace_get",
-            "description": "Get one hosted Claude Code workspace by id (status, owner, sandbox dir, claude_session_id).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"id": {"type": "string"}},
-                "required": ["id"]
-            }
-        }
-    ));
-    tools.push(json!(
-        {
-            "name": "workspace_transcript",
-            "description": "Read the complete transcript (chat history) of a hosted Claude Code workspace — every message and tool call. Use this to dream over a session and append/enrich journal memory based on what happened.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "after": {"type": "integer", "minimum": 0, "description": "only messages with seq greater than this"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 5000}
-                },
-                "required": ["id"]
-            }
-        }
-    ));
-    tools.push(json!(
-        {
             "name":"entity_types_list",
             "title": "List custom entity types",
             "description": "The user-defined entity type registry (kind-config: fields, board grouping, presentation).",
@@ -693,7 +642,7 @@ fn build_tools() -> Value {
         {
             "name":"entity_type_create",
             "title": "Define a custom entity type",
-            "description": "Admin only. Creates a type with typed fields (text|number|bool|date|choice|ref). Slugs are permanent.",
+            "description": "Creates a type with typed fields (text|number|bool|date|choice|ref). Slugs are permanent.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -730,7 +679,7 @@ fn build_tools() -> Value {
         {
             "name":"entity_type_update",
             "title": "Evolve a custom entity type",
-            "description": "Admin only. Rename/describe/archive a type, add fields, relabel/reorder/archive fields. Slugs and field types never change.",
+            "description": "Rename/describe/archive a type, add fields, relabel/reorder/archive fields. Slugs and field types never change.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -870,7 +819,7 @@ fn build_tools() -> Value {
     tools.push(json!(
         {
             "name":"artifacts_list",
-            "description": "List your Claude Code artifacts (skills, agents, slash-commands) — scoped to the authenticated identity",
+            "description": "List the acting identity's Claude Code artifacts (skills, agents, slash-commands), including disabled ones",
             "inputSchema": {"type": "object", "properties": {}}
         }
     ));
@@ -885,85 +834,23 @@ fn build_tools() -> Value {
             }
         }
     ));
-    // ---- Rust-branch additions (conversation capture + reflection queue) ----
-    // Local agent sessions captured at SessionEnd onto cc_sessions
-    // (origin='captured'); reflection drains the reflected_at IS NULL queue.
-    let conversation_message_schema = json!({
-        "type": "object",
-        "properties": {
-            "role": {"type": "string", "description": "user | assistant | tool | system"},
-            "kind": {"type": "string", "description": "message kind (defaults to 'text')"},
-            "content": {"description": "message payload; a bare string is stored as {text}"},
-            "raw": {"description": "lossless original payload (optional)"},
-            "tokens_in": {"type": "integer"},
-            "tokens_out": {"type": "integer"}
-        },
-        "required": ["role"],
-        "additionalProperties": false
-    });
     tools.push(json!(
         {
-            "name": "conversation_log",
-            "title": "Capture a session transcript",
-            "description": "Capture a local agent session into hive (Rust-branch addition; not in the Node toolset). Upserts the conversation by (runtime, external_id) — idempotent re-ingest — and writes the supplied turns; pass replace:true to swap the stored transcript (a resumed session re-fires with the FULL transcript). Owner/namespace come from your token. Captured conversations queue for reflection; nothing is journaled directly.",
+            "name":"identity_artifacts_sync",
+            "description": "The sync payload for an identity: its ENABLED artifacts only (what the Claude Code plugin pulls). Defaults to the acting identity; pass `actor` for another.",
             "inputSchema": {
                 "type": "object",
-                "properties": {
-                    "external_id": {"type": "string", "description": "the app's own session id (idempotent capture key)"},
-                    "runtime": {"type": "string", "description": "claude_code (default) | codex | opencode | …"},
-                    "title": {"type": "string"},
-                    "summary": {"type": "string"},
-                    "replace": {"type": "boolean", "description": "replace the stored transcript instead of appending"},
-                    "messages": {"type": "array", "items": conversation_message_schema}
-                },
-                "required": ["external_id"],
-                "additionalProperties": false,
-                "$schema": "http://json-schema.org/draft-07/schema#"
+                "properties": {"actor": {"type": "string"}}
             }
         }
     ));
     tools.push(json!(
         {
-            "name": "conversation_list_pending",
-            "title": "List conversations pending reflection",
-            "description": "The reflection queue: captured conversations not yet reflected (reflected_at IS NULL), namespace-scoped, oldest first (Rust-branch addition; not in the Node toolset).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 200}},
-                "additionalProperties": false,
-                "$schema": "http://json-schema.org/draft-07/schema#"
-            }
-        }
-    ));
-    tools.push(json!(
-        {
-            "name": "conversation_get",
-            "title": "Get a conversation transcript",
-            "description": "A captured conversation plus its transcript with content flattened to plain text, namespace-checked (Rust-branch addition; not in the Node toolset).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"id": {"type": "string"}},
-                "required": ["id"],
-                "additionalProperties": false,
-                "$schema": "http://json-schema.org/draft-07/schema#"
-            }
-        }
-    ));
-    tools.push(json!(
-        {
-            "name": "conversation_mark_reflected",
-            "title": "Mark a conversation reflected",
-            "description": "Stamp a captured conversation's reflection cursor and optionally store the rolling summary, draining it from the reflection queue (Rust-branch addition; not in the Node toolset).",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string"},
-                    "summary": {"type": "string", "description": "the rolling summary reflection produced"}
-                },
-                "required": ["id"],
-                "additionalProperties": false,
-                "$schema": "http://json-schema.org/draft-07/schema#"
-            }
+            "name":"embeddings_status",
+            "title": "Embedding corpus status",
+            "description": "Totals, per-kind and per-model counts, and the pending (re-)embed backlog for the semantic index.",
+            "inputSchema": empty_schema.clone(),
+            "execution": {"taskSupport": FORBIDDEN}
         }
     ));
     Value::Array(tools)
@@ -1325,13 +1212,13 @@ impl<'a> Args<'a> {
 
 // ---- dispatch ----
 
-/// tools/call dispatch — Node parity: handler results are content blocks,
+/// tools/call dispatch — SDK parity: handler results are content blocks,
 /// thrown handler errors become isError content, an unknown tool is the SDK's
-/// "MCP error -32602: Tool X not found" isError result. `actor` is the
-/// authenticated identity (authorship pin).
+/// "MCP error -32602: Tool X not found" isError result. `ctx.actor` is the
+/// acting identity (authorship pin).
 pub async fn call_tool(
     store: &Store,
-    ctx: &AuthCtx,
+    ctx: &LocalCtx,
     name: &str,
     args: &Map<String, Value>,
 ) -> Value {
@@ -1344,70 +1231,28 @@ pub async fn call_tool(
 
 async fn dispatch(
     store: &Store,
-    ctx: &AuthCtx,
+    ctx: &LocalCtx,
     name: &str,
     args: &Map<String, Value>,
 ) -> ToolResult {
-    // Authorship pin is the authenticated identity; reads/writes are scoped to
-    // its per-user namespace (admins are unscoped).
-    let actor = ctx.actor();
-    let viewer: Option<String> = if ctx.is_admin() {
-        None
-    } else {
-        Some(ctx.namespace_user().to_string())
-    };
+    // Authorship pin is the caller-supplied acting identity. Single user:
+    // reads are unscoped, writes stamp the actor as the namespace owner.
+    let actor = ctx.actor.as_str();
     match name {
-        "workspace_list" => {
-            let mut a = Args::new("workspace_list", args);
-            let limit = a.opt_int("limit", Some(1), Some(500));
-            a.finish()?;
-            Ok(ok_content(
-                &store
-                    .workspace_list(&ctx.visibility(), limit.unwrap_or(50))
-                    .await?,
-            ))
-        }
-        "workspace_get" => {
-            let mut a = Args::new("workspace_get", args);
-            let id = a.req_str("id");
-            a.finish()?;
-            match store.workspace_get(&ctx.visibility(), id.unwrap()).await? {
-                Some(ws) => Ok(ok_content(&ws)),
-                None => Ok(ok_content(&json!({"error": "not found"}))),
-            }
-        }
-        "workspace_transcript" => {
-            let mut a = Args::new("workspace_transcript", args);
-            let id = a.req_str("id");
-            let after = a.opt_int("after", Some(0), None);
-            let limit = a.opt_int("limit", Some(1), Some(5000));
-            a.finish()?;
-            let id = id.unwrap();
-            if store.workspace_get(&ctx.visibility(), id).await?.is_none() {
-                return Ok(ok_content(&json!({"error": "not found"})));
-            }
-            Ok(ok_content(
-                &store
-                    .workspace_transcript(id, after.unwrap_or(0), limit.unwrap_or(2000))
-                    .await?,
-            ))
-        }
         "journal_append" => journal_append(store, ctx, args).await,
         "journal_list" => {
             let mut a = Args::new("journal_list", args);
             let limit = a.opt_int("limit", Some(1), Some(200));
             a.finish()?;
             Ok(ok_content(
-                &store
-                    .visible_journal(&ctx.visibility(), None, None, limit.unwrap_or(30), 0)
-                    .await?,
+                &store.journal_list(limit.unwrap_or(30), 0).await?,
             ))
         }
         "journal_get" => {
             let mut a = Args::new("journal_get", args);
             let id = a.req_str("id");
             a.finish()?;
-            match store.journal_get(id.unwrap(), &ctx.visibility()).await? {
+            match store.journal_get(id.unwrap()).await? {
                 Some(e) => Ok(ok_content(&e)),
                 None => Ok(ok_content(&json!({"error": "not found"}))),
             }
@@ -1470,15 +1315,9 @@ async fn dispatch(
             let recipient = a.req_enum("recipient", &actor_names());
             let unread_only = a.opt_bool("unread_only");
             a.finish()?;
-            let recipient = recipient.unwrap();
-            // Viewer gate: an inbox is private to its recipient — snippets
-            // quote entries other viewers may not see (DIRECTION.md Phase 0).
-            if !can_act_for_identity(store, ctx, recipient).await? {
-                return Ok(tool_error("forbidden"));
-            }
             Ok(ok_content(
                 &store
-                    .inbox_list(recipient, unread_only.unwrap_or(true))
+                    .inbox_list(recipient.unwrap(), unread_only.unwrap_or(true))
                     .await?,
             ))
         }
@@ -1488,24 +1327,11 @@ async fn dispatch(
             let recipient = a.opt_str("recipient").map(String::from);
             a.finish()?;
             if let Some(id) = id {
-                // Gate on the item's recipient (kind-agnostic — the row must
-                // stay markable even when its ref_kind postdates this build).
-                // Missing and foreign ids answer the same {"marked": false} so
-                // the tool doesn't oracle which ids exist in others' inboxes.
-                let allowed = match store.inbox_recipient(&id).await? {
-                    Some(recipient) => can_act_for_identity(store, ctx, &recipient).await?,
-                    None => false,
-                };
-                if !allowed {
-                    return Ok(ok_content(&json!({"marked": false})));
-                }
+                // A missing id answers {"marked": false} (rows_affected 0).
                 let marked = store.inbox_mark_read(&id).await? > 0;
                 return Ok(ok_content(&json!({"marked": marked})));
             }
             if let Some(recipient) = recipient {
-                if !can_act_for_identity(store, ctx, &recipient).await? {
-                    return Ok(tool_error("forbidden"));
-                }
                 let marked = store.inbox_mark_all_read(&recipient).await?;
                 return Ok(ok_content(&json!({"marked": marked})));
             }
@@ -1517,9 +1343,7 @@ async fn dispatch(
             let limit = a.opt_int("limit", None, None);
             a.finish()?;
             let limit = limit.unwrap_or(25).max(0) as usize;
-            Ok(ok_content(
-                &store.search(&q.unwrap(), limit, viewer.as_deref()).await?,
-            ))
+            Ok(ok_content(&store.search(&q.unwrap(), limit).await?))
         }
         "mail_search" => {
             let mut a = Args::new("mail_search", args);
@@ -1527,9 +1351,7 @@ async fn dispatch(
             let limit = a.opt_int("limit", Some(1), Some(200));
             a.finish()?;
             Ok(ok_content(
-                &store
-                    .mail_search(&q.unwrap(), viewer.as_deref(), limit.unwrap_or(50))
-                    .await?,
+                &store.mail_search(&q.unwrap(), limit.unwrap_or(50)).await?,
             ))
         }
         "mail_thread_get" => {
@@ -1537,24 +1359,16 @@ async fn dispatch(
             let thread_id = a.req_str("thread_id").map(String::from);
             a.finish()?;
             Ok(ok_content(
-                &store
-                    .mail_thread_get(&thread_id.unwrap(), viewer.as_deref())
-                    .await?,
+                &store.mail_thread_get(&thread_id.unwrap()).await?,
             ))
         }
         "mail_accounts_list" => {
             let a = Args::new("mail_accounts_list", args);
             a.finish()?;
-            Ok(ok_content(
-                &store.mail_accounts_list(viewer.as_deref()).await?,
-            ))
+            Ok(ok_content(&store.mail_accounts_list().await?))
         }
-        "dashboard" => {
-            if !ctx.is_admin() {
-                return Ok(ok_content(&json!({"error": "admin only"})));
-            }
-            Ok(ok_content(&store.dashboard().await?))
-        }
+        "dashboard" => Ok(ok_content(&store.dashboard().await?)),
+        "embeddings_status" => Ok(ok_content(&store.embedding_stats().await?)),
         "semantic_search" => {
             let mut a = Args::new("semantic_search", args);
             let q = a.req_str("q").map(String::from);
@@ -1574,7 +1388,6 @@ async fn dispatch(
                 rerank,
                 blanket,
                 threshold,
-                viewer: viewer.clone(),
                 ..Default::default()
             };
             Ok(ok_content(&store.semantic_search(&q.unwrap(), opts).await?))
@@ -1634,13 +1447,8 @@ async fn dispatch(
                 kind,
                 sections,
             };
-            let target = target.unwrap();
-            if !can_edit_actor_profile(store, ctx, &target).await? {
-                return Ok(tool_error("forbidden"));
-            }
-            // Node passes "mcp" as the acting principal here (not the token actor).
             Ok(ok_content(
-                &store.profile_update(&target, patch, "mcp").await?,
+                &store.profile_update(&target.unwrap(), patch, actor).await?,
             ))
         }
         "recall" => {
@@ -1651,18 +1459,13 @@ async fn dispatch(
             let budget = a.opt_int("budget", None, None);
             let threshold = a.opt_f64("threshold");
             a.finish()?;
-            let identity = identity.unwrap();
-            if !can_act_for_identity(store, ctx, &identity).await? {
-                return Ok(tool_error("not_your_identity"));
-            }
             let opts = RecallOptions {
                 peer,
                 query,
                 budget: budget.map(|b| b.max(0) as usize),
                 threshold,
-                viewer: viewer.clone(),
             };
-            Ok(ok_content(&store.recall(&identity, opts).await?))
+            Ok(ok_content(&store.recall(&identity.unwrap(), opts).await?))
         }
         "sources_list" => Ok(ok_content(&store.sources_list(None).await?)),
         "sources_add" => {
@@ -1744,23 +1547,7 @@ async fn dispatch(
             a.finish()?;
             Ok(ok_content(&store.phases_list(project_id.as_deref()).await?))
         }
-        "share_entry" => {
-            let mut a = Args::new("share_entry", args);
-            let scope = a.req_enum("scope", &["entry", "journal"]);
-            let ref_ = a.req_str("ref").map(String::from);
-            let viewer = a.req_enum("viewer", &actor_names()).map(String::from);
-            a.finish()?;
-            let input = NewShare {
-                scope: ShareScope::from_str_lossy(scope.unwrap()),
-                ref_: ref_.unwrap(),
-                viewer: viewer.unwrap(),
-            };
-            Ok(ok_content(&store.shares_create(input).await?))
-        }
         "actor_delete" => {
-            if !is_admin(store, actor).await? {
-                return Ok(forbidden());
-            }
             let mut a = Args::new("actor_delete", args);
             let slug = a.req_str("slug").map(String::from);
             let dry_run = a.opt_bool("dry_run");
@@ -1776,9 +1563,6 @@ async fn dispatch(
             }
         }
         "actor_merge" => {
-            if !is_admin(store, actor).await? {
-                return Ok(forbidden());
-            }
             let mut a = Args::new("actor_merge", args);
             let from = a.req_str("from").map(String::from);
             let into = a.req_str("into").map(String::from);
@@ -1863,9 +1647,6 @@ async fn dispatch(
             ))
         }
         "entity_type_create" => {
-            if !is_admin(store, actor).await? {
-                return Ok(forbidden());
-            }
             let input: hive_shared::NewEntityType =
                 serde_json::from_value(Value::Object(args.clone()))
                     .map_err(|e| invalid_args("entity_type_create", &e.to_string()))?;
@@ -1878,9 +1659,6 @@ async fn dispatch(
             }
         }
         "entity_type_update" => {
-            if !is_admin(store, actor).await? {
-                return Ok(forbidden());
-            }
             let mut a = Args::new("entity_type_update", args);
             let target = a.req_str("type").map(String::from);
             a.finish()?;
@@ -1932,7 +1710,7 @@ async fn dispatch(
                 desc: dir.as_deref() != Some("asc"),
                 fields,
             };
-            match store.custom_entities_list(&filter, &ctx.visibility()).await {
+            match store.custom_entities_list(&filter).await {
                 Ok(items) => Ok(ok_content(&items)),
                 Err(e) => entity_write_result(e),
             }
@@ -1941,10 +1719,7 @@ async fn dispatch(
             let mut a = Args::new("entity_get", args);
             let id = a.req_str("id");
             a.finish()?;
-            match store
-                .custom_entities_get(id.unwrap(), &ctx.visibility())
-                .await?
-            {
+            match store.custom_entities_get(id.unwrap()).await? {
                 Some(e) => Ok(ok_content(&e)),
                 None => Ok(ok_content(&json!({"error": "not found"}))),
             }
@@ -1954,7 +1729,7 @@ async fn dispatch(
                 serde_json::from_value(Value::Object(args.clone()))
                     .map_err(|e| invalid_args("entity_create", &e.to_string()))?;
             match store
-                .custom_entities_create(input, actor, ctx.namespace_owner())
+                .custom_entities_create(input, actor, Some(actor))
                 .await
             {
                 Ok(e) => Ok(ok_content(&e)),
@@ -1970,13 +1745,7 @@ async fn dispatch(
             let patch: hive_shared::CustomEntityPatch = serde_json::from_value(Value::Object(body))
                 .map_err(|e| invalid_args("entity_update", &e.to_string()))?;
             match store
-                .custom_entities_update(
-                    &id.unwrap(),
-                    patch,
-                    actor,
-                    &ctx.visibility(),
-                    ctx.namespace_owner(),
-                )
+                .custom_entities_update(&id.unwrap(), patch, actor, Some(actor))
                 .await
             {
                 Ok(Some(e)) => Ok(ok_content(&e)),
@@ -1988,10 +1757,7 @@ async fn dispatch(
             let mut a = Args::new("entity_delete", args);
             let id = a.req_str("id");
             a.finish()?;
-            match store
-                .custom_entities_delete(id.unwrap(), actor, &ctx.visibility())
-                .await?
-            {
+            match store.custom_entities_delete(id.unwrap(), actor).await? {
                 Some(()) => Ok(ok_content(&json!({"deleted": true}))),
                 None => Ok(ok_content(&json!({"error": "not found"}))),
             }
@@ -2010,60 +1776,22 @@ async fn dispatch(
             let mut a = Args::new("artifacts_get", args);
             let id = a.req_str("id");
             a.finish()?;
-            // Identity gate on the row's actor; a foreign id answers exactly
-            // like a missing one so the tool doesn't oracle other identities'
-            // artifact ids (same posture as inbox_mark_read).
             match store.artifacts_get(id.unwrap()).await? {
-                Some(art) if can_act_for_identity(store, ctx, &art.actor).await? => {
-                    Ok(ok_content(&art))
-                }
-                _ => Ok(ok_content(&json!({"error": "not found"}))),
+                Some(art) => Ok(ok_content(&art)),
+                None => Ok(ok_content(&json!({"error": "not found"}))),
             }
         }
-        // ---- conversation capture + reflection queue ----
-        "conversation_log" => conversation_log(store, ctx, args).await,
-        "conversation_list_pending" => {
-            let mut a = Args::new("conversation_list_pending", args);
-            let limit = a.opt_int("limit", Some(1), Some(200));
+        // The plugin's sync surface: ENABLED artifacts only.
+        "identity_artifacts_sync" => {
+            let mut a = Args::new("identity_artifacts_sync", args);
+            let target = a.opt_str("actor").map(String::from);
             a.finish()?;
+            let items = store
+                .artifacts_for_actor(target.as_deref().unwrap_or(actor))
+                .await?;
             Ok(ok_content(
-                &store
-                    .conversations_pending(&ctx.visibility(), limit.unwrap_or(50))
-                    .await?,
+                &json!({"count": items.len(), "artifacts": items}),
             ))
-        }
-        "conversation_get" => {
-            let mut a = Args::new("conversation_get", args);
-            let id = a.req_str("id");
-            a.finish()?;
-            match store
-                .conversation_get_flat(&ctx.visibility(), id.unwrap())
-                .await?
-            {
-                Some(view) => Ok(ok_content(&view)),
-                None => Ok(ok_content(&json!({"error": "not found"}))),
-            }
-        }
-        "conversation_mark_reflected" => {
-            let mut a = Args::new("conversation_mark_reflected", args);
-            let id = a.req_str("id").map(String::from);
-            let summary = a.opt_str("summary").map(String::from);
-            a.finish()?;
-            let id = id.unwrap();
-            // Owner-or-admin, the same write gate as the REST route.
-            let Some(conv) = store.conversation_get_captured(&id).await? else {
-                return Ok(ok_content(&json!({"error": "not found"})));
-            };
-            if !ctx.is_admin() && ctx.namespace_user() != conv.owner {
-                return Ok(tool_error("forbidden"));
-            }
-            match store
-                .conversation_mark_reflected(&id, summary.as_deref())
-                .await?
-            {
-                Some(c) => Ok(ok_content(&c)),
-                None => Ok(ok_content(&json!({"error": "not found"}))),
-            }
         }
         _ => Ok(tool_error(&format!(
             "MCP error -32602: Tool {name} not found"
@@ -2071,7 +1799,7 @@ async fn dispatch(
     }
 }
 
-async fn journal_append(store: &Store, ctx: &AuthCtx, args: &Map<String, Value>) -> ToolResult {
+async fn journal_append(store: &Store, ctx: &LocalCtx, args: &Map<String, Value>) -> ToolResult {
     let mut a = Args::new("journal_append", args);
     a.req_str("body");
     a.finish()?;
@@ -2079,100 +1807,14 @@ async fn journal_append(store: &Store, ctx: &AuthCtx, args: &Map<String, Value>)
     // serde message inside the SDK's "Input validation error" wrapper.
     let mut input: NewJournalEntry = serde_json::from_value(Value::Object(args.clone()))
         .map_err(|e| invalid_args("journal_append", &e.to_string()))?;
-    // Author is the token's actor — a client cannot write as someone else. The
-    // entry lands in the writing principal's namespace (its granting user).
-    let actor = ctx.actor().to_string();
+    // Author is the acting identity — never a request parameter. The entry
+    // lands in that identity's namespace (user_scope stays populated for the
+    // 1.6 cutover / 1.7 importer even though single-user reads don't filter).
+    let actor = ctx.actor.clone();
     input.author = Some(actor.clone());
     Ok(ok_content(
         &store
-            .journal_append(input, Some(&actor), ctx.namespace_owner())
+            .journal_append(input, Some(&actor), Some(&actor))
             .await?,
     ))
-}
-
-/// conversation_log: capture upsert (by runtime/external_id) + transcript
-/// write in one call — what an agent's SessionEnd hook fires. Owner/namespace
-/// come from the token's ctx. Deliberately NO journal mirroring (reflection
-/// summarizes into the journal later).
-async fn conversation_log(store: &Store, ctx: &AuthCtx, args: &Map<String, Value>) -> ToolResult {
-    let mut a = Args::new("conversation_log", args);
-    let external_id = a.req_str("external_id").map(String::from);
-    let runtime = a.opt_str("runtime").map(String::from);
-    let title = a.opt_str("title").map(String::from);
-    let summary = a.opt_str("summary").map(String::from);
-    let replace = a.opt_bool("replace").unwrap_or(false);
-    a.finish()?;
-    // messages via serde — nested failures report the serde message inside
-    // the SDK's "Input validation error" wrapper (journal_append precedent).
-    let messages: Vec<hive_shared::NewConversationMessage> = match args.get("messages") {
-        None => Vec::new(),
-        Some(v) => serde_json::from_value(v.clone())
-            .map_err(|e| invalid_args("conversation_log", &e.to_string()))?,
-    };
-    let external_id = external_id.unwrap();
-    if external_id.trim().is_empty() {
-        return Ok(tool_error("external_id required"));
-    }
-    let owner = ctx.namespace_user().to_string();
-    let input = hive_shared::NewCapturedConversation {
-        runtime,
-        external_id,
-        title,
-        summary,
-    };
-    let Some(id) = store
-        .conversation_upsert_captured(&owner, ctx.actor(), input)
-        .await?
-    else {
-        // The capture key belongs to a different owner's session.
-        return Ok(tool_error("forbidden"));
-    };
-    // A metadata-only refresh (no turns, no replace) must not dirty the
-    // reflection queue, so skip the transcript write entirely.
-    let appended = if messages.is_empty() && !replace {
-        0
-    } else {
-        store
-            .conversation_replace_messages(&id, &messages, replace)
-            .await?
-    };
-    Ok(ok_content(&json!({"id": id, "appended": appended})))
-}
-
-/// One shared identity gate for MCP and HTTP: crate::middleware::can_act_for_identity.
-async fn can_act_for_identity(
-    store: &Store,
-    ctx: &AuthCtx,
-    identity: &str,
-) -> Result<bool, ToolFailure> {
-    Ok(crate::middleware::can_act_for_identity(store, ctx, identity).await?)
-}
-
-async fn can_edit_actor_profile(
-    store: &Store,
-    ctx: &AuthCtx,
-    actor: &str,
-) -> Result<bool, ToolFailure> {
-    if ctx.is_admin() || actor == ctx.actor() {
-        return Ok(true);
-    }
-    if ctx.principal == Some("session") {
-        let Some(target) = store.people_get(actor).await? else {
-            return Ok(false);
-        };
-        return Ok(target.owner.as_deref() == Some(ctx.actor()));
-    }
-    Ok(false)
-}
-
-/// mcp.ts isAdmin(): the token's actor maps to a user with role 'admin'.
-async fn is_admin(store: &Store, actor: &str) -> Result<bool, ToolFailure> {
-    let users = store.users_list().await?;
-    Ok(users
-        .iter()
-        .any(|u| u.actor == actor && u.role == UserRole::Admin))
-}
-
-fn forbidden() -> Value {
-    ok_content(&json!({"error": "forbidden — admin only"}))
 }

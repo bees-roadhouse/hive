@@ -73,18 +73,6 @@ impl Store {
         rows.iter().map(row_to_inbox).collect()
     }
 
-    /// Recipient of one item, kind-agnostic: the ownership gate must work even
-    /// for rows whose ref_kind this build can't parse (mark-read is a plain
-    /// UPDATE — only display goes through the fail-closed row mapper).
-    pub async fn inbox_recipient(&self, item_id: &str) -> Result<Option<String>> {
-        Ok(
-            crate::pgq::query_scalar("SELECT recipient FROM inbox WHERE id = ?")
-                .bind(item_id)
-                .fetch_optional(self.db())
-                .await?,
-        )
-    }
-
     pub async fn inbox_mark_read(&self, item_id: &str) -> Result<u64> {
         let res =
             crate::pgq::query("UPDATE inbox SET read_at = ? WHERE id = ? AND read_at IS NULL")

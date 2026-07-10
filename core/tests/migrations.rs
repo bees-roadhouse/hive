@@ -2,35 +2,11 @@
 // convention promises to tolerate: a fresh database (inline DDL builds the
 // final shape, the migration no-ops) and an old-shape database (2-col PK,
 // NOT NULL vec, no chunk_idx/owner/vec_v — the migration wipes + reshapes).
+// Postgres-specific by nature; this file dies with the 1.6 SQLite cutover.
 
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 
-/// A pool pinned to a brand-new schema WITHOUT running migrate() — the
-/// upgrade-path test lays down the old shape by hand first. Mirrors
-/// db::test_pool()'s search_path setup ("{schema},public" so the vector type
-/// resolves).
-async fn raw_schema_pool() -> PgPool {
-    let url = hive_api::db::database_url();
-    let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&url)
-        .await
-        .expect("connect admin");
-    sqlx::raw_sql(&format!("CREATE SCHEMA \"{schema}\""))
-        .execute(&admin)
-        .await
-        .expect("create schema");
-    admin.close().await;
-    let opts: PgConnectOptions = url.parse().expect("parse DATABASE_URL");
-    let opts = opts.options([("search_path", format!("{schema},public"))]);
-    PgPoolOptions::new()
-        .max_connections(5)
-        .connect_with(opts)
-        .await
-        .expect("connect pool")
-}
+mod common;
 
 async fn column_exists(pool: &PgPool, column: &str) -> bool {
     sqlx::query_scalar::<_, i32>(
@@ -90,8 +66,9 @@ async fn assert_final_embeddings_shape(pool: &PgPool) {
 
 #[tokio::test]
 async fn fresh_database_lands_on_final_embeddings_shape() {
-    // test_pool runs the migrator + the inline DDL, exactly like a boot.
-    let pool = hive_api::db::test_pool().await;
+    // test_store's pool ran the migrator + the inline DDL, exactly like a boot.
+    let store = common::test_store().await;
+    let pool = store.db().clone();
     assert_final_embeddings_shape(&pool).await;
 
     // The native vector column round-trips through the pgvector binding, and
@@ -127,7 +104,7 @@ async fn fresh_database_lands_on_final_embeddings_shape() {
 
 #[tokio::test]
 async fn migration_reshapes_and_wipes_old_embeddings_table() {
-    let pool = raw_schema_pool().await;
+    let pool = common::raw_schema_pool().await;
 
     // The pre-0.6 shape, verbatim from the old inline DDL, plus one legacy
     // row that must NOT survive (chunking changes row identity — wipe and
@@ -156,7 +133,7 @@ async fn migration_reshapes_and_wipes_old_embeddings_table() {
     .await
     .expect("legacy row");
 
-    hive_api::db::migrate(&pool).await.expect("migrate");
+    hive_core::db::migrate(&pool).await.expect("migrate");
 
     assert_final_embeddings_shape(&pool).await;
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM embeddings")
@@ -167,6 +144,6 @@ async fn migration_reshapes_and_wipes_old_embeddings_table() {
 
     // And migrate() must be re-runnable on the now-final shape (the inline
     // DDL + a second boot racing are the everyday case).
-    hive_api::db::migrate(&pool).await.expect("re-migrate");
+    hive_core::db::migrate(&pool).await.expect("re-migrate");
     assert_final_embeddings_shape(&pool).await;
 }

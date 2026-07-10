@@ -200,39 +200,22 @@ fn json_string_array(raw: &str) -> Vec<String> {
 }
 
 impl Store {
-    pub async fn mail_accounts_list(&self, viewer: Option<&str>) -> Result<Vec<MailAccount>> {
-        let rows = match viewer {
-            Some(viewer) => {
-                crate::pgq::query_as::<MailAccount>(
-                    "SELECT id, address AS label, address, 'jmap' AS provider, last_synced_at \
-                 FROM mail_accounts WHERE owner = ? ORDER BY address ASC",
-                )
-                .bind(viewer)
-                .fetch_all(self.db())
-                .await?
-            }
-            None => {
-                crate::pgq::query_as::<MailAccount>(
-                    "SELECT id, address AS label, address, 'jmap' AS provider, last_synced_at \
-                 FROM mail_accounts ORDER BY owner ASC, address ASC",
-                )
-                .fetch_all(self.db())
-                .await?
-            }
-        };
-        Ok(rows)
+    pub async fn mail_accounts_list(&self) -> Result<Vec<MailAccount>> {
+        Ok(crate::pgq::query_as::<MailAccount>(
+            "SELECT id, address AS label, address, 'jmap' AS provider, last_synced_at \
+             FROM mail_accounts ORDER BY owner ASC, address ASC",
+        )
+        .fetch_all(self.db())
+        .await?)
     }
 
     pub async fn mail_messages_list(
         &self,
-        viewer: Option<&str>,
         query: Option<&str>,
         account_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<MailMessageSummary>> {
-        let rows = self
-            .mail_message_rows(viewer, query, account_id, limit)
-            .await?;
+        let rows = self.mail_message_rows(query, account_id, limit).await?;
         Ok(rows
             .into_iter()
             .map(MailThreadMessage::from)
@@ -240,39 +223,17 @@ impl Store {
             .collect())
     }
 
-    pub async fn mail_search(
-        &self,
-        query: &str,
-        viewer: Option<&str>,
-        limit: i64,
-    ) -> Result<Vec<MailMessageSummary>> {
-        self.mail_messages_list(viewer, Some(query), None, limit)
-            .await
+    pub async fn mail_search(&self, query: &str, limit: i64) -> Result<Vec<MailMessageSummary>> {
+        self.mail_messages_list(Some(query), None, limit).await
     }
 
-    pub async fn mail_thread_get(
-        &self,
-        thread_id: &str,
-        viewer: Option<&str>,
-    ) -> Result<MailThread> {
-        let rows =
-            match viewer {
-                Some(viewer) => crate::pgq::query_as::<MailMessageRow>(&mail_message_select(
-                    "WHERE m.user_scope = ? AND m.jmap_thread_id = ? ORDER BY m.received_at ASC",
-                ))
-                .bind(viewer)
-                .bind(thread_id)
-                .fetch_all(self.db())
-                .await?,
-                None => {
-                    crate::pgq::query_as::<MailMessageRow>(&mail_message_select(
-                        "WHERE m.jmap_thread_id = ? ORDER BY m.received_at ASC",
-                    ))
-                    .bind(thread_id)
-                    .fetch_all(self.db())
-                    .await?
-                }
-            };
+    pub async fn mail_thread_get(&self, thread_id: &str) -> Result<MailThread> {
+        let rows = crate::pgq::query_as::<MailMessageRow>(&mail_message_select(
+            "WHERE m.jmap_thread_id = ? ORDER BY m.received_at ASC",
+        ))
+        .bind(thread_id)
+        .fetch_all(self.db())
+        .await?;
         let mut messages: Vec<MailThreadMessage> =
             rows.into_iter().map(MailThreadMessage::from).collect();
         self.attach_chips(&mut messages).await?;
@@ -325,16 +286,12 @@ impl Store {
 
     async fn mail_message_rows(
         &self,
-        viewer: Option<&str>,
         query: Option<&str>,
         account_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<MailMessageRow>> {
         let limit = limit.clamp(1, 200);
         let mut clauses: Vec<&str> = Vec::new();
-        if viewer.is_some() {
-            clauses.push("m.user_scope = ?");
-        }
         if account_id.is_some() {
             clauses.push("m.account_id = ?");
         }
@@ -356,9 +313,6 @@ impl Store {
             "{where_sql}{deleted_filter}ORDER BY m.received_at DESC LIMIT ?"
         ));
         let mut q = crate::pgq::query_as::<MailMessageRow>(&sql);
-        if let Some(viewer) = viewer {
-            q = q.bind(viewer);
-        }
         if let Some(account_id) = account_id {
             q = q.bind(account_id);
         }
@@ -455,29 +409,13 @@ impl Store {
         .await?)
     }
 
-    /// All accounts (admin) or the viewer's own, with sync state.
-    pub async fn mail_accounts_admin_list(
-        &self,
-        viewer: Option<&str>,
-    ) -> Result<Vec<MailAccountAdminView>> {
-        let rows = match viewer {
-            Some(viewer) => {
-                crate::pgq::query_as::<MailAccountAdminView>(&format!(
-                    "{MAIL_ACCOUNT_ADMIN_SELECT} WHERE owner = ? ORDER BY address ASC"
-                ))
-                .bind(viewer)
-                .fetch_all(self.db())
-                .await?
-            }
-            None => {
-                crate::pgq::query_as::<MailAccountAdminView>(&format!(
-                    "{MAIL_ACCOUNT_ADMIN_SELECT} ORDER BY owner ASC, address ASC"
-                ))
-                .fetch_all(self.db())
-                .await?
-            }
-        };
-        Ok(rows)
+    /// All accounts, with sync state.
+    pub async fn mail_accounts_admin_list(&self) -> Result<Vec<MailAccountAdminView>> {
+        Ok(crate::pgq::query_as::<MailAccountAdminView>(&format!(
+            "{MAIL_ACCOUNT_ADMIN_SELECT} ORDER BY owner ASC, address ASC"
+        ))
+        .fetch_all(self.db())
+        .await?)
     }
 
     pub async fn mail_account_owner(&self, id: &str) -> Result<Option<String>> {
@@ -1491,21 +1429,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mail_queries_are_viewer_gated() {
+    async fn mail_queries_read_unscoped() {
         let store = seeded_store().await;
 
-        let alice_accounts = store.mail_accounts_list(Some("alice")).await.unwrap();
-        assert_eq!(alice_accounts.len(), 1);
-        assert_eq!(alice_accounts[0].id, "acct-alice");
+        let accounts = store.mail_accounts_list().await.unwrap();
+        assert_eq!(accounts.len(), 2, "single user sees every account");
 
-        let alice_messages = store
-            .mail_messages_list(Some("alice"), None, None, 20)
-            .await
-            .unwrap();
-        assert_eq!(alice_messages.len(), 1);
-        assert_eq!(alice_messages[0].id, "msg-alice-1");
+        let messages = store.mail_messages_list(None, None, 20).await.unwrap();
+        assert_eq!(messages.len(), 2);
+        let alice = messages.iter().find(|m| m.id == "msg-alice-1").unwrap();
         assert_eq!(
-            alice_messages[0].labels,
+            alice.labels,
             vec![
                 "flagged".to_string(),
                 "Bee Roadhouse".to_string(),
@@ -1513,22 +1447,12 @@ mod tests {
             ]
         );
 
-        let hits = store
-            .mail_search("budget", Some("alice"), 20)
-            .await
-            .unwrap();
+        let hits = store.mail_search("nectar budget", 20).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "msg-alice-1");
 
-        let thread = store
-            .mail_thread_get("thread-shared", Some("alice"))
-            .await
-            .unwrap();
-        assert_eq!(thread.messages.len(), 1);
-        assert_eq!(thread.messages[0].summary.id, "msg-alice-1");
-
-        let admin_thread = store.mail_thread_get("thread-shared", None).await.unwrap();
-        assert_eq!(admin_thread.messages.len(), 2);
+        let thread = store.mail_thread_get("thread-shared").await.unwrap();
+        assert_eq!(thread.messages.len(), 2, "whole thread, no viewer gate");
     }
 
     #[tokio::test]
@@ -2196,11 +2120,13 @@ mod tests {
         assert_eq!(pointed, 2, "both attachments point at the shared blob");
 
         // The thread payload now reports them stored.
-        let thread = store
-            .mail_thread_get("thread-shared", Some("alice"))
-            .await
-            .unwrap();
-        let atts = &thread.messages[0].attachments;
+        let thread = store.mail_thread_get("thread-shared").await.unwrap();
+        let atts = &thread
+            .messages
+            .iter()
+            .find(|m| m.summary.id == "msg-alice-1")
+            .unwrap()
+            .attachments;
         assert_eq!(atts.len(), 2);
         assert!(atts.iter().all(|a| a.stored));
     }

@@ -84,8 +84,6 @@ pub struct RecallOptions {
     pub budget: Option<usize>,
     /// Optional minimum semantic score for journal hits included in recall.
     pub threshold: Option<f64>,
-    /// Namespace user to scope the journal recall to (None = admin/unscoped).
-    pub viewer: Option<String>,
 }
 
 impl Store {
@@ -137,7 +135,6 @@ impl Store {
                     peer: peer.map(String::from),
                     mode: Some("precision".to_string()),
                     threshold: opts.threshold,
-                    viewer: opts.viewer.clone(),
                     kinds: Some(vec![EntityKind::Journal]),
                     ..Default::default()
                 },

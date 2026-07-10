@@ -1,8 +1,11 @@
-// Search query side — parity port of store.ts `search` (FTS5 keyword + viewer
-// ACL), `semanticSearch` (the standard/precision hybrid cascade),
-// `embeddableItems`, `embeddingStats`, and `visibleEntryIds`/`scopeHits`.
+// Search query side — parity port of store.ts `search` (keyword),
+// `semanticSearch` (the standard/precision hybrid cascade), `embeddableItems`,
+// and `embeddingStats`. Single-user: the viewer ACL machinery (visibility
+// index, scope_hits, owner filtering) died in the Phase 1 teardown — reads are
+// unscoped. Writes still stamp `embeddings.owner` (see embeddable_items) so
+// the storage shape stays stable for the 1.6 cutover and 1.7 importer.
 //
-// Decoupling note: journal/tasks/decisions/events/shares/links data is read via
+// Decoupling note: journal/tasks/decisions/events/links data is read via
 // private SQL here (not via those store modules) — the orchestrator dedups at
 // integration.
 
@@ -29,8 +32,6 @@ pub struct SemanticOptions {
     pub blanket: Option<bool>,
     /// "standard" (default) | "precision".
     pub mode: Option<String>,
-    /// Scope results to entries this viewer may see.
-    pub viewer: Option<String>,
     /// Boost (not filter) hits whose actors include this actor.
     pub identity: Option<String>,
     /// Boost (not filter) hits whose actors include this actor.
@@ -240,228 +241,9 @@ fn origin_table(kind: &str) -> Option<&'static str> {
         .map(|(_, t)| *t)
 }
 
-/// A pure `kind:id → visible?` predicate for one viewer, resolved up front in
-/// four queries (the ACL set plus one origin map per anchored table) so the
-/// cascade can scope candidates without per-hit SQL.
-struct VisibilityIndex {
-    visible_entries: HashSet<String>,
-    /// `kind:id` → origin_entry_id for task/decision/event rows.
-    origin_of: HashMap<String, Option<String>>,
-    /// `slug:id` keys of custom entity rows this viewer may see (scope lives
-    /// on the row itself, not an origin entry).
-    custom_visible: HashSet<String>,
-    /// Mail ids owned by this viewer. Mail scopes by `user_scope` alone —
-    /// owner-only, no share or mention piercing (DIRECTION.md D9).
-    mail_visible: HashSet<String>,
-}
-
-impl VisibilityIndex {
-    /// journal ids check the ACL set directly; task/decision/event go through
-    /// their origin entry; mail through its owner set; anything else is
-    /// invisible (fail closed).
-    fn allows(&self, kind: &str, id: &str) -> bool {
-        if kind == "journal" {
-            return self.visible_entries.contains(id);
-        }
-        if kind == "mail" {
-            return self.mail_visible.contains(id);
-        }
-        match self.origin_of.get(&ref_key(kind, id)) {
-            Some(Some(origin)) => self.visible_entries.contains(origin),
-            Some(None) => false,
-            // Not an anchored built-in: visible only if it's a custom entity
-            // row this viewer may see — unknown kinds stay invisible.
-            None => self.custom_visible.contains(&ref_key(kind, id)),
-        }
-    }
-}
-
 impl Store {
-    /// Resolved once per scoped semantic query. The cascade needs a pure
-    /// predicate over EVERY vector candidate, so origin maps load their whole
-    /// (small) tables up front — but only for kinds the query can return:
-    /// `kinds` skips excluded tables (recall's journal-only path pays nothing
-    /// here).
-    async fn visibility_index(
-        &self,
-        viewer: &str,
-        kinds: Option<&[EntityKind]>,
-        mail_ids: &HashSet<String>,
-    ) -> Result<VisibilityIndex> {
-        // `viewer` is always a concrete namespace user here (admins search
-        // unscoped — the route passes viewer=None). The visible set is already
-        // namespace-gated inside visible_entry_ids.
-        let visible_entries = self
-            .visible_entry_ids(&crate::Visibility::Namespace(viewer.to_string()))
-            .await?
-            .unwrap_or_default();
-        let mut origin_of: HashMap<String, Option<String>> = HashMap::new();
-        for (kind, table) in ORIGIN_TABLE {
-            if kinds.is_some_and(|ks| !ks.iter().any(|k| k.as_str() == *kind)) {
-                continue;
-            }
-            let rows = crate::pgq::query(&format!("SELECT id, origin_entry_id FROM {table}"))
-                .fetch_all(self.db())
-                .await?;
-            for r in &rows {
-                origin_of.insert(
-                    ref_key(kind, r.try_get::<String, _>("id")?.as_str()),
-                    r.try_get("origin_entry_id")?,
-                );
-            }
-        }
-        // Custom entity rows carry their scope directly. The typed `kinds`
-        // filter can never name a custom slug, so any restriction excludes
-        // them; only the unrestricted cascade loads this map (dormant until
-        // custom kinds get embeddings).
-        let mut custom_visible: HashSet<String> = HashSet::new();
-        if kinds.is_none() {
-            let rows = crate::pgq::query(
-                "SELECT e.id, t.slug FROM entities e JOIN entity_types t ON t.id = e.type_id \
-                 WHERE e.user_scope IS NULL OR e.user_scope = ?",
-            )
-            .bind(viewer)
-            .fetch_all(self.db())
-            .await?;
-            for r in &rows {
-                custom_visible.insert(ref_key(
-                    r.try_get::<String, _>("slug")?.as_str(),
-                    r.try_get::<String, _>("id")?.as_str(),
-                ));
-            }
-        }
-        // Mail scoping is a plain owner check, resolved over the BOUNDED
-        // candidate id set the caller collected (vector candidates + keyword
-        // hits) — never a full mail_messages load (200k rows post-backfill).
-        // The candidate SQL already pre-filters by embeddings.owner; this is
-        // the authority check (user_scope + tombstones) on what survived.
-        let mut mail_visible: HashSet<String> = HashSet::new();
-        if kinds.is_none_or(|ks| ks.contains(&EntityKind::Mail)) && !mail_ids.is_empty() {
-            let ids: Vec<&str> = mail_ids.iter().map(String::as_str).collect();
-            let sql = format!(
-                "SELECT id FROM mail_messages WHERE id IN ({}) \
-                 AND user_scope = ? AND deleted_at IS NULL",
-                placeholders_or_never(ids.len())
-            );
-            let mut q = crate::pgq::query(&sql);
-            for id in &ids {
-                q = q.bind(*id);
-            }
-            q = q.bind(viewer);
-            for r in &q.fetch_all(self.db()).await? {
-                mail_visible.insert(r.try_get::<String, _>("id")?);
-            }
-        }
-        Ok(VisibilityIndex {
-            visible_entries,
-            origin_of,
-            custom_visible,
-            mail_visible,
-        })
-    }
-
-    /// Drop search hits a viewer can't see (store.ts `scopeHits`). Hits are
-    /// already a bounded candidate list, so origins resolve in one batched
-    /// IN query per kind present instead of full-table scans.
-    async fn scope_hits(&self, hits: Vec<SearchHit>, viewer: &str) -> Result<Vec<SearchHit>> {
-        let visible_entries = self
-            .visible_entry_ids(&crate::Visibility::Namespace(viewer.to_string()))
-            .await?
-            .unwrap_or_default();
-        let mut origin_of: HashMap<String, Option<String>> = HashMap::new();
-        for (kind, table) in ORIGIN_TABLE {
-            let ids: Vec<&str> = hits
-                .iter()
-                .filter(|h| h.kind.as_str() == *kind)
-                .map(|h| h.id.as_str())
-                .collect();
-            if ids.is_empty() {
-                continue;
-            }
-            let sql = format!(
-                "SELECT id, origin_entry_id FROM {table} WHERE id IN ({})",
-                placeholders_or_never(ids.len())
-            );
-            let mut q = crate::pgq::query(&sql);
-            for id in &ids {
-                q = q.bind(*id);
-            }
-            for r in &q.fetch_all(self.db()).await? {
-                origin_of.insert(
-                    ref_key(kind, r.try_get::<String, _>("id")?.as_str()),
-                    r.try_get("origin_entry_id")?,
-                );
-            }
-        }
-        // Mail hits scope by owner, batched over the bounded candidate list —
-        // never a full mail_messages load (200k rows post-backfill).
-        let mut mail_visible: HashSet<String> = HashSet::new();
-        let mail_ids: Vec<&str> = hits
-            .iter()
-            .filter(|h| h.kind == "mail")
-            .map(|h| h.id.as_str())
-            .collect();
-        if !mail_ids.is_empty() {
-            let sql = format!(
-                "SELECT id FROM mail_messages WHERE id IN ({}) \
-                 AND user_scope = ? AND deleted_at IS NULL",
-                placeholders_or_never(mail_ids.len())
-            );
-            let mut q = crate::pgq::query(&sql);
-            for id in &mail_ids {
-                q = q.bind(*id);
-            }
-            q = q.bind(viewer);
-            for r in &q.fetch_all(self.db()).await? {
-                mail_visible.insert(r.try_get::<String, _>("id")?);
-            }
-        }
-        // Hits whose kind is neither journal, mail, nor an anchored built-in
-        // may be custom entities — resolve their visibility in one batched
-        // query.
-        let mut custom_visible: HashSet<String> = HashSet::new();
-        let custom_ids: Vec<&str> = hits
-            .iter()
-            .filter(|h| h.kind != "journal" && h.kind != "mail" && origin_table(&h.kind).is_none())
-            .map(|h| h.id.as_str())
-            .collect();
-        if !custom_ids.is_empty() {
-            let sql = format!(
-                "SELECT e.id, t.slug FROM entities e JOIN entity_types t ON t.id = e.type_id \
-                 WHERE e.id IN ({}) AND (e.user_scope IS NULL OR e.user_scope = ?)",
-                placeholders_or_never(custom_ids.len())
-            );
-            let mut q = crate::pgq::query(&sql);
-            for id in &custom_ids {
-                q = q.bind(*id);
-            }
-            q = q.bind(viewer);
-            for r in &q.fetch_all(self.db()).await? {
-                custom_visible.insert(ref_key(
-                    r.try_get::<String, _>("slug")?.as_str(),
-                    r.try_get::<String, _>("id")?.as_str(),
-                ));
-            }
-        }
-        let index = VisibilityIndex {
-            visible_entries,
-            origin_of,
-            custom_visible,
-            mail_visible,
-        };
-        Ok(hits
-            .into_iter()
-            .filter(|h| index.allows(h.kind.as_str(), &h.id))
-            .collect())
-    }
-
-    /// FTS5 keyword search with optional viewer scoping (store.ts `search`).
-    pub async fn search(
-        &self,
-        query: &str,
-        limit: usize,
-        viewer: Option<&str>,
-    ) -> Result<Vec<SearchHit>> {
+    /// Keyword search (store.ts `search`), unscoped.
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         if query.trim().is_empty() {
             return Ok(vec![]);
         }
@@ -469,8 +251,6 @@ impl Store {
         if match_q.is_empty() {
             return Ok(vec![]);
         }
-        // Over-fetch when scoping so permission filtering doesn't starve the result.
-        let fetch = if viewer.is_some() { limit * 5 } else { limit };
         // Postgres FTS: tsvector @@ tsquery, ts_rank for ranking (higher = better,
         // so DESC), ts_headline for the snippet. Replaces FTS5 MATCH/bm25/snippet.
         let rows = crate::pgq::query(
@@ -483,10 +263,10 @@ impl Store {
         .bind(&match_q)
         .bind(&match_q)
         .bind(&match_q)
-        .bind(fetch as i64)
+        .bind(limit as i64)
         .fetch_all(self.db())
         .await?;
-        let hits: Vec<SearchHit> = rows
+        let mut hits: Vec<SearchHit> = rows
             .iter()
             .map(|r| -> Result<SearchHit> {
                 // ts_rank is f32 and higher = better; clamp to a 0..1 score.
@@ -500,10 +280,6 @@ impl Store {
                 })
             })
             .collect::<Result<_>>()?;
-        let mut hits = match viewer {
-            Some(v) => self.scope_hits(hits, v).await?,
-            None => hits,
-        };
         hits.truncate(limit);
         Ok(hits)
     }
@@ -736,11 +512,9 @@ impl Store {
     /// `vec_v` column instead of loading the whole BYTEA table. Returns
     /// chunk-level `(kind:id, sim)` rows, NOT yet collapsed.
     ///
-    /// Owner filtering runs in SQL (`embeddings.owner`) so a 200k-row foreign
-    /// mailbox never occupies candidate slots; `admit()` stays the authority
-    /// on top. When `kinds` is None a second probe excludes the bulk kinds so
-    /// mail volume can never evict journal/tasks from the candidate set —
-    /// union'd and deduped by the caller's collapse.
+    /// When `kinds` is None a second probe excludes the bulk kinds so mail
+    /// volume can never evict journal/tasks from the candidate set — union'd
+    /// and deduped by the caller's collapse.
     ///
     /// Raw sqlx (not pgq): the query vector binds via the pgvector crate and
     /// `$1` is reused in SELECT + ORDER BY, which the `?` rewriter can't
@@ -748,7 +522,6 @@ impl Store {
     async fn ann_candidates(
         &self,
         q: &[f32],
-        viewer: Option<&str>,
         kinds: Option<&[EntityKind]>,
         chunk_k: i64,
         bulk: &[String],
@@ -766,8 +539,7 @@ impl Store {
 
         const BASE: &str = "SELECT ref_kind, ref_id, chunk_idx, 1 - (vec_v <=> $1) AS sim \
              FROM embeddings \
-             WHERE model = $2 AND vec_v IS NOT NULL \
-               AND ($3::text IS NULL OR owner IS NULL OR owner = $3)";
+             WHERE model = $2 AND vec_v IS NOT NULL";
         let mut rows: Vec<(String, f64)> = Vec::new();
         let mut push_rows = |fetched: Vec<sqlx::postgres::PgRow>| -> Result<()> {
             for r in &fetched {
@@ -783,11 +555,10 @@ impl Store {
         match kinds {
             Some(ks) => {
                 let arr: Vec<String> = ks.iter().map(|k| k.as_str().to_string()).collect();
-                let sql = format!("{BASE} AND ref_kind = ANY($4) ORDER BY vec_v <=> $1 LIMIT $5");
+                let sql = format!("{BASE} AND ref_kind = ANY($3) ORDER BY vec_v <=> $1 LIMIT $4");
                 let fetched = sqlx::query(&sql)
                     .bind(&qv)
                     .bind(model)
-                    .bind(viewer)
                     .bind(&arr)
                     .bind(chunk_k)
                     .fetch_all(&mut *tx)
@@ -795,22 +566,20 @@ impl Store {
                 push_rows(fetched)?;
             }
             None => {
-                let sql = format!("{BASE} ORDER BY vec_v <=> $1 LIMIT $4");
+                let sql = format!("{BASE} ORDER BY vec_v <=> $1 LIMIT $3");
                 let fetched = sqlx::query(&sql)
                     .bind(&qv)
                     .bind(model)
-                    .bind(viewer)
                     .bind(chunk_k)
                     .fetch_all(&mut *tx)
                     .await?;
                 push_rows(fetched)?;
                 if !bulk.is_empty() {
                     let sql =
-                        format!("{BASE} AND ref_kind <> ALL($4) ORDER BY vec_v <=> $1 LIMIT $5");
+                        format!("{BASE} AND ref_kind <> ALL($3) ORDER BY vec_v <=> $1 LIMIT $4");
                     let fetched = sqlx::query(&sql)
                         .bind(&qv)
                         .bind(model)
-                        .bind(viewer)
                         .bind(bulk)
                         .bind(chunk_k)
                         .fetch_all(&mut *tx)
@@ -825,36 +594,26 @@ impl Store {
 
     /// Brute-force BYTEA candidate stage — the pre-pgvector path, kept for
     /// non-384-dim providers (the 256-dim hash embedder in dev/CI) so the
-    /// whole cascade stays exercised without ONNX. Owner-filtered in SQL like
-    /// the ANN path; full scan of model-matched rows, cosine in Rust. Returns
-    /// chunk-level rows for the same collapse.
+    /// whole cascade stays exercised without ONNX. Full scan of model-matched
+    /// rows, cosine in Rust. Returns chunk-level rows for the same collapse.
     async fn brute_candidates(
         &self,
         q: &[f32],
-        viewer: Option<&str>,
         kinds: Option<&[EntityKind]>,
     ) -> Result<Vec<(String, f64)>> {
         let kind_clause = match kinds {
             Some(ks) => format!(" AND ref_kind IN ({})", placeholders_or_never(ks.len())),
             None => String::new(),
         };
-        let owner_clause = if viewer.is_some() {
-            " AND (owner IS NULL OR owner = ?)"
-        } else {
-            ""
-        };
         let sql = format!(
             "SELECT ref_kind, ref_id, vec FROM embeddings \
-             WHERE model = ? AND dim = ? AND vec IS NOT NULL{kind_clause}{owner_clause}"
+             WHERE model = ? AND dim = ? AND vec IS NOT NULL{kind_clause}"
         );
         let mut q_db = crate::pgq::query(&sql)
             .bind(hive_embed::embed_model())
             .bind(q.len() as i64);
         for k in kinds.unwrap_or(&[]) {
             q_db = q_db.bind(k.as_str());
-        }
-        if let Some(v) = viewer {
-            q_db = q_db.bind(v);
         }
         let rows = q_db.fetch_all(self.db()).await?;
         rows.iter()
@@ -1026,9 +785,9 @@ impl Store {
 
     /// Semantic search — store.ts `semanticSearch`, the full standard|precision
     /// hybrid pipeline (vector pass → FTS blend → Markov-blanket boost →
-    /// identity/peer soft boosts → optional cross-encoder rerank). Viewer ACL
-    /// scoping applies BEFORE every pool cut, not as a post-filter, so hidden
-    /// rows can't starve a viewer's results (DIRECTION.md Phase 0 item 2).
+    /// identity/peer soft boosts → optional cross-encoder rerank). The `kinds`
+    /// filter applies BEFORE every pool cut, not as a post-filter, so excluded
+    /// kinds can't starve the result pool.
     pub async fn semantic_search(
         &self,
         query: &str,
@@ -1066,83 +825,43 @@ impl Store {
         // cascade below stays exercised without ONNX. The q.len() guard
         // covers the transformers latch: a mid-flight model failure degrades
         // embed_query to 256-dim hash vectors, which must not bind against
-        // vector(384). Both paths owner-filter in SQL; admit() stays the
-        // authority on top.
+        // vector(384).
         let owned_query = query.to_string();
         let q = tokio::task::spawn_blocking(move || hive_embed::embed_query(&owned_query)).await?;
         let chunk_k = (stage1_pool * 4).max(limit) as i64;
         let bulk = bulk_kinds();
         let raw_rows = if hive_embed::embed_dim() == 384 && q.len() == 384 {
-            self.ann_candidates(
-                &q,
-                opts.viewer.as_deref(),
-                opts.kinds.as_deref(),
-                chunk_k,
-                &bulk,
-            )
-            .await?
-        } else {
-            self.brute_candidates(&q, opts.viewer.as_deref(), opts.kinds.as_deref())
+            self.ann_candidates(&q, opts.kinds.as_deref(), chunk_k, &bulk)
                 .await?
+        } else {
+            self.brute_candidates(&q, opts.kinds.as_deref()).await?
         };
         // Chunked rows share one `kind:id` key — collapse to the item's best
         // chunk (MAX sim) so pool slots, the fallback, and the final hit list
         // stay one-entry-per-item. Everything downstream works on parent keys.
         let mut scored_all = collapse_chunks(raw_rows);
 
-        // Keyword rows are fetched BEFORE the visibility index so its mail
-        // arm can batch-resolve every candidate mail id in one bounded query.
+        // Over-fetch keyword rows when a kinds filter will thin the pool.
         // Blend/scoring order below is unchanged.
-        let kw_fetch = if opts.viewer.is_some() || opts.kinds.is_some() {
+        let kw_fetch = if opts.kinds.is_some() {
             stage2_pool * 5
         } else {
             stage2_pool
         };
         let kw_all: Vec<SearchHit> = if hybrid {
-            self.search(query, kw_fetch, None).await?
+            self.search(query, kw_fetch).await?
         } else {
             Vec::new()
         };
 
-        // Resolve the viewer ACL once, up front. `admit` is pure after that:
-        // a candidate enters any pool only if its kind parses (a newer
-        // binary's rows must not hold slots this build drops at hydration),
-        // passes the kinds filter, and is visible to the viewer. Applied
-        // before every cut, including the fallback.
-        let visible = match opts.viewer.as_deref() {
-            Some(v) => {
-                let mut mail_ids: HashSet<String> = HashSet::new();
-                for (k, _) in &scored_all {
-                    let (kind, id) = split_key(k);
-                    if kind == "mail" {
-                        mail_ids.insert(id.to_string());
-                    }
-                }
-                for h in &kw_all {
-                    if h.kind == "mail" {
-                        mail_ids.insert(h.id.clone());
-                    }
-                }
-                Some(
-                    self.visibility_index(v, opts.kinds.as_deref(), &mail_ids)
-                        .await?,
-                )
-            }
-            None => None,
-        };
-        let admit = |kind_s: &str, id: &str| -> bool {
-            // The typed filter can only name built-ins, so when it's set it
-            // excludes everything else (custom slugs included). Unrestricted
-            // queries admit whatever the visibility index allows — which
-            // handles custom entity rows by their own scope.
-            if let Some(ks) = opts.kinds.as_ref() {
-                match EntityKind::parse(kind_s) {
-                    Some(kind) if ks.contains(&kind) => {}
-                    _ => return false,
-                }
-            }
-            match &visible {
-                Some(ix) => ix.allows(kind_s, id),
+        // `admit` gates every pool cut: a candidate enters only if its kind
+        // parses when a kinds filter is set (a newer binary's rows must not
+        // hold slots this build drops at hydration). The typed filter can
+        // only name built-ins, so when it's set it excludes everything else
+        // (custom slugs included).
+        let admit = |kind_s: &str| -> bool {
+            match opts.kinds.as_ref() {
+                Some(ks) => matches!(EntityKind::parse(kind_s), Some(kind) if ks.contains(&kind)),
                 None => true,
             }
         };
@@ -1150,8 +869,8 @@ impl Store {
         // Admission applies before ANY cut — the threshold filter, the stage
         // pools, and the fallback refill all see an already-admitted list.
         scored_all.retain(|(k, _)| {
-            let (kind, id) = split_key(k);
-            admit(kind, id)
+            let (kind, _) = split_key(k);
+            admit(kind)
         });
         let passing: Vec<&(String, f64)> =
             scored_all.iter().filter(|(_, s)| *s >= threshold).collect();
@@ -1180,11 +899,11 @@ impl Store {
 
         // 2. Keyword pass (FTS) — rank-based score decaying from the top.
         if hybrid {
-            // Over-fetched above when a filter will thin the pool (mirrors
-            // search()'s own viewer over-fetch); admit BEFORE the stage cut,
-            // so hidden or excluded-kind rows can't hold keyword slots.
+            // Over-fetched above when a kinds filter will thin the pool;
+            // admit BEFORE the stage cut, so excluded-kind rows can't hold
+            // keyword slots.
             let mut kw = kw_all;
-            kw.retain(|r| admit(r.kind.as_str(), &r.id));
+            kw.retain(|r| admit(r.kind.as_str()));
             kw.truncate(stage2_pool);
             let total = kw.len().max(1) as f64;
             for (i, r) in kw.iter().enumerate() {
@@ -1280,8 +999,8 @@ impl Store {
 
         // 5. Fallback — never return empty when admitted vectors exist
         // (scored_all was admission-filtered above, so this can't smuggle
-        // hidden or unknown-kind rows back in). Runs before hydration so
-        // fallback keys hydrate too.
+        // unknown-kind rows back in). Runs before hydration so fallback keys
+        // hydrate too.
         if ranked.is_empty() && !scored_all.is_empty() {
             ranked = scored_all.iter().take(limit).cloned().collect();
         }
@@ -1331,7 +1050,6 @@ impl Store {
             })
             .collect();
 
-        // Already viewer-scoped above (before every cut) — no post-filter.
         Ok(hits)
     }
 }

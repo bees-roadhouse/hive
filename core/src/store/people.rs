@@ -32,16 +32,6 @@ impl Store {
         row.as_ref().map(row_to_person).transpose()
     }
 
-    /// AI identities a given human owns — the grantable set for OAuth consent.
-    pub async fn people_ais_owned_by(&self, owner_slug: &str) -> Result<Vec<Person>> {
-        let rows =
-            crate::pgq::query("SELECT * FROM people WHERE kind = 'ai' AND owner = ? ORDER BY slug")
-                .bind(owner_slug)
-                .fetch_all(self.db())
-                .await?;
-        rows.iter().map(row_to_person).collect()
-    }
-
     pub async fn people_ensure(&self, name: &str, kind: ActorKind) -> Result<Person> {
         let slug = slugify(name);
         if let Some(existing) = self.people_by_slug(&slug).await? {

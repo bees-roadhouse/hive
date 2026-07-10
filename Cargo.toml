@@ -1,5 +1,5 @@
 [workspace]
-members = ["shared", "embed", "core", "api", "jmap-sync"]
+members = ["shared", "embed", "core", "jmap-sync"]
 resolver = "2"
 
 [workspace.package]
@@ -20,36 +20,24 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# --- Async / HTTP ---
-axum = { version = "0.8", features = ["ws", "multipart"] }
-tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
-hyper = { version = "1.5", features = ["full"] }
+# --- HTTP client (source polling, outbox webhooks) ---
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 
 # --- Database ---
-# postgres is the datastore; sqlite stays only so the import path can READ an
-# uploaded legacy hive.db file (api/src/legacy_import.rs) when migrating data in.
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "sqlite", "migrate", "chrono", "uuid", "json"] }
+# postgres is the datastore until the Phase 1 SQLite cutover (PR 1.6).
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "migrate", "chrono", "uuid", "json"] }
 # Native `vector` column binding (embeddings.vec_v). 0.4 pairs with sqlx 0.8.
 pgvector = { version = "0.4", features = ["sqlx"] }
 
-# --- Auth / Crypto ---
-jsonwebtoken = "9.3"
+# --- Crypto (credential vault: reversible encryption of mail credentials) ---
 rand = "0.8"
 sha2 = "0.10"
 base64 = "0.22"
-scrypt = "0.11"
-subtle = "2.6"
-hex = "0.4"
 
 # --- Time / IDs ---
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
 nanoid = "0.4"
-
-# --- Config / Env ---
-dotenvy = "0.15"
 
 # --- Embeddings / ML (the hive-embed crate wraps these) ---
 ort = { version = "2.0.0-rc.12", features = ["ndarray"] }
@@ -62,7 +50,6 @@ hf-hub = { version = "0.4", default-features = false, features = ["ureq", "defau
 
 # --- Feeds ---
 rss = "2.0"
-atom_syndication = "0.12"
 
 # --- Mail (the jmap-sync crate wraps these) ---
 # Pinned exact: jmap-client went dormant 2024-01..2025-09; the containment rule
