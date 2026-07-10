@@ -34,3 +34,19 @@ uuid = { workspace = true }
 # Credential vault: reversible encryption of mail credentials at rest
 # (Phase 3 replaces this with the OS keychain).
 aes-gcm = "0.10"
+
+# Durable layer (PR 1.4): op log envelope + segments, blockstore, key management
+ciborium = { workspace = true }
+blake3 = { workspace = true }
+fastcdc = { workspace = true }
+chacha20poly1305 = { workspace = true }
+argon2 = { workspace = true }
+keyring = { workspace = true }
+data-encoding = { workspace = true }
+
+[dev-dependencies]
+# Hermetic tempdir stores for the oplog/blockstore/keys tests.
+tempfile = { workspace = true }
+# SQLCipher spike (see core/tests/sqlcipher_spike.rs): de-risks the PR 1.5
+# fold target ahead of the 1.6 cutover.
+rusqlite = { workspace = true }

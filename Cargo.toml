@@ -61,6 +61,35 @@ html2text = "0.17"
 async-trait = "0.1"
 futures-util = "0.3"
 
+# --- Durable layer (PR 1.4: op log + blockstore + keys; record format frozen) ---
+# CBOR encoding of the frozen record envelope and blob manifests.
+ciborium = "0.2"
+# Content addressing (block ids, frame chain) + keyed-hash/derive-key KDF modes.
+blake3 = "1.8"
+# Content-defined chunking for large blobs (v2020 gear table).
+fastcdc = "4.0"
+# XChaCha20-Poly1305 AEAD for segment frames, blob blocks, and key wraps.
+# 0.10 line: 0.11 raises MSRV to 1.85, above the workspace's 1.84.
+chacha20poly1305 = "0.10"
+# Argon2id KEK derivation for the passphrase export wrap (RFC 9106 params).
+argon2 = "0.5"
+# OS keychain custody of the master key. Pure-rust zbus Secret Service on Linux
+# (headless CI still links; no libdbus); v3 line because v4 raises MSRV to 1.88.
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
+# base32 recovery codes + lowercase-hex block filenames.
+data-encoding = "2"
+
+# --- Dev/test only ---
+# Hermetic tempdir stores for the oplog/blockstore/keys tests.
+tempfile = "3"
+# SQLCipher spike for the PR 1.5/1.6 cutover: bundled SQLCipher (SQLite 3.45,
+# FTS5 compiled in, JSON core) with vendored OpenSSL so mac/Windows need no
+# system crypto lib. Pinned to 0.32: its libsqlite3-sys (0.30) is the one
+# sqlx-sqlite also resolves — cargo's `links = "sqlite3"` uniqueness is
+# checked over optional deps too, so rusqlite can only float once sqlx
+# leaves core at the 1.6 cutover. Dev-only until then.
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+
 # --- Shared workspace crates ---
 hive-shared = { path = "shared" }
 hive-embed = { path = "embed" }
