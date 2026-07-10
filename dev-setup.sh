@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
-# Idempotent setup for the hive dev environment (Rust API + Postgres + Solid
-# web). Run by the SessionStart hook so a fresh Claude Code container comes up
-# ready to develop. Safe to re-run.
+# Idempotent setup for the hive dev environment (Rust API + Postgres). Run by
+# the SessionStart hook so a fresh Claude Code container comes up ready to
+# develop. Safe to re-run.
 set -euo pipefail
 
 cd "$(dirname "$0")"
-
-echo "🐝 hive setup — installing deps…"
-corepack enable >/dev/null 2>&1 || true
-# CI=true: non-interactive. minimumReleaseAge=0: this sandbox's registry policy
-# can flag very-recently-published transitives; we don't gate on release age.
-CI=true pnpm install --no-frozen-lockfile --config.minimumReleaseAge=0
 
 # The store layer is Postgres (the Rust rewrite retired SQLite). Bring up a
 # local dev container when a container runtime is available; otherwise the
@@ -34,6 +28,4 @@ else
 fi
 
 echo "✅ ready."
-echo "   API:    DATABASE_URL=$DB_URL HIVE_EMBED=hash cargo run -p hive-api    (:7878, MCP at /mcp)"
-echo "   web:    pnpm dev:web                                                  (:5173, proxies the API)"
-echo "   worker: cargo run -p hive-worker    (or: worker:once)"
+echo "   API: DATABASE_URL=$DB_URL HIVE_EMBED=hash cargo run -p hive-api    (:7878, MCP at /mcp)"

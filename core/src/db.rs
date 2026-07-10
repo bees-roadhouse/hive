@@ -512,7 +512,8 @@ const SCHEMA_SEARCH: &str = r#"
     -- psql @> queries and server-side filtering later without a migration.
     CREATE INDEX IF NOT EXISTS entities_fields_gin ON entities USING GIN (fields jsonb_path_ops);
 
-    -- Phase 1 mail archive. hive-mail writes these; sync state (JMAP state
+    -- Phase 1 mail archive. The mail sync driver (jmap-sync's consumer;
+    -- returns as a module in Phase 3) writes these; sync state (JMAP state
     -- strings, backfill cursor, backoff bookkeeping) lives on mail_accounts,
     -- and the account credential is a cc_credentials row named by cred_id.
     -- user_scope is NEVER NULL for mail (there is no global mail).

@@ -8,10 +8,10 @@ use sqlx::Row;
 
 use super::{new_id, now_iso, placeholders_or_never, Store};
 
-/// The job kinds the worker's drainer owns. The claim is narrowed to these so
-/// foreign kinds (Phase 2 `mail.send`, drained by hive-mail) stay queued for
-/// their own drainer instead of being swallowed as no-op successes
-/// (DIRECTION.md Phase 0 item 6).
+/// The job kinds this drainer owns. The claim is narrowed to these so foreign
+/// kinds (`mail.send`, drained by the mail module when it returns in Phase 3)
+/// stay queued for their own drainer instead of being swallowed as no-op
+/// successes (DIRECTION.md Phase 0 item 6).
 const WORKER_OUTBOX_KINDS: &[&str] = &["webhook", "log"];
 
 impl Store {

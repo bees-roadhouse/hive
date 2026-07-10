@@ -1,5 +1,5 @@
 // Embedding-corpus reaper — the safety net behind every synchronous delete
-// path, and the ONLY mechanism for window aging. hive-mail drops search +
+// path, and the ONLY mechanism for window aging. Mail sync drops search +
 // embedding rows in the same transaction as tombstones/moves (D6), and actor
 // deletion cascades its own rows, but nothing "events" a message out of the
 // newest-N window or a journal entry past the embed window — those are moving
@@ -65,7 +65,7 @@ impl Store {
 
         // Mail: everything not matching the shared eligibility predicate —
         // orphans (message row gone) fall out of the same NOT EXISTS. This is
-        // the net behind hive-mail's synchronous D6 deletes AND the only
+        // the net behind mail sync's synchronous D6 deletes AND the only
         // window-aging path (new mail silently pushes old mail past newest-N).
         let sql = format!(
             "DELETE FROM embeddings e WHERE e.ref_kind = 'mail' AND NOT EXISTS \

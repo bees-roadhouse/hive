@@ -43,8 +43,8 @@ pub fn router() -> Router<Store> {
     match &dist {
         Some(dir) => tracing::info!(dist = %dir.display(), "serving SPA"),
         None => tracing::warn!(
-            "SPA dist not found (set HIVE_WEB_DIST or build packages/web); \
-             non-API paths will 404"
+            "SPA dist not found (the retired SPA no longer ships in-tree; \
+             set HIVE_WEB_DIST to serve one); non-API paths will 404"
         ),
     }
     Router::new().fallback(move |req: Request| serve_spa(dist.clone(), req))
@@ -60,8 +60,8 @@ async fn serve_spa(dist: Option<PathBuf>, req: Request) -> Response {
     let Some(dist) = dist else {
         return (
             StatusCode::NOT_FOUND,
-            "hive web UI not found: set HIVE_WEB_DIST to the built packages/web/dist \
-             directory (default candidates: ./packages/web/dist, /app/web)",
+            "hive web UI not found: the retired SPA no longer ships in-tree; \
+             set HIVE_WEB_DIST to a built dist directory to serve one",
         )
             .into_response();
     };

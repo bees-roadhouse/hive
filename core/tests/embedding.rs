@@ -1,14 +1,20 @@
-// Chunked backfill under a 384-dim "transformers" provider (a mock ONNX
-// engine — offline + deterministic like the hash path, but dimension-eligible
-// for the native vector column): chunk rows, item-level hash on every row,
-// owner stamping, DUAL-WRITE of vec (BYTEA) + vec_v (pgvector), skip-on-replay,
-// and atomic chunk-set replacement when the text changes.
+// Chunked embedding backfill (store::embed_backfill) — the worker crate's
+// chunked_backfill.rs + embed_budget.rs tests, adapted to drive
+// `Store::backfill_embeddings()` directly (PR 1.2 moved the code here and
+// deleted the worker).
 //
-// Own integration-test file on purpose: the provider choice ($HIVE_EMBED) and
-// the engine are latched once per process, so this must not share a binary
-// with the hash-provider tests.
+// Both tests run under a 384-dim "transformers" provider (a mock ONNX engine —
+// offline + deterministic like the hash path, but dimension-eligible for the
+// native vector column): the provider choice ($HIVE_EMBED) and the engine are
+// latched once per process, so one binary means ONE provider for every test in
+// it. $HIVE_EMBED_STAGE_BUDGET_SECS is process-global too, so the tests
+// serialize on ENV_LOCK — the budget test's zero-budget window must never
+// overlap another test's backfill call.
 
 use hive_core::store::Store;
+use tokio::sync::Mutex;
+
+static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
 struct Mock384;
 impl hive_embed::OnnxProvider for Mock384 {
@@ -27,23 +33,20 @@ impl hive_embed::OnnxProvider for Mock384 {
     }
 }
 
-async fn test_setup() -> (sqlx::PgPool, Store, hive_worker::Worker) {
+async fn test_setup() -> (sqlx::PgPool, Store) {
     // Must beat the first embed call: the provider choice latches once per
     // process, and installing the mock first keeps the lazy default ort
     // engine (real model download) from ever wiring itself in.
     std::env::set_var("HIVE_EMBED", "transformers");
     hive_embed::set_onnx_provider(Box::new(Mock384));
     let pool = hive_core::db::test_pool().await;
-    (
-        pool.clone(),
-        Store::new(pool.clone()),
-        hive_worker::Worker::new(pool),
-    )
+    (pool.clone(), Store::new(pool))
 }
 
 #[tokio::test]
 async fn chunked_dual_write_skip_and_atomic_replace() {
-    let (pool, store, worker) = test_setup().await;
+    let _env = ENV_LOCK.lock().await;
+    let (pool, store) = test_setup().await;
     assert_eq!(hive_embed::embed_dim(), 384, "mock must be vec_v-eligible");
 
     // A body several times the 450-token (1800-char) chunk target → the item
@@ -61,13 +64,12 @@ async fn chunked_dual_write_skip_and_atomic_replace() {
     .await
     .unwrap();
 
-    worker.cycle(1).await.expect("cycle 1");
-    let run = store.worker_status().await.unwrap().last_run.unwrap();
-    assert_eq!(
-        run.embedded, 1,
-        "one ITEM embedded (chunks don't inflate it)"
+    let embedded = store.backfill_embeddings().await.expect("backfill 1");
+    assert_eq!(embedded, 1, "one ITEM embedded (chunks don't inflate it)");
+    assert!(
+        !hive_embed::transformers_latched(),
+        "mock engine must not latch"
     );
-    assert!(!run.latched, "mock engine must not latch");
 
     let rows: Vec<(i32, Option<String>, String, bool, bool, i64)> = sqlx::query_as(
         "SELECT chunk_idx, owner, hash, vec IS NOT NULL, vec_v IS NOT NULL, dim \
@@ -97,9 +99,8 @@ async fn chunked_dual_write_skip_and_atomic_replace() {
     let n_chunks = rows.len() as i64;
 
     // Replay with an unchanged hash: the batched skip-map must skip it.
-    worker.cycle(2).await.expect("cycle 2");
-    let run = store.worker_status().await.unwrap().last_run.unwrap();
-    assert_eq!(run.embedded, 0, "unchanged item skips");
+    let embedded = store.backfill_embeddings().await.expect("backfill 2");
+    assert_eq!(embedded, 0, "unchanged item skips");
     let (count,): (i64,) =
         sqlx::query_as("SELECT count(*) FROM embeddings WHERE ref_id = 'jrnl_long'")
             .fetch_one(&pool)
@@ -113,9 +114,8 @@ async fn chunked_dual_write_skip_and_atomic_replace() {
         .execute(&pool)
         .await
         .unwrap();
-    worker.cycle(3).await.expect("cycle 3");
-    let run = store.worker_status().await.unwrap().last_run.unwrap();
-    assert_eq!(run.embedded, 1, "changed hash re-embeds");
+    let embedded = store.backfill_embeddings().await.expect("backfill 3");
+    assert_eq!(embedded, 1, "changed hash re-embeds");
     let rows: Vec<(i32, String)> = sqlx::query_as(
         "SELECT chunk_idx, hash FROM embeddings WHERE ref_id = 'jrnl_long' ORDER BY chunk_idx",
     )
@@ -125,4 +125,37 @@ async fn chunked_dual_write_skip_and_atomic_replace() {
     assert_eq!(rows.len(), 1, "shrunk text leaves exactly one chunk row");
     assert_eq!(rows[0].0, 0);
     assert_ne!(&rows[0].1, item_hash, "hash rolled with the text");
+}
+
+#[tokio::test]
+async fn zero_budget_defers_items_to_the_next_call() {
+    let _env = ENV_LOCK.lock().await;
+    let (pool, store) = test_setup().await;
+    std::env::set_var("HIVE_EMBED_STAGE_BUDGET_SECS", "0");
+
+    sqlx::query(
+        "INSERT INTO journal (id, author, body, created_at) \
+         VALUES ('jrnl_budget', 'pia', 'body to embed later', '2026-01-01T00:00:00.000Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Zero budget: the stale item is seen but never started.
+    let embedded = store
+        .backfill_embeddings()
+        .await
+        .expect("backfill under zero budget");
+    assert_eq!(embedded, 0, "zero budget must defer, not embed");
+    let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM embeddings")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "no rows written under a spent budget");
+
+    // Budget restored (read fresh each call): the deferred item drains.
+    std::env::set_var("HIVE_EMBED_STAGE_BUDGET_SECS", "20");
+    let embedded = store.backfill_embeddings().await.expect("backfill drains");
+    assert_eq!(embedded, 1, "deferred item embeds next call");
+    std::env::remove_var("HIVE_EMBED_STAGE_BUDGET_SECS");
 }
