@@ -52,9 +52,10 @@ fn app() -> Element {
                 style: "margin-top: 1.4rem; font-size: 0.9rem; color: #6f684f; \
                         border: 1px solid #2c2818; border-radius: 8px; padding: 0.9rem 1.2rem; \
                         max-width: 30rem; line-height: 1.6;",
-                "The engine is being assembled (Phase 1: append-only op-log, encrypted "
-                "blockstore, SQLite index). Journal, search, mail, calendar, and contacts "
-                "wire into this window at the storage cutover."
+                "Nothing is loading — this build is only the app shell. The storage "
+                "engine is being built in the repo and arrives as app updates: journal "
+                "and search first, then mail, calendar, and contacts. This screen is "
+                "all this version does."
             }
         }
     }
