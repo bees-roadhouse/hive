@@ -61,6 +61,85 @@ fn js_slice(s: &str, n: usize) -> String {
     String::from_utf16_lossy(&units)
 }
 
+/// Display/rerank material for one ranked hit, fetched keyed (never a corpus
+/// scan). `snippet` is only populated for kinds that store one (mail).
+struct HydratedHit {
+    title: String,
+    text: String,
+    snippet: String,
+}
+
+/// `hnsw.ef_search` for the ANN candidate probes. Default 80 — above
+/// pgvector's 40 because the WHERE clauses post-filter the index stream and a
+/// LIMIT can starve below k otherwise. Clamped to pgvector's accepted range.
+fn vec_ef_search() -> u32 {
+    std::env::var("HIVE_VEC_EF_SEARCH")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(80)
+        .min(1000)
+}
+
+/// Kinds whose sheer row count could flood an unrestricted candidate pool
+/// (mail post-backfill is ~200k chunks vs ~1k journal). The double-probe and
+/// the diversified pool fill treat these as "bulk". JSON array or
+/// comma-separated; `[]` disables the diversification.
+fn bulk_kinds() -> Vec<String> {
+    match std::env::var("HIVE_SEARCH_BULK_KINDS") {
+        Ok(raw) => parse_bulk_kinds(&raw),
+        Err(_) => vec!["mail".to_string()],
+    }
+}
+
+fn parse_bulk_kinds(raw: &str) -> Vec<String> {
+    let raw = raw.trim();
+    if let Ok(serde_json::Value::Array(a)) = serde_json::from_str(raw) {
+        return a
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Default per-kind rank weights (mail is deliberately demoted so bulk archive
+/// material doesn't outrank curated memory at equal similarity). Unlisted
+/// kinds weigh 1.0.
+fn default_kind_weights() -> HashMap<String, f64> {
+    HashMap::from([("mail".to_string(), 0.85)])
+}
+
+/// Merge a `{"kind": weight}` JSON object over the defaults. Non-object or
+/// non-numeric entries are ignored (never fail a search over bad config).
+fn merge_kind_weights(base: &mut HashMap<String, f64>, raw: &str) {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(map)) => {
+            for (k, v) in map {
+                if let Some(f) = v.as_f64() {
+                    base.insert(k, f);
+                }
+            }
+        }
+        _ => tracing::warn!("unparseable search.kind_weights JSON, using defaults"),
+    }
+}
+
+/// Collapse chunk-level vector rows to one row per parent `kind:id`, scored by
+/// the best chunk (MAX sim). Input rows may repeat keys (chunks, and the
+/// double-probe unions overlap); output is sorted best-first.
+fn collapse_chunks(mut rows: Vec<(String, f64)>) -> Vec<(String, f64)> {
+    rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut seen: HashSet<String> = HashSet::new();
+    rows.retain(|(k, _)| seen.insert(k.clone()));
+    rows
+}
+
 fn ref_key(kind: &str, id: &str) -> String {
     format!("{kind}:{id}")
 }
@@ -198,6 +277,7 @@ impl Store {
         &self,
         viewer: &str,
         kinds: Option<&[EntityKind]>,
+        mail_ids: &HashSet<String>,
     ) -> Result<VisibilityIndex> {
         // `viewer` is always a concrete namespace user here (admins search
         // unscoped — the route passes viewer=None). The visible set is already
@@ -243,19 +323,25 @@ impl Store {
                 ));
             }
         }
-        // Mail scoping is a plain owner check. This full set stays small
-        // until mail vectors exist (the D8 embed gate); the 1.5 retrieval
-        // work moves the filter into the candidate SQL (embeddings.owner)
-        // and this load becomes a safety net rather than the boundary.
+        // Mail scoping is a plain owner check, resolved over the BOUNDED
+        // candidate id set the caller collected (vector candidates + keyword
+        // hits) — never a full mail_messages load (200k rows post-backfill).
+        // The candidate SQL already pre-filters by embeddings.owner; this is
+        // the authority check (user_scope + tombstones) on what survived.
         let mut mail_visible: HashSet<String> = HashSet::new();
-        if kinds.is_none_or(|ks| ks.contains(&EntityKind::Mail)) {
-            let rows = crate::pgq::query(
-                "SELECT id FROM mail_messages WHERE user_scope = ? AND deleted_at IS NULL",
-            )
-            .bind(viewer)
-            .fetch_all(self.db())
-            .await?;
-            for r in &rows {
+        if kinds.is_none_or(|ks| ks.contains(&EntityKind::Mail)) && !mail_ids.is_empty() {
+            let ids: Vec<&str> = mail_ids.iter().map(String::as_str).collect();
+            let sql = format!(
+                "SELECT id FROM mail_messages WHERE id IN ({}) \
+                 AND user_scope = ? AND deleted_at IS NULL",
+                placeholders_or_never(ids.len())
+            );
+            let mut q = crate::pgq::query(&sql);
+            for id in &ids {
+                q = q.bind(*id);
+            }
+            q = q.bind(viewer);
+            for r in &q.fetch_all(self.db()).await? {
                 mail_visible.insert(r.try_get::<String, _>("id")?);
             }
         }
@@ -621,6 +707,314 @@ impl Store {
             .collect()
     }
 
+    /// Per-kind rank weights: defaults ← `search.kind_weights` config JSON ←
+    /// `HIVE_SEARCH_KIND_WEIGHTS` env (strongest). Merged per key, so an
+    /// override only has to name the kinds it changes.
+    async fn kind_weights(&self) -> HashMap<String, f64> {
+        let mut w = default_kind_weights();
+        if let Ok(Some(raw)) = self.config_get("search.kind_weights").await {
+            merge_kind_weights(&mut w, &raw);
+        }
+        if let Ok(raw) = std::env::var("HIVE_SEARCH_KIND_WEIGHTS") {
+            if !raw.trim().is_empty() {
+                merge_kind_weights(&mut w, &raw);
+            }
+        }
+        w
+    }
+
+    /// ANN candidate stage (plan B5): HNSW index probes over the native
+    /// `vec_v` column instead of loading the whole BYTEA table. Returns
+    /// chunk-level `(kind:id, sim)` rows, NOT yet collapsed.
+    ///
+    /// Owner filtering runs in SQL (`embeddings.owner`) so a 200k-row foreign
+    /// mailbox never occupies candidate slots; `admit()` stays the authority
+    /// on top. When `kinds` is None a second probe excludes the bulk kinds so
+    /// mail volume can never evict journal/tasks from the candidate set —
+    /// union'd and deduped by the caller's collapse.
+    ///
+    /// Raw sqlx (not pgq): the query vector binds via the pgvector crate and
+    /// `$1` is reused in SELECT + ORDER BY, which the `?` rewriter can't
+    /// express.
+    async fn ann_candidates(
+        &self,
+        q: &[f32],
+        viewer: Option<&str>,
+        kinds: Option<&[EntityKind]>,
+        chunk_k: i64,
+        bulk: &[String],
+    ) -> Result<Vec<(String, f64)>> {
+        let qv = pgvector::Vector::from(q.to_vec());
+        let model = hive_embed::embed_model();
+        // ef_search is SET LOCAL (transaction-scoped) — never leaks into the
+        // pooled connection. Formatted, not bound: SET takes no parameters;
+        // the value is a parsed+clamped integer.
+        let ef = vec_ef_search();
+        let mut tx = self.db().begin().await?;
+        sqlx::query(&format!("SET LOCAL hnsw.ef_search = {ef}"))
+            .execute(&mut *tx)
+            .await?;
+
+        const BASE: &str = "SELECT ref_kind, ref_id, chunk_idx, 1 - (vec_v <=> $1) AS sim \
+             FROM embeddings \
+             WHERE model = $2 AND vec_v IS NOT NULL \
+               AND ($3::text IS NULL OR owner IS NULL OR owner = $3)";
+        let mut rows: Vec<(String, f64)> = Vec::new();
+        let mut push_rows = |fetched: Vec<sqlx::postgres::PgRow>| -> Result<()> {
+            for r in &fetched {
+                let key = ref_key(
+                    r.try_get::<String, _>("ref_kind")?.as_str(),
+                    r.try_get::<String, _>("ref_id")?.as_str(),
+                );
+                rows.push((key, r.try_get::<f64, _>("sim")?));
+            }
+            Ok(())
+        };
+
+        match kinds {
+            Some(ks) => {
+                let arr: Vec<String> = ks.iter().map(|k| k.as_str().to_string()).collect();
+                let sql = format!("{BASE} AND ref_kind = ANY($4) ORDER BY vec_v <=> $1 LIMIT $5");
+                let fetched = sqlx::query(&sql)
+                    .bind(&qv)
+                    .bind(model)
+                    .bind(viewer)
+                    .bind(&arr)
+                    .bind(chunk_k)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                push_rows(fetched)?;
+            }
+            None => {
+                let sql = format!("{BASE} ORDER BY vec_v <=> $1 LIMIT $4");
+                let fetched = sqlx::query(&sql)
+                    .bind(&qv)
+                    .bind(model)
+                    .bind(viewer)
+                    .bind(chunk_k)
+                    .fetch_all(&mut *tx)
+                    .await?;
+                push_rows(fetched)?;
+                if !bulk.is_empty() {
+                    let sql =
+                        format!("{BASE} AND ref_kind <> ALL($4) ORDER BY vec_v <=> $1 LIMIT $5");
+                    let fetched = sqlx::query(&sql)
+                        .bind(&qv)
+                        .bind(model)
+                        .bind(viewer)
+                        .bind(bulk)
+                        .bind(chunk_k)
+                        .fetch_all(&mut *tx)
+                        .await?;
+                    push_rows(fetched)?;
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(rows)
+    }
+
+    /// Brute-force BYTEA candidate stage — the pre-pgvector path, kept for
+    /// non-384-dim providers (the 256-dim hash embedder in dev/CI) so the
+    /// whole cascade stays exercised without ONNX. Owner-filtered in SQL like
+    /// the ANN path; full scan of model-matched rows, cosine in Rust. Returns
+    /// chunk-level rows for the same collapse.
+    async fn brute_candidates(
+        &self,
+        q: &[f32],
+        viewer: Option<&str>,
+        kinds: Option<&[EntityKind]>,
+    ) -> Result<Vec<(String, f64)>> {
+        let kind_clause = match kinds {
+            Some(ks) => format!(" AND ref_kind IN ({})", placeholders_or_never(ks.len())),
+            None => String::new(),
+        };
+        let owner_clause = if viewer.is_some() {
+            " AND (owner IS NULL OR owner = ?)"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT ref_kind, ref_id, vec FROM embeddings \
+             WHERE model = ? AND dim = ? AND vec IS NOT NULL{kind_clause}{owner_clause}"
+        );
+        let mut q_db = crate::pgq::query(&sql)
+            .bind(hive_embed::embed_model())
+            .bind(q.len() as i64);
+        for k in kinds.unwrap_or(&[]) {
+            q_db = q_db.bind(k.as_str());
+        }
+        if let Some(v) = viewer {
+            q_db = q_db.bind(v);
+        }
+        let rows = q_db.fetch_all(self.db()).await?;
+        rows.iter()
+            .map(|r| -> Result<(String, f64)> {
+                let key = ref_key(
+                    r.try_get::<String, _>("ref_kind")?.as_str(),
+                    r.try_get::<String, _>("ref_id")?.as_str(),
+                );
+                let vec = hive_embed::from_blob(&r.try_get::<Vec<u8>, _>("vec")?);
+                Ok((key, hive_embed::cosine(q, &vec)))
+            })
+            .collect()
+    }
+
+    /// Keyed hydration for ranked hits — one IN-query per kind present,
+    /// replacing the old query-time `embeddable_items()` corpus scan. A key
+    /// that doesn't resolve (orphaned embedding, deleted mail, unknown kind)
+    /// is simply absent from the map: callers DROP those hits rather than
+    /// surfacing raw-id titles.
+    async fn hydrate_hits(&self, keys: &[String]) -> Result<HashMap<String, HydratedHit>> {
+        let mut by_kind: HashMap<&str, Vec<&str>> = HashMap::new();
+        for k in keys {
+            let (kind, id) = split_key(k);
+            if !id.is_empty() {
+                by_kind.entry(kind).or_default().push(id);
+            }
+        }
+        let mut out: HashMap<String, HydratedHit> = HashMap::new();
+        let mut custom_ids: Vec<&str> = Vec::new();
+        for (kind, ids) in by_kind {
+            let sql_in = placeholders_or_never(ids.len());
+            match kind {
+                "journal" => {
+                    let sql =
+                        format!("SELECT id, author, body FROM journal WHERE id IN ({sql_in})");
+                    let mut q = crate::pgq::query(&sql);
+                    for id in &ids {
+                        q = q.bind(*id);
+                    }
+                    for r in &q.fetch_all(self.db()).await? {
+                        let id: String = r.try_get("id")?;
+                        let author: String = r.try_get("author")?;
+                        let body: String = r.try_get("body")?;
+                        out.insert(
+                            ref_key("journal", &id),
+                            HydratedHit {
+                                title: format!("{author}: {}", js_slice(&body, 40)),
+                                text: body,
+                                snippet: String::new(),
+                            },
+                        );
+                    }
+                }
+                "task" | "event" => {
+                    let table = if kind == "task" { "tasks" } else { "events" };
+                    let sql = format!("SELECT id, title, body FROM {table} WHERE id IN ({sql_in})");
+                    let mut q = crate::pgq::query(&sql);
+                    for id in &ids {
+                        q = q.bind(*id);
+                    }
+                    for r in &q.fetch_all(self.db()).await? {
+                        let id: String = r.try_get("id")?;
+                        let title: String = r.try_get("title")?;
+                        let body: String = r.try_get("body")?;
+                        out.insert(
+                            ref_key(kind, &id),
+                            HydratedHit {
+                                text: format!("{title} {body}"),
+                                title,
+                                snippet: String::new(),
+                            },
+                        );
+                    }
+                }
+                "decision" => {
+                    let sql = format!(
+                        "SELECT id, title, context, decision, consequences \
+                         FROM decisions WHERE id IN ({sql_in})"
+                    );
+                    let mut q = crate::pgq::query(&sql);
+                    for id in &ids {
+                        q = q.bind(*id);
+                    }
+                    for r in &q.fetch_all(self.db()).await? {
+                        let id: String = r.try_get("id")?;
+                        let title: String = r.try_get("title")?;
+                        let context: String = r.try_get("context")?;
+                        let decision: String = r.try_get("decision")?;
+                        let consequences: String = r.try_get("consequences")?;
+                        out.insert(
+                            ref_key("decision", &id),
+                            HydratedHit {
+                                text: format!("{title} {context} {decision} {consequences}"),
+                                title,
+                                snippet: String::new(),
+                            },
+                        );
+                    }
+                }
+                "mail" => {
+                    // Tombstoned mail hydrates as a miss on purpose — the
+                    // embeddings row may outlive the message until the reaper
+                    // sweeps it.
+                    let sql = format!(
+                        "SELECT id, subject, from_name, from_addr, snippet, body_text \
+                         FROM mail_messages WHERE id IN ({sql_in}) AND deleted_at IS NULL"
+                    );
+                    let mut q = crate::pgq::query(&sql);
+                    for id in &ids {
+                        q = q.bind(*id);
+                    }
+                    for r in &q.fetch_all(self.db()).await? {
+                        let id: String = r.try_get("id")?;
+                        let subject: String = r.try_get("subject")?;
+                        let from_name: Option<String> = r.try_get("from_name")?;
+                        let from_addr: String = r.try_get("from_addr")?;
+                        let snippet: String = r.try_get("snippet")?;
+                        let body: String = r.try_get("body_text")?;
+                        let from = from_name
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or(from_addr);
+                        let title = if subject.trim().is_empty() {
+                            from.clone()
+                        } else {
+                            subject.clone()
+                        };
+                        out.insert(
+                            ref_key("mail", &id),
+                            HydratedHit {
+                                title,
+                                text: format!("From: {from}\nSubject: {subject}\n\n{body}"),
+                                snippet,
+                            },
+                        );
+                    }
+                }
+                _ => custom_ids.extend(ids),
+            }
+        }
+        // Everything else may be a custom entity type slug — one batched
+        // query keyed by the row's actual slug, so a kind/slug mismatch stays
+        // a miss (fail closed, same as the old admit() contract).
+        if !custom_ids.is_empty() {
+            let sql = format!(
+                "SELECT e.id, t.slug, e.title FROM entities e \
+                 JOIN entity_types t ON t.id = e.type_id WHERE e.id IN ({})",
+                placeholders_or_never(custom_ids.len())
+            );
+            let mut q = crate::pgq::query(&sql);
+            for id in &custom_ids {
+                q = q.bind(*id);
+            }
+            for r in &q.fetch_all(self.db()).await? {
+                let id: String = r.try_get("id")?;
+                let slug: String = r.try_get("slug")?;
+                let title: String = r.try_get("title")?;
+                out.insert(
+                    ref_key(&slug, &id),
+                    HydratedHit {
+                        text: title.clone(),
+                        title,
+                        snippet: String::new(),
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+
     /// Semantic search — store.ts `semanticSearch`, the full standard|precision
     /// hybrid pipeline (vector pass → FTS blend → Markov-blanket boost →
     /// identity/peer soft boosts → optional cross-encoder rerank). Viewer ACL
@@ -645,13 +1039,86 @@ impl Store {
             return Ok(vec![]);
         }
 
+        // Cascade over-fetch: precision widens each stage's pool.
+        let stage1_pool = if precision {
+            (limit * 4).max(limit)
+        } else {
+            (limit * 2).max(limit)
+        };
+        let stage2_pool = if precision {
+            (limit * 3).max(limit)
+        } else {
+            limit * 2
+        };
+
+        // 1. Vector candidate pass. Provider dispatch: the 384-dim model uses
+        // the HNSW ANN probes over vec_v; anything else (the 256-dim hash
+        // provider in dev/CI) keeps the brute-force BYTEA scan so the whole
+        // cascade below stays exercised without ONNX. The q.len() guard
+        // covers the transformers latch: a mid-flight model failure degrades
+        // embed_query to 256-dim hash vectors, which must not bind against
+        // vector(384). Both paths owner-filter in SQL; admit() stays the
+        // authority on top.
+        let owned_query = query.to_string();
+        let q = tokio::task::spawn_blocking(move || hive_embed::embed_query(&owned_query)).await?;
+        let chunk_k = (stage1_pool * 4).max(limit) as i64;
+        let bulk = bulk_kinds();
+        let raw_rows = if hive_embed::embed_dim() == 384 && q.len() == 384 {
+            self.ann_candidates(
+                &q,
+                opts.viewer.as_deref(),
+                opts.kinds.as_deref(),
+                chunk_k,
+                &bulk,
+            )
+            .await?
+        } else {
+            self.brute_candidates(&q, opts.viewer.as_deref(), opts.kinds.as_deref())
+                .await?
+        };
+        // Chunked rows share one `kind:id` key — collapse to the item's best
+        // chunk (MAX sim) so pool slots, the fallback, and the final hit list
+        // stay one-entry-per-item. Everything downstream works on parent keys.
+        let mut scored_all = collapse_chunks(raw_rows);
+
+        // Keyword rows are fetched BEFORE the visibility index so its mail
+        // arm can batch-resolve every candidate mail id in one bounded query.
+        // Blend/scoring order below is unchanged.
+        let kw_fetch = if opts.viewer.is_some() || opts.kinds.is_some() {
+            stage2_pool * 5
+        } else {
+            stage2_pool
+        };
+        let kw_all: Vec<SearchHit> = if hybrid {
+            self.search(query, kw_fetch, None).await?
+        } else {
+            Vec::new()
+        };
+
         // Resolve the viewer ACL once, up front. `admit` is pure after that:
         // a candidate enters any pool only if its kind parses (a newer
         // binary's rows must not hold slots this build drops at hydration),
         // passes the kinds filter, and is visible to the viewer. Applied
         // before every cut, including the fallback.
         let visible = match opts.viewer.as_deref() {
-            Some(v) => Some(self.visibility_index(v, opts.kinds.as_deref()).await?),
+            Some(v) => {
+                let mut mail_ids: HashSet<String> = HashSet::new();
+                for (k, _) in &scored_all {
+                    let (kind, id) = split_key(k);
+                    if kind == "mail" {
+                        mail_ids.insert(id.to_string());
+                    }
+                }
+                for h in &kw_all {
+                    if h.kind == "mail" {
+                        mail_ids.insert(h.id.clone());
+                    }
+                }
+                Some(
+                    self.visibility_index(v, opts.kinds.as_deref(), &mail_ids)
+                        .await?,
+                )
+            }
             None => None,
         };
         let admit = |kind_s: &str, id: &str| -> bool {
@@ -671,73 +1138,6 @@ impl Store {
             }
         };
 
-        let items = self.embeddable_items().await?;
-        let mut title_of: HashMap<String, String> = HashMap::new();
-        let mut text_of: HashMap<String, String> = HashMap::new();
-        for it in &items {
-            let key = ref_key(&it.kind, &it.id);
-            title_of.insert(key.clone(), it.title.clone());
-            text_of.insert(key, it.text.clone());
-        }
-
-        // Cascade over-fetch: precision widens each stage's pool.
-        let stage1_pool = if precision {
-            (limit * 4).max(limit)
-        } else {
-            (limit * 2).max(limit)
-        };
-        let stage2_pool = if precision {
-            (limit * 3).max(limit)
-        } else {
-            limit * 2
-        };
-
-        // 1. Vector pass — full cosine over model-matched blobs (model+dim
-        // filter so a partial backfill never compares across dimensions). The
-        // kind filter also lives in SQL so excluded kinds' vectors never load;
-        // admit() stays the guarantee if this query ever changes.
-        let owned_query = query.to_string();
-        let q = tokio::task::spawn_blocking(move || hive_embed::embed_query(&owned_query)).await?;
-        let kind_clause = match &opts.kinds {
-            Some(ks) => format!(" AND ref_kind IN ({})", placeholders_or_never(ks.len())),
-            None => String::new(),
-        };
-        // vec IS NOT NULL: the column is nullable since the 0002 reshape
-        // (dual-write keeps it populated everywhere today, but this read
-        // decodes it as NOT NULL — don't let a vec_v-only row error the whole
-        // search). The ANN rewrite (plan B5) replaces this scan.
-        let sql = format!(
-            "SELECT ref_kind, ref_id, vec FROM embeddings \
-             WHERE model = ? AND dim = ? AND vec IS NOT NULL{kind_clause}"
-        );
-        let mut q_db = crate::pgq::query(&sql)
-            .bind(hive_embed::embed_model())
-            .bind(q.len() as i64);
-        for k in opts.kinds.as_deref().unwrap_or(&[]) {
-            q_db = q_db.bind(k.as_str());
-        }
-        let rows = q_db.fetch_all(self.db()).await?;
-        let mut scored_all: Vec<(String, f64)> = rows
-            .iter()
-            .map(|r| -> Result<(String, f64)> {
-                let key = ref_key(
-                    r.try_get::<String, _>("ref_kind")?.as_str(),
-                    r.try_get::<String, _>("ref_id")?.as_str(),
-                );
-                let vec = hive_embed::from_blob(&r.try_get::<Vec<u8>, _>("vec")?);
-                Ok((key, hive_embed::cosine(&q, &vec)))
-            })
-            .collect::<Result<_>>()?;
-        scored_all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        // Chunked rows share one `kind:id` key — collapse to the item's
-        // best-scoring chunk (first after the sort) so pool slots, the
-        // fallback, and the final hit list stay one-entry-per-item. The real
-        // ANN-side collapse lands with the query rewrite (plan B5); this keeps
-        // the brute-force path correct meanwhile.
-        {
-            let mut seen: HashSet<String> = HashSet::new();
-            scored_all.retain(|(k, _)| seen.insert(k.clone()));
-        }
         // Admission applies before ANY cut — the threshold filter, the stage
         // pools, and the fallback refill all see an already-admitted list.
         scored_all.retain(|(k, _)| {
@@ -748,22 +1148,33 @@ impl Store {
             scored_all.iter().filter(|(_, s)| *s >= threshold).collect();
         let raw_hit_keys: HashSet<String> = passing.iter().map(|(k, _)| k.clone()).collect();
 
+        // Diversified stage-1 fill: the best candidates overall, PLUS (when
+        // no kinds filter narrows the query) the best non-bulk candidates —
+        // so a 200k-chunk mailbox can never evict journal/tasks from the
+        // pool. ScoreMap dedups; insertion order stays deterministic.
         let mut scores = ScoreMap::default();
         for (k, s) in passing.iter().take(stage1_pool) {
             scores.entry(k).vector = *s;
         }
+        if opts.kinds.is_none() && !bulk.is_empty() {
+            for (k, s) in passing
+                .iter()
+                .filter(|(k, _)| {
+                    let (kind, _) = split_key(k);
+                    !bulk.iter().any(|b| b == kind)
+                })
+                .take(stage1_pool)
+            {
+                scores.entry(k).vector = *s;
+            }
+        }
 
         // 2. Keyword pass (FTS) — rank-based score decaying from the top.
         if hybrid {
-            // Over-fetch when a filter will thin the pool (mirrors search()'s
-            // own viewer over-fetch), then admit BEFORE the stage cut, so
-            // hidden or excluded-kind rows can't hold keyword slots.
-            let fetch = if visible.is_some() || opts.kinds.is_some() {
-                stage2_pool * 5
-            } else {
-                stage2_pool
-            };
-            let mut kw = self.search(query, fetch, None).await?;
+            // Over-fetched above when a filter will thin the pool (mirrors
+            // search()'s own viewer over-fetch); admit BEFORE the stage cut,
+            // so hidden or excluded-kind rows can't hold keyword slots.
+            let mut kw = kw_all;
             kw.retain(|r| admit(r.kind.as_str(), &r.id));
             kw.truncate(stage2_pool);
             let total = kw.len().max(1) as f64;
@@ -818,8 +1229,10 @@ impl Store {
             scores.retain_keys(&keep);
         }
 
-        // 4. Blended sort, with the identity/peer soft boost (+0.1 — a nudge,
-        // not a filter).
+        // 4. Blended sort, with the per-kind rank weight (multiplicative,
+        // applied exactly once) and then the identity/peer soft boost (+0.1 —
+        // a nudge, not a filter).
+        let weights = self.kind_weights().await;
         let focus: HashSet<&str> = [opts.identity.as_deref(), opts.peer.as_deref()]
             .into_iter()
             .flatten()
@@ -833,36 +1246,51 @@ impl Store {
         let mut ranked: Vec<(String, f64)> = Vec::with_capacity(scores.len());
         for kk in scores.keys().to_vec() {
             let s = *scores.get(&kk).unwrap();
+            let (kind, id) = split_key(&kk);
             let scoped = if focus.is_empty() {
                 0.0
+            } else if self
+                .hit_actors(kind, id)
+                .await?
+                .iter()
+                .any(|a| focus.contains(a.as_str()))
+            {
+                0.1
             } else {
-                let (k, id) = split_key(&kk);
-                if self
-                    .hit_actors(k, id)
-                    .await?
-                    .iter()
-                    .any(|a| focus.contains(a.as_str()))
-                {
-                    0.1
-                } else {
-                    0.0
-                }
+                0.0
             };
             let base = if s.keyword > 0.0 && s.vector > 0.0 {
                 s.vector * w_vec + s.keyword * w_kw + s.blanket
             } else {
                 s.vector + s.blanket
             };
-            ranked.push((kk, base + scoped));
+            let kind_w = weights.get(kind).copied().unwrap_or(1.0);
+            ranked.push((kk, base * kind_w + scoped));
         }
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 5. Fallback — never return empty when admitted vectors exist
+        // (scored_all was admission-filtered above, so this can't smuggle
+        // hidden or unknown-kind rows back in). Runs before hydration so
+        // fallback keys hydrate too.
+        if ranked.is_empty() && !scored_all.is_empty() {
+            ranked = scored_all.iter().take(limit).cloned().collect();
+        }
+
+        // 6. Keyed hydration over the ranked pool (bounded — never the old
+        // corpus scan). A key that doesn't hydrate is DROPPED before the
+        // pre-rerank cut, so an orphaned embedding can't hold a result slot
+        // OR starve the survivors out of theirs.
+        let keys: Vec<String> = ranked.iter().map(|(k, _)| k.clone()).collect();
+        let hydrated = self.hydrate_hits(&keys).await?;
+        ranked.retain(|(k, _)| hydrated.contains_key(k));
         ranked.truncate(pre_rerank_n);
 
-        // 5. Cross-encoder rerank (precision stage 4, or the standard flag).
+        // 7. Cross-encoder rerank (precision stage 4, or the standard flag).
         if use_rerank && !ranked.is_empty() {
             let docs: Vec<String> = ranked
                 .iter()
-                .map(|(k, _)| text_of.get(k).cloned().unwrap_or_default())
+                .map(|(k, _)| hydrated.get(k).map(|h| h.text.clone()).unwrap_or_default())
                 .collect();
             let owned_query = query.to_string();
             let rr = tokio::task::spawn_blocking(move || hive_embed::rerank(&owned_query, &docs))
@@ -879,24 +1307,18 @@ impl Store {
         }
         ranked.truncate(limit);
 
-        // 6. Fallback — never return empty when admitted vectors exist
-        // (scored_all was admission-filtered above, so this can't smuggle
-        // hidden or unknown-kind rows back in).
-        if ranked.is_empty() && !scored_all.is_empty() {
-            ranked = scored_all.iter().take(limit).cloned().collect();
-        }
-
         let hits: Vec<SearchHit> = ranked
             .into_iter()
-            .map(|(k, score)| {
+            .filter_map(|(k, score)| {
                 let (kind, id) = split_key(&k);
-                SearchHit {
+                let h = hydrated.get(&k)?;
+                Some(SearchHit {
                     kind: kind.to_string(),
                     id: id.to_string(),
-                    title: title_of.get(&k).cloned().unwrap_or_else(|| id.to_string()),
-                    snippet: String::new(),
+                    title: h.title.clone(),
+                    snippet: h.snippet.clone(),
                     score: (score * 1000.0).round() / 1000.0,
-                }
+                })
             })
             .collect();
 
@@ -944,5 +1366,41 @@ mod tests {
         let keep: HashSet<String> = ["a:2".to_string()].into();
         m.retain_keys(&keep);
         assert_eq!(m.keys(), ["a:2".to_string()]);
+    }
+
+    #[test]
+    fn collapse_chunks_takes_max_per_parent_and_sorts() {
+        let rows = vec![
+            ("journal:a".to_string(), 0.4),
+            ("mail:m".to_string(), 0.7),
+            ("journal:a".to_string(), 0.9),
+            ("mail:m".to_string(), 0.7), // double-probe overlap duplicate
+            ("journal:a".to_string(), 0.1),
+        ];
+        let out = collapse_chunks(rows);
+        assert_eq!(
+            out,
+            vec![("journal:a".to_string(), 0.9), ("mail:m".to_string(), 0.7)]
+        );
+    }
+
+    #[test]
+    fn bulk_kinds_parse_json_and_csv() {
+        assert_eq!(parse_bulk_kinds(r#"["mail","doc"]"#), ["mail", "doc"]);
+        assert_eq!(parse_bulk_kinds("mail, doc"), ["mail", "doc"]);
+        assert!(parse_bulk_kinds("[]").is_empty());
+        assert!(parse_bulk_kinds("  ").is_empty());
+    }
+
+    #[test]
+    fn kind_weights_merge_over_defaults() {
+        let mut w = default_kind_weights();
+        assert_eq!(w.get("mail"), Some(&0.85));
+        merge_kind_weights(&mut w, r#"{"journal": 1.2, "mail": "bogus"}"#);
+        assert_eq!(w.get("journal"), Some(&1.2));
+        assert_eq!(w.get("mail"), Some(&0.85), "non-numeric entries ignored");
+        merge_kind_weights(&mut w, "not json"); // must not panic or clear
+        assert_eq!(w.get("journal"), Some(&1.2));
+        assert_eq!(w.get("task"), None, "unlisted kinds default to 1.0 at use");
     }
 }
