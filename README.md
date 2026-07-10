@@ -208,6 +208,9 @@ setup is safe.
 | `HIVE_CONVERSATION_RETENTION_DAYS` | unset (keep forever) | worker — hard-delete archived conversations older than N days |
 | `HIVE_SESSION_ISOLATION` | `container` | runner — `host` refuses to start without `HIVE_RUNNER_UNSAFE_HOST=1` |
 
+Mail sync (JMAP archive: enabling, `HIVE_CRED_KEY`, account connect, backup
+posture, validation) has its own runbook: [docs/mail-ops.md](./docs/mail-ops.md).
+
 ## Branching
 
 Adapted from [BR canon](https://kb.beesroadhouse.com/books/developer-operations-devops/page/branching-strategy)

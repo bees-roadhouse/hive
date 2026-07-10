@@ -26,3 +26,8 @@ async-trait = { workspace = true }
 sqlx = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+# The Stalwart e2e seeds fixture mail over raw JMAP Email/set — jmap-sync
+# deliberately exposes no set operations, so the test speaks HTTP directly.
+reqwest = { workspace = true }

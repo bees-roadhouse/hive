@@ -201,6 +201,9 @@ async fn sync_account(store: &Store, acct: MailAccountSync) -> Result<()> {
         cfg.account_id = Some(acct.jmap_account_id.clone());
     }
     cfg.max_body_bytes = env_u64("HIVE_MAIL_MAX_BODY_BYTES", cfg.max_body_bytes as u64) as usize;
+    // Mostly a test knob: the Stalwart e2e sets 10 to force a multi-page
+    // backfill out of a small fixture mailbox.
+    cfg.page_size = env_u64("HIVE_MAIL_PAGE_SIZE", cfg.page_size as u64) as usize;
 
     let (ingest, _) = store.mail_mailbox_sets(&acct.id).await?;
     cfg.ingest_mailbox_ids = ingest.into_iter().collect();
