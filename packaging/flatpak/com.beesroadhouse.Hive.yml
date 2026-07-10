@@ -20,9 +20,6 @@ finish-args:
   - --socket=fallback-x11
   - --device=dri
   - --share=ipc
-  # WebKitGTK's DMA-BUF renderer blanks to a white window on NVIDIA; force the
-  # shared-memory rendering path (standard workaround for webkit-based apps).
-  - --env=WEBKIT_DISABLE_DMABUF_RENDERER=1
   # Phase 3+ will add scoped filesystem/network/keyring holes as modules land;
   # keep this list minimal until then (DIRECTION.md D27).
 modules:

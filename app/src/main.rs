@@ -5,7 +5,8 @@
 // (the append-only store) wires in at the PR 1.6 cutover; until then the
 // window reports build status instead of data.
 
-use dioxus::desktop::{Config, LogicalSize, WindowBuilder};
+use dioxus::desktop::tao::dpi::LogicalSize;
+use dioxus::desktop::{Config, WindowBuilder};
 use dioxus::prelude::*;
 
 fn main() {
@@ -24,7 +25,7 @@ fn app() -> Element {
     let version = env!("CARGO_PKG_VERSION");
     rsx! {
         div {
-            style: "min-height: 100vh; margin: 0; display: flex; flex-direction: column; \
+            style: "position: fixed; inset: 0; display: flex; flex-direction: column; \
                     align-items: center; justify-content: center; gap: 0.6rem; \
                     background: #14120e; color: #e8e2d4; \
                     font-family: system-ui, sans-serif;",
