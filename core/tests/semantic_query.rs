@@ -56,6 +56,10 @@ fn vec_with_sim(q: &[f32], sim: f64, seed: u64) -> Vec<f32> {
         .collect()
 }
 
+// Seeding helpers, cutover shape: crafted vectors go through the store's
+// embedding seam (so the ANN sees them); fixture rows go through the raw_sql
+// diagnostics seam (direct index writes — these tests exercise the QUERY
+// path, not the record path).
 async fn insert_embedding(
     store: &Store,
     kind: &str,
@@ -64,75 +68,78 @@ async fn insert_embedding(
     owner: Option<&str>,
     vec: &[f32],
 ) {
-    hive_core::pgq::query(
-        "INSERT INTO embeddings (ref_kind, ref_id, chunk_idx, model, dim, owner, vec, hash, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'h', ?)",
-    )
-    .bind(kind)
-    .bind(id)
-    .bind(chunk_idx)
-    .bind(hive_embed::embed_model())
-    .bind(vec.len() as i64)
-    .bind(owner)
-    .bind(hive_embed::to_blob(vec))
-    .bind(hive_core::store::now_iso())
-    .execute(store.db())
-    .await
-    .expect("embedding insert");
+    store
+        .upsert_embedding_raw(
+            kind,
+            id,
+            chunk_idx as i64,
+            hive_embed::embed_model(),
+            owner,
+            vec.to_vec(),
+            "h",
+        )
+        .await
+        .expect("embedding insert");
 }
 
 async fn insert_journal(store: &Store, id: &str, author: &str, scope: Option<&str>, body: &str) {
-    hive_core::pgq::query(
-        "INSERT INTO journal (id, author, body, user_scope, created_at) VALUES (?, ?, ?, ?, ?)",
-    )
-    .bind(id)
-    .bind(author)
-    .bind(body)
-    .bind(scope)
-    .bind(hive_core::store::now_iso())
-    .execute(store.db())
-    .await
-    .expect("journal insert");
+    store
+        .raw_sql(
+            "INSERT INTO journal (id, author, body, user_scope, created_at) VALUES (?, ?, ?, ?, ?)",
+            vec![
+                id.into(),
+                author.into(),
+                body.into(),
+                scope.map(str::to_string).into(),
+                hive_core::store::now_iso().into(),
+            ],
+        )
+        .await
+        .expect("journal insert");
 }
 
 async fn insert_mail_account(store: &Store, id: &str, owner: &str) {
-    hive_core::pgq::query(
-        "INSERT INTO mail_accounts (id, owner, address, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?)",
-    )
-    .bind(id)
-    .bind(owner)
-    .bind(format!("{owner}@example.test"))
-    .bind(hive_core::store::now_iso())
-    .bind(hive_core::store::now_iso())
-    .execute(store.db())
-    .await
-    .expect("mail account insert");
+    store
+        .raw_sql(
+            "INSERT INTO mail_accounts (id, owner, address, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?)",
+            vec![
+                id.into(),
+                owner.into(),
+                format!("{owner}@example.test").into(),
+                hive_core::store::now_iso().into(),
+                hive_core::store::now_iso().into(),
+            ],
+        )
+        .await
+        .expect("mail account insert");
 }
 
 async fn insert_mail(store: &Store, id: &str, account: &str, owner: &str, deleted: bool) {
     let now = hive_core::store::now_iso();
-    hive_core::pgq::query(
-        "INSERT INTO mail_messages (id, account_id, jmap_id, jmap_thread_id, received_at, \
-           subject, from_addr, snippet, body_text, user_scope, deleted_at, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(id)
-    .bind(account)
-    .bind(format!("j-{id}"))
-    .bind(format!("t-{id}"))
-    .bind(&now)
-    .bind(format!("Subject {id}"))
-    .bind("sender@example.test")
-    .bind("snippet text")
-    .bind(format!("body of {id}"))
-    .bind(owner)
-    .bind(deleted.then(|| now.clone()))
-    .bind(&now)
-    .bind(&now)
-    .execute(store.db())
-    .await
-    .expect("mail insert");
+    store
+        .raw_sql(
+            "INSERT INTO mail_messages (id, account_id, jmap_id, jmap_thread_id, received_at, \
+               subject, from_addr, snippet, body_text, user_scope, deleted_at, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            vec![
+                id.into(),
+                account.into(),
+                format!("j-{id}").into(),
+                format!("t-{id}").into(),
+                now.clone().into(),
+                format!("Subject {id}").into(),
+                "sender@example.test".into(),
+                "snippet text".into(),
+                format!("body of {id}").into(),
+                owner.into(),
+                deleted.then(|| now.clone()).into(),
+                now.clone().into(),
+                now.clone().into(),
+            ],
+        )
+        .await
+        .expect("mail insert");
 }
 
 fn opts(limit: usize) -> SemanticOptions {

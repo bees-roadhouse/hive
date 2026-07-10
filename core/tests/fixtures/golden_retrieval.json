@@ -1,5 +1,5 @@
 {
-  "captured_under": "postgres tsvector/ts_rank + brute-force cosine, HIVE_EMBED=hash (dim 256), reranker off, hybrid on",
+  "captured_under": "sqlite FTS5 porter/bm25 + brute-force cosine, hash embedder (dim 256), reranker off, hybrid on",
   "queries": [
     {
       "surface": "search",
@@ -8,7 +8,7 @@
         {
           "label": "journal:Honey harvest planning: we should pull s",
           "kind": "journal",
-          "score": 0.689
+          "score": 0.911
         }
       ]
     },
@@ -19,7 +19,7 @@
         {
           "label": "journal:Read about oxalic acid vaporization for ",
           "kind": "journal",
-          "score": 0.63
+          "score": 0.914
         }
       ]
     },
@@ -30,7 +30,7 @@
         {
           "label": "journal:The garden fence needs mending before th",
           "kind": "journal",
-          "score": 0.7
+          "score": 0.913
         }
       ]
     },
@@ -39,19 +39,24 @@
       "query": "canning tomatoes",
       "hits": [
         {
-          "label": "journal:Weekend plan: prep the [topic: Canning] ",
-          "kind": "journal",
-          "score": 0.106
+          "label": "entity:Canned Brandywine Tomatoes",
+          "kind": "recipe",
+          "score": 0.847
         },
         {
-          "label": "journal:Reflected on the pantry inventory: we ar",
+          "label": "journal:Weekend plan: prep the [topic: Canning] ",
           "kind": "journal",
-          "score": 0.095
+          "score": 0.803
         },
         {
           "label": "journal:Summarized the seed catalog: the heirloo",
           "kind": "journal",
-          "score": 0.095
+          "score": 0.777
+        },
+        {
+          "label": "journal:Reflected on the pantry inventory: we ar",
+          "kind": "journal",
+          "score": 0.754
         }
       ]
     },
@@ -62,7 +67,7 @@
         {
           "label": "journal:Met with the county inspector about the ",
           "kind": "journal",
-          "score": 0.241
+          "score": 0.862
         }
       ]
     },
@@ -116,7 +121,7 @@
           "score": 0.02
         },
         {
-          "label": "journal:Winter prep checklist drafted for [proje",
+          "label": "journal:The orchard drainage ditch flooded again",
           "kind": "journal",
           "score": 0.02
         }
@@ -259,12 +264,17 @@
           "score": 0.057
         },
         {
-          "label": "journal:Event on the calendar: the beekeeping cl",
+          "label": "journal:Rain barrels are full after the storm; t",
           "kind": "journal",
           "score": 0.05
         },
         {
-          "label": "journal:Rain barrels are full after the storm; t",
+          "label": "journal:The orchard drainage ditch flooded again",
+          "kind": "journal",
+          "score": 0.05
+        },
+        {
+          "label": "journal:Met with the county inspector about the ",
           "kind": "journal",
           "score": 0.05
         },
@@ -274,17 +284,12 @@
           "score": 0.05
         },
         {
-          "label": "task:Install mouse guards",
+          "label": "task:Connect drip lines",
           "kind": "task",
           "score": 0.05
         },
         {
-          "label": "event:Beekeeping club field day",
-          "kind": "event",
-          "score": 0.05
-        },
-        {
-          "label": "task:Connect drip lines",
+          "label": "task:Regrade the orchard ditch",
           "kind": "task",
           "score": 0.05
         }
@@ -305,11 +310,6 @@
           "score": 0.074
         },
         {
-          "label": "journal:We must winterize the pump house before ",
-          "kind": "journal",
-          "score": 0.05
-        },
-        {
           "label": "journal:Bottling day went long but we filled nin",
           "kind": "journal",
           "score": 0.05
@@ -320,9 +320,9 @@
           "score": 0.05
         },
         {
-          "label": "task:Winterize the pump house",
-          "kind": "task",
-          "score": 0.05
+          "label": "journal:We must winterize the pump house before ",
+          "kind": "journal",
+          "score": 0.02
         },
         {
           "label": "journal:Decision made after the inspector visit:",
@@ -331,6 +331,11 @@
         },
         {
           "label": "journal:Rain barrels are full after the storm; t",
+          "kind": "journal",
+          "score": 0.02
+        },
+        {
+          "label": "journal:The orchard drainage ditch flooded again",
           "kind": "journal",
           "score": 0.02
         },
@@ -351,14 +356,14 @@
       "query": "nate: beekeeping inspections",
       "hits": [
         {
-          "label": "journal:Met with the county inspector about the ",
-          "kind": "journal",
-          "score": 0.389
-        },
-        {
           "label": "journal:Spring inspection of the west apiary wen",
           "kind": "journal",
-          "score": 0.266
+          "score": 0.391
+        },
+        {
+          "label": "journal:Met with the county inspector about the ",
+          "kind": "journal",
+          "score": 0.264
         },
         {
           "label": "journal:Event on the calendar: the beekeeping cl",

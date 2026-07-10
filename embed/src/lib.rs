@@ -196,6 +196,89 @@ pub fn rerank(query: &str, docs: &[String]) -> Option<Vec<f64>> {
     }
 }
 
+// ---- the injectable embedder seam (PR 1.6) ------------------------------------
+
+/// Object-safe embedding engine handle. hive-core takes `Arc<dyn Embedder>` at
+/// `Store::new` instead of calling this crate's free functions, so tests inject
+/// `HashEmbedder` (or a mock) explicitly and core never consults `HIVE_EMBED` —
+/// the OnceLock provider latch above survives only as `DefaultEmbedder`'s
+/// construction path (the app's default wiring).
+pub trait Embedder: Send + Sync {
+    /// The model name stamped on stored vectors.
+    fn model(&self) -> String;
+    /// Nominal vector dimension.
+    fn dim(&self) -> usize;
+    /// Embed a passage/document into a unit-length vector.
+    fn embed(&self, text: &str) -> Vec<f32>;
+    /// Embed a search query (BGE models get the retrieval instruction prefix).
+    fn embed_query(&self, text: &str) -> Vec<f32>;
+    /// Whether a cross-encoder reranker is available right now.
+    fn rerank_available(&self) -> bool;
+    /// Cross-encoder relevance scores per doc, in input order.
+    fn rerank(&self, query: &str, docs: &[String]) -> Option<Vec<f64>>;
+    /// Whether the engine is configured for a real model but has latched to
+    /// the hash fallback (persisting callers must pause, not mislabel rows).
+    fn latched(&self) -> bool;
+}
+
+/// The env-driven engine: delegates to this crate's free functions, i.e. the
+/// `HIVE_EMBED` provider choice, the lazy ONNX install, and the failure latch.
+#[derive(Default, Clone, Copy)]
+pub struct DefaultEmbedder;
+
+impl Embedder for DefaultEmbedder {
+    fn model(&self) -> String {
+        embed_model().to_string()
+    }
+    fn dim(&self) -> usize {
+        embed_dim()
+    }
+    fn embed(&self, text: &str) -> Vec<f32> {
+        embed(text)
+    }
+    fn embed_query(&self, text: &str) -> Vec<f32> {
+        embed_query(text)
+    }
+    fn rerank_available(&self) -> bool {
+        rerank_available()
+    }
+    fn rerank(&self, query: &str, docs: &[String]) -> Option<Vec<f64>> {
+        rerank(query, docs)
+    }
+    fn latched(&self) -> bool {
+        transformers_latched()
+    }
+}
+
+/// The deterministic hash engine, environment-free: what tests inject. Never
+/// latches, never reranks, never downloads.
+#[derive(Default, Clone, Copy)]
+pub struct HashEmbedder;
+
+impl Embedder for HashEmbedder {
+    fn model(&self) -> String {
+        HASH_MODEL.to_string()
+    }
+    fn dim(&self) -> usize {
+        HASH_DIM
+    }
+    fn embed(&self, text: &str) -> Vec<f32> {
+        embed_hash(text)
+    }
+    fn embed_query(&self, text: &str) -> Vec<f32> {
+        embed_hash(text)
+    }
+    fn rerank_available(&self) -> bool {
+        false
+    }
+    fn rerank(&self, _query: &str, _docs: &[String]) -> Option<Vec<f64>> {
+        None
+    }
+    fn latched(&self) -> bool {
+        false
+    }
+}
+
 // ---- vector <-> blob (packed little-endian f32) ------------------------------
 
 pub fn to_blob(embedding: &[f32]) -> Vec<u8> {

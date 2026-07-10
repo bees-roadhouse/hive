@@ -1,11 +1,29 @@
+// Mail archive: read paths on the index; write paths as records per the fold
+// contract — module.doc (account/mailbox/message/attachment upserts),
+// cursor.set (sync state), tombstone (JMAP destroys; soft delete in the
+// fold), redact (admin scrub). The sync daemon is PAUSED until the Phase 3
+// mail module, but every path compiles and is fold-tested.
+//
+// Command-layer responsibilities the fold refuses on purpose:
+//   - mail FTS membership (ingest mailboxes ∩ not junk): direct writes to the
+//     `search` table here (mail search rows do NOT rebuild from replay; the
+//     Phase 3 resync re-creates them);
+//   - embeddings drops (via SqliteIndex so the ANN forgets too);
+//   - attachment BYTES: the blockstore, with blob_refs (runtime table)
+//     holding hash → serialized BlobRef. mail_attachments.blob_hash names
+//     rows there.
+
+use std::collections::HashSet;
+
 use anyhow::{anyhow, Result};
+use rusqlite::OptionalExtension;
 use serde::Serialize;
-use sqlx::Row;
+use serde_json::json;
 
 use super::cc_credentials::NewCcCredential;
-use super::{new_id, now_iso, Store};
+use super::{new_id, now_iso, Core, Draft, Store};
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MailAccount {
     pub id: String,
     pub label: String,
@@ -15,7 +33,7 @@ pub struct MailAccount {
 }
 
 /// Management view: sync state + error surface, never secrets.
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MailAccountAdminView {
     pub id: String,
     pub owner: String,
@@ -32,7 +50,7 @@ pub struct MailAccountAdminView {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize)]
 pub struct MailMailboxView {
     pub id: String,
     pub jmap_id: String,
@@ -42,7 +60,7 @@ pub struct MailMailboxView {
     pub ingest: bool,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 struct MailMessageRow {
     pub id: String,
     pub account_id: String,
@@ -74,9 +92,9 @@ pub struct MailMessageSummary {
     pub has_attachments: bool,
 }
 
-/// Lightweight attachment row for thread payloads: enough for the SPA to
-/// render a chip and link the serving route. `stored` = bytes are in the
-/// local blob store (false = oversize/missing/pending — link would 404).
+/// Lightweight attachment row for thread payloads: enough to render a chip
+/// and link the serving path. `stored` = bytes are in the local blockstore
+/// (false = oversize/missing/pending — a fetch would 404).
 #[derive(Debug, Clone, Serialize)]
 pub struct MailAttachmentChip {
     pub id: String,
@@ -199,14 +217,61 @@ fn json_string_array(raw: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn row_to_message(r: &rusqlite::Row) -> rusqlite::Result<MailMessageRow> {
+    Ok(MailMessageRow {
+        id: r.get("id")?,
+        account_id: r.get("account_id")?,
+        thread_id: r.get("thread_id")?,
+        labels_json: r.get("labels_json")?,
+        subject: r.get("subject")?,
+        from_name: r.get("from_name")?,
+        from_email: r.get("from_email")?,
+        to_json: r.get("to_json")?,
+        cc_json: r.get("cc_json")?,
+        received_at: r.get("received_at")?,
+        snippet: r.get("snippet")?,
+        body_text: r.get("body_text")?,
+        has_attachments: r.get("has_attachments")?,
+    })
+}
+
+fn row_to_admin_view(r: &rusqlite::Row) -> rusqlite::Result<MailAccountAdminView> {
+    Ok(MailAccountAdminView {
+        id: r.get("id")?,
+        owner: r.get("owner")?,
+        address: r.get("address")?,
+        jmap_url: r.get("jmap_url")?,
+        jmap_username: r.get("jmap_username")?,
+        jmap_account_id: r.get("jmap_account_id")?,
+        backfill_status: r.get("backfill_status")?,
+        enabled: r.get("enabled")?,
+        attempts: r.get("attempts")?,
+        last_error: r.get("last_error")?,
+        last_synced_at: r.get("last_synced_at")?,
+        last_status: r.get("last_status")?,
+        created_at: r.get("created_at")?,
+    })
+}
+
 impl Store {
     pub async fn mail_accounts_list(&self) -> Result<Vec<MailAccount>> {
-        Ok(crate::pgq::query_as::<MailAccount>(
-            "SELECT id, address AS label, address, 'jmap' AS provider, last_synced_at \
-             FROM mail_accounts ORDER BY owner ASC, address ASC",
-        )
-        .fetch_all(self.db())
-        .await?)
+        self.run(|core| {
+            let mut stmt = core.conn().prepare(
+                "SELECT id, address AS label, address, 'jmap' AS provider, last_synced_at \
+                 FROM mail_accounts ORDER BY owner ASC, address ASC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(MailAccount {
+                    id: r.get(0)?,
+                    label: r.get(1)?,
+                    address: r.get(2)?,
+                    provider: r.get(3)?,
+                    last_synced_at: r.get(4)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
     }
 
     pub async fn mail_messages_list(
@@ -215,12 +280,17 @@ impl Store {
         account_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<MailMessageSummary>> {
-        let rows = self.mail_message_rows(query, account_id, limit).await?;
-        Ok(rows
-            .into_iter()
-            .map(MailThreadMessage::from)
-            .map(|m| m.summary)
-            .collect())
+        let query = query.map(str::to_string);
+        let account_id = account_id.map(str::to_string);
+        self.run(move |core| {
+            let rows = mail_message_rows(core, query.as_deref(), account_id.as_deref(), limit)?;
+            Ok(rows
+                .into_iter()
+                .map(MailThreadMessage::from)
+                .map(|m| m.summary)
+                .collect())
+        })
+        .await
     }
 
     pub async fn mail_search(&self, query: &str, limit: i64) -> Result<Vec<MailMessageSummary>> {
@@ -228,105 +298,29 @@ impl Store {
     }
 
     pub async fn mail_thread_get(&self, thread_id: &str) -> Result<MailThread> {
-        let rows = crate::pgq::query_as::<MailMessageRow>(&mail_message_select(
-            "WHERE m.jmap_thread_id = ? ORDER BY m.received_at ASC",
-        ))
-        .bind(thread_id)
-        .fetch_all(self.db())
-        .await?;
-        let mut messages: Vec<MailThreadMessage> =
-            rows.into_iter().map(MailThreadMessage::from).collect();
-        self.attach_chips(&mut messages).await?;
-        let subject = messages
-            .first()
-            .map(|m| m.summary.subject.clone())
-            .unwrap_or_default();
-        Ok(MailThread {
-            thread_id: thread_id.to_string(),
-            subject,
-            messages,
+        let thread_id = thread_id.to_string();
+        self.run(move |core| {
+            let rows: Vec<MailMessageRow> = {
+                let sql =
+                    mail_message_select("WHERE m.jmap_thread_id = ?1 ORDER BY m.received_at ASC");
+                let mut stmt = core.conn().prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params![thread_id], row_to_message)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut messages: Vec<MailThreadMessage> =
+                rows.into_iter().map(MailThreadMessage::from).collect();
+            attach_chips(core, &mut messages)?;
+            let subject = messages
+                .first()
+                .map(|m| m.summary.subject.clone())
+                .unwrap_or_default();
+            Ok(MailThread {
+                thread_id,
+                subject,
+                messages,
+            })
         })
-    }
-
-    /// Fill the attachment chips for a set of thread messages (one query).
-    async fn attach_chips(&self, messages: &mut [MailThreadMessage]) -> Result<()> {
-        if messages.is_empty() {
-            return Ok(());
-        }
-        #[derive(sqlx::FromRow)]
-        struct ChipRow {
-            id: String,
-            message_id: String,
-            filename: String,
-            mime: String,
-            size: i64,
-            stored: bool,
-        }
-        let ids: Vec<String> = messages.iter().map(|m| m.summary.id.clone()).collect();
-        let rows = crate::pgq::query_as::<ChipRow>(
-            "SELECT id, message_id, filename, mime, size, (blob_hash IS NOT NULL) AS stored \
-             FROM mail_attachments WHERE message_id = ANY(?) ORDER BY created_at ASC, id ASC",
-        )
-        .bind(&ids)
-        .fetch_all(self.db())
-        .await?;
-        for row in rows {
-            if let Some(m) = messages.iter_mut().find(|m| m.summary.id == row.message_id) {
-                m.attachments.push(MailAttachmentChip {
-                    id: row.id,
-                    filename: row.filename,
-                    mime: row.mime,
-                    size: row.size,
-                    stored: row.stored,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    async fn mail_message_rows(
-        &self,
-        query: Option<&str>,
-        account_id: Option<&str>,
-        limit: i64,
-    ) -> Result<Vec<MailMessageRow>> {
-        let limit = limit.clamp(1, 200);
-        let mut clauses: Vec<&str> = Vec::new();
-        if account_id.is_some() {
-            clauses.push("m.account_id = ?");
-        }
-        let trimmed = query.map(str::trim).filter(|q| !q.is_empty());
-        if trimmed.is_some() {
-            clauses.push("(m.subject ILIKE ? OR m.from_addr ILIKE ? OR COALESCE(m.from_name, '') ILIKE ? OR m.snippet ILIKE ? OR m.body_text ILIKE ? OR m.keywords_json::text ILIKE ?)");
-        }
-        let where_sql = if clauses.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {} ", clauses.join(" AND "))
-        };
-        let deleted_filter = if where_sql.is_empty() {
-            "WHERE m.deleted_at IS NULL "
-        } else {
-            "AND m.deleted_at IS NULL "
-        };
-        let sql = mail_message_select(&format!(
-            "{where_sql}{deleted_filter}ORDER BY m.received_at DESC LIMIT ?"
-        ));
-        let mut q = crate::pgq::query_as::<MailMessageRow>(&sql);
-        if let Some(account_id) = account_id {
-            q = q.bind(account_id);
-        }
-        if let Some(term) = trimmed {
-            let needle = format!("%{term}%");
-            q = q
-                .bind(needle.clone())
-                .bind(needle.clone())
-                .bind(needle.clone())
-                .bind(needle.clone())
-                .bind(needle.clone())
-                .bind(needle);
-        }
-        Ok(q.bind(limit).fetch_all(self.db()).await?)
+        .await
     }
 
     // ---- account management (the connect surface; the mail sync driver —
@@ -334,9 +328,8 @@ impl Store {
 
     /// Register a mail account: the credential lands in the AES-GCM vault
     /// (which hard-requires HIVE_CRED_KEY) and the account row starts
-    /// 'pending' for mail sync to pick up. The caller (route) has already
-    /// validated the credential against the server via session discovery and
-    /// captured `jmap_account_id`.
+    /// 'pending' for mail sync to pick up. The caller has already validated
+    /// the credential against the server and captured `jmap_account_id`.
     #[allow(clippy::too_many_arguments)]
     pub async fn mail_account_create(
         &self,
@@ -347,13 +340,20 @@ impl Store {
         jmap_account_id: &str,
         secret: &str,
     ) -> Result<MailAccountAdminView> {
-        let exists: Option<String> = crate::pgq::query_scalar::<String>(
-            "SELECT id FROM mail_accounts WHERE owner = ? AND address = ?",
-        )
-        .bind(owner)
-        .bind(address)
-        .fetch_optional(self.db())
-        .await?;
+        let exists = {
+            let (owner_s, address_s) = (owner.to_string(), address.to_string());
+            self.run(move |core| {
+                Ok(core
+                    .conn()
+                    .query_row(
+                        "SELECT id FROM mail_accounts WHERE owner = ?1 AND address = ?2",
+                        rusqlite::params![owner_s, address_s],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?)
+            })
+            .await?
+        };
         if exists.is_some() {
             return Err(anyhow!(
                 "mail account {address} is already connected for {owner}"
@@ -373,21 +373,24 @@ impl Store {
             .await?;
         let id = new_id("macct");
         let ts = now_iso();
-        crate::pgq::query(
-            "INSERT INTO mail_accounts (id, owner, address, jmap_url, jmap_username, jmap_account_id, cred_id, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(owner)
-        .bind(address)
-        .bind(jmap_url)
-        .bind(jmap_username)
-        .bind(jmap_account_id)
-        .bind(&cred.id)
-        .bind(&ts)
-        .bind(&ts)
-        .execute(self.db())
-        .await?;
+        let draft = Draft::new(
+            crate::oplog::kind::MODULE_DOC,
+            owner,
+            &ts,
+            json!({"module": "mail", "doc_kind": "account", "id": id, "fields": {
+                "owner": owner, "address": address, "jmap_url": jmap_url,
+                "jmap_username": jmap_username, "jmap_account_id": jmap_account_id,
+                "cred_id": cred.id, "created_at": ts, "updated_at": ts,
+            }}),
+        );
+        let id_c = id.clone();
+        let view = self
+            .run(move |core| {
+                core.commit(vec![draft])?;
+                mail_account_admin_view_core(core, &id_c)
+            })
+            .await?
+            .ok_or_else(|| anyhow!("account {id} vanished after insert"))?;
         // ids only on the wire: it is globally readable (D10).
         self.emit(
             "mail.account.connected",
@@ -395,77 +398,110 @@ impl Store {
             serde_json::json!({"id": id}),
         )
         .await?;
-        self.mail_account_admin_view(&id)
-            .await?
-            .ok_or_else(|| anyhow!("account {id} vanished after insert"))
+        Ok(view)
     }
 
     pub async fn mail_account_admin_view(&self, id: &str) -> Result<Option<MailAccountAdminView>> {
-        Ok(crate::pgq::query_as::<MailAccountAdminView>(&format!(
-            "{MAIL_ACCOUNT_ADMIN_SELECT} WHERE id = ?"
-        ))
-        .bind(id)
-        .fetch_optional(self.db())
-        .await?)
+        let id = id.to_string();
+        self.run(move |core| mail_account_admin_view_core(core, &id))
+            .await
     }
 
     /// All accounts, with sync state.
     pub async fn mail_accounts_admin_list(&self) -> Result<Vec<MailAccountAdminView>> {
-        Ok(crate::pgq::query_as::<MailAccountAdminView>(&format!(
-            "{MAIL_ACCOUNT_ADMIN_SELECT} ORDER BY owner ASC, address ASC"
-        ))
-        .fetch_all(self.db())
-        .await?)
+        self.run(|core| {
+            let mut stmt = core.conn().prepare(&format!(
+                "{MAIL_ACCOUNT_ADMIN_SELECT} ORDER BY owner ASC, address ASC"
+            ))?;
+            let rows = stmt.query_map([], row_to_admin_view)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
     }
 
     pub async fn mail_account_owner(&self, id: &str) -> Result<Option<String>> {
-        Ok(
-            crate::pgq::query_scalar::<String>("SELECT owner FROM mail_accounts WHERE id = ?")
-                .bind(id)
-                .fetch_optional(self.db())
-                .await?,
-        )
+        let id = id.to_string();
+        self.run(move |core| mail_account_owner_core(core, &id))
+            .await
     }
 
-    /// Delete an account and everything derived from it. Messages and
-    /// attachments go via FK cascade; search/embeddings/inbox/links rows and
-    /// the vault credential go explicitly, then orphaned blobs. One
-    /// transaction — an account is never left half-deleted.
+    /// Delete an account and everything derived from it. The account
+    /// tombstone's fold cascade drops mailboxes → messages → attachments and
+    /// their FTS/vector rows; inbox/link rows and the vault credential and
+    /// orphaned blobs go explicitly — one batch.
     pub async fn mail_account_delete(&self, id: &str) -> Result<bool> {
-        let Some(owner) = self.mail_account_owner(id).await? else {
+        let id_s = id.to_string();
+        let owner = self
+            .run(move |core| {
+                let Some(owner) = mail_account_owner_core(core, &id_s)? else {
+                    return Ok(None);
+                };
+                let ts = now_iso();
+                let mut drafts: Vec<Draft> = Vec::new();
+                let msg_ids: Vec<String> = {
+                    let mut stmt = core
+                        .conn()
+                        .prepare("SELECT id FROM mail_messages WHERE account_id = ?1")?;
+                    let rows = stmt.query_map(rusqlite::params![id_s], |r| r.get(0))?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                for mid in &msg_ids {
+                    let inbox_ids: Vec<String> = {
+                        let mut stmt = core.conn().prepare(
+                            "SELECT id FROM inbox WHERE ref_kind = 'mail' AND ref_id = ?1",
+                        )?;
+                        let rows = stmt.query_map(rusqlite::params![mid], |r| r.get(0))?;
+                        rows.collect::<rusqlite::Result<Vec<_>>>()?
+                    };
+                    for iid in inbox_ids {
+                        drafts.push(Draft::new(
+                            crate::oplog::kind::TOMBSTONE,
+                            &owner,
+                            &ts,
+                            json!({"kind": "inbox", "id": iid}),
+                        ));
+                    }
+                    let link_ids: Vec<String> = {
+                        let mut stmt = core.conn().prepare(
+                            "SELECT id FROM links WHERE (source_kind = 'mail' AND source_id = ?1) \
+                             OR (target_kind = 'mail' AND target_id = ?1)",
+                        )?;
+                        let rows = stmt.query_map(rusqlite::params![mid], |r| r.get(0))?;
+                        rows.collect::<rusqlite::Result<Vec<_>>>()?
+                    };
+                    for lid in link_ids {
+                        drafts.push(super::links::link_remove_draft(&lid, &ts));
+                    }
+                }
+                let cred_id: Option<String> = core
+                    .conn()
+                    .query_row(
+                        "SELECT cred_id FROM mail_accounts WHERE id = ?1",
+                        rusqlite::params![id_s],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                drafts.push(Draft::new(
+                    crate::oplog::kind::TOMBSTONE,
+                    &owner,
+                    &ts,
+                    json!({"kind": "mail_account", "id": id_s}),
+                ));
+                core.commit(drafts)?;
+                if let Some(cred) = cred_id {
+                    core.conn().execute(
+                        "DELETE FROM cc_credentials WHERE id = ?1",
+                        rusqlite::params![cred],
+                    )?;
+                }
+                gc_orphan_blobs(core, None)?;
+                Ok(Some(owner))
+            })
+            .await?;
+        let Some(owner) = owner else {
             return Ok(false);
         };
-        let mut tx = self.db().begin().await?;
-        for sql in [
-            "DELETE FROM search WHERE kind = 'mail' AND ref_id IN (SELECT id FROM mail_messages WHERE account_id = ?)",
-            "DELETE FROM embeddings WHERE ref_kind = 'mail' AND ref_id IN (SELECT id FROM mail_messages WHERE account_id = ?)",
-            "DELETE FROM inbox WHERE ref_kind = 'mail' AND ref_id IN (SELECT id FROM mail_messages WHERE account_id = ?)",
-            "DELETE FROM links WHERE (source_kind = 'mail' AND source_id IN (SELECT id FROM mail_messages WHERE account_id = ?)) \
-             OR (target_kind = 'mail' AND target_id IN (SELECT id FROM mail_messages WHERE account_id = ?))",
-        ] {
-            let mut q = crate::pgq::query(sql).bind(id);
-            if sql.contains("target_kind") {
-                q = q.bind(id);
-            }
-            q.execute(&mut *tx).await?;
-        }
-        crate::pgq::query(
-            "DELETE FROM cc_credentials WHERE id = (SELECT cred_id FROM mail_accounts WHERE id = ?)",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-        crate::pgq::query("DELETE FROM mail_accounts WHERE id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        crate::pgq::query(
-            "DELETE FROM blobs b WHERE NOT EXISTS \
-             (SELECT 1 FROM mail_attachments a WHERE a.blob_hash = b.hash)",
-        )
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
         self.emit(
             "mail.account.deleted",
             &owner,
@@ -478,18 +514,38 @@ impl Store {
     /// Enabling clears the backoff so mail sync picks the account up on its
     /// next tick instead of waiting out a stale next_attempt_at.
     pub async fn mail_account_set_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
-        let n = crate::pgq::query(
-            "UPDATE mail_accounts SET enabled = ?, attempts = CASE WHEN ? THEN 0 ELSE attempts END, \
-             next_attempt_at = NULL, updated_at = ? WHERE id = ?",
-        )
-        .bind(enabled)
-        .bind(enabled)
-        .bind(now_iso())
-        .bind(id)
-        .execute(self.db())
-        .await?
-        .rows_affected();
-        Ok(n > 0)
+        let id = id.to_string();
+        self.run(move |core| {
+            if mail_account_owner_core(core, &id)?.is_none() {
+                return Ok(false);
+            }
+            let ts = now_iso();
+            let mut drafts = vec![Draft::new(
+                crate::oplog::kind::MODULE_DOC,
+                "admin",
+                &ts,
+                json!({"module": "mail", "doc_kind": "account", "id": id, "fields": {
+                    "enabled": enabled, "updated_at": ts,
+                }}),
+            )];
+            drafts.push(Draft::new(
+                crate::oplog::kind::CURSOR_SET,
+                "admin",
+                &ts,
+                if enabled {
+                    json!({"module": "mail", "account": id, "cursor": {
+                        "attempts": 0, "next_attempt_at": null,
+                    }})
+                } else {
+                    json!({"module": "mail", "account": id, "cursor": {
+                        "next_attempt_at": null,
+                    }})
+                },
+            ));
+            core.commit(drafts)?;
+            Ok(true)
+        })
+        .await
     }
 
     /// Force a full reconciliation: the sentinel state string makes the next
@@ -498,36 +554,61 @@ impl Store {
     /// clearing the state would just capture a fresh one and silently skip
     /// interim changes).
     pub async fn mail_account_force_resync(&self, id: &str) -> Result<bool> {
-        let n = crate::pgq::query(
-            "UPDATE mail_accounts SET email_state = 'force-resync', attempts = 0, \
-             next_attempt_at = NULL, last_error = NULL, updated_at = ? WHERE id = ?",
-        )
-        .bind(now_iso())
-        .bind(id)
-        .execute(self.db())
-        .await?
-        .rows_affected();
-        Ok(n > 0)
+        let id = id.to_string();
+        self.run(move |core| {
+            if mail_account_owner_core(core, &id)?.is_none() {
+                return Ok(false);
+            }
+            core.commit(vec![Draft::new(
+                crate::oplog::kind::CURSOR_SET,
+                "admin",
+                &now_iso(),
+                json!({"module": "mail", "account": id, "cursor": {
+                    "email_state": "force-resync", "attempts": 0,
+                    "next_attempt_at": null, "last_error": null,
+                }}),
+            )])?;
+            Ok(true)
+        })
+        .await
     }
 
     pub async fn mail_mailbox_owner(&self, mailbox_id: &str) -> Result<Option<String>> {
-        Ok(crate::pgq::query_scalar::<String>(
-            "SELECT a.owner FROM mail_mailboxes b JOIN mail_accounts a ON a.id = b.account_id \
-             WHERE b.id = ?",
-        )
-        .bind(mailbox_id)
-        .fetch_optional(self.db())
-        .await?)
+        let mailbox_id = mailbox_id.to_string();
+        self.run(move |core| {
+            Ok(core
+                .conn()
+                .query_row(
+                    "SELECT a.owner FROM mail_mailboxes b JOIN mail_accounts a ON a.id = b.account_id \
+                     WHERE b.id = ?1",
+                    rusqlite::params![mailbox_id],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        })
+        .await
     }
 
     pub async fn mail_mailboxes_list(&self, account_id: &str) -> Result<Vec<MailMailboxView>> {
-        Ok(crate::pgq::query_as::<MailMailboxView>(
-            "SELECT id, jmap_id, name, role, sort_order, ingest FROM mail_mailboxes \
-             WHERE account_id = ? ORDER BY sort_order ASC, name ASC",
-        )
-        .bind(account_id)
-        .fetch_all(self.db())
-        .await?)
+        let account_id = account_id.to_string();
+        self.run(move |core| {
+            let mut stmt = core.conn().prepare(
+                "SELECT id, jmap_id, name, role, sort_order, ingest FROM mail_mailboxes \
+                 WHERE account_id = ?1 ORDER BY sort_order ASC, name ASC",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![account_id], |r| {
+                Ok(MailMailboxView {
+                    id: r.get(0)?,
+                    jmap_id: r.get(1)?,
+                    name: r.get(2)?,
+                    role: r.get(3)?,
+                    sort_order: r.get(4)?,
+                    ingest: r.get(5)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
     }
 
     /// The per-mailbox opt-in (the spam gate). Turning a mailbox ON resets
@@ -536,56 +617,77 @@ impl Store {
     /// mailbox's messages out of retrieval immediately (D6 semantics: rows
     /// stay, search/embedding membership goes).
     pub async fn mail_mailbox_set_ingest(&self, mailbox_id: &str, ingest: bool) -> Result<bool> {
-        #[derive(sqlx::FromRow)]
-        struct BoxRow {
-            account_id: String,
-            jmap_id: String,
-        }
-        let Some(row) = crate::pgq::query_as::<BoxRow>(
-            "SELECT account_id, jmap_id FROM mail_mailboxes WHERE id = ?",
-        )
-        .bind(mailbox_id)
-        .fetch_optional(self.db())
-        .await?
-        else {
-            return Ok(false);
-        };
-        let mut tx = self.db().begin().await?;
-        crate::pgq::query("UPDATE mail_mailboxes SET ingest = ? WHERE id = ?")
-            .bind(ingest)
-            .bind(mailbox_id)
-            .execute(&mut *tx)
-            .await?;
-        if ingest {
-            crate::pgq::query(
-                "UPDATE mail_accounts SET backfill_status = 'pending', updated_at = ? WHERE id = ?",
-            )
-            .bind(now_iso())
-            .bind(&row.account_id)
-            .execute(&mut *tx)
-            .await?;
-        } else {
-            // mailbox_ids_json is a JSON array of jmap ids; the quoted-id
-            // containment match is exact enough (ids are server-issued and
-            // never substrings of each other in practice).
-            let needle = format!("%\"{}\"%", row.jmap_id);
-            for sql in [
-                "DELETE FROM search WHERE kind = 'mail' AND ref_id IN \
-                 (SELECT id FROM mail_messages WHERE account_id = ? AND mailbox_ids_json LIKE ?)",
-                "DELETE FROM embeddings WHERE ref_kind = 'mail' AND ref_id IN \
-                 (SELECT id FROM mail_messages WHERE account_id = ? AND mailbox_ids_json LIKE ?)",
-                "UPDATE mail_messages SET embed_state = 'skip' \
-                 WHERE account_id = ? AND mailbox_ids_json LIKE ?",
-            ] {
-                crate::pgq::query(sql)
-                    .bind(&row.account_id)
-                    .bind(&needle)
-                    .execute(&mut *tx)
-                    .await?;
+        let mailbox_id = mailbox_id.to_string();
+        self.run(move |core| {
+            let row: Option<(String, String)> = core
+                .conn()
+                .query_row(
+                    "SELECT account_id, jmap_id FROM mail_mailboxes WHERE id = ?1",
+                    rusqlite::params![mailbox_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((account_id, jmap_id)) = row else {
+                return Ok(false);
+            };
+            let ts = now_iso();
+            let mut drafts = vec![Draft::new(
+                crate::oplog::kind::MODULE_DOC,
+                "admin",
+                &ts,
+                json!({"module": "mail", "doc_kind": "mailbox", "id": mailbox_id, "fields": {
+                    "ingest": ingest,
+                }}),
+            )];
+            let mut affected: Vec<String> = Vec::new();
+            if ingest {
+                drafts.push(Draft::new(
+                    crate::oplog::kind::CURSOR_SET,
+                    "admin",
+                    &ts,
+                    json!({"module": "mail", "account": account_id, "cursor": {
+                        "backfill_status": "pending",
+                    }}),
+                ));
+            } else {
+                // mailbox_ids_json is a JSON array of jmap ids; the quoted-id
+                // containment match is exact enough (ids are server-issued and
+                // never substrings of each other in practice).
+                let needle = format!("%\"{jmap_id}\"%");
+                affected = {
+                    let mut stmt = core.conn().prepare(
+                        "SELECT id FROM mail_messages WHERE account_id = ?1 AND mailbox_ids_json LIKE ?2",
+                    )?;
+                    let rows =
+                        stmt.query_map(rusqlite::params![account_id, needle], |r| r.get(0))?;
+                    rows.collect::<rusqlite::Result<Vec<_>>>()?
+                };
+                for mid in &affected {
+                    drafts.push(Draft::new(
+                        crate::oplog::kind::MODULE_DOC,
+                        "admin",
+                        &ts,
+                        json!({"module": "mail", "doc_kind": "message", "id": mid, "fields": {
+                            "embed_state": "skip",
+                        }}),
+                    ));
+                }
             }
-        }
-        tx.commit().await?;
-        Ok(true)
+            core.commit(drafts)?;
+            if !ingest {
+                // Retrieval drop is command-layer business (mail FTS is not
+                // fold-maintained): search rows + vectors leave immediately.
+                for mid in &affected {
+                    core.conn().execute(
+                        "DELETE FROM search WHERE kind = 'mail' AND ref_id = ?1",
+                        rusqlite::params![mid],
+                    )?;
+                    core.index.remove_embeddings("mail", mid)?;
+                }
+            }
+            Ok(true)
+        })
+        .await
     }
 }
 
@@ -603,12 +705,118 @@ fn mail_message_select(suffix: &str) -> String {
     )
 }
 
+fn mail_account_owner_core(core: &Core, id: &str) -> Result<Option<String>> {
+    Ok(core
+        .conn()
+        .query_row(
+            "SELECT owner FROM mail_accounts WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+fn mail_account_admin_view_core(core: &Core, id: &str) -> Result<Option<MailAccountAdminView>> {
+    Ok(core
+        .conn()
+        .query_row(
+            &format!("{MAIL_ACCOUNT_ADMIN_SELECT} WHERE id = ?1"),
+            rusqlite::params![id],
+            row_to_admin_view,
+        )
+        .optional()?)
+}
+
+/// Fill the attachment chips for a set of thread messages (one query).
+fn attach_chips(core: &Core, messages: &mut [MailThreadMessage]) -> Result<()> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<String> = messages.iter().map(|m| m.summary.id.clone()).collect();
+    let sql = format!(
+        "SELECT id, message_id, filename, mime, size, (blob_hash IS NOT NULL) AS stored \
+         FROM mail_attachments WHERE message_id IN ({}) ORDER BY created_at ASC, id ASC",
+        super::placeholders_or_never(ids.len())
+    );
+    let mut stmt = core.conn().prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, i64>(4)?,
+            r.get::<_, bool>(5)?,
+        ))
+    })?;
+    for row in rows {
+        let (id, message_id, filename, mime, size, stored) = row?;
+        if let Some(m) = messages.iter_mut().find(|m| m.summary.id == message_id) {
+            m.attachments.push(MailAttachmentChip {
+                id,
+                filename,
+                mime,
+                size,
+                stored,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn mail_message_rows(
+    core: &Core,
+    query: Option<&str>,
+    account_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<MailMessageRow>> {
+    let limit = limit.clamp(1, 200);
+    let mut clauses: Vec<&str> = Vec::new();
+    if account_id.is_some() {
+        clauses.push("m.account_id = ?");
+    }
+    let trimmed = query.map(str::trim).filter(|q| !q.is_empty());
+    if trimmed.is_some() {
+        // SQLite LIKE is ASCII case-insensitive by default — the ILIKE port.
+        clauses.push("(m.subject LIKE ? OR m.from_addr LIKE ? OR COALESCE(m.from_name, '') LIKE ? OR m.snippet LIKE ? OR m.body_text LIKE ? OR m.keywords_json LIKE ?)");
+    }
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {} ", clauses.join(" AND "))
+    };
+    let deleted_filter = if where_sql.is_empty() {
+        "WHERE m.deleted_at IS NULL "
+    } else {
+        "AND m.deleted_at IS NULL "
+    };
+    let sql = mail_message_select(&format!(
+        "{where_sql}{deleted_filter}ORDER BY m.received_at DESC LIMIT ?"
+    ));
+    let mut binds: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    if let Some(account_id) = account_id {
+        binds.push(Box::new(account_id.to_string()));
+    }
+    if let Some(term) = trimmed {
+        let needle = format!("%{term}%");
+        for _ in 0..6 {
+            binds.push(Box::new(needle.clone()));
+        }
+    }
+    binds.push(Box::new(limit));
+    let mut stmt = core.conn().prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref())),
+        row_to_message,
+    )?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 // ---- ingest (the mail-sync sink; DIRECTION.md D6/D10) --------------------
 //
 // The mail sync driver (the retired daemon, then the Phase 3 module)
 // implements jmap-sync's MailSink/CursorStore by delegating here, so every
-// write stays in the store layer (and under test_pool). The api crate
-// deliberately does NOT depend on jmap-sync — MailIngestMessage mirrors its
+// write stays in the store layer. MailIngestMessage mirrors jmap-sync's
 // NormalizedMessage as plain fields.
 
 /// Attachment metadata as mail sync hands it over (mirrors jmap-sync's
@@ -664,7 +872,7 @@ pub struct MailIngestOutcome {
 }
 
 /// Everything the daemon needs to sync one account, minus the secret.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct MailAccountSync {
     pub id: String,
     pub owner: String,
@@ -680,8 +888,8 @@ pub struct MailAccountSync {
     pub attempts: i64,
 }
 
-/// tsvector input has a hard ~1MB limit a large newsletter can hit; clip on a
-/// char boundary well below it (DIRECTION.md seam 2).
+/// FTS input has practical size limits a large newsletter can hit; clip on a
+/// char boundary well below them (DIRECTION.md seam 2).
 pub fn fts_clip(body: &str, max_bytes: usize) -> &str {
     if body.len() <= max_bytes {
         return body;
@@ -739,27 +947,49 @@ pub const MAIL_EMBED_ELIGIBLE_SQL: &str = "m.deleted_at IS NULL \
 impl Store {
     /// Enabled accounts whose backoff window has elapsed.
     pub async fn mail_accounts_due(&self) -> Result<Vec<MailAccountSync>> {
-        Ok(crate::pgq::query_as::<MailAccountSync>(
-            "SELECT id, owner, address, jmap_url, jmap_username, jmap_account_id, cred_id, \
-             email_state, mailbox_state, backfill_status, backfill_cursor, attempts \
-             FROM mail_accounts WHERE enabled AND (next_attempt_at IS NULL OR next_attempt_at <= ?) \
-             ORDER BY id",
-        )
-        .bind(now_iso())
-        .fetch_all(self.db())
-        .await?)
+        self.run(|core| {
+            let mut stmt = core.conn().prepare(
+                "SELECT id, owner, address, jmap_url, jmap_username, jmap_account_id, cred_id, \
+                 email_state, mailbox_state, backfill_status, backfill_cursor, attempts \
+                 FROM mail_accounts WHERE enabled AND (next_attempt_at IS NULL OR next_attempt_at <= ?1) \
+                 ORDER BY id",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![now_iso()], |r| {
+                Ok(MailAccountSync {
+                    id: r.get(0)?,
+                    owner: r.get(1)?,
+                    address: r.get(2)?,
+                    jmap_url: r.get(3)?,
+                    jmap_username: r.get(4)?,
+                    jmap_account_id: r.get(5)?,
+                    cred_id: r.get(6)?,
+                    email_state: r.get(7)?,
+                    mailbox_state: r.get(8)?,
+                    backfill_status: r.get(9)?,
+                    backfill_cursor: r
+                        .get::<_, Option<String>>(10)?
+                        .and_then(|s| serde_json::from_str(&s).ok()),
+                    attempts: r.get(11)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
     }
 
     pub async fn mail_account_set_jmap_id(&self, id: &str, jmap_account_id: &str) -> Result<()> {
-        crate::pgq::query(
-            "UPDATE mail_accounts SET jmap_account_id = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(jmap_account_id)
-        .bind(now_iso())
-        .bind(id)
-        .execute(self.db())
-        .await?;
-        Ok(())
+        let (id, jmap_account_id) = (id.to_string(), jmap_account_id.to_string());
+        self.run(move |core| {
+            core.commit(vec![Draft::new(
+                crate::oplog::kind::MODULE_DOC,
+                "admin",
+                &now_iso(),
+                json!({"module": "mail", "doc_kind": "account", "id": id, "fields": {
+                    "jmap_account_id": jmap_account_id, "updated_at": now_iso(),
+                }}),
+            )])
+        })
+        .await
     }
 
     /// The persisted sync cursor: (email_state, mailbox_state,
@@ -773,31 +1003,37 @@ impl Store {
         String,
         Option<serde_json::Value>,
     )> {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            email_state: Option<String>,
-            mailbox_state: Option<String>,
-            backfill_status: String,
-            backfill_cursor: Option<serde_json::Value>,
-        }
-        let row = crate::pgq::query_as::<Row>(
-            "SELECT email_state, mailbox_state, backfill_status, backfill_cursor \
-             FROM mail_accounts WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(self.db())
-        .await?
-        .ok_or_else(|| anyhow!("mail account {id} not found"))?;
-        Ok((
-            row.email_state,
-            row.mailbox_state,
-            row.backfill_status,
-            row.backfill_cursor,
-        ))
+        let id = id.to_string();
+        self.run(move |core| {
+            let row = core
+                .conn()
+                .query_row(
+                    "SELECT email_state, mailbox_state, backfill_status, backfill_cursor \
+                     FROM mail_accounts WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| {
+                        Ok((
+                            r.get::<_, Option<String>>(0)?,
+                            r.get::<_, Option<String>>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| anyhow!("mail account {id} not found"))?;
+            Ok((
+                row.0,
+                row.1,
+                row.2,
+                row.3.and_then(|s| serde_json::from_str(&s).ok()),
+            ))
+        })
+        .await
     }
 
     /// Persist sync state. Backfill status/cursor and the two JMAP state
-    /// strings are the whole cursor (DIRECTION.md D5).
+    /// strings are the whole cursor (DIRECTION.md D5) — one cursor.set record.
     pub async fn mail_cursor_save(
         &self,
         id: &str,
@@ -806,65 +1042,92 @@ impl Store {
         backfill_status: &str,
         backfill_cursor: Option<&serde_json::Value>,
     ) -> Result<()> {
-        crate::pgq::query(
-            "UPDATE mail_accounts SET email_state = ?, mailbox_state = ?, backfill_status = ?, \
-             backfill_cursor = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(email_state)
-        .bind(mailbox_state)
-        .bind(backfill_status)
-        .bind(backfill_cursor)
-        .bind(now_iso())
-        .bind(id)
-        .execute(self.db())
-        .await?;
-        Ok(())
+        let payload = json!({"module": "mail", "account": id, "cursor": {
+            "email_state": email_state,
+            "mailbox_state": mailbox_state,
+            "backfill_status": backfill_status,
+            "backfill_cursor": backfill_cursor.map(|v| v.to_string()),
+        }});
+        self.run(move |core| {
+            core.commit(vec![Draft::new(
+                crate::oplog::kind::CURSOR_SET,
+                "system",
+                &now_iso(),
+                payload,
+            )])
+        })
+        .await
     }
 
     pub async fn mail_account_mark_ok(&self, id: &str) -> Result<()> {
-        crate::pgq::query(
-            "UPDATE mail_accounts SET attempts = 0, next_attempt_at = NULL, last_error = NULL, \
-             last_status = 'ok', last_synced_at = ?, updated_at = ? WHERE id = ?",
-        )
-        .bind(now_iso())
-        .bind(now_iso())
-        .bind(id)
-        .execute(self.db())
-        .await?;
-        Ok(())
+        let id = id.to_string();
+        self.run(move |core| {
+            core.commit(vec![Draft::new(
+                crate::oplog::kind::CURSOR_SET,
+                "system",
+                &now_iso(),
+                json!({"module": "mail", "account": id, "cursor": {
+                    "attempts": 0, "next_attempt_at": null, "last_error": null,
+                    "last_status": "ok", "last_synced_at": now_iso(),
+                }}),
+            )])
+        })
+        .await
     }
 
     /// Outbox-style backoff at the account level; after 8 attempts the
     /// account disables itself and the caller notifies its owner loudly
     /// (D5: sources' silent retry-forever is the known-bad pattern).
     pub async fn mail_account_mark_failed(&self, id: &str, error: &str) -> Result<bool> {
-        let attempts: i64 = crate::pgq::query_scalar::<i64>(
-            "UPDATE mail_accounts SET attempts = attempts + 1, last_error = ?, \
-             last_status = 'error', updated_at = ? WHERE id = ? RETURNING attempts",
-        )
-        .bind(fts_clip(error, 2000))
-        .bind(now_iso())
-        .bind(id)
-        .fetch_one(self.db())
-        .await?;
-        if attempts >= 8 {
-            crate::pgq::query(
-                "UPDATE mail_accounts SET enabled = FALSE, next_attempt_at = NULL WHERE id = ?",
-            )
-            .bind(id)
-            .execute(self.db())
-            .await?;
-            return Ok(true);
-        }
-        let delay = super::outbox::backoff_secs(attempts);
-        let next = (chrono::Utc::now() + chrono::Duration::seconds(delay))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        crate::pgq::query("UPDATE mail_accounts SET next_attempt_at = ? WHERE id = ?")
-            .bind(next)
-            .bind(id)
-            .execute(self.db())
-            .await?;
-        Ok(false)
+        let (id, error) = (id.to_string(), error.to_string());
+        self.run(move |core| {
+            let prior: i64 = core
+                .conn()
+                .query_row(
+                    "SELECT attempts FROM mail_accounts WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| anyhow!("mail account {id} not found"))?;
+            let attempts = prior + 1;
+            let ts = now_iso();
+            let mut cursor = json!({
+                "attempts": attempts,
+                "last_error": fts_clip(&error, 2000),
+                "last_status": "error",
+            });
+            let disable = attempts >= 8;
+            let mut drafts = Vec::new();
+            if disable {
+                cursor["next_attempt_at"] = serde_json::Value::Null;
+                drafts.push(Draft::new(
+                    crate::oplog::kind::MODULE_DOC,
+                    "system",
+                    &ts,
+                    json!({"module": "mail", "doc_kind": "account", "id": id, "fields": {
+                        "enabled": false, "updated_at": ts,
+                    }}),
+                ));
+            } else {
+                let delay = super::outbox::backoff_secs(attempts);
+                let next = (chrono::Utc::now() + chrono::Duration::seconds(delay))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                cursor["next_attempt_at"] = serde_json::Value::String(next);
+            }
+            drafts.insert(
+                0,
+                Draft::new(
+                    crate::oplog::kind::CURSOR_SET,
+                    "system",
+                    &ts,
+                    json!({"module": "mail", "account": id, "cursor": cursor}),
+                ),
+            );
+            core.commit(drafts)?;
+            Ok(disable)
+        })
+        .await
     }
 
     /// Upsert mailbox names/roles; never flips an existing row's ingest flag
@@ -874,244 +1137,265 @@ impl Store {
         account_id: &str,
         boxes: &[(String, String, Option<String>, i64)],
     ) -> Result<()> {
-        let mut tx = self.db().begin().await?;
-        for (jmap_id, name, role, sort_order) in boxes {
-            crate::pgq::query(
-                "INSERT INTO mail_mailboxes (id, account_id, jmap_id, name, role, sort_order) \
-                 VALUES (?, ?, ?, ?, ?, ?) \
-                 ON CONFLICT (account_id, jmap_id) DO UPDATE SET name = excluded.name, \
-                 role = excluded.role, sort_order = excluded.sort_order",
-            )
-            .bind(new_id("mbox"))
-            .bind(account_id)
-            .bind(jmap_id)
-            .bind(name)
-            .bind(role)
-            .bind(sort_order)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(())
+        let account_id = account_id.to_string();
+        let boxes = boxes.to_vec();
+        self.run(move |core| {
+            let ts = now_iso();
+            let mut drafts = Vec::new();
+            for (jmap_id, name, role, sort_order) in &boxes {
+                let existing: Option<String> = core
+                    .conn()
+                    .query_row(
+                        "SELECT id FROM mail_mailboxes WHERE account_id = ?1 AND jmap_id = ?2",
+                        rusqlite::params![account_id, jmap_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                match existing {
+                    // Existing row: name/role/sort_order refresh; ingest is
+                    // operator intent and is deliberately NOT carried.
+                    Some(id) => drafts.push(Draft::new(
+                        crate::oplog::kind::MODULE_DOC,
+                        "system",
+                        &ts,
+                        json!({"module": "mail", "doc_kind": "mailbox", "id": id, "fields": {
+                            "name": name, "role": role, "sort_order": sort_order,
+                        }}),
+                    )),
+                    None => drafts.push(Draft::new(
+                        crate::oplog::kind::MODULE_DOC,
+                        "system",
+                        &ts,
+                        json!({"module": "mail", "doc_kind": "mailbox", "id": new_id("mbox"), "fields": {
+                            "account_id": account_id, "jmap_id": jmap_id,
+                            "name": name, "role": role, "sort_order": sort_order,
+                        }}),
+                    )),
+                }
+            }
+            core.commit(drafts)
+        })
+        .await
     }
 
     /// (ingest-enabled jmap ids, inbox-role jmap ids) for one account.
     pub async fn mail_mailbox_sets(
         &self,
         account_id: &str,
-    ) -> Result<(
-        std::collections::HashSet<String>,
-        std::collections::HashSet<String>,
-    )> {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            jmap_id: String,
-            role: Option<String>,
-            ingest: bool,
-        }
-        let rows = crate::pgq::query_as::<Row>(
-            "SELECT jmap_id, role, ingest FROM mail_mailboxes WHERE account_id = ?",
-        )
-        .bind(account_id)
-        .fetch_all(self.db())
-        .await?;
-        let mut ingest = std::collections::HashSet::new();
-        let mut inbox = std::collections::HashSet::new();
-        for r in rows {
-            if r.ingest {
-                ingest.insert(r.jmap_id.clone());
+    ) -> Result<(HashSet<String>, HashSet<String>)> {
+        let account_id = account_id.to_string();
+        self.run(move |core| {
+            let mut stmt = core.conn().prepare(
+                "SELECT jmap_id, role, ingest FROM mail_mailboxes WHERE account_id = ?1",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![account_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
+            })?;
+            let mut ingest = HashSet::new();
+            let mut inbox = HashSet::new();
+            for row in rows {
+                let (jmap_id, role, ing) = row?;
+                if ing {
+                    ingest.insert(jmap_id.clone());
+                }
+                if role.as_deref() == Some("inbox") {
+                    inbox.insert(jmap_id);
+                }
             }
-            if r.role.as_deref() == Some("inbox") {
-                inbox.insert(r.jmap_id);
-            }
-        }
-        Ok((ingest, inbox))
+            Ok((ingest, inbox))
+        })
+        .await
     }
 
     /// Every stored jmap_id including tombstoned rows — the reconciliation
     /// diff base (never re-fetching known ids is what keeps redaction sticky).
-    pub async fn mail_known_jmap_ids(
-        &self,
-        account_id: &str,
-    ) -> Result<std::collections::HashSet<String>> {
-        let rows = crate::pgq::query("SELECT jmap_id FROM mail_messages WHERE account_id = ?")
-            .bind(account_id)
-            .fetch_all(self.db())
-            .await?;
-        let mut out = std::collections::HashSet::with_capacity(rows.len());
-        for r in &rows {
-            out.insert(r.try_get::<String, _>("jmap_id")?);
-        }
-        Ok(out)
+    pub async fn mail_known_jmap_ids(&self, account_id: &str) -> Result<HashSet<String>> {
+        let account_id = account_id.to_string();
+        self.run(move |core| {
+            let mut stmt = core
+                .conn()
+                .prepare("SELECT jmap_id FROM mail_messages WHERE account_id = ?1")?;
+            let rows = stmt.query_map(rusqlite::params![account_id], |r| r.get(0))?;
+            Ok(rows.collect::<rusqlite::Result<HashSet<String>>>()?)
+        })
+        .await
     }
 
-    /// The sink's upsert: one transaction per batch; idempotent on
-    /// (account_id, jmap_id); the conflict arm touches ONLY mutable metadata
-    /// (mailbox_ids, keywords) so replays are no-ops, moves/flags apply (D6),
-    /// and admin redaction can never be re-hydrated by sync. FTS membership
-    /// re-evaluates in the same transaction: ingest-enabled ∩ not-junk rows
-    /// are searchable the moment they commit, everything else leaves search
-    /// AND embeddings immediately.
+    /// The sink's upsert, as records: one batch per call; idempotent on
+    /// (account_id, jmap_id) via the command layer's existing-row probe. On
+    /// replays the record carries ONLY mutable metadata (mailbox_ids,
+    /// keywords) so bodies never rewrite, moves/flags apply (D6), and admin
+    /// redaction can never be re-hydrated by sync. FTS membership re-evaluates
+    /// in the same pass: ingest-enabled ∩ not-junk rows are searchable the
+    /// moment the batch lands, everything else leaves search AND embeddings
+    /// immediately.
     pub async fn mail_ingest_batch(
         &self,
         account_id: &str,
         owner: &str,
-        ingest_ids: &std::collections::HashSet<String>,
-        inbox_ids: &std::collections::HashSet<String>,
+        ingest_ids: &HashSet<String>,
+        inbox_ids: &HashSet<String>,
         msgs: Vec<MailIngestMessage>,
     ) -> Result<MailIngestOutcome> {
-        let mut out = MailIngestOutcome::default();
         if msgs.is_empty() {
-            return Ok(out);
+            return Ok(MailIngestOutcome::default());
         }
-        let mut tx = self.db().begin().await?;
-        for m in &msgs {
-            let eligible = m.mailbox_ids.iter().any(|id| ingest_ids.contains(id))
-                && !m.keywords.iter().any(|k| k == "$junk");
-            let embed_on_insert = if eligible && m.parse_error.is_none() {
-                "pending"
-            } else {
-                "skip"
-            };
-            #[derive(sqlx::FromRow)]
-            struct Upserted {
-                id: String,
-                inserted: bool,
-            }
-            // xmax = 0 exposes insert-vs-update through ON CONFLICT.
-            let row = crate::pgq::query_as::<Upserted>(
-                "INSERT INTO mail_messages (id, account_id, user_scope, jmap_id, jmap_thread_id, \
-                 message_id_hdr, in_reply_to, references_json, from_addr, from_name, to_json, \
-                 cc_json, reply_to_json, subject, sent_at, received_at, mailbox_ids_json, \
-                 keywords_json, body_text, body_source, snippet, size, has_attachments, \
-                 embed_state, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-                 ON CONFLICT (account_id, jmap_id) DO UPDATE SET \
-                 mailbox_ids_json = excluded.mailbox_ids_json, \
-                 keywords_json = excluded.keywords_json, \
-                 updated_at = excluded.updated_at \
-                 RETURNING id, (xmax = 0) AS inserted",
-            )
-            .bind(new_id("mail"))
-            .bind(account_id)
-            .bind(owner)
-            .bind(&m.jmap_id)
-            .bind(&m.thread_id)
-            .bind(&m.message_id_hdr)
-            .bind(&m.in_reply_to)
-            .bind(&m.references_json)
-            .bind(&m.from_addr)
-            .bind(&m.from_name)
-            .bind(&m.to_json)
-            .bind(&m.cc_json)
-            .bind(&m.reply_to_json)
-            .bind(&m.subject)
-            .bind(&m.sent_at)
-            .bind(&m.received_at)
-            .bind(&m.mailbox_ids_json)
-            .bind(&m.keywords_json)
-            .bind(&m.body_text)
-            .bind(&m.body_source)
-            .bind(&m.snippet)
-            .bind(m.size)
-            .bind(m.has_attachments)
-            .bind(embed_on_insert)
-            .bind(&m.received_at)
-            .bind(now_iso())
-            .fetch_one(&mut *tx)
-            .await?;
-
-            // Tombstoned rows keep their (account_id, jmap_id) key, so a
-            // replay or move lands on the conflict arm — never resurrect
-            // them into search.
-            let deleted: Option<String> = crate::pgq::query_scalar::<String>(
-                "SELECT deleted_at FROM mail_messages WHERE id = ? AND deleted_at IS NOT NULL",
-            )
-            .bind(&row.id)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let live_eligible = eligible && deleted.is_none();
-
-            // Attachment metadata rows; blob_hash stays NULL (= bytes
-            // pending) until the fetch pipeline stores them. Replays land on
-            // DO NOTHING via the NULLS-NOT-DISTINCT unique key. Tombstoned
-            // rows (incl. admin-redacted ones, whose attachment rows were
-            // deleted) get nothing back — otherwise a metadata replay would
-            // re-queue redacted bytes for download.
-            if deleted.is_none() {
-                for att in &m.attachments {
-                    crate::pgq::query(
-                        "INSERT INTO mail_attachments (id, message_id, jmap_blob_id, filename, \
-                         mime, size, content_id, disposition, created_at) \
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-                         ON CONFLICT (message_id, jmap_blob_id, content_id) DO NOTHING",
+        let account_id = account_id.to_string();
+        let owner = owner.to_string();
+        let ingest_ids = ingest_ids.clone();
+        let inbox_ids = inbox_ids.clone();
+        self.run(move |core| {
+            let mut out = MailIngestOutcome::default();
+            let ts = now_iso();
+            let mut drafts: Vec<Draft> = Vec::new();
+            // (id, live_eligible, inserted, subject, clipped body) per message,
+            // applied to search after the fold lands the rows.
+            let mut post: Vec<(String, bool, String, String)> = Vec::new();
+            for m in &msgs {
+                let eligible = m.mailbox_ids.iter().any(|id| ingest_ids.contains(id))
+                    && !m.keywords.iter().any(|k| k == "$junk");
+                let existing: Option<(String, Option<String>, String)> = core
+                    .conn()
+                    .query_row(
+                        "SELECT id, deleted_at, embed_state FROM mail_messages \
+                         WHERE account_id = ?1 AND jmap_id = ?2",
+                        rusqlite::params![account_id, m.jmap_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                     )
-                    .bind(new_id("matt"))
-                    .bind(&row.id)
-                    .bind(&att.jmap_blob_id)
-                    .bind(&att.filename)
-                    .bind(&att.mime)
-                    .bind(att.size)
-                    .bind(&att.content_id)
-                    .bind(&att.disposition)
-                    .bind(now_iso())
-                    .execute(&mut *tx)
-                    .await?;
+                    .optional()?;
+                let (id, deleted, embed_state, inserted) = match &existing {
+                    Some((id, deleted, embed_state)) => {
+                        (id.clone(), deleted.clone(), embed_state.clone(), false)
+                    }
+                    None => (new_id("mail"), None, String::new(), true),
+                };
+                let live_eligible = eligible && deleted.is_none();
+
+                if inserted {
+                    let embed_on_insert = if eligible && m.parse_error.is_none() {
+                        "pending"
+                    } else {
+                        "skip"
+                    };
+                    drafts.push(Draft::new(
+                        crate::oplog::kind::MODULE_DOC,
+                        &owner,
+                        &ts,
+                        json!({"module": "mail", "doc_kind": "message", "id": id, "fields": {
+                            "account_id": account_id, "user_scope": owner,
+                            "jmap_id": m.jmap_id, "jmap_thread_id": m.thread_id,
+                            "message_id_hdr": m.message_id_hdr, "in_reply_to": m.in_reply_to,
+                            "references_json": m.references_json,
+                            "from_addr": m.from_addr, "from_name": m.from_name,
+                            "to_json": m.to_json, "cc_json": m.cc_json,
+                            "reply_to_json": m.reply_to_json,
+                            "subject": m.subject, "sent_at": m.sent_at,
+                            "received_at": m.received_at,
+                            "mailbox_ids_json": m.mailbox_ids_json,
+                            "keywords_json": m.keywords_json,
+                            "body_text": m.body_text, "body_source": m.body_source,
+                            "snippet": m.snippet, "size": m.size,
+                            "has_attachments": m.has_attachments,
+                            "embed_state": embed_on_insert,
+                            "created_at": m.received_at, "updated_at": ts,
+                        }}),
+                    ));
+                } else {
+                    // Replay/delta: mutable metadata ONLY — bodies are
+                    // immutable on conflict (redaction durability).
+                    let mut fields = json!({
+                        "mailbox_ids_json": m.mailbox_ids_json,
+                        "keywords_json": m.keywords_json,
+                        "updated_at": ts,
+                    });
+                    if live_eligible && embed_state == "skip" {
+                        // A move back INTO ingest re-queues a previously
+                        // skipped row.
+                        fields["embed_state"] = json!("pending");
+                    } else if !live_eligible && embed_state != "skip" {
+                        fields["embed_state"] = json!("skip");
+                    }
+                    drafts.push(Draft::new(
+                        crate::oplog::kind::MODULE_DOC,
+                        &owner,
+                        &ts,
+                        json!({"module": "mail", "doc_kind": "message", "id": id, "fields": fields}),
+                    ));
+                }
+
+                // Attachment metadata rows; blob_hash stays NULL (= bytes
+                // pending) until the fetch pipeline stores them. Replays are
+                // absorbed by the existing-row probe (the Postgres NULLS-NOT-
+                // DISTINCT DO NOTHING). Tombstoned rows (incl. admin-redacted
+                // ones, whose attachment rows were deleted) get nothing back —
+                // otherwise a metadata replay would re-queue redacted bytes.
+                if deleted.is_none() {
+                    for att in &m.attachments {
+                        let dup: bool = core.conn().query_row(
+                            "SELECT EXISTS(SELECT 1 FROM mail_attachments WHERE message_id = ?1 \
+                             AND jmap_blob_id = ?2 AND COALESCE(content_id, '') = COALESCE(?3, ''))",
+                            rusqlite::params![id, att.jmap_blob_id, att.content_id],
+                            |r| r.get(0),
+                        )?;
+                        if dup {
+                            continue;
+                        }
+                        drafts.push(Draft::new(
+                            crate::oplog::kind::MODULE_DOC,
+                            &owner,
+                            &ts,
+                            json!({"module": "mail", "doc_kind": "attachment", "id": new_id("matt"), "fields": {
+                                "message_id": id, "jmap_blob_id": att.jmap_blob_id,
+                                "filename": att.filename, "mime": att.mime,
+                                "size": att.size, "content_id": att.content_id,
+                                "disposition": att.disposition, "created_at": ts,
+                            }}),
+                        ));
+                    }
+                }
+
+                if inserted && live_eligible && m.mailbox_ids.iter().any(|x| inbox_ids.contains(x))
+                {
+                    out.notify.push((id.clone(), m.subject.clone()));
+                }
+                post.push((
+                    id,
+                    live_eligible,
+                    if m.subject.trim().is_empty() {
+                        "(no subject)".to_string()
+                    } else {
+                        m.subject.clone()
+                    },
+                    fts_clip(&m.body_text, FTS_CLIP_BYTES).to_string(),
+                ));
+                out.stored += 1;
+            }
+            core.commit(drafts)?;
+
+            // FTS membership (command-layer business — see module header).
+            for (id, live_eligible, title, body) in &post {
+                if *live_eligible {
+                    super::search::index_entity_conn(core.conn(), "mail", id, title, body, &[])?;
+                } else {
+                    core.conn().execute(
+                        "DELETE FROM search WHERE kind = 'mail' AND ref_id = ?1",
+                        rusqlite::params![id],
+                    )?;
+                    core.index.remove_embeddings("mail", id)?;
                 }
             }
-
-            if live_eligible {
-                let title = if m.subject.trim().is_empty() {
-                    "(no subject)"
-                } else {
-                    m.subject.as_str()
-                };
-                super::search::index_entity_conn(
-                    &mut tx,
-                    "mail",
-                    &row.id,
-                    title,
-                    fts_clip(&m.body_text, FTS_CLIP_BYTES),
-                    &[],
-                )
-                .await?;
-                // A move back INTO ingest re-queues a previously skipped row.
-                crate::pgq::query(
-                    "UPDATE mail_messages SET embed_state = 'pending' \
-                     WHERE id = ? AND embed_state = 'skip'",
-                )
-                .bind(&row.id)
-                .execute(&mut *tx)
-                .await?;
-            } else {
-                crate::pgq::query("DELETE FROM search WHERE kind = 'mail' AND ref_id = ?")
-                    .bind(&row.id)
-                    .execute(&mut *tx)
-                    .await?;
-                crate::pgq::query("DELETE FROM embeddings WHERE ref_kind = 'mail' AND ref_id = ?")
-                    .bind(&row.id)
-                    .execute(&mut *tx)
-                    .await?;
-                crate::pgq::query("UPDATE mail_messages SET embed_state = 'skip' WHERE id = ?")
-                    .bind(&row.id)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-
-            if row.inserted
-                && live_eligible
-                && m.mailbox_ids.iter().any(|id| inbox_ids.contains(id))
-            {
-                out.notify.push((row.id.clone(), m.subject.clone()));
-            }
-            out.stored += 1;
-        }
-        tx.commit().await?;
-        Ok(out)
+            Ok(out)
+        })
+        .await
     }
 
-    /// JMAP destroys: tombstone + drop retrieval rows in the SAME transaction
-    /// (D6 — deleted mail must not stay searchable until a sweep).
+    /// JMAP destroys: tombstone records (the fold soft-deletes the row, drops
+    /// its attachments metadata, FTS, and vectors — D6: deleted mail must not
+    /// stay searchable until a sweep).
     pub async fn mail_tombstone_batch(
         &self,
         account_id: &str,
@@ -1120,40 +1404,46 @@ impl Store {
         if jmap_ids.is_empty() {
             return Ok(0);
         }
-        let mut tx = self.db().begin().await?;
-        let mut n = 0usize;
-        for jmap_id in jmap_ids {
-            let Some(id) = crate::pgq::query_scalar::<String>(
-                "UPDATE mail_messages SET deleted_at = ?, embed_state = 'skip' \
-                 WHERE account_id = ? AND jmap_id = ? AND deleted_at IS NULL RETURNING id",
-            )
-            .bind(now_iso())
-            .bind(account_id)
-            .bind(jmap_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            else {
-                continue;
-            };
-            crate::pgq::query("DELETE FROM search WHERE kind = 'mail' AND ref_id = ?")
-                .bind(&id)
-                .execute(&mut *tx)
-                .await?;
-            crate::pgq::query("DELETE FROM embeddings WHERE ref_kind = 'mail' AND ref_id = ?")
-                .bind(&id)
-                .execute(&mut *tx)
-                .await?;
-            n += 1;
-        }
-        tx.commit().await?;
-        Ok(n)
+        let account_id = account_id.to_string();
+        let jmap_ids = jmap_ids.to_vec();
+        self.run(move |core| {
+            let ts = now_iso();
+            let mut drafts = Vec::new();
+            let mut doomed: Vec<String> = Vec::new();
+            for jmap_id in &jmap_ids {
+                let id: Option<String> = core
+                    .conn()
+                    .query_row(
+                        "SELECT id FROM mail_messages WHERE account_id = ?1 AND jmap_id = ?2 AND deleted_at IS NULL",
+                        rusqlite::params![account_id, jmap_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let Some(id) = id else { continue };
+                drafts.push(Draft::new(
+                    crate::oplog::kind::TOMBSTONE,
+                    "system",
+                    &ts,
+                    json!({"kind": "mail", "id": id}),
+                ));
+                doomed.push(id);
+            }
+            let n = doomed.len();
+            core.commit(drafts)?;
+            // The fold dropped the persisted vectors; forget the ANN entries too.
+            for id in &doomed {
+                core.index.remove_embeddings("mail", id)?;
+            }
+            Ok(n)
+        })
+        .await
     }
 }
 
 // ---- attachments (byte pipeline + serving + GC; plan A6) ------------------
 
 /// One attachment awaiting bytes, as the fetch pipeline consumes it.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone)]
 pub struct MailAttachmentPending {
     pub id: String,
     pub jmap_blob_id: String,
@@ -1162,9 +1452,10 @@ pub struct MailAttachmentPending {
     pub size: i64,
 }
 
-/// Everything the serving route needs, resolved in one query. `data` rides
-/// along because household-scale attachments are ≤ the fetch cap anyway.
-#[derive(Debug, Clone, sqlx::FromRow)]
+/// Everything the serving path needs, resolved in one query + a blockstore
+/// read. `data` rides along because household-scale attachments are ≤ the
+/// fetch cap anyway.
+#[derive(Debug, Clone)]
 pub struct MailAttachmentServe {
     pub user_scope: String,
     pub filename: String,
@@ -1182,37 +1473,57 @@ impl Store {
         account_id: &str,
         limit: i64,
     ) -> Result<Vec<MailAttachmentPending>> {
-        Ok(crate::pgq::query_as::<MailAttachmentPending>(
-            "SELECT t.id, t.jmap_blob_id, t.mime, t.size FROM mail_attachments t \
-             JOIN mail_messages m ON m.id = t.message_id \
-             WHERE m.account_id = ? AND m.deleted_at IS NULL \
-             AND t.blob_hash IS NULL AND t.skipped_reason IS NULL \
-             ORDER BY t.created_at ASC, t.id ASC LIMIT ?",
-        )
-        .bind(account_id)
-        .bind(limit.clamp(1, 500))
-        .fetch_all(self.db())
-        .await?)
+        let account_id = account_id.to_string();
+        self.run(move |core| {
+            let mut stmt = core.conn().prepare(
+                "SELECT t.id, t.jmap_blob_id, t.mime, t.size FROM mail_attachments t \
+                 JOIN mail_messages m ON m.id = t.message_id \
+                 WHERE m.account_id = ?1 AND m.deleted_at IS NULL \
+                 AND t.blob_hash IS NULL AND t.skipped_reason IS NULL \
+                 ORDER BY t.created_at ASC, t.id ASC LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![account_id, limit.clamp(1, 500)], |r| {
+                Ok(MailAttachmentPending {
+                    id: r.get(0)?,
+                    jmap_blob_id: r.get(1)?,
+                    mime: r.get(2)?,
+                    size: r.get(3)?,
+                })
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
     }
 
     /// Permanently park an attachment ('oversize' | 'missing'); it leaves the
     /// pending queue and its chip renders dimmed. Never overwrites stored
     /// bytes.
     pub async fn mail_attachment_mark_skipped(&self, att_id: &str, reason: &str) -> Result<()> {
-        crate::pgq::query(
-            "UPDATE mail_attachments SET skipped_reason = ? WHERE id = ? AND blob_hash IS NULL",
-        )
-        .bind(reason)
-        .bind(att_id)
-        .execute(self.db())
-        .await?;
-        Ok(())
+        let (att_id, reason) = (att_id.to_string(), reason.to_string());
+        self.run(move |core| {
+            let unstored: bool = core.conn().query_row(
+                "SELECT EXISTS(SELECT 1 FROM mail_attachments WHERE id = ?1 AND blob_hash IS NULL)",
+                rusqlite::params![att_id],
+                |r| r.get(0),
+            )?;
+            if !unstored {
+                return Ok(());
+            }
+            core.commit(vec![Draft::new(
+                crate::oplog::kind::MODULE_DOC,
+                "system",
+                &now_iso(),
+                json!({"module": "mail", "doc_kind": "attachment", "id": att_id, "fields": {
+                    "skipped_reason": reason,
+                }}),
+            )])
+        })
+        .await
     }
 
-    /// Store fetched bytes content-addressed: blob insert dedups on hash
-    /// (identical attachments across messages share one row), then the
-    /// attachment points at it. One transaction so a crash can't leave the
-    /// pointer without the bytes.
+    /// Store fetched bytes content-addressed: the blockstore dedups blocks by
+    /// construction and blob_refs dedups on hash (identical attachments across
+    /// messages share one entry); the attachment metadata then points at it.
     pub async fn mail_attachment_store_blob(
         &self,
         att_id: &str,
@@ -1220,1115 +1531,224 @@ impl Store {
         mime: &str,
         bytes: &[u8],
     ) -> Result<()> {
-        let mut tx = self.db().begin().await?;
-        crate::pgq::query(
-            "INSERT INTO blobs (hash, size, mime, data, created_at) VALUES (?, ?, ?, ?, ?) \
-             ON CONFLICT (hash) DO NOTHING",
-        )
-        .bind(hash)
-        .bind(bytes.len() as i64)
-        .bind(mime)
-        .bind(bytes)
-        .bind(now_iso())
-        .execute(&mut *tx)
-        .await?;
-        crate::pgq::query(
-            "UPDATE mail_attachments SET blob_hash = ?, skipped_reason = NULL WHERE id = ?",
-        )
-        .bind(hash)
-        .bind(att_id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
+        let (att_id, hash, mime) = (att_id.to_string(), hash.to_string(), mime.to_string());
+        let bytes = bytes.to_vec();
+        self.run(move |core| {
+            let keys = core.keys.clone();
+            let blob = core.blocks.put(keys.as_ref(), &bytes, Some(&mime))?;
+            let mut raw = Vec::new();
+            ciborium::into_writer(&blob, &mut raw).map_err(|e| anyhow!("encoding BlobRef: {e}"))?;
+            core.conn().execute(
+                "INSERT OR IGNORE INTO blob_refs (hash, ref, size, mime, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![hash, raw, bytes.len() as i64, mime, now_iso()],
+            )?;
+            core.commit(vec![Draft::new(
+                crate::oplog::kind::MODULE_DOC,
+                "system",
+                &now_iso(),
+                json!({"module": "mail", "doc_kind": "attachment", "id": att_id, "fields": {
+                    "blob_hash": hash, "skipped_reason": null,
+                }}),
+            )])?;
+            Ok(())
+        })
+        .await
     }
 
-    /// The serving route's lookup: attachment joined to its owning message
-    /// for the user_scope ACL, bytes left-joined (NULL = not stored). By id
-    /// only — blobs are NEVER addressable by hash from the outside.
+    /// The serving path's lookup: attachment joined to its owning message
+    /// for the user_scope check, bytes fetched from the blockstore (None =
+    /// not stored). By id only — blobs are NEVER addressable by hash from the
+    /// outside.
     pub async fn mail_attachment_serve(&self, att_id: &str) -> Result<Option<MailAttachmentServe>> {
-        Ok(crate::pgq::query_as::<MailAttachmentServe>(
-            "SELECT m.user_scope, t.filename, t.mime, t.blob_hash, b.data \
-             FROM mail_attachments t \
-             JOIN mail_messages m ON m.id = t.message_id \
-             LEFT JOIN blobs b ON b.hash = t.blob_hash \
-             WHERE t.id = ?",
-        )
-        .bind(att_id)
-        .fetch_optional(self.db())
-        .await?)
+        let att_id = att_id.to_string();
+        self.run(move |core| {
+            let row: Option<(String, String, String, Option<String>)> = core
+                .conn()
+                .query_row(
+                    "SELECT m.user_scope, t.filename, t.mime, t.blob_hash \
+                     FROM mail_attachments t \
+                     JOIN mail_messages m ON m.id = t.message_id \
+                     WHERE t.id = ?1",
+                    rusqlite::params![att_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            let Some((user_scope, filename, mime, blob_hash)) = row else {
+                return Ok(None);
+            };
+            let data = match &blob_hash {
+                Some(hash) => read_blob(core, hash),
+                None => None,
+            };
+            Ok(Some(MailAttachmentServe {
+                user_scope,
+                filename,
+                mime,
+                blob_hash,
+                data,
+            }))
+        })
+        .await
     }
 
-    /// Admin redaction (plan A6): scrub the body columns, tombstone, and drop
-    /// every derived row (search, embeddings, attachments, now-orphaned
-    /// blobs) in one transaction. Durability is guaranteed by the ingest
-    /// conflict arm (metadata-only — body columns never rewritten), the
-    /// tombstone check gating attachment re-inserts, and reconcile never
+    /// Admin redaction (plan A6), as records: redact (columns clear, FTS +
+    /// vectors drop) + tombstone (soft delete + attachment rows drop) +
+    /// module.doc restoring the visible "[redacted]" subject and flags, then
+    /// runtime blob cleanup. Durability is guaranteed by the ingest replay
+    /// path (metadata-only on existing rows — body columns never rewritten),
+    /// the tombstone check gating attachment re-inserts, and reconcile never
     /// re-fetching known jmap ids. Returns the owning namespace for the
     /// caller's post-commit wire event; None = no such message.
     pub async fn mail_message_redact(&self, id: &str) -> Result<Option<String>> {
-        let mut tx = self.db().begin().await?;
-        let ts = now_iso();
-        let Some(owner) = crate::pgq::query_scalar::<String>(
-            "UPDATE mail_messages SET body_text = '', snippet = '', subject = '[redacted]', \
-             has_attachments = FALSE, deleted_at = ?, embed_state = 'skip', updated_at = ? \
-             WHERE id = ? RETURNING user_scope",
-        )
-        .bind(&ts)
-        .bind(&ts)
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?
-        else {
-            return Ok(None);
-        };
-        crate::pgq::query("DELETE FROM search WHERE kind = 'mail' AND ref_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        crate::pgq::query("DELETE FROM embeddings WHERE ref_kind = 'mail' AND ref_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        let hashes: Vec<String> = crate::pgq::query_scalar::<String>(
-            "SELECT DISTINCT blob_hash FROM mail_attachments \
-             WHERE message_id = ? AND blob_hash IS NOT NULL",
-        )
-        .bind(id)
-        .fetch_all(&mut *tx)
-        .await?;
-        crate::pgq::query("DELETE FROM mail_attachments WHERE message_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        for hash in &hashes {
-            crate::pgq::query(
-                "DELETE FROM blobs b WHERE b.hash = ? AND NOT EXISTS \
-                 (SELECT 1 FROM mail_attachments a WHERE a.blob_hash = b.hash)",
-            )
-            .bind(hash)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(Some(owner))
+        let id = id.to_string();
+        self.run(move |core| {
+            let owner: Option<String> = core
+                .conn()
+                .query_row(
+                    "SELECT user_scope FROM mail_messages WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(owner) = owner else {
+                return Ok(None);
+            };
+            let hashes: Vec<String> = {
+                let mut stmt = core.conn().prepare(
+                    "SELECT DISTINCT blob_hash FROM mail_attachments \
+                     WHERE message_id = ?1 AND blob_hash IS NOT NULL",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![id], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let ts = now_iso();
+            core.commit(vec![
+                Draft::new(
+                    crate::oplog::kind::REDACT,
+                    "admin",
+                    &ts,
+                    json!({"kind": "mail", "id": id}),
+                ),
+                Draft::new(
+                    crate::oplog::kind::TOMBSTONE,
+                    "admin",
+                    &ts,
+                    json!({"kind": "mail", "id": id}),
+                ),
+                Draft::new(
+                    crate::oplog::kind::MODULE_DOC,
+                    "admin",
+                    &ts,
+                    json!({"module": "mail", "doc_kind": "message", "id": id, "fields": {
+                        "subject": "[redacted]", "has_attachments": false,
+                        "embed_state": "skip", "updated_at": ts,
+                    }}),
+                ),
+            ])?;
+            core.index.remove_embeddings("mail", &id)?;
+            for hash in &hashes {
+                gc_blob_if_orphan(core, hash)?;
+            }
+            Ok(Some(owner))
+        })
+        .await
     }
 
-    /// Refcount blob GC (mail sync runs it weekly): delete blobs no
-    /// attachment points at, but only ones older than 24h — the grace window
-    /// covers a fetch pipeline that has inserted the blob but not yet
-    /// committed the attachment pointer in a racing transaction.
+    /// Refcount blob GC (weekly when sync runs): delete blob_refs +
+    /// blockstore blobs no attachment points at, but only ones older than
+    /// 24h — the grace window covers a fetch pipeline that has stored bytes
+    /// but not yet committed the attachment pointer.
     pub async fn mail_blobs_gc(&self) -> Result<u64> {
         let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24))
             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
             .to_string();
-        Ok(crate::pgq::query(
-            "DELETE FROM blobs b WHERE b.created_at < ? AND NOT EXISTS \
-             (SELECT 1 FROM mail_attachments a WHERE a.blob_hash = b.hash)",
-        )
-        .bind(cutoff)
-        .execute(self.db())
-        .await?
-        .rows_affected())
+        self.run(move |core| gc_orphan_blobs(core, Some(&cutoff)))
+            .await
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db;
+/// Read one blob's bytes back from the blockstore via its blob_refs pointer.
+fn read_blob(core: &Core, hash: &str) -> Option<Vec<u8>> {
+    let raw: Option<Vec<u8>> = core
+        .conn()
+        .query_row(
+            "SELECT ref FROM blob_refs WHERE hash = ?1",
+            rusqlite::params![hash],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+    let blob: crate::blockstore::BlobRef = ciborium::from_reader(raw?.as_slice()).ok()?;
+    core.blocks.get(core.keys.clone().as_ref(), &blob).ok()
+}
 
-    async fn seeded_store() -> Store {
-        let pool = db::test_pool().await;
-        let store = Store::new(pool);
-        let now = "2026-07-05T00:00:00Z";
-
-        crate::pgq::query(
-            "INSERT INTO mail_accounts (id, owner, address, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind("acct-alice")
-        .bind("alice")
-        .bind("alice@example.test")
-        .bind(now)
-        .bind(now)
-        .execute(store.db())
-        .await
-        .unwrap();
-        crate::pgq::query(
-            "INSERT INTO mail_accounts (id, owner, address, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind("acct-bob")
-        .bind("bob")
-        .bind("bob@example.test")
-        .bind(now)
-        .bind(now)
-        .execute(store.db())
-        .await
-        .unwrap();
-        crate::pgq::query(
-            "INSERT INTO mail_mailboxes (id, account_id, jmap_id, name, role, sort_order) VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind("mbox-alice-inbox")
-        .bind("acct-alice")
-        .bind("inbox")
-        .bind("Inbox")
-        .bind("inbox")
-        .bind(0_i64)
-        .execute(store.db())
-        .await
-        .unwrap();
-        crate::pgq::query(
-            "INSERT INTO mail_messages (id, account_id, user_scope, jmap_thread_id, jmap_id, message_id_hdr, subject, from_name, from_addr, to_json, cc_json, received_at, keywords_json, snippet, body_text, has_attachments, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind("msg-alice-1")
-        .bind("acct-alice")
-        .bind("alice")
-        .bind("thread-shared")
-        .bind("jmap-alice-1")
-        .bind("<alice-1@example.test>")
-        .bind("Quarterly bees")
-        .bind("Bee Ops")
-        .bind("ops@example.test")
-        .bind(r#"[{"email":"alice@example.test"}]"#)
-        .bind("[]")
-        .bind("2026-07-04T12:00:00Z")
-        .bind(r##"{"$flagged":true,"Bee Roadhouse":true,"$seen":true}"##)
-        .bind("nectar budget")
-        .bind("The nectar budget has fictional hive details.")
-        .bind(false)
-        .bind(now)
-        .bind(now)
-        .execute(store.db())
-        .await
-        .unwrap();
-        crate::pgq::query(
-            "INSERT INTO mail_messages (id, account_id, user_scope, jmap_thread_id, jmap_id, message_id_hdr, subject, from_name, from_addr, to_json, cc_json, received_at, snippet, body_text, has_attachments, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind("msg-bob-1")
-        .bind("acct-bob")
-        .bind("bob")
-        .bind("thread-shared")
-        .bind("jmap-bob-1")
-        .bind("<bob-1@example.test>")
-        .bind("Private swarm")
-        .bind("Bob Ops")
-        .bind("bobops@example.test")
-        .bind(r#"[{"email":"bob@example.test"}]"#)
-        .bind("[]")
-        .bind("2026-07-04T13:00:00Z")
-        .bind("wax budget")
-        .bind("The wax budget must stay in Bob's namespace.")
-        .bind(false)
-        .bind(now)
-        .bind(now)
-        .execute(store.db())
-        .await
-        .unwrap();
-
-        store
+/// Delete `hash` from blob_refs + blockstore when nothing references it.
+fn gc_blob_if_orphan(core: &mut Core, hash: &str) -> Result<bool> {
+    let referenced: bool = core.conn().query_row(
+        "SELECT EXISTS(SELECT 1 FROM mail_attachments WHERE blob_hash = ?1)",
+        rusqlite::params![hash],
+        |r| r.get(0),
+    )?;
+    if referenced {
+        return Ok(false);
     }
-
-    #[tokio::test]
-    async fn mail_queries_read_unscoped() {
-        let store = seeded_store().await;
-
-        let accounts = store.mail_accounts_list().await.unwrap();
-        assert_eq!(accounts.len(), 2, "single user sees every account");
-
-        let messages = store.mail_messages_list(None, None, 20).await.unwrap();
-        assert_eq!(messages.len(), 2);
-        let alice = messages.iter().find(|m| m.id == "msg-alice-1").unwrap();
-        assert_eq!(
-            alice.labels,
-            vec![
-                "flagged".to_string(),
-                "Bee Roadhouse".to_string(),
-                "seen".to_string(),
-            ]
-        );
-
-        let hits = store.mail_search("nectar budget", 20).await.unwrap();
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].id, "msg-alice-1");
-
-        let thread = store.mail_thread_get("thread-shared").await.unwrap();
-        assert_eq!(thread.messages.len(), 2, "whole thread, no viewer gate");
-    }
-
-    #[tokio::test]
-    async fn account_lifecycle_create_toggle_resync_delete() {
-        // Same constant every test uses; set_var is process-global but
-        // idempotent here.
-        std::env::set_var("HIVE_CRED_KEY", "mail-store-test-key");
-        let pool = db::test_pool().await;
-        let store = Store::new(pool);
-
-        let view = store
-            .mail_account_create(
-                "alice",
-                "alice@example.test",
-                "https://mail.example.test",
-                Some("alice-login"),
-                "jmap-acc-1",
-                "hunter2",
-            )
-            .await
-            .unwrap();
-        assert_eq!(view.backfill_status, "pending");
-        assert!(view.enabled);
-        assert_eq!(view.jmap_account_id, "jmap-acc-1");
-
-        // The credential landed in the vault, named by cred_id, and decrypts.
-        let cred_id: Option<String> =
-            crate::pgq::query_scalar::<String>("SELECT cred_id FROM mail_accounts WHERE id = ?")
-                .bind(&view.id)
-                .fetch_optional(store.db())
-                .await
-                .unwrap();
-        let secret = store
-            .cc_cred_decrypt_by_id(cred_id.as_deref().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(secret.as_deref(), Some("hunter2"));
-
-        // A second connect for the same owner+address refuses.
-        assert!(store
-            .mail_account_create(
-                "alice",
-                "alice@example.test",
-                "https://mail.example.test",
-                None,
-                "jmap-acc-1",
-                "hunter2",
-            )
-            .await
-            .is_err());
-
-        // Re-enabling clears the backoff bookkeeping.
-        crate::pgq::query(
-            "UPDATE mail_accounts SET attempts = 5, next_attempt_at = '2099-01-01T00:00:00.000Z' WHERE id = ?",
+    let raw: Option<Vec<u8>> = core
+        .conn()
+        .query_row(
+            "SELECT ref FROM blob_refs WHERE hash = ?1",
+            rusqlite::params![hash],
+            |r| r.get(0),
         )
-        .bind(&view.id)
-        .execute(store.db())
-        .await
-        .unwrap();
-        assert!(store
-            .mail_account_set_enabled(&view.id, true)
-            .await
-            .unwrap());
-        let attempts: Option<i64> =
-            crate::pgq::query_scalar::<i64>("SELECT attempts FROM mail_accounts WHERE id = ?")
-                .bind(&view.id)
-                .fetch_optional(store.db())
-                .await
-                .unwrap();
-        assert_eq!(attempts, Some(0));
-
-        // Force-resync plants the sentinel that routes the next delta into
-        // reconciliation.
-        assert!(store.mail_account_force_resync(&view.id).await.unwrap());
-        let state: Option<String> = crate::pgq::query_scalar::<String>(
-            "SELECT email_state FROM mail_accounts WHERE id = ?",
-        )
-        .bind(&view.id)
-        .fetch_optional(store.db())
-        .await
-        .unwrap();
-        assert_eq!(state.as_deref(), Some("force-resync"));
-
-        // Seed a message plus every derived row, then delete the account and
-        // assert nothing survives — including the vault row and orphan blob.
-        let now = "2026-07-09T00:00:00.000Z";
-        crate::pgq::query(
-            "INSERT INTO mail_messages (id, account_id, user_scope, jmap_thread_id, jmap_id, subject, from_addr, to_json, cc_json, received_at, snippet, body_text, has_attachments, created_at, updated_at) \
-             VALUES (?, ?, 'alice', 't1', 'j1', 's', 'a@b.c', '[]', '[]', ?, '', 'body', TRUE, ?, ?)",
-        )
-        .bind("msg-cascade-1")
-        .bind(&view.id)
-        .bind(now)
-        .bind(now)
-        .bind(now)
-        .execute(store.db())
-        .await
-        .unwrap();
-        store
-            .index_entity("mail", "msg-cascade-1", "s", "body", &[])
-            .await
-            .unwrap();
-        crate::pgq::query("INSERT INTO blobs (hash, size, mime, data, created_at) VALUES ('h1', 1, 'text/plain', ?, ?)")
-            .bind(vec![0u8])
-            .bind(now)
-            .execute(store.db())
-            .await
-            .unwrap();
-        crate::pgq::query(
-            "INSERT INTO mail_attachments (id, message_id, blob_hash, jmap_blob_id, created_at) VALUES ('att1', 'msg-cascade-1', 'h1', 'b1', ?)",
-        )
-        .bind(now)
-        .execute(store.db())
-        .await
-        .unwrap();
-
-        assert!(store.mail_account_delete(&view.id).await.unwrap());
-        for (what, sql) in [
-            ("account", "SELECT COUNT(*) FROM mail_accounts WHERE id = ?"),
-            ("messages", "SELECT COUNT(*) FROM mail_messages WHERE account_id = ?"),
-            ("search", "SELECT COUNT(*) FROM search WHERE kind = 'mail' AND ref_id = 'msg-cascade-1' AND ? = ?"),
-        ] {
-            let mut q = crate::pgq::query_scalar::<i64>(sql).bind(&view.id);
-            if sql.contains("? = ?") {
-                q = q.bind(&view.id);
+        .optional()?;
+    if let Some(raw) = raw {
+        if let Ok(blob) = ciborium::from_reader::<crate::blockstore::BlobRef, _>(raw.as_slice()) {
+            let keys = core.keys.clone();
+            if let Err(e) = core.blocks.delete(keys.as_ref(), &blob) {
+                tracing::warn!(hash, "blockstore delete failed during blob GC: {e}");
             }
-            let n = q.fetch_one(store.db()).await.unwrap();
-            assert_eq!(n, 0, "{what} rows survived the cascade");
         }
-        let creds: i64 =
-            crate::pgq::query_scalar::<i64>("SELECT COUNT(*) FROM cc_credentials WHERE id = ?")
-                .bind(cred_id.as_deref().unwrap())
-                .fetch_one(store.db())
-                .await
-                .unwrap();
-        assert_eq!(creds, 0, "vault credential survived the cascade");
-        let blobs: i64 = crate::pgq::query_scalar::<i64>("SELECT COUNT(*) FROM blobs")
-            .fetch_one(store.db())
-            .await
-            .unwrap();
-        assert_eq!(blobs, 0, "orphan blob survived the cascade");
+        core.conn().execute(
+            "DELETE FROM blob_refs WHERE hash = ?1",
+            rusqlite::params![hash],
+        )?;
+        return Ok(true);
     }
+    Ok(false)
+}
 
-    #[tokio::test]
-    async fn mailbox_ingest_toggle_gates_retrieval() {
-        let store = seeded_store().await;
-        // Give alice's message mailbox membership + a search row, as the
-        // sink would have.
-        crate::pgq::query(
-            "UPDATE mail_messages SET mailbox_ids_json = '[\"inbox\"]', embed_state = 'pending' WHERE id = 'msg-alice-1'",
-        )
-        .execute(store.db())
-        .await
-        .unwrap();
-        store
-            .index_entity(
-                "mail",
-                "msg-alice-1",
-                "Quarterly bees",
-                "nectar budget",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        // OFF: the mailbox's messages leave retrieval (search + embed queue)
-        // but the rows stay (D6).
-        assert!(store
-            .mail_mailbox_set_ingest("mbox-alice-inbox", false)
-            .await
-            .unwrap());
-        let search_rows: i64 = crate::pgq::query_scalar::<i64>(
-            "SELECT COUNT(*) FROM search WHERE kind = 'mail' AND ref_id = 'msg-alice-1'",
-        )
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert_eq!(search_rows, 0);
-        let embed_state: Option<String> = crate::pgq::query_scalar::<String>(
-            "SELECT embed_state FROM mail_messages WHERE id = 'msg-alice-1'",
-        )
-        .fetch_optional(store.db())
-        .await
-        .unwrap();
-        assert_eq!(embed_state.as_deref(), Some("skip"));
-        let row_still_there: i64 = crate::pgq::query_scalar::<i64>(
-            "SELECT COUNT(*) FROM mail_messages WHERE id = 'msg-alice-1'",
-        )
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert_eq!(row_still_there, 1);
-
-        // ON: the account's backfill re-arms so history gets picked up.
-        assert!(store
-            .mail_mailbox_set_ingest("mbox-alice-inbox", true)
-            .await
-            .unwrap());
-        let status: Option<String> = crate::pgq::query_scalar::<String>(
-            "SELECT backfill_status FROM mail_accounts WHERE id = 'acct-alice'",
-        )
-        .fetch_optional(store.db())
-        .await
-        .unwrap();
-        assert_eq!(status.as_deref(), Some("pending"));
-    }
-
-    fn ingest_msg(jmap_id: &str, mailbox: &str, keywords: &[&str]) -> MailIngestMessage {
-        MailIngestMessage {
-            jmap_id: jmap_id.to_string(),
-            thread_id: format!("t-{jmap_id}"),
-            message_id_hdr: Some(format!("<{jmap_id}@example.test>")),
-            in_reply_to: None,
-            references_json: "[]".into(),
-            from_addr: "sender@example.test".into(),
-            from_name: Some("Sender".into()),
-            to_json: "[]".into(),
-            cc_json: "[]".into(),
-            reply_to_json: "[]".into(),
-            subject: format!("subject {jmap_id}"),
-            sent_at: None,
-            received_at: "2026-07-09T12:00:00.000Z".into(),
-            mailbox_ids: vec![mailbox.to_string()],
-            mailbox_ids_json: format!("[\"{mailbox}\"]"),
-            keywords: keywords.iter().map(|s| s.to_string()).collect(),
-            keywords_json: "{}".into(),
-            body_text: format!("body of {jmap_id} with honeycomb"),
-            body_source: "plain".into(),
-            snippet: "snippet".into(),
-            size: 100,
-            has_attachments: false,
-            attachments: Vec::new(),
-            parse_error: None,
+/// Sweep every orphaned blob_refs row (optionally only those created before
+/// `cutoff`). Returns how many were removed.
+fn gc_orphan_blobs(core: &mut Core, cutoff: Option<&str>) -> Result<u64> {
+    let sql = match cutoff {
+        Some(_) => {
+            "SELECT b.hash FROM blob_refs b WHERE b.created_at < ?1 AND NOT EXISTS \
+             (SELECT 1 FROM mail_attachments a WHERE a.blob_hash = b.hash)"
         }
-    }
-
-    fn ingest_att(blob_id: &str, filename: &str, size: i64) -> MailIngestAttachment {
-        MailIngestAttachment {
-            jmap_blob_id: blob_id.to_string(),
-            filename: filename.to_string(),
-            mime: "application/pdf".into(),
-            size,
-            content_id: None,
-            disposition: Some("attachment".into()),
+        None => {
+            "SELECT b.hash FROM blob_refs b WHERE NOT EXISTS \
+             (SELECT 1 FROM mail_attachments a WHERE a.blob_hash = b.hash)"
         }
-    }
-
-    #[tokio::test]
-    async fn ingest_batch_is_idempotent_and_metadata_only_on_replay() {
-        let store = seeded_store().await;
-        crate::pgq::query("UPDATE mail_mailboxes SET ingest = TRUE WHERE id = 'mbox-alice-inbox'")
-            .execute(store.db())
-            .await
-            .unwrap();
-        let (ingest, inbox) = store.mail_mailbox_sets("acct-alice").await.unwrap();
-        assert!(ingest.contains("inbox") && inbox.contains("inbox"));
-
-        let out = store
-            .mail_ingest_batch(
-                "acct-alice",
-                "alice",
-                &ingest,
-                &inbox,
-                vec![ingest_msg("j-new-1", "inbox", &[])],
-            )
-            .await
-            .unwrap();
-        assert_eq!(out.stored, 1);
-        assert_eq!(out.notify.len(), 1, "new inbox-role message notifies");
-
-        // FTS row exists, embed queued.
-        let fts: i64 = crate::pgq::query_scalar::<i64>(
-            "SELECT COUNT(*) FROM search WHERE kind = 'mail' AND title = 'subject j-new-1'",
-        )
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert_eq!(fts, 1);
-
-        // Replay with changed metadata AND a (hostile) changed body: metadata
-        // applies, the body must NOT rewrite — that invariant is what makes
-        // admin redaction durable.
-        let mut replay = ingest_msg("j-new-1", "inbox", &["$seen"]);
-        replay.keywords_json = r#"{"$seen":true}"#.into();
-        replay.body_text = "REWRITTEN".into();
-        let out2 = store
-            .mail_ingest_batch("acct-alice", "alice", &ingest, &inbox, vec![replay])
-            .await
-            .unwrap();
-        assert!(out2.notify.is_empty(), "replays never re-notify");
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            body_text: String,
-            keywords_json: String,
-        }
-        let row = crate::pgq::query_as::<Row>(
-            "SELECT body_text, keywords_json FROM mail_messages WHERE account_id = 'acct-alice' AND jmap_id = 'j-new-1'",
-        )
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert!(
-            row.body_text.contains("honeycomb"),
-            "body is immutable on conflict"
-        );
-        assert!(
-            row.keywords_json.contains("$seen"),
-            "metadata updates apply"
-        );
-
-        let count: i64 = crate::pgq::query_scalar::<i64>(
-            "SELECT COUNT(*) FROM mail_messages WHERE account_id = 'acct-alice' AND jmap_id = 'j-new-1'",
-        )
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert_eq!(count, 1, "unique key absorbed the replay");
-    }
-
-    #[tokio::test]
-    async fn ingest_gates_junk_and_non_ingest_mailboxes() {
-        let store = seeded_store().await;
-        crate::pgq::query("UPDATE mail_mailboxes SET ingest = TRUE WHERE id = 'mbox-alice-inbox'")
-            .execute(store.db())
-            .await
-            .unwrap();
-        let (ingest, inbox) = store.mail_mailbox_sets("acct-alice").await.unwrap();
-
-        let out = store
-            .mail_ingest_batch(
-                "acct-alice",
-                "alice",
-                &ingest,
-                &inbox,
-                vec![
-                    ingest_msg("j-junk", "inbox", &["$junk"]),
-                    ingest_msg("j-elsewhere", "archive-box", &[]),
-                ],
-            )
-            .await
-            .unwrap();
-        assert_eq!(out.stored, 2);
-        assert!(out.notify.is_empty(), "junk + non-ingest never notify");
-        let fts: i64 = crate::pgq::query_scalar::<i64>(
-            "SELECT COUNT(*) FROM search WHERE kind = 'mail' AND (title = 'subject j-junk' OR title = 'subject j-elsewhere')",
-        )
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert_eq!(fts, 0, "neither row is searchable");
-        let skipped: i64 = crate::pgq::query_scalar::<i64>(
-            "SELECT COUNT(*) FROM mail_messages WHERE jmap_id IN ('j-junk', 'j-elsewhere') AND embed_state = 'skip'",
-        )
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert_eq!(skipped, 2);
-    }
-
-    #[tokio::test]
-    async fn tombstone_removes_retrieval_in_the_same_batch_and_stays_dead() {
-        let store = seeded_store().await;
-        crate::pgq::query("UPDATE mail_mailboxes SET ingest = TRUE WHERE id = 'mbox-alice-inbox'")
-            .execute(store.db())
-            .await
-            .unwrap();
-        let (ingest, inbox) = store.mail_mailbox_sets("acct-alice").await.unwrap();
-        store
-            .mail_ingest_batch(
-                "acct-alice",
-                "alice",
-                &ingest,
-                &inbox,
-                vec![ingest_msg("j-dead", "inbox", &[])],
-            )
-            .await
-            .unwrap();
-
-        let n = store
-            .mail_tombstone_batch("acct-alice", &["j-dead".to_string()])
-            .await
-            .unwrap();
-        assert_eq!(n, 1);
-        let fts: i64 = crate::pgq::query_scalar::<i64>(
-            "SELECT COUNT(*) FROM search WHERE kind = 'mail' AND title = 'subject j-dead'",
-        )
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert_eq!(fts, 0, "deleted mail leaves search in the same batch");
-
-        // A cannotCalculateChanges replay re-upserts the id; the tombstone
-        // must hold (no search resurrection).
-        store
-            .mail_ingest_batch(
-                "acct-alice",
-                "alice",
-                &ingest,
-                &inbox,
-                vec![ingest_msg("j-dead", "inbox", &[])],
-            )
-            .await
-            .unwrap();
-        let fts_after: i64 = crate::pgq::query_scalar::<i64>(
-            "SELECT COUNT(*) FROM search WHERE kind = 'mail' AND title = 'subject j-dead'",
-        )
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert_eq!(fts_after, 0, "replay must not resurrect a tombstoned row");
-        // known_jmap_ids still reports it, so reconcile never re-fetches it.
-        assert!(store
-            .mail_known_jmap_ids("acct-alice")
-            .await
-            .unwrap()
-            .contains("j-dead"));
-    }
-
-    #[tokio::test]
-    async fn mail_token_links_gate_by_scope_and_resolve_subjects() {
-        let store = seeded_store().await;
-        // seeded: msg-alice-1 (user_scope 'alice', subject "Quarterly bees").
-
-        // Alice-scoped entry citing alice's mail → a 'cites' link + a subject chip.
-        let entry = store
-            .journal_append(
-                hive_shared::NewJournalEntry {
-                    author: Some("alice".into()),
-                    body: "Following up on [mail:msg-alice-1] before Thursday.".into(),
-                    tags: None,
-                    anchors: None,
-                },
-                Some("alice"),
-                Some("alice"),
-            )
-            .await
-            .unwrap();
-        let links: i64 = crate::pgq::query_scalar::<i64>(
-            "SELECT COUNT(*) FROM links WHERE source_kind = 'journal' AND source_id = ? \
-             AND target_kind = 'mail' AND target_id = 'msg-alice-1' AND rel = 'cites'",
-        )
-        .bind(&entry.entry.id)
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert_eq!(links, 1);
-        let refs = store.refs_for(&entry.entry.body).await.unwrap();
-        assert_eq!(refs.len(), 1);
-        assert_eq!(refs[0].name, "Quarterly bees");
-        assert_eq!(refs[0].id, "msg-alice-1");
-
-        // Bob-scoped entry citing alice's mail → the token simply doesn't link.
-        let cross = store
-            .journal_append(
-                hive_shared::NewJournalEntry {
-                    author: Some("bob".into()),
-                    body: "Trying to cite [mail:msg-alice-1] across namespaces.".into(),
-                    tags: None,
-                    anchors: None,
-                },
-                Some("bob"),
-                Some("bob"),
-            )
-            .await
-            .unwrap();
-        let cross_links: i64 = crate::pgq::query_scalar::<i64>(
-            "SELECT COUNT(*) FROM links WHERE source_id = ? AND target_kind = 'mail'",
-        )
-        .bind(&cross.entry.id)
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert_eq!(cross_links, 0, "cross-namespace citation must not link");
-
-        // Tombstoned mail stops resolving (the raw token stays visible).
-        crate::pgq::query(
-            "UPDATE mail_messages SET deleted_at = '2026-07-09T00:00:00.000Z' WHERE id = 'msg-alice-1'",
-        )
-        .execute(store.db())
-        .await
-        .unwrap();
-        let dead_refs = store.refs_for(&entry.entry.body).await.unwrap();
-        assert!(dead_refs.is_empty(), "dead citations resolve to nothing");
-    }
-
-    #[tokio::test]
-    async fn backoff_disables_after_eight_failures() {
-        std::env::set_var("HIVE_CRED_KEY", "mail-store-test-key");
-        let pool = db::test_pool().await;
-        let store = Store::new(pool);
-        let view = store
-            .mail_account_create(
-                "alice",
-                "backoff@example.test",
-                "https://mail.example.test",
-                None,
-                "acc-b",
-                "pw",
-            )
-            .await
-            .unwrap();
-        for i in 1..=7 {
-            let disabled = store
-                .mail_account_mark_failed(&view.id, "connect refused")
-                .await
-                .unwrap();
-            assert!(!disabled, "attempt {i} must only back off");
-        }
-        assert!(
-            store
-                .mail_account_mark_failed(&view.id, "connect refused")
-                .await
-                .unwrap(),
-            "the 8th failure disables the account"
-        );
-        let due = store.mail_accounts_due().await.unwrap();
-        assert!(
-            !due.iter().any(|a| a.id == view.id),
-            "disabled accounts never come due"
-        );
-    }
-
-    #[tokio::test]
-    async fn ingest_writes_attachment_metadata_idempotently() {
-        let store = seeded_store().await;
-        crate::pgq::query("UPDATE mail_mailboxes SET ingest = TRUE WHERE id = 'mbox-alice-inbox'")
-            .execute(store.db())
-            .await
-            .unwrap();
-        let (ingest, inbox) = store.mail_mailbox_sets("acct-alice").await.unwrap();
-
-        let mut msg = ingest_msg("j-att-1", "inbox", &[]);
-        msg.attachments = vec![
-            ingest_att("blob-a", "report.pdf", 1000),
-            ingest_att("blob-b", "photo.jpg", 2000),
-        ];
-        msg.has_attachments = true;
-        store
-            .mail_ingest_batch("acct-alice", "alice", &ingest, &inbox, vec![msg.clone()])
-            .await
-            .unwrap();
-
-        let rows: i64 = crate::pgq::query_scalar::<i64>(
-            "SELECT COUNT(*) FROM mail_attachments WHERE blob_hash IS NULL AND skipped_reason IS NULL",
-        )
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert_eq!(rows, 2, "metadata rows land with bytes pending");
-
-        // Replay: the unique key absorbs it — no duplicate rows.
-        store
-            .mail_ingest_batch("acct-alice", "alice", &ingest, &inbox, vec![msg])
-            .await
-            .unwrap();
-        let rows_after: i64 =
-            crate::pgq::query_scalar::<i64>("SELECT COUNT(*) FROM mail_attachments")
-                .fetch_one(store.db())
-                .await
-                .unwrap();
-        assert_eq!(rows_after, 2, "replay must not duplicate attachment rows");
-    }
-
-    #[tokio::test]
-    async fn attachments_pending_excludes_skipped_stored_and_deleted() {
-        let store = seeded_store().await;
-        crate::pgq::query("UPDATE mail_mailboxes SET ingest = TRUE WHERE id = 'mbox-alice-inbox'")
-            .execute(store.db())
-            .await
-            .unwrap();
-        let (ingest, inbox) = store.mail_mailbox_sets("acct-alice").await.unwrap();
-        let mut msg = ingest_msg("j-pend", "inbox", &[]);
-        msg.attachments = vec![
-            ingest_att("blob-pending", "pending.pdf", 100),
-            ingest_att("blob-oversize", "huge.iso", 100),
-            ingest_att("blob-stored", "done.pdf", 100),
-        ];
-        store
-            .mail_ingest_batch("acct-alice", "alice", &ingest, &inbox, vec![msg])
-            .await
-            .unwrap();
-
-        let att_id = |blob: &str| {
-            let store = store.clone();
-            let blob = blob.to_string();
-            async move {
-                crate::pgq::query_scalar::<String>(
-                    "SELECT id FROM mail_attachments WHERE jmap_blob_id = ?",
-                )
-                .bind(blob)
-                .fetch_one(store.db())
-                .await
-                .unwrap()
+    };
+    let hashes: Vec<String> = {
+        let mut stmt = core.conn().prepare(sql)?;
+        match cutoff {
+            Some(c) => {
+                let rows = stmt.query_map(rusqlite::params![c], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
             }
-        };
-        store
-            .mail_attachment_mark_skipped(&att_id("blob-oversize").await, "oversize")
-            .await
-            .unwrap();
-        store
-            .mail_attachment_store_blob(&att_id("blob-stored").await, "hash-1", "text/plain", b"x")
-            .await
-            .unwrap();
-
-        let pending = store
-            .mail_attachments_pending("acct-alice", 50)
-            .await
-            .unwrap();
-        assert_eq!(pending.len(), 1, "skipped + stored rows leave the queue");
-        assert_eq!(pending[0].jmap_blob_id, "blob-pending");
-
-        // Tombstoning the message drops its attachments out of the queue too.
-        store
-            .mail_tombstone_batch("acct-alice", &["j-pend".to_string()])
-            .await
-            .unwrap();
-        assert!(store
-            .mail_attachments_pending("acct-alice", 50)
-            .await
-            .unwrap()
-            .is_empty());
-    }
-
-    #[tokio::test]
-    async fn attachment_store_blob_dedups_by_hash() {
-        let store = seeded_store().await;
-        let now = "2026-07-09T00:00:00.000Z";
-        for (att, blob) in [("att-d1", "b1"), ("att-d2", "b2")] {
-            crate::pgq::query(
-                "INSERT INTO mail_attachments (id, message_id, jmap_blob_id, created_at) \
-                 VALUES (?, 'msg-alice-1', ?, ?)",
-            )
-            .bind(att)
-            .bind(blob)
-            .bind(now)
-            .execute(store.db())
-            .await
-            .unwrap();
+            None => {
+                let rows = stmt.query_map([], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            }
         }
-
-        // Same bytes fetched twice (e.g. the same PDF on two messages).
-        let bytes = b"identical attachment bytes";
-        let hash = blake3_hex_for_tests(bytes);
-        store
-            .mail_attachment_store_blob("att-d1", &hash, "application/pdf", bytes)
-            .await
-            .unwrap();
-        store
-            .mail_attachment_store_blob("att-d2", &hash, "application/pdf", bytes)
-            .await
-            .unwrap();
-
-        let blobs: i64 = crate::pgq::query_scalar::<i64>("SELECT COUNT(*) FROM blobs")
-            .fetch_one(store.db())
-            .await
-            .unwrap();
-        assert_eq!(blobs, 1, "identical bytes share one blob row");
-        let pointed: i64 = crate::pgq::query_scalar::<i64>(
-            "SELECT COUNT(*) FROM mail_attachments WHERE blob_hash = ?",
-        )
-        .bind(&hash)
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert_eq!(pointed, 2, "both attachments point at the shared blob");
-
-        // The thread payload now reports them stored.
-        let thread = store.mail_thread_get("thread-shared").await.unwrap();
-        let atts = &thread
-            .messages
-            .iter()
-            .find(|m| m.summary.id == "msg-alice-1")
-            .unwrap()
-            .attachments;
-        assert_eq!(atts.len(), 2);
-        assert!(atts.iter().all(|a| a.stored));
-    }
-
-    /// THE redaction invariant (plan A6): after mail_message_redact, a full
-    /// ingest replay of the same jmap_id (reconcile/delta metadata update)
-    /// must not resurrect body, subject, search, or attachment rows.
-    #[tokio::test]
-    async fn redact_scrubs_everything_and_replay_cannot_resurrect() {
-        let store = seeded_store().await;
-        crate::pgq::query("UPDATE mail_mailboxes SET ingest = TRUE WHERE id = 'mbox-alice-inbox'")
-            .execute(store.db())
-            .await
-            .unwrap();
-        let (ingest, inbox) = store.mail_mailbox_sets("acct-alice").await.unwrap();
-        let mut msg = ingest_msg("j-redact", "inbox", &[]);
-        msg.attachments = vec![ingest_att("blob-r", "secret.pdf", 10)];
-        msg.has_attachments = true;
-        store
-            .mail_ingest_batch("acct-alice", "alice", &ingest, &inbox, vec![msg.clone()])
-            .await
-            .unwrap();
-        let mail_id: String = crate::pgq::query_scalar::<String>(
-            "SELECT id FROM mail_messages WHERE jmap_id = 'j-redact'",
-        )
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        let att_id: String = crate::pgq::query_scalar::<String>(
-            "SELECT id FROM mail_attachments WHERE message_id = ?",
-        )
-        .bind(&mail_id)
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        store
-            .mail_attachment_store_blob(&att_id, "redact-hash", "application/pdf", b"secret")
-            .await
-            .unwrap();
-        crate::pgq::query(
-            "INSERT INTO embeddings (ref_kind, ref_id, model, dim, vec, hash, created_at) \
-             VALUES ('mail', ?, 'hash', 4, ?, 'h', '2026-07-09T00:00:00.000Z')",
-        )
-        .bind(&mail_id)
-        .bind(vec![0u8; 16])
-        .execute(store.db())
-        .await
-        .unwrap();
-
-        let owner = store.mail_message_redact(&mail_id).await.unwrap();
-        assert_eq!(owner.as_deref(), Some("alice"));
-
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            body_text: String,
-            snippet: String,
-            subject: String,
-            has_attachments: bool,
-            deleted_at: Option<String>,
-            embed_state: String,
+    };
+    let mut n = 0u64;
+    for hash in &hashes {
+        if gc_blob_if_orphan(core, hash)? {
+            n += 1;
         }
-        let row = crate::pgq::query_as::<Row>(
-            "SELECT body_text, snippet, subject, has_attachments, deleted_at, embed_state \
-             FROM mail_messages WHERE id = ?",
-        )
-        .bind(&mail_id)
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert_eq!(row.body_text, "");
-        assert_eq!(row.snippet, "");
-        assert_eq!(row.subject, "[redacted]");
-        assert!(!row.has_attachments);
-        assert!(row.deleted_at.is_some());
-        assert_eq!(row.embed_state, "skip");
-        for (what, sql) in [
-            (
-                "search",
-                "SELECT COUNT(*) FROM search WHERE kind = 'mail' AND ref_id = ?",
-            ),
-            (
-                "embeddings",
-                "SELECT COUNT(*) FROM embeddings WHERE ref_kind = 'mail' AND ref_id = ?",
-            ),
-            (
-                "attachments",
-                "SELECT COUNT(*) FROM mail_attachments WHERE message_id = ?",
-            ),
-        ] {
-            let n: i64 = crate::pgq::query_scalar::<i64>(sql)
-                .bind(&mail_id)
-                .fetch_one(store.db())
-                .await
-                .unwrap();
-            assert_eq!(n, 0, "{what} rows survived redaction");
-        }
-        let blobs: i64 = crate::pgq::query_scalar::<i64>("SELECT COUNT(*) FROM blobs")
-            .fetch_one(store.db())
-            .await
-            .unwrap();
-        assert_eq!(blobs, 0, "orphaned blob survived redaction");
-
-        // The replay: same jmap_id, hostile body + attachments. The conflict
-        // arm is metadata-only and the tombstone gates attachments, so
-        // nothing comes back.
-        let mut replay = msg;
-        replay.body_text = "RESURRECTED BODY".into();
-        replay.subject = "resurrected subject".into();
-        store
-            .mail_ingest_batch("acct-alice", "alice", &ingest, &inbox, vec![replay])
-            .await
-            .unwrap();
-        let after = crate::pgq::query_as::<Row>(
-            "SELECT body_text, snippet, subject, has_attachments, deleted_at, embed_state \
-             FROM mail_messages WHERE id = ?",
-        )
-        .bind(&mail_id)
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert_eq!(after.body_text, "", "replay must not restore the body");
-        assert_eq!(
-            after.subject, "[redacted]",
-            "replay must not restore the subject"
-        );
-        assert!(
-            after.deleted_at.is_some(),
-            "replay must not clear the tombstone"
-        );
-        let search: i64 = crate::pgq::query_scalar::<i64>(
-            "SELECT COUNT(*) FROM search WHERE kind = 'mail' AND ref_id = ?",
-        )
-        .bind(&mail_id)
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert_eq!(search, 0, "replay must not re-index a redacted row");
-        let atts: i64 = crate::pgq::query_scalar::<i64>(
-            "SELECT COUNT(*) FROM mail_attachments WHERE message_id = ?",
-        )
-        .bind(&mail_id)
-        .fetch_one(store.db())
-        .await
-        .unwrap();
-        assert_eq!(atts, 0, "replay must not re-queue redacted attachments");
     }
-
-    #[tokio::test]
-    async fn blob_gc_deletes_only_unreferenced_aged_blobs() {
-        let store = seeded_store().await;
-        let old = "2020-01-01T00:00:00.000Z";
-        let fresh = (chrono::Utc::now())
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
-        for (hash, created) in [
-            ("gc-old-orphan", old),
-            ("gc-old-referenced", old),
-            ("gc-fresh-orphan", fresh.as_str()),
-        ] {
-            crate::pgq::query(
-                "INSERT INTO blobs (hash, size, mime, data, created_at) VALUES (?, 1, 'text/plain', ?, ?)",
-            )
-            .bind(hash)
-            .bind(vec![0u8])
-            .bind(created)
-            .execute(store.db())
-            .await
-            .unwrap();
-        }
-        crate::pgq::query(
-            "INSERT INTO mail_attachments (id, message_id, blob_hash, jmap_blob_id, created_at) \
-             VALUES ('att-gc', 'msg-alice-1', 'gc-old-referenced', 'bgc', ?)",
-        )
-        .bind(old)
-        .execute(store.db())
-        .await
-        .unwrap();
-
-        let swept = store.mail_blobs_gc().await.unwrap();
-        assert_eq!(swept, 1, "exactly the aged orphan goes");
-        let left: Vec<String> =
-            crate::pgq::query_scalar::<String>("SELECT hash FROM blobs ORDER BY hash")
-                .fetch_all(store.db())
-                .await
-                .unwrap();
-        assert_eq!(
-            left,
-            vec![
-                "gc-fresh-orphan".to_string(),
-                "gc-old-referenced".to_string()
-            ],
-            "referenced + in-grace blobs survive"
-        );
-    }
-
-    /// blake3 lives with the mail sync driver (bytes are hashed before they
-    /// reach the store), so tests hash with a tiny fixed stand-in — the store
-    /// treats hashes as opaque content addresses.
-    fn blake3_hex_for_tests(bytes: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(bytes);
-        format!("{:x}", h.finalize())
-    }
+    Ok(n)
 }

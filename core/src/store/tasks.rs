@@ -1,12 +1,12 @@
-// Tasks list/get/update + anchor emergence (store.ts `tasks`).
-// Owned by the core-stores workstream.
+// Tasks list/get/update + anchor emergence (store.ts `tasks`). Creates and
+// updates are entity.create/entity.update records (the fold maintains FTS).
 
 use anyhow::Result;
 use hive_shared::{Priority, Task, TaskPatch, TaskStatus};
+use rusqlite::OptionalExtension;
 use serde_json::json;
-use sqlx::Row;
 
-use super::{json_vec, new_id, now_iso, to_json, Store};
+use super::{json_vec, new_id, now_iso, to_json, Core, Draft, Store};
 
 /// Inputs for the internal creation path (store.ts `tasks.create` input shape).
 /// Tasks only ever emerge from journal anchors / bracket tokens.
@@ -55,12 +55,15 @@ pub struct TaskFilter {
 impl Store {
     /// Priority-then-recency sort, filters applied after the fetch (as Node does).
     pub async fn tasks_list(&self, filter: TaskFilter) -> Result<Vec<Task>> {
-        let rows = crate::pgq::query(
-            "SELECT * FROM tasks ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC",
-        )
-        .fetch_all(self.db())
-        .await?;
-        let tasks: Vec<Task> = rows.iter().map(row_to_task).collect::<Result<Vec<_>>>()?;
+        let tasks: Vec<Task> = self
+            .run(|core| {
+                let mut stmt = core.conn().prepare(
+                    "SELECT * FROM tasks ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC",
+                )?;
+                let rows = stmt.query_map([], row_to_task)?;
+                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+            })
+            .await?;
         Ok(tasks
             .into_iter()
             .filter(|t| {
@@ -91,58 +94,28 @@ impl Store {
     }
 
     pub async fn tasks_get(&self, task_id: &str) -> Result<Option<Task>> {
-        let row = crate::pgq::query("SELECT * FROM tasks WHERE id = ?")
-            .bind(task_id)
-            .fetch_optional(self.db())
-            .await?;
-        row.as_ref().map(row_to_task).transpose()
+        let task_id = task_id.to_string();
+        self.run(move |core| {
+            Ok(core
+                .conn()
+                .query_row(
+                    "SELECT * FROM tasks WHERE id = ?1",
+                    rusqlite::params![task_id],
+                    row_to_task,
+                )
+                .optional()?)
+        })
+        .await
     }
 
     pub async fn tasks_create(&self, input: TaskCreate, actor: &str) -> Result<Task> {
-        // Only ensure-by-name when the project value is not already a known project id.
-        if let Some(project) = &input.project {
-            if self.projects_get(project).await?.is_none() {
-                self.projects_ensure(project).await?;
-            }
-        }
-        let ts = now_iso();
-        let t = Task {
-            id: new_id("task"),
-            title: input.title,
-            body: input.body,
-            status: input.status,
-            priority: input.priority,
-            tags: input.tags,
-            assignees: input.assignees,
-            project: input.project,
-            phase: input.phase,
-            due: input.due,
-            origin_entry_id: input.origin_entry_id,
-            anchor_text: input.anchor_text,
-            created_at: ts.clone(),
-            updated_at: ts,
-        };
-        crate::pgq::query(
-            "INSERT INTO tasks (id, project, phase, due, title, body, status, priority, tags, assignees, origin_entry_id, anchor_text, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&t.id)
-        .bind(&t.project)
-        .bind(&t.phase)
-        .bind(&t.due)
-        .bind(&t.title)
-        .bind(&t.body)
-        .bind(t.status.as_str())
-        .bind(t.priority.as_str())
-        .bind(to_json(&t.tags))
-        .bind(to_json(&t.assignees))
-        .bind(&t.origin_entry_id)
-        .bind(&t.anchor_text)
-        .bind(&t.created_at)
-        .bind(&t.updated_at)
-        .execute(self.db())
-        .await?;
-        self.index_entity("task", &t.id, &t.title, &t.body, &t.tags)
+        let actor_s = actor.to_string();
+        let t = self
+            .run(move |core| {
+                let (t, drafts) = task_create_plan(core, input, &actor_s)?;
+                core.commit(drafts)?;
+                Ok(t)
+            })
             .await?;
         self.emit("task.created", actor, json!({"id": t.id, "title": t.title}))
             .await?;
@@ -155,34 +128,46 @@ impl Store {
         patch: TaskPatch,
         actor: &str,
     ) -> Result<Option<Task>> {
-        let Some(current) = self.tasks_get(task_id).await? else {
-            return Ok(None);
-        };
-        let next = Task {
-            title: patch.title.unwrap_or(current.title),
-            body: patch.body.unwrap_or(current.body),
-            status: patch.status.unwrap_or(current.status),
-            priority: patch.priority.unwrap_or(current.priority),
-            tags: patch.tags.unwrap_or(current.tags),
-            assignees: patch.assignees.unwrap_or(current.assignees),
-            updated_at: now_iso(),
-            ..current
-        };
-        crate::pgq::query(
-            "UPDATE tasks SET title=?, body=?, status=?, priority=?, tags=?, assignees=?, updated_at=? WHERE id=?",
-        )
-        .bind(&next.title)
-        .bind(&next.body)
-        .bind(next.status.as_str())
-        .bind(next.priority.as_str())
-        .bind(to_json(&next.tags))
-        .bind(to_json(&next.assignees))
-        .bind(&next.updated_at)
-        .bind(&next.id)
-        .execute(self.db())
-        .await?;
-        self.index_entity("task", &next.id, &next.title, &next.body, &next.tags)
+        let task_id_s = task_id.to_string();
+        let actor_s = actor.to_string();
+        let next = self
+            .run(move |core| {
+                let Some(current) = core
+                    .conn()
+                    .query_row(
+                        "SELECT * FROM tasks WHERE id = ?1",
+                        rusqlite::params![task_id_s],
+                        row_to_task,
+                    )
+                    .optional()?
+                else {
+                    return Ok(None);
+                };
+                let next = Task {
+                    title: patch.title.unwrap_or(current.title),
+                    body: patch.body.unwrap_or(current.body),
+                    status: patch.status.unwrap_or(current.status),
+                    priority: patch.priority.unwrap_or(current.priority),
+                    tags: patch.tags.unwrap_or(current.tags),
+                    assignees: patch.assignees.unwrap_or(current.assignees),
+                    updated_at: now_iso(),
+                    ..current
+                };
+                core.commit(vec![Draft::new(
+                    crate::oplog::kind::ENTITY_UPDATE,
+                    &actor_s,
+                    &next.updated_at,
+                    json!({"kind": "task", "id": next.id, "fields": {
+                        "title": next.title, "body": next.body,
+                        "status": next.status.as_str(), "priority": next.priority.as_str(),
+                        "tags": to_json(&next.tags), "assignees": to_json(&next.assignees),
+                        "updated_at": next.updated_at,
+                    }}),
+                )])?;
+                Ok(Some(next))
+            })
             .await?;
+        let Some(next) = next else { return Ok(None) };
         self.emit(
             "task.updated",
             actor,
@@ -193,21 +178,76 @@ impl Store {
     }
 }
 
-pub(crate) fn row_to_task(r: &sqlx::postgres::PgRow) -> Result<Task> {
+/// The entity.create payload for one task (also the `emerged` element shape
+/// journal.append pre-materializes).
+pub(crate) fn task_create_payload(t: &Task) -> serde_json::Value {
+    json!({"kind": "task", "id": t.id, "fields": {
+        "project": t.project, "phase": t.phase, "due": t.due,
+        "title": t.title, "body": t.body,
+        "status": t.status.as_str(), "priority": t.priority.as_str(),
+        "tags": to_json(&t.tags), "assignees": to_json(&t.assignees),
+        "origin_entry_id": t.origin_entry_id, "anchor_text": t.anchor_text,
+        "created_at": t.created_at, "updated_at": t.updated_at,
+    }})
+}
+
+/// Build the Task + its record drafts (project ensure-by-name first when the
+/// value isn't a known project id — matching the Postgres path).
+pub(crate) fn task_create_plan(
+    core: &Core,
+    input: TaskCreate,
+    actor: &str,
+) -> Result<(Task, Vec<Draft>)> {
+    let mut drafts: Vec<Draft> = Vec::new();
+    if let Some(project) = &input.project {
+        if super::projects::project_get(core.conn(), project)?.is_none() {
+            let (_p, draft) = super::projects::project_ensure_plan(core, project)?;
+            if let Some(d) = draft {
+                drafts.push(d);
+            }
+        }
+    }
+    let ts = now_iso();
+    let t = Task {
+        id: new_id("task"),
+        title: input.title,
+        body: input.body,
+        status: input.status,
+        priority: input.priority,
+        tags: input.tags,
+        assignees: input.assignees,
+        project: input.project,
+        phase: input.phase,
+        due: input.due,
+        origin_entry_id: input.origin_entry_id,
+        anchor_text: input.anchor_text,
+        created_at: ts.clone(),
+        updated_at: ts.clone(),
+    };
+    drafts.push(Draft::new(
+        crate::oplog::kind::ENTITY_CREATE,
+        actor,
+        &ts,
+        task_create_payload(&t),
+    ));
+    Ok((t, drafts))
+}
+
+pub(crate) fn row_to_task(r: &rusqlite::Row) -> rusqlite::Result<Task> {
     Ok(Task {
-        id: r.try_get("id")?,
-        title: r.try_get("title")?,
-        body: r.try_get("body")?,
-        status: TaskStatus::from_str_lossy(r.try_get::<String, _>("status")?.as_str()),
-        priority: Priority::from_str_lossy(r.try_get::<String, _>("priority")?.as_str()),
-        tags: json_vec(r.try_get::<String, _>("tags")?.as_str()),
-        assignees: json_vec(r.try_get::<String, _>("assignees")?.as_str()),
-        project: r.try_get("project")?,
-        phase: r.try_get("phase")?,
-        due: r.try_get("due")?,
-        origin_entry_id: r.try_get("origin_entry_id")?,
-        anchor_text: r.try_get("anchor_text")?,
-        created_at: r.try_get("created_at")?,
-        updated_at: r.try_get("updated_at")?,
+        id: r.get("id")?,
+        title: r.get("title")?,
+        body: r.get("body")?,
+        status: TaskStatus::from_str_lossy(r.get::<_, String>("status")?.as_str()),
+        priority: Priority::from_str_lossy(r.get::<_, String>("priority")?.as_str()),
+        tags: json_vec(r.get::<_, String>("tags")?.as_str()),
+        assignees: json_vec(r.get::<_, String>("assignees")?.as_str()),
+        project: r.get("project")?,
+        phase: r.get("phase")?,
+        due: r.get("due")?,
+        origin_entry_id: r.get("origin_entry_id")?,
+        anchor_text: r.get("anchor_text")?,
+        created_at: r.get("created_at")?,
+        updated_at: r.get("updated_at")?,
     })
 }

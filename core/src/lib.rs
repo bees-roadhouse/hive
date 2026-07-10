@@ -1,19 +1,16 @@
-// hive-core: the store layer (Postgres store, schema/migrations, pgq query
-// helpers) plus the MCP tool layer — the single-user data core the desktop
-// shell (Phase 2) and the stdio bridge (PR 1.8) will drive directly.
-// PR 1.4 adds the append-only durable layer underneath: the op-log record
-// envelope + encrypted segment files (oplog), the content-addressed encrypted
-// blockstore (blockstore), and master-key custody (keys). PR 1.5 adds the
-// derived side: the SQLCipher-encrypted SQLite index (index) and the record
-// projector that maintains it (fold) — additive; the Store still runs on
-// Postgres until the 1.6 cutover.
+// hive-core: the single-user data core (PR 1.6 cutover shape). The append-only
+// op log (oplog) is the source of truth; the SQLCipher SQLite index (index) is
+// its rebuildable projection, maintained by the fold; the blockstore holds
+// payload bytes; keys holds master-key custody. The store layer rides ONE
+// writer thread that owns all of it (store/core.rs) behind the unchanged
+// async Store surface, and mcp is the tool layer the desktop shell (Phase 2)
+// and the stdio bridge (PR 1.8) drive directly. Postgres left at the cutover;
+// the PR 1.7 importer reads old instances with its own Postgres client.
 
 pub mod blockstore;
-pub mod db;
 pub mod fold;
 pub mod index;
 pub mod keys;
 pub mod mcp;
 pub mod oplog;
-pub mod pgq;
 pub mod store;

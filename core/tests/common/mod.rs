@@ -1,44 +1,35 @@
 // The one store-construction seam for every hive-core integration test.
 //
-// PR 1.6 (the SQLite cutover) swaps THIS function to a tempdir SQLite store +
-// mock keys — test bodies stay unchanged. That only works if no test body
-// touches Postgres construction directly, so: every integration test builds
-// its store through `test_store()`, and anything inherently Postgres-shaped
-// (the migration-reshape harness below) lives here, clearly marked to die
-// with the cutover.
+// PR 1.6 (the SQLite cutover) swapped THIS function to a tempdir data dir +
+// in-memory keys + the injected deterministic hash embedder — test bodies
+// stayed unchanged. That only works if no test body touches store
+// construction directly, so: every integration test builds its store through
+// `test_store()` (or `test_store_with` when it needs a different embedder or
+// to reopen the same data dir).
 
+use std::sync::Arc;
+
+use hive_core::keys::MemoryKeySource;
 use hive_core::store::Store;
+use hive_embed::Embedder;
 
-/// A Store over a fresh, isolated database (today: a uniquely-named Postgres
-/// schema via `db::test_pool()`; after PR 1.6: tempdir SQLite).
+/// Keep each store's tempdir alive for the test's duration (a dropped
+/// TempDir deletes the data dir under the writer thread).
+static DIRS: std::sync::Mutex<Vec<tempfile::TempDir>> = std::sync::Mutex::new(Vec::new());
+
+/// A Store over a fresh, isolated data dir: tempdir SQLite index + op log,
+/// MemoryKeySource, deterministic hash embedder.
+#[allow(dead_code)] // each test binary compiles common/ separately; some only use test_store_with
 pub async fn test_store() -> Store {
-    Store::new(hive_core::db::test_pool().await)
+    test_store_with(Arc::new(hive_embed::HashEmbedder))
 }
 
-/// A raw pool pinned to a brand-new schema WITHOUT running migrate() — the
-/// migration upgrade-path test lays down the old shape by hand first.
-/// Postgres-specific by nature; dies with migrations.rs at the 1.6 cutover.
+/// Same, with an explicit embedder (the 384-dim mock suites inject theirs).
 #[allow(dead_code)]
-pub async fn raw_schema_pool() -> sqlx::PgPool {
-    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-
-    let url = hive_core::db::database_url();
-    let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
-    let admin = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&url)
-        .await
-        .expect("connect admin");
-    sqlx::raw_sql(&format!("CREATE SCHEMA \"{schema}\""))
-        .execute(&admin)
-        .await
-        .expect("create schema");
-    admin.close().await;
-    let opts: PgConnectOptions = url.parse().expect("parse DATABASE_URL");
-    let opts = opts.options([("search_path", format!("{schema},public"))]);
-    PgPoolOptions::new()
-        .max_connections(5)
-        .connect_with(opts)
-        .await
-        .expect("connect pool")
+pub fn test_store_with(embedder: Arc<dyn Embedder>) -> Store {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::new(dir.path(), Arc::new(MemoryKeySource([7u8; 32])), embedder)
+        .expect("open test store");
+    DIRS.lock().expect("dirs lock").push(dir);
+    store
 }
