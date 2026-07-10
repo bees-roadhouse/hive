@@ -1,7 +1,7 @@
 {
   "name": "hive",
   "private": true,
-  "version": "0.5.0",
+  "version": "0.7.0",
   "description": "Rust + Solid.js shared AI workspace for journal memory, MCP, tasks, search, and agent integrations.",
   "type": "module",
   "engines": {

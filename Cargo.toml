@@ -3,7 +3,7 @@ members = ["shared", "embed", "api", "worker", "jmap-sync", "mail"]
 resolver = "2"
 
 [workspace.package]
-version = "0.5.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.84"
 authors = ["Pia <pia@beesroadhouse.com>"]
