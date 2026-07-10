@@ -143,14 +143,15 @@ Release. The legacy Node images stopped publishing in 0.6.0.
 
 ## Rust Code Style
 
-- Keep store logic in `api/src/store/*` and route wiring in `api/src/routes/*`.
+- Keep store logic in `core/src/store/*` (the hive-core crate; api re-exports it)
+  and route wiring in `api/src/routes/*`.
 - Keep middleware behavior centralized in `api/src/middleware.rs`.
 - Keep OAuth/OIDC behavior in `api/src/routes/oauth.rs` and related store/auth
   helpers.
 - Use sqlx with explicit queries that match the existing style.
-- Migrations in `api/src/db.rs` must be idempotent and safe for API/worker race
+- Migrations in `core/src/db.rs` must be idempotent and safe for API/worker race
   at startup. Schema management is hybrid: the inline DDL constants in
-  `api/src/db.rs` are the base schema, and `api/migrations/` holds sqlx
+  `core/src/db.rs` are the base schema, and `core/migrations/` holds sqlx
   migrations reserved for reshapes the inline style cannot express. `migrate()`
   runs the sqlx migrator first, so every migration must tolerate both a fresh
   database (inline DDL has not run yet — guard with `IF EXISTS` or

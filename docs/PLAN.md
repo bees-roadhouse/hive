@@ -34,8 +34,9 @@ cutover (never port auth/workspaces to SQLite just to delete them). Emergence
 parsing stays in the command layer at append time; the fold is a mechanical
 records-to-SQLite projector, so parser evolution can never change replay results.
 Two verified facts shape the sequence: PR #91's ANN is pgvector HNSW in SQL
-(`ann_candidates`, api/src/store/semantic.rs:752), and `to_match_query`
-(semantic.rs:157) emits tsquery syntax that is invalid FTS5, so a golden retrieval
+(`ann_candidates`, store/semantic.rs:752 — under core/src/ once PR 1.1 lands), and
+`to_match_query` (semantic.rs:157) emits tsquery syntax that is invalid FTS5, so a
+golden retrieval
 fixture must be captured while Postgres still runs. Tailwind: `pgq.rs` exists
 because queries were born with SQLite `?` placeholders.
 

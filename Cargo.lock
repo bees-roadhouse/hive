@@ -1145,7 +1145,6 @@ dependencies = [
  "pgvector",
  "rand 0.8.6",
  "reqwest 0.12.28",
- "rss",
  "serde",
  "serde_json",
  "sha2",

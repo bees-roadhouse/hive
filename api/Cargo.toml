@@ -34,8 +34,6 @@ base64 = { workspace = true }
 subtle = { workspace = true }
 hex = { workspace = true }
 
-# Feeds (pollSources runs api-side too; the worker reuses it)
-rss = { workspace = true }
 
 # Misc
 nanoid = { workspace = true }
