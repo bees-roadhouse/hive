@@ -1,12 +1,25 @@
-// The store — parity port of packages/api/src/store.ts, split per resource so
-// each area can evolve independently. Every module is an `impl Store` block;
-// the struct itself is just the pool plus the in-process SSE bus (Node's
-// bus.ts), so `emit()` both persists the wire event and fans it to listeners.
+// The store — the PR 1.6 cutover shape. The public surface of every module
+// (`pub async fn` per resource) is unchanged from the Postgres era; under it,
+// every call ships a closure to the single writer thread that owns the
+// rusqlite connection, the op-log writer, and the blockstore (store/core.rs).
+// Writes are record batches through the fold; reads are plain SQL on the
+// derived index. `emit()` is broadcast-bus-only: the wire table died with
+// Postgres — the op log is its durable successor, and a bounded in-memory
+// ring keeps "recent activity" (dashboard) and feed-ingest dedup working
+// within a process lifetime.
 
-use anyhow::Result;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use anyhow::{anyhow, Result};
+use hive_embed::Embedder;
 use hive_shared::WireEvent;
-use sqlx::PgPool;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, oneshot};
+
+use crate::keys::KeySource;
+
+pub(crate) mod core;
 
 pub mod actors;
 pub mod artifacts;
@@ -38,37 +51,125 @@ pub mod tasks;
 pub mod topics;
 pub mod workerstatus;
 
+pub(crate) use self::core::{Core, Draft};
+
 /// Current instant in the exact shape JS `new Date().toISOString()` produces —
-/// millisecond precision, trailing `Z` — so rows sort lexicographically next to
-/// rows written by the Node API.
+/// millisecond precision, trailing `Z` — the same 24-char shape the op-log
+/// envelope freezes (lexicographic order is chronological order).
 pub fn now_iso() -> String {
     chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string()
 }
 
+/// One queued unit of work for the writer thread.
+type Job = Box<dyn FnOnce(&mut Core) + Send>;
+
+/// How many recent wire events the in-memory ring retains.
+const WIRE_RING_CAP: usize = 1024;
+
 #[derive(Clone)]
 pub struct Store {
-    db: PgPool,
+    jobs: mpsc::UnboundedSender<Job>,
     bus: broadcast::Sender<WireEvent>,
+    wire: Arc<Mutex<VecDeque<WireEvent>>>,
+    embedder: Arc<dyn Embedder>,
+    device: String,
+    data_dir: PathBuf,
+    /// The writer thread's handle, for `shutdown` (reopen-the-same-dir tests
+    /// and an orderly app exit).
+    writer: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 impl Store {
-    pub fn new(db: PgPool) -> Self {
+    /// Open (or create) a store under `data_dir`. Spawns the writer thread;
+    /// heals any unfolded op-log tail before the first command runs.
+    pub fn new(
+        data_dir: &Path,
+        keys: Arc<dyn KeySource + Send + Sync>,
+        embedder: Arc<dyn Embedder>,
+    ) -> Result<Store> {
+        let mut core = core::open_core(data_dir, keys)?;
+        let device = core.device.clone();
+        let (jobs, mut rx) = mpsc::unbounded_channel::<Job>();
+        let writer = std::thread::Builder::new()
+            .name("hive-store-writer".to_string())
+            .spawn(move || {
+                while let Some(job) = rx.blocking_recv() {
+                    job(&mut core);
+                }
+            })
+            .map_err(|e| anyhow!("spawning the store writer thread: {e}"))?;
         let (bus, _) = broadcast::channel(1024);
-        Self { db, bus }
+        Ok(Store {
+            jobs,
+            bus,
+            wire: Arc::new(Mutex::new(VecDeque::with_capacity(64))),
+            embedder,
+            device,
+            data_dir: data_dir.to_path_buf(),
+            writer: Arc::new(Mutex::new(Some(writer))),
+        })
     }
 
-    pub fn db(&self) -> &PgPool {
-        &self.db
+    /// Orderly close: drain the queue, stop the writer thread, and wait for
+    /// it to release the index/log files. Only meaningful on the last clone —
+    /// other live clones keep the thread running (join would block, so this
+    /// hands the handle back untouched in that case).
+    pub async fn shutdown(self) -> Result<()> {
+        let Store { jobs, writer, .. } = self;
+        drop(jobs);
+        let handle = writer.lock().expect("writer handle poisoned").take();
+        if let Some(handle) = handle {
+            tokio::task::spawn_blocking(move || {
+                handle
+                    .join()
+                    .map_err(|_| anyhow!("store writer thread panicked"))
+            })
+            .await??;
+        }
+        Ok(())
     }
 
-    /// Subscribe to live wire events (the SSE stream's feed).
+    /// This installation's device id (the op-log author device).
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+
+    /// The data dir this store was opened on.
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// The injected embedding engine.
+    pub(crate) fn embedder(&self) -> &Arc<dyn Embedder> {
+        &self.embedder
+    }
+
+    /// Run one closure on the writer thread and await its result — the
+    /// mpsc-command / oneshot-reply seam every store method rides.
+    pub(crate) async fn run<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Core) -> Result<T> + Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        self.jobs
+            .send(Box::new(move |core| {
+                let _ = tx.send(f(core));
+            }))
+            .map_err(|_| anyhow!("store writer thread is gone"))?;
+        rx.await
+            .map_err(|_| anyhow!("store writer thread dropped the reply"))?
+    }
+
+    /// Subscribe to live wire events (the app shell's notification feed).
     pub fn subscribe(&self) -> broadcast::Receiver<WireEvent> {
         self.bus.subscribe()
     }
 
-    /// Append a wire event and fan it out to SSE subscribers (store.emit + bus.publish).
+    /// Publish a wire event: in-memory ring + broadcast fan-out. No table —
+    /// durable history is the op log's job now.
     pub async fn emit(
         &self,
         kind: &str,
@@ -82,51 +183,172 @@ impl Store {
             payload,
             created_at: now_iso(),
         };
-        crate::pgq::query(
-            "INSERT INTO wire (id, kind, actor, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(&ev.id)
-        .bind(&ev.kind)
-        .bind(&ev.actor)
-        .bind(ev.payload.to_string())
-        .bind(&ev.created_at)
-        .execute(&self.db)
-        .await?;
+        {
+            let mut ring = self.wire.lock().expect("wire ring poisoned");
+            if ring.len() == WIRE_RING_CAP {
+                ring.pop_front();
+            }
+            ring.push_back(ev.clone());
+        }
         // A lagging/absent subscriber must never fail the mutation path.
         let _ = self.bus.send(ev.clone());
         Ok(ev)
     }
 
-    /// The wire log, newest first.
+    /// Recent wire events, newest first (this process's ring — session-scoped
+    /// by design since the wire table died).
     pub async fn wire_log(&self, limit: i64) -> Result<Vec<WireEvent>> {
-        let rows = crate::pgq::query_as::<WireRow>(
-            "SELECT id, kind, actor, payload, created_at FROM wire ORDER BY created_at DESC LIMIT ?",
-        )
-        .bind(limit)
-        .fetch_all(&self.db)
-        .await?;
-        Ok(rows.into_iter().map(WireRow::into_event).collect())
+        let ring = self.wire.lock().expect("wire ring poisoned");
+        Ok(ring
+            .iter()
+            .rev()
+            .take(limit.max(0) as usize)
+            .cloned()
+            .collect())
     }
-}
 
-#[derive(sqlx::FromRow)]
-struct WireRow {
-    id: String,
-    kind: String,
-    actor: String,
-    payload: String,
-    created_at: String,
-}
+    /// Ring probe: does any retained event of `kind` carry `guid` in its
+    /// payload? (Feed-ingest dedup — best-effort within process lifetime.)
+    pub(crate) fn wire_ring_has_guid(&self, kind: &str, guid: &str) -> bool {
+        let ring = self.wire.lock().expect("wire ring poisoned");
+        ring.iter().any(|ev| {
+            ev.kind == kind && ev.payload.get("guid").and_then(|v| v.as_str()) == Some(guid)
+        })
+    }
 
-impl WireRow {
-    fn into_event(self) -> WireEvent {
-        WireEvent {
-            id: self.id,
-            kind: self.kind,
-            actor: self.actor,
-            payload: serde_json::from_str(&self.payload).unwrap_or(serde_json::Value::Null),
-            created_at: self.created_at,
+    /// Rewrite ring authorship (actor merge) — returns how many events moved.
+    pub(crate) fn wire_ring_reassign(&self, from: &str, to: &str) -> i64 {
+        let mut ring = self.wire.lock().expect("wire ring poisoned");
+        let mut n = 0;
+        for ev in ring.iter_mut() {
+            if ev.actor == from {
+                ev.actor = to.to_string();
+                n += 1;
+            }
         }
+        n
+    }
+
+    /// Count ring events authored by `actor` (preview accounting).
+    pub(crate) fn wire_ring_count(&self, actor: &str) -> i64 {
+        let ring = self.wire.lock().expect("wire ring poisoned");
+        ring.iter().filter(|ev| ev.actor == actor).count() as i64
+    }
+
+    /// Drop ring events authored by `actor` (actor delete) — returns count.
+    pub(crate) fn wire_ring_purge(&self, actor: &str) -> i64 {
+        let mut ring = self.wire.lock().expect("wire ring poisoned");
+        let before = ring.len();
+        ring.retain(|ev| ev.actor != actor);
+        (before - ring.len()) as i64
+    }
+
+    // ── diagnostics / test seams ────────────────────────────────────────────
+
+    /// Run one SQL statement on the derived index, binding JSON params
+    /// (strings/numbers/bools/null). SELECTs return rows as JSON values;
+    /// other statements return one row holding rows_affected. Test/diagnostic
+    /// seam ONLY: writes through here bypass the op log and will not survive
+    /// an index rebuild — production code goes through records.
+    #[doc(hidden)]
+    pub async fn raw_sql(
+        &self,
+        sql: &str,
+        params: Vec<serde_json::Value>,
+    ) -> Result<Vec<Vec<serde_json::Value>>> {
+        let sql = sql.to_string();
+        self.run(move |core| {
+            let conn = core.conn();
+            let mut stmt = conn.prepare(&sql)?;
+            let binds: Vec<Box<dyn rusqlite::types::ToSql>> = params
+                .iter()
+                .map(|v| -> Box<dyn rusqlite::types::ToSql> {
+                    match v {
+                        serde_json::Value::Null => Box::new(rusqlite::types::Null),
+                        serde_json::Value::Bool(b) => Box::new(*b),
+                        serde_json::Value::Number(n) => {
+                            if let Some(i) = n.as_i64() {
+                                Box::new(i)
+                            } else {
+                                Box::new(n.as_f64().unwrap_or(0.0))
+                            }
+                        }
+                        other => Box::new(
+                            other
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| other.to_string()),
+                        ),
+                    }
+                })
+                .collect();
+            let bind_refs = rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref()));
+            if stmt.column_count() == 0 {
+                let n = stmt.execute(bind_refs)?;
+                return Ok(vec![vec![serde_json::json!(n as i64)]]);
+            }
+            let ncols = stmt.column_count();
+            let mut rows = stmt.query(bind_refs)?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                let mut vals = Vec::with_capacity(ncols);
+                for i in 0..ncols {
+                    use rusqlite::types::ValueRef;
+                    vals.push(match row.get_ref(i)? {
+                        ValueRef::Null => serde_json::Value::Null,
+                        ValueRef::Integer(v) => serde_json::json!(v),
+                        ValueRef::Real(v) => serde_json::json!(v),
+                        ValueRef::Text(t) => {
+                            serde_json::Value::String(String::from_utf8_lossy(t).to_string())
+                        }
+                        ValueRef::Blob(b) => {
+                            serde_json::Value::String(data_encoding::HEXLOWER.encode(b))
+                        }
+                    });
+                }
+                out.push(vals);
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    /// Insert/replace one embedding row (and its ANN entry) directly. Test
+    /// seam for crafted-vector fixtures; the production path is
+    /// `backfill_embeddings`.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_embedding_raw(
+        &self,
+        ref_kind: &str,
+        ref_id: &str,
+        chunk_idx: i64,
+        model: &str,
+        owner: Option<&str>,
+        vec: Vec<f32>,
+        hash: &str,
+    ) -> Result<()> {
+        let (ref_kind, ref_id, model, hash) = (
+            ref_kind.to_string(),
+            ref_id.to_string(),
+            model.to_string(),
+            hash.to_string(),
+        );
+        let owner = owner.map(str::to_string);
+        let now = now_iso();
+        self.run(move |core| {
+            core.index.upsert_embedding(
+                &ref_kind,
+                &ref_id,
+                chunk_idx,
+                &model,
+                owner.as_deref(),
+                &vec,
+                &hash,
+                &now,
+            )
+        })
+        .await
     }
 }
 

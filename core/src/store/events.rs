@@ -1,11 +1,11 @@
-// Events list/get (store.ts `events`). Owned by core-stores.
+// Events list/get (store.ts `events`). Creates are entity.create records.
 
 use anyhow::Result;
 use hive_shared::EventItem;
+use rusqlite::OptionalExtension;
 use serde_json::json;
-use sqlx::Row;
 
-use super::{json_vec, new_id, now_iso, to_json, Store};
+use super::{json_vec, new_id, now_iso, to_json, Draft, Store};
 
 /// Inputs for the internal creation path (store.ts `events.create` input shape).
 #[derive(Debug, Clone, Default)]
@@ -21,48 +21,39 @@ pub struct EventCreate {
 
 impl Store {
     pub async fn events_list(&self) -> Result<Vec<EventItem>> {
-        let rows = crate::pgq::query("SELECT * FROM events ORDER BY COALESCE(at, created_at) DESC")
-            .fetch_all(self.db())
-            .await?;
-        rows.iter().map(row_to_event).collect()
+        self.run(|core| {
+            let mut stmt = core
+                .conn()
+                .prepare("SELECT * FROM events ORDER BY COALESCE(at, created_at) DESC")?;
+            let rows = stmt.query_map([], row_to_event)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
     }
 
     pub async fn events_get(&self, event_id: &str) -> Result<Option<EventItem>> {
-        let row = crate::pgq::query("SELECT * FROM events WHERE id = ?")
-            .bind(event_id)
-            .fetch_optional(self.db())
-            .await?;
-        row.as_ref().map(row_to_event).transpose()
+        let event_id = event_id.to_string();
+        self.run(move |core| {
+            Ok(core
+                .conn()
+                .query_row(
+                    "SELECT * FROM events WHERE id = ?1",
+                    rusqlite::params![event_id],
+                    row_to_event,
+                )
+                .optional()?)
+        })
+        .await
     }
 
     pub async fn events_create(&self, input: EventCreate, actor: &str) -> Result<EventItem> {
-        let e = EventItem {
-            id: new_id("evt"),
-            title: input.title,
-            body: input.body,
-            at: input.at,
-            tags: input.tags,
-            assignees: input.assignees,
-            origin_entry_id: input.origin_entry_id,
-            anchor_text: input.anchor_text,
-            created_at: now_iso(),
-        };
-        crate::pgq::query(
-            "INSERT INTO events (id, title, body, at, tags, assignees, origin_entry_id, anchor_text, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&e.id)
-        .bind(&e.title)
-        .bind(&e.body)
-        .bind(&e.at)
-        .bind(to_json(&e.tags))
-        .bind(to_json(&e.assignees))
-        .bind(&e.origin_entry_id)
-        .bind(&e.anchor_text)
-        .bind(&e.created_at)
-        .execute(self.db())
-        .await?;
-        self.index_entity("event", &e.id, &e.title, &e.body, &e.tags)
+        let actor_s = actor.to_string();
+        let e = self
+            .run(move |core| {
+                let (e, draft) = event_create_plan(input, &actor_s);
+                core.commit(vec![draft])?;
+                Ok(e)
+            })
             .await?;
         self.emit(
             "event.created",
@@ -74,16 +65,48 @@ impl Store {
     }
 }
 
-pub(crate) fn row_to_event(r: &sqlx::postgres::PgRow) -> Result<EventItem> {
+/// The entity.create payload for one event (also journal.append's `emerged`
+/// element shape).
+pub(crate) fn event_create_payload(e: &EventItem) -> serde_json::Value {
+    json!({"kind": "event", "id": e.id, "fields": {
+        "title": e.title, "body": e.body, "at": e.at,
+        "tags": to_json(&e.tags), "assignees": to_json(&e.assignees),
+        "origin_entry_id": e.origin_entry_id, "anchor_text": e.anchor_text,
+        "created_at": e.created_at,
+    }})
+}
+
+pub(crate) fn event_create_plan(input: EventCreate, actor: &str) -> (EventItem, Draft) {
+    let e = EventItem {
+        id: new_id("evt"),
+        title: input.title,
+        body: input.body,
+        at: input.at,
+        tags: input.tags,
+        assignees: input.assignees,
+        origin_entry_id: input.origin_entry_id,
+        anchor_text: input.anchor_text,
+        created_at: now_iso(),
+    };
+    let draft = Draft::new(
+        crate::oplog::kind::ENTITY_CREATE,
+        actor,
+        &e.created_at,
+        event_create_payload(&e),
+    );
+    (e, draft)
+}
+
+pub(crate) fn row_to_event(r: &rusqlite::Row) -> rusqlite::Result<EventItem> {
     Ok(EventItem {
-        id: r.try_get("id")?,
-        title: r.try_get("title")?,
-        body: r.try_get("body")?,
-        at: r.try_get("at")?,
-        tags: json_vec(r.try_get::<String, _>("tags")?.as_str()),
-        assignees: json_vec(r.try_get::<String, _>("assignees")?.as_str()),
-        origin_entry_id: r.try_get("origin_entry_id")?,
-        anchor_text: r.try_get("anchor_text")?,
-        created_at: r.try_get("created_at")?,
+        id: r.get("id")?,
+        title: r.get("title")?,
+        body: r.get("body")?,
+        at: r.get("at")?,
+        tags: json_vec(r.get::<_, String>("tags")?.as_str()),
+        assignees: json_vec(r.get::<_, String>("assignees")?.as_str()),
+        origin_entry_id: r.get("origin_entry_id")?,
+        anchor_text: r.get("anchor_text")?,
+        created_at: r.get("created_at")?,
     })
 }

@@ -1,55 +1,71 @@
 // Chunked embedding backfill (store::embed_backfill) — the worker crate's
-// chunked_backfill.rs + embed_budget.rs tests, adapted to drive
-// `Store::backfill_embeddings()` directly (PR 1.2 moved the code here and
-// deleted the worker).
-//
-// Both tests run under a 384-dim "transformers" provider (a mock ONNX engine —
-// offline + deterministic like the hash path, but dimension-eligible for the
-// native vector column): the provider choice ($HIVE_EMBED) and the engine are
-// latched once per process, so one binary means ONE provider for every test in
-// it. $HIVE_EMBED_STAGE_BUDGET_SECS is process-global too, so the tests
-// serialize on ENV_LOCK — the budget test's zero-budget window must never
-// overlap another test's backfill call.
+// chunked_backfill.rs + embed_budget.rs tests, adapted at the PR 1.6 cutover:
+// the provider is an INJECTED 384-dim mock Embedder (no env latch, no ONNX),
+// and the dual-write vec_v assertions died with the Postgres-native vector
+// column — chunk rows now
+// prove themselves through the embeddings table + the in-memory ANN.
+// $HIVE_EMBED_STAGE_BUDGET_SECS is process-global, so the tests serialize on
+// ENV_LOCK — the budget test's zero-budget window must never overlap another
+// test's backfill call.
 
 mod common;
+
+use std::sync::Arc;
 
 use hive_core::store::Store;
 use tokio::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
+/// Deterministic + unit-length 384-dim engine: the 256-dim hash embedding
+/// zero-padded to the BGE small dimension.
 struct Mock384;
-impl hive_embed::OnnxProvider for Mock384 {
-    fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
-        // Deterministic + unit-length: the 256-dim hash embedding zero-padded
-        // to the BGE small dimension.
+
+impl hive_embed::Embedder for Mock384 {
+    fn model(&self) -> String {
+        "mock-bge-384".to_string()
+    }
+    fn dim(&self) -> usize {
+        384
+    }
+    fn embed(&self, text: &str) -> Vec<f32> {
         let mut v = hive_embed::embed_hash(text);
         v.resize(384, 0.0);
-        Ok(v)
+        v
     }
-    fn rerank(&self, _query: &str, _docs: &[String]) -> anyhow::Result<Vec<f64>> {
-        anyhow::bail!("no reranker in the mock")
+    fn embed_query(&self, text: &str) -> Vec<f32> {
+        self.embed(text)
     }
-    fn supports_rerank(&self) -> bool {
+    fn rerank_available(&self) -> bool {
+        false
+    }
+    fn rerank(&self, _query: &str, _docs: &[String]) -> Option<Vec<f64>> {
+        None
+    }
+    fn latched(&self) -> bool {
         false
     }
 }
 
-async fn test_setup() -> (sqlx::PgPool, Store) {
-    // Must beat the first embed call: the provider choice latches once per
-    // process, and installing the mock first keeps the lazy default ort
-    // engine (real model download) from ever wiring itself in.
-    std::env::set_var("HIVE_EMBED", "transformers");
-    hive_embed::set_onnx_provider(Box::new(Mock384));
-    let store = common::test_store().await;
-    (store.db().clone(), store)
+async fn test_setup() -> Store {
+    common::test_store_with(Arc::new(Mock384))
+}
+
+async fn seed_journal(store: &Store, id: &str, body: &str) {
+    store
+        .raw_sql(
+            "INSERT INTO journal (id, author, body, user_scope, created_at) \
+             VALUES (?, 'nate', ?, 'nate', '2026-01-01T00:00:00.000Z')",
+            vec![id.into(), body.into()],
+        )
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
-async fn chunked_dual_write_skip_and_atomic_replace() {
+async fn chunked_write_skip_and_atomic_replace() {
     let _env = ENV_LOCK.lock().await;
-    let (pool, store) = test_setup().await;
-    assert_eq!(hive_embed::embed_dim(), 384, "mock must be vec_v-eligible");
+    let store = test_setup().await;
 
     // A body several times the 450-token (1800-char) chunk target → the item
     // must land as multiple chunk rows.
@@ -57,91 +73,83 @@ async fn chunked_dual_write_skip_and_atomic_replace() {
         .map(|i| format!("Paragraph {i:02}: {}", "chunked backfill notes ".repeat(8)))
         .collect::<Vec<_>>()
         .join("\n\n");
-    sqlx::query(
-        "INSERT INTO journal (id, author, body, user_scope, created_at) \
-         VALUES ('jrnl_long', 'nate', $1, 'nate', '2026-01-01T00:00:00.000Z')",
-    )
-    .bind(&long_body)
-    .execute(&pool)
-    .await
-    .unwrap();
+    seed_journal(&store, "jrnl_long", &long_body).await;
 
     let embedded = store.backfill_embeddings().await.expect("backfill 1");
     assert_eq!(embedded, 1, "one ITEM embedded (chunks don't inflate it)");
-    assert!(
-        !hive_embed::transformers_latched(),
-        "mock engine must not latch"
-    );
 
-    let rows: Vec<(i32, Option<String>, String, bool, bool, i64)> = sqlx::query_as(
-        "SELECT chunk_idx, owner, hash, vec IS NOT NULL, vec_v IS NOT NULL, dim \
-         FROM embeddings WHERE ref_kind = 'journal' AND ref_id = 'jrnl_long' ORDER BY chunk_idx",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    let rows = store
+        .raw_sql(
+            "SELECT chunk_idx, owner, hash, vec IS NOT NULL, dim, model \
+             FROM embeddings WHERE ref_kind = 'journal' AND ref_id = 'jrnl_long' ORDER BY chunk_idx",
+            vec![],
+        )
+        .await
+        .unwrap();
     assert!(rows.len() > 1, "long text must chunk: {} rows", rows.len());
-    let item_hash = &rows[0].2;
-    for (i, (chunk_idx, owner, hash, has_vec, has_vec_v, dim)) in rows.iter().enumerate() {
-        assert_eq!(*chunk_idx, i as i32, "contiguous chunk indexes");
-        assert_eq!(owner.as_deref(), Some("nate"), "owner stamped on every row");
-        assert_eq!(hash, item_hash, "item-level hash identical on every chunk");
-        assert!(has_vec, "dual-write keeps BYTEA vec populated");
-        assert!(has_vec_v, "384-dim model writes the native vector too");
-        assert_eq!(*dim, 384);
+    let item_hash = rows[0][2].as_str().unwrap().to_string();
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(row[0].as_i64(), Some(i as i64), "contiguous chunk indexes");
+        assert_eq!(row[1].as_str(), Some("nate"), "owner stamped on every row");
+        assert_eq!(
+            row[2].as_str(),
+            Some(item_hash.as_str()),
+            "item-level hash identical on every chunk"
+        );
+        assert_eq!(row[3].as_i64(), Some(1), "packed vec populated");
+        assert_eq!(row[4].as_i64(), Some(384));
+        assert_eq!(row[5].as_str(), Some("mock-bge-384"));
     }
-    // The native column really holds 384-dim vectors (not just non-NULL).
-    let (v,): (pgvector::Vector,) = sqlx::query_as(
-        "SELECT vec_v FROM embeddings WHERE ref_kind = 'journal' AND ref_id = 'jrnl_long' AND chunk_idx = 0",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(v.as_slice().len(), 384);
     let n_chunks = rows.len() as i64;
 
     // Replay with an unchanged hash: the batched skip-map must skip it.
     let embedded = store.backfill_embeddings().await.expect("backfill 2");
     assert_eq!(embedded, 0, "unchanged item skips");
-    let (count,): (i64,) =
-        sqlx::query_as("SELECT count(*) FROM embeddings WHERE ref_id = 'jrnl_long'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let count = store
+        .raw_sql(
+            "SELECT count(*) FROM embeddings WHERE ref_id = 'jrnl_long'",
+            vec![],
+        )
+        .await
+        .unwrap()[0][0]
+        .as_i64()
+        .unwrap();
     assert_eq!(count, n_chunks, "skip leaves the chunk set untouched");
 
     // Shrink the body: the whole chunk set must be replaced atomically —
     // fewer rows, no stale high-index chunks, new hash everywhere.
-    sqlx::query("UPDATE journal SET body = 'short now' WHERE id = 'jrnl_long'")
-        .execute(&pool)
+    store
+        .raw_sql(
+            "UPDATE journal SET body = 'short now' WHERE id = 'jrnl_long'",
+            vec![],
+        )
         .await
         .unwrap();
     let embedded = store.backfill_embeddings().await.expect("backfill 3");
     assert_eq!(embedded, 1, "changed hash re-embeds");
-    let rows: Vec<(i32, String)> = sqlx::query_as(
-        "SELECT chunk_idx, hash FROM embeddings WHERE ref_id = 'jrnl_long' ORDER BY chunk_idx",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+    let rows = store
+        .raw_sql(
+            "SELECT chunk_idx, hash FROM embeddings WHERE ref_id = 'jrnl_long' ORDER BY chunk_idx",
+            vec![],
+        )
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1, "shrunk text leaves exactly one chunk row");
-    assert_eq!(rows[0].0, 0);
-    assert_ne!(&rows[0].1, item_hash, "hash rolled with the text");
+    assert_eq!(rows[0][0].as_i64(), Some(0));
+    assert_ne!(
+        rows[0][1].as_str().unwrap(),
+        item_hash,
+        "hash rolled with the text"
+    );
 }
 
 #[tokio::test]
 async fn zero_budget_defers_items_to_the_next_call() {
     let _env = ENV_LOCK.lock().await;
-    let (pool, store) = test_setup().await;
+    let store = test_setup().await;
     std::env::set_var("HIVE_EMBED_STAGE_BUDGET_SECS", "0");
 
-    sqlx::query(
-        "INSERT INTO journal (id, author, body, created_at) \
-         VALUES ('jrnl_budget', 'pia', 'body to embed later', '2026-01-01T00:00:00.000Z')",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    seed_journal(&store, "jrnl_budget", "body to embed later").await;
 
     // Zero budget: the stale item is seen but never started.
     let embedded = store
@@ -149,9 +157,11 @@ async fn zero_budget_defers_items_to_the_next_call() {
         .await
         .expect("backfill under zero budget");
     assert_eq!(embedded, 0, "zero budget must defer, not embed");
-    let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM embeddings")
-        .fetch_one(&pool)
+    let count = store
+        .raw_sql("SELECT count(*) FROM embeddings", vec![])
         .await
+        .unwrap()[0][0]
+        .as_i64()
         .unwrap();
     assert_eq!(count, 0, "no rows written under a spent budget");
 

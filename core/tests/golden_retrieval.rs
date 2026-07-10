@@ -30,9 +30,26 @@
 //   HIVE_GOLDEN_REGEN=1 cargo test -p hive-core --test golden_retrieval
 //
 // The 1.6 cutover MAY relax the score tolerance (FTS5/bm25 replaces
-// ts_rank, usearch replaces pgvector — scores will not be bit-identical) but
-// MUST keep the label-set equality and top-3 order assertions: those are the
-// retrieval-behavior contract this fixture exists to freeze.
+// ts_rank — scores will not be bit-identical) but MUST keep the label-set
+// equality and top-3 order assertions: those are the retrieval-behavior
+// contract this fixture exists to freeze.
+//
+// CUTOVER PROVENANCE (PR 1.6): the fixture was regenerated ONCE against the
+// SQLite backend after a documented investigation (full Postgres-vs-SQLite
+// diff in the PR report). The vector path is bit-identical (hash embeddings +
+// the same Rust cosine; every vector-dominated query matched with Δscore 0);
+// the conscious differences are keyword-side and cross-backend by nature:
+//   1. Stemming: Postgres `english` is Snowball/Porter2, whose exception
+//      list holds "canning" invariant while "canned" stems to "can" — so
+//      Postgres never matched the "Canned Brandywine Tomatoes" recipe for
+//      the query "canning tomatoes" (verified against a live Postgres).
+//      FTS5's porter (Porter1, no exception list) stems both to "can", so
+//      the recipe now (correctly) hits and leads that query.
+//   2. Ranking: bm25 replaces ts_rank; keyword ORDER feeds the hybrid blend
+//      as rank positions, which reshuffles blend tails and swapped one
+//      recall top-2 pair.
+// With the baseline captured under THIS deterministic backend, the strict
+// 1e-6 score tolerance is back in force (and the suite runs it twice).
 
 mod common;
 
@@ -236,15 +253,20 @@ async fn seed(store: &Store) -> anyhow::Result<HashMap<String, String>> {
     }
 
     // A couple of explicit cross-entity links so the Markov-blanket boost has
-    // graph structure to walk.
-    let honey_entries: Vec<(String,)> = sqlx::query_as(
-        "SELECT id FROM journal WHERE body LIKE '%Honey harvest planning%' OR body LIKE '%Bottling day%' ORDER BY created_at",
-    )
-    .fetch_all(store.db())
-    .await?;
+    // graph structure to walk. (Reads ride the raw_sql diagnostics seam — the
+    // Postgres-client calls died with the cutover; same queries, same rows.)
+    let honey_entries: Vec<String> = store
+        .raw_sql(
+            "SELECT id FROM journal WHERE body LIKE '%Honey harvest planning%' OR body LIKE '%Bottling day%' ORDER BY created_at",
+            vec![],
+        )
+        .await?
+        .into_iter()
+        .filter_map(|row| row[0].as_str().map(str::to_string))
+        .collect();
     if let [a, b] = honey_entries.as_slice() {
         store
-            .links_create("journal", &a.0, "journal", &b.0, "relates")
+            .links_create("journal", a, "journal", b, "relates")
             .await?;
     }
 
@@ -253,10 +275,16 @@ async fn seed(store: &Store) -> anyhow::Result<HashMap<String, String>> {
 
     // ---- stable-label map (see header): id -> content label ----
     let mut labels: HashMap<String, String> = HashMap::new();
-    let journal_rows: Vec<(String, String)> = sqlx::query_as("SELECT id, body FROM journal")
-        .fetch_all(store.db())
-        .await?;
-    for (id, body) in journal_rows {
+    let pairs = |rows: Vec<Vec<serde_json::Value>>| -> Vec<(String, String)> {
+        rows.into_iter()
+            .filter_map(|row| Some((row[0].as_str()?.to_string(), row[1].as_str()?.to_string())))
+            .collect()
+    };
+    for (id, body) in pairs(
+        store
+            .raw_sql("SELECT id, body FROM journal", vec![])
+            .await?,
+    ) {
         let label: String = body.chars().take(40).collect();
         labels.insert(id, format!("journal:{label}"));
     }
@@ -265,17 +293,19 @@ async fn seed(store: &Store) -> anyhow::Result<HashMap<String, String>> {
         ("decisions", "decision"),
         ("events", "event"),
     ] {
-        let rows: Vec<(String, String)> = sqlx::query_as(&format!("SELECT id, title FROM {table}"))
-            .fetch_all(store.db())
-            .await?;
-        for (id, title) in rows {
+        for (id, title) in pairs(
+            store
+                .raw_sql(&format!("SELECT id, title FROM {table}"), vec![])
+                .await?,
+        ) {
             labels.insert(id, format!("{kind}:{title}"));
         }
     }
-    let ent_rows: Vec<(String, String)> = sqlx::query_as("SELECT id, title FROM entities")
-        .fetch_all(store.db())
-        .await?;
-    for (id, title) in ent_rows {
+    for (id, title) in pairs(
+        store
+            .raw_sql("SELECT id, title FROM entities", vec![])
+            .await?,
+    ) {
         labels.insert(id, format!("entity:{title}"));
     }
     Ok(labels)
@@ -363,7 +393,7 @@ async fn capture(store: &Store, labels: &HashMap<String, String>) -> anyhow::Res
 
     Ok(GoldenFixture {
         captured_under: format!(
-            "postgres tsvector/ts_rank + brute-force cosine, HIVE_EMBED=hash (dim {}), reranker off, hybrid on",
+            "sqlite FTS5 porter/bm25 + brute-force cosine, hash embedder (dim {}), reranker off, hybrid on",
             hive_embed::embed_dim()
         ),
         queries,

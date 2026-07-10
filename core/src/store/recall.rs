@@ -7,7 +7,7 @@ use hive_shared::{
     snip, EntityKind, EventItem, Priority, Profile, ProjectRef, RecallData, RecallJournalHit,
     RecallResult, SearchHit, Task, TaskStatus, RECALL_DEFAULT_BUDGET,
 };
-use sqlx::Row;
+use rusqlite::OptionalExtension;
 
 use super::semantic::SemanticOptions;
 use super::{json_vec, Store};
@@ -141,24 +141,33 @@ impl Store {
             )
             .await?
         };
-        let mut journal_hits: Vec<RecallJournalHit> = Vec::new();
-        for h in raw_hits {
-            let row =
-                crate::pgq::query("SELECT author, body, created_at FROM journal WHERE id = ?")
-                    .bind(&h.id)
-                    .fetch_optional(self.db())
-                    .await?;
-            let Some(r) = row else { continue };
-            let body: String = r.try_get("body")?;
-            journal_hits.push(RecallJournalHit {
-                hit: SearchHit {
-                    title: derive_journal_title(&body),
-                    ..h
-                },
-                author: r.try_get("author")?,
-                created_at: r.try_get("created_at")?,
-            });
-        }
+        let journal_hits: Vec<RecallJournalHit> = self
+            .run(move |core| {
+                let mut out = Vec::new();
+                for h in raw_hits {
+                    let row: Option<(String, String, String)> = core
+                        .conn()
+                        .query_row(
+                            "SELECT author, body, created_at FROM journal WHERE id = ?1",
+                            rusqlite::params![h.id],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                        )
+                        .optional()?;
+                    let Some((author, body, created_at)) = row else {
+                        continue;
+                    };
+                    out.push(RecallJournalHit {
+                        hit: SearchHit {
+                            title: derive_journal_title(&body),
+                            ..h
+                        },
+                        author,
+                        created_at,
+                    });
+                }
+                Ok(out)
+            })
+            .await?;
 
         let recent_events = self.recall_recent_events(5).await?;
 
@@ -271,59 +280,52 @@ impl Store {
     /// Node: `tasks.list({ assignee: identity }).filter(t => t.status !== "done")`
     /// — priority order (urgent→low), then created_at DESC.
     async fn recall_open_tasks(&self, assignee: &str) -> Result<Vec<Task>> {
-        let rows = crate::pgq::query(
-            "SELECT * FROM tasks ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC",
-        )
-        .fetch_all(self.db())
-        .await?;
-        let mut out = Vec::new();
-        for r in &rows {
-            let task = Task {
-                id: r.try_get("id")?,
-                title: r.try_get("title")?,
-                body: r.try_get("body")?,
-                status: TaskStatus::from_str_lossy(r.try_get::<String, _>("status")?.as_str()),
-                priority: Priority::from_str_lossy(r.try_get::<String, _>("priority")?.as_str()),
-                tags: json_vec(&r.try_get::<String, _>("tags")?),
-                assignees: json_vec(&r.try_get::<String, _>("assignees")?),
-                project: r.try_get("project")?,
-                phase: r.try_get("phase")?,
-                due: r.try_get("due")?,
-                origin_entry_id: r.try_get("origin_entry_id")?,
-                anchor_text: r.try_get("anchor_text")?,
-                created_at: r.try_get("created_at")?,
-                updated_at: r.try_get("updated_at")?,
-            };
-            if task.status != TaskStatus::Done && task.assignees.iter().any(|a| a == assignee) {
-                out.push(task);
+        let assignee = assignee.to_string();
+        self.run(move |core| {
+            let mut stmt = core.conn().prepare(
+                "SELECT * FROM tasks ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(Task {
+                    id: r.get("id")?,
+                    title: r.get("title")?,
+                    body: r.get("body")?,
+                    status: TaskStatus::from_str_lossy(r.get::<_, String>("status")?.as_str()),
+                    priority: Priority::from_str_lossy(r.get::<_, String>("priority")?.as_str()),
+                    tags: json_vec(&r.get::<_, String>("tags")?),
+                    assignees: json_vec(&r.get::<_, String>("assignees")?),
+                    project: r.get("project")?,
+                    phase: r.get("phase")?,
+                    due: r.get("due")?,
+                    origin_entry_id: r.get("origin_entry_id")?,
+                    anchor_text: r.get("anchor_text")?,
+                    created_at: r.get("created_at")?,
+                    updated_at: r.get("updated_at")?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let task = row?;
+                if task.status != TaskStatus::Done && task.assignees.contains(&assignee)
+                {
+                    out.push(task);
+                }
             }
-        }
-        Ok(out)
+            Ok(out)
+        })
+        .await
     }
 
     /// Node: `events.list().slice(0, 5)` — COALESCE(at, created_at) DESC.
     async fn recall_recent_events(&self, limit: i64) -> Result<Vec<EventItem>> {
-        let rows = crate::pgq::query(
-            "SELECT * FROM events ORDER BY COALESCE(at, created_at) DESC LIMIT ?",
-        )
-        .bind(limit)
-        .fetch_all(self.db())
-        .await?;
-        rows.iter()
-            .map(|r| -> Result<EventItem> {
-                Ok(EventItem {
-                    id: r.try_get("id")?,
-                    title: r.try_get("title")?,
-                    body: r.try_get("body")?,
-                    at: r.try_get("at")?,
-                    tags: json_vec(&r.try_get::<String, _>("tags")?),
-                    assignees: json_vec(&r.try_get::<String, _>("assignees")?),
-                    origin_entry_id: r.try_get("origin_entry_id")?,
-                    anchor_text: r.try_get("anchor_text")?,
-                    created_at: r.try_get("created_at")?,
-                })
-            })
-            .collect()
+        self.run(move |core| {
+            let mut stmt = core
+                .conn()
+                .prepare("SELECT * FROM events ORDER BY COALESCE(at, created_at) DESC LIMIT ?1")?;
+            let rows = stmt.query_map(rusqlite::params![limit], super::events::row_to_event)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
     }
 }
 

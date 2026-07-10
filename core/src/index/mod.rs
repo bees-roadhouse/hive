@@ -38,7 +38,8 @@
 //     the Postgres column set (kind, ref_id, title, body) minus `tsv`.
 //   - JSONB columns are TEXT holding JSON (queried via json_extract; a JSONB
 //     type name would get NUMERIC affinity in SQLite and mangle strings).
-//   - embeddings drops the pgvector-only `vec_v` column, its HNSW index, and
+//   - embeddings drops the Postgres-native `vec_v` vector column, its HNSW
+//     index, and
 //     the vec-presence CHECK; `vec` (packed little-endian f32 BLOB) is NOT
 //     NULL instead. `ann_keys` (new) pairs u64 ANN handles with
 //     (ref_kind, ref_id, chunk_idx).
@@ -48,13 +49,33 @@
 //   - mail_attachments.blob_hash no longer REFERENCES a blobs table: bytes
 //     live in the PR 1.4 blockstore; the column keeps the blake3 hash.
 //   - tasks.phase/tasks.due (ALTER-added in Postgres) are in the base DDL.
-//   - Postgres-era tables that do NOT cross: wire (bus-only after 1.6),
-//     outbox, blobs (blockstore), cc_credentials (Phase 3 keychain),
-//     identities (not in the 1.5 set).
+//   - Postgres-era tables that do NOT cross: wire (bus-only after 1.6) and
+//     blobs (bytes live in the blockstore; `blob_refs` below holds the
+//     BlobRef pointers).
 //   - aliases (new, fold-owned) projects `alias` records; fold_meta (new)
 //     holds the per-device applied-seq watermark.
 //   - worker_status crosses (trivially portable) but is RUNTIME state the
 //     1.6 store writes directly — the fold never touches it.
+//
+// PR 1.6 amendments (FOLD_VERSION 2):
+//
+//   - identities crosses after all, fold-owned (the identity built-in kind;
+//     the MCP identity_* tools survived the teardown and D18 wants their
+//     writes as records).
+//   - Three RUNTIME tables join worker_status (store-written, fold-blind,
+//     excluded from the canonical dump; an index rebuild loses them, which is
+//     each one's documented trade):
+//       cc_credentials — the AES-GCM mail-credential vault (HIVE_CRED_KEY).
+//         Phase 3 replaces it with the OS keychain; mail is paused, so a
+//         rebuild losing vault rows means re-entering a password.
+//       outbox — the webhook/log work queue. Transient by nature.
+//       blob_refs — hash → serialized BlobRef for blockstore payloads
+//         (today: mail attachment bytes). Loses pointers on rebuild; the
+//         Phase 3 mail module re-fetches, and 1.7-imported blobs carry their
+//         refs in log records instead.
+//   - search_fts tokenizes with `porter unicode61`: parity with the Postgres
+//     `to_tsvector('english')` stemming the golden retrieval fixture was
+//     captured under (see fold/mod.rs v2 notes).
 //
 // Timestamps stay TEXT in the store's 24-char ISO shape (see store/mod.rs) —
 // lexicographic order is chronological order.
@@ -568,6 +589,7 @@ const DUMP_TABLES: &[(&str, &str)] = &[
     ("mail_messages", "id"),
     ("mail_attachments", "id"),
     ("sources", "id"),
+    ("identities", "id"),
     ("aliases", "namespace, \"from\""),
     ("search", "kind, ref_id"),
     ("fold_meta", "device"),
@@ -601,6 +623,10 @@ const DROP_DERIVED: &str = r#"
     DROP TABLE IF EXISTS mail_mailboxes;
     DROP TABLE IF EXISTS mail_accounts;
     DROP TABLE IF EXISTS sources;
+    DROP TABLE IF EXISTS identities;
+    DROP TABLE IF EXISTS cc_credentials;
+    DROP TABLE IF EXISTS outbox;
+    DROP TABLE IF EXISTS blob_refs;
     DROP TABLE IF EXISTS worker_status;
     DROP TABLE IF EXISTS embeddings;
     DROP TABLE IF EXISTS ann_keys;
@@ -751,7 +777,8 @@ const DDL: &str = r#"
     );
 
     -- Local embeddings, one row per chunk. vec = packed little-endian f32
-    -- (NOT NULL here: the pgvector vec_v column and its CHECK don't cross).
+    -- (NOT NULL here: the Postgres-native vec_v column and its CHECK don't
+    -- cross).
     -- Maintained by the embed pipeline ABOVE the fold, except that tombstone/
     -- redact records delete rows so shredded content leaves retrieval.
     CREATE TABLE IF NOT EXISTS embeddings (
@@ -845,7 +872,8 @@ const DDL: &str = r#"
     );
     CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
       kind UNINDEXED, ref_id UNINDEXED, title, body,
-      content='search', content_rowid='rowid'
+      content='search', content_rowid='rowid',
+      tokenize='porter unicode61'
     );
     CREATE TRIGGER IF NOT EXISTS search_fts_ai AFTER INSERT ON search BEGIN
       INSERT INTO search_fts(rowid, kind, ref_id, title, body)
@@ -1006,6 +1034,62 @@ const DDL: &str = r#"
       ON mail_attachments (message_id, jmap_blob_id, COALESCE(content_id, ''));
     CREATE INDEX IF NOT EXISTS mail_attachments_message ON mail_attachments (message_id);
     CREATE INDEX IF NOT EXISTS mail_attachments_blob ON mail_attachments (blob_hash);
+
+    -- Cross-platform identity mapping (fold-owned from v2: the `identity`
+    -- built-in kind): Discord/Telegram/Slack user ids → a people.slug.
+    CREATE TABLE IF NOT EXISTS identities (
+      id          TEXT PRIMARY KEY,
+      platform    TEXT NOT NULL,
+      platform_id TEXT NOT NULL,
+      actor       TEXT NOT NULL,
+      created_at  TEXT NOT NULL,
+      UNIQUE (platform, platform_id)
+    );
+
+    -- ── RUNTIME tables (store-written, fold-blind, not in the canonical
+    -- dump; see the module header for each one's rebuild trade) ─────────────
+
+    -- The credential vault, encrypted at rest (AES-256-GCM via HIVE_CRED_KEY,
+    -- on top of SQLCipher). Only consumer: mail account credentials
+    -- (mail_accounts.cred_id). Phase 3 replaces it with the OS keychain.
+    CREATE TABLE IF NOT EXISTS cc_credentials (
+      id           TEXT PRIMARY KEY,
+      owner        TEXT NOT NULL,
+      kind         TEXT NOT NULL,
+      runtime      TEXT NOT NULL DEFAULT 'claude_code',
+      provider     TEXT,
+      label        TEXT NOT NULL DEFAULT '',
+      ciphertext   TEXT NOT NULL,
+      nonce        TEXT NOT NULL,
+      tail         TEXT NOT NULL DEFAULT '',
+      created_at   TEXT NOT NULL,
+      last_used_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS cc_credentials_owner ON cc_credentials (owner);
+
+    -- Outbound work queue (webhooks, logs; mail.send returns in Phase 3).
+    CREATE TABLE IF NOT EXISTS outbox (
+      id           TEXT PRIMARY KEY,
+      kind         TEXT NOT NULL,
+      payload      TEXT NOT NULL DEFAULT '{}',
+      status       TEXT NOT NULL DEFAULT 'pending',
+      attempts     BIGINT NOT NULL DEFAULT 0,
+      last_error   TEXT,
+      run_after    TEXT NOT NULL,
+      created_at   TEXT NOT NULL,
+      completed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS outbox_pending ON outbox (status, run_after);
+
+    -- hash → serialized BlobRef (CBOR) for payload bytes living in the
+    -- blockstore. mail_attachments.blob_hash names rows here.
+    CREATE TABLE IF NOT EXISTS blob_refs (
+      hash       TEXT PRIMARY KEY,
+      ref        BLOB NOT NULL,
+      size       BIGINT NOT NULL DEFAULT 0,
+      mime       TEXT NOT NULL DEFAULT 'application/octet-stream',
+      created_at TEXT NOT NULL
+    );
 
     -- Identifier remapping (fold-owned; projects `alias` records). The 1.7
     -- importer emits these for re-keyed blob hashes.

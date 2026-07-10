@@ -1,27 +1,39 @@
 // Cross-platform identity mapping (Rust-branch addition): Discord/Telegram/
-// Slack user ids → a people.slug.
+// Slack user ids → a people.slug. Fold-owned from contract v2 (the `identity`
+// built-in kind): creates/updates/removes are records.
 
 use anyhow::{Context, Result};
 use hive_shared::{ActorKind, Identity, IdentityPatch, NewIdentity};
+use rusqlite::OptionalExtension;
 use serde_json::json;
-use sqlx::Row;
 
-use super::{new_id, now_iso, Store};
+use super::{new_id, now_iso, Draft, Store};
 
 impl Store {
     pub async fn identities_list(&self) -> Result<Vec<Identity>> {
-        let rows = crate::pgq::query("SELECT * FROM identities ORDER BY platform, platform_id")
-            .fetch_all(self.db())
-            .await?;
-        rows.iter().map(row_to_identity).collect()
+        self.run(|core| {
+            let mut stmt = core
+                .conn()
+                .prepare("SELECT * FROM identities ORDER BY platform, platform_id")?;
+            let rows = stmt.query_map([], row_to_identity)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
     }
 
     pub async fn identities_get(&self, id: &str) -> Result<Option<Identity>> {
-        let row = crate::pgq::query("SELECT * FROM identities WHERE id = ?")
-            .bind(id)
-            .fetch_optional(self.db())
-            .await?;
-        row.as_ref().map(row_to_identity).transpose()
+        let id = id.to_string();
+        self.run(move |core| {
+            Ok(core
+                .conn()
+                .query_row(
+                    "SELECT * FROM identities WHERE id = ?1",
+                    rusqlite::params![id],
+                    row_to_identity,
+                )
+                .optional()?)
+        })
+        .await
     }
 
     pub async fn identities_resolve(
@@ -29,21 +41,30 @@ impl Store {
         platform: &str,
         platform_id: &str,
     ) -> Result<Option<String>> {
-        Ok(crate::pgq::query_scalar(
-            "SELECT actor FROM identities WHERE platform = ? AND platform_id = ?",
-        )
-        .bind(platform)
-        .bind(platform_id)
-        .fetch_optional(self.db())
-        .await?)
+        let (platform, platform_id) = (platform.to_string(), platform_id.to_string());
+        self.run(move |core| {
+            Ok(core
+                .conn()
+                .query_row(
+                    "SELECT actor FROM identities WHERE platform = ?1 AND platform_id = ?2",
+                    rusqlite::params![platform, platform_id],
+                    |r| r.get(0),
+                )
+                .optional()?)
+        })
+        .await
     }
 
     pub async fn identities_for_actor(&self, actor: &str) -> Result<Vec<Identity>> {
-        let rows = crate::pgq::query("SELECT * FROM identities WHERE actor = ? ORDER BY platform")
-            .bind(actor)
-            .fetch_all(self.db())
-            .await?;
-        rows.iter().map(row_to_identity).collect()
+        let actor = actor.to_string();
+        self.run(move |core| {
+            let mut stmt = core
+                .conn()
+                .prepare("SELECT * FROM identities WHERE actor = ?1 ORDER BY platform")?;
+            let rows = stmt.query_map(rusqlite::params![actor], row_to_identity)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
     }
 
     pub async fn identities_create(&self, input: NewIdentity, by: &str) -> Result<Identity> {
@@ -67,16 +88,16 @@ impl Store {
             actor: input.actor,
             created_at: now_iso(),
         };
-        crate::pgq::query(
-            "INSERT INTO identities (id, platform, platform_id, actor, created_at) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(&item.id)
-        .bind(&item.platform)
-        .bind(&item.platform_id)
-        .bind(&item.actor)
-        .bind(&item.created_at)
-        .execute(self.db())
-        .await?;
+        let draft = Draft::new(
+            crate::oplog::kind::ENTITY_CREATE,
+            by,
+            &item.created_at,
+            json!({"kind": "identity", "id": item.id, "fields": {
+                "platform": item.platform, "platform_id": item.platform_id,
+                "actor": item.actor, "created_at": item.created_at,
+            }}),
+        );
+        self.run(move |core| core.commit(vec![draft])).await?;
         self.emit(
             "identity.created",
             by,
@@ -128,11 +149,13 @@ impl Store {
             return Ok(None);
         };
         let actor = patch.actor.unwrap_or_else(|| cur.actor.clone());
-        crate::pgq::query("UPDATE identities SET actor = ? WHERE id = ?")
-            .bind(&actor)
-            .bind(id)
-            .execute(self.db())
-            .await?;
+        let draft = Draft::new(
+            crate::oplog::kind::ENTITY_UPDATE,
+            by,
+            &now_iso(),
+            json!({"kind": "identity", "id": id, "fields": {"actor": actor}}),
+        );
+        self.run(move |core| core.commit(vec![draft])).await?;
         self.emit("identity.updated", by, json!({"id": id, "actor": actor}))
             .await?;
         Ok(Some(Identity { actor, ..cur }))
@@ -142,10 +165,13 @@ impl Store {
         let Some(cur) = self.identities_get(id).await? else {
             return Ok(false);
         };
-        crate::pgq::query("DELETE FROM identities WHERE id = ?")
-            .bind(id)
-            .execute(self.db())
-            .await?;
+        let draft = Draft::new(
+            crate::oplog::kind::TOMBSTONE,
+            by,
+            &now_iso(),
+            json!({"kind": "identity", "id": id}),
+        );
+        self.run(move |core| core.commit(vec![draft])).await?;
         self.emit(
             "identity.removed",
             by,
@@ -156,12 +182,12 @@ impl Store {
     }
 }
 
-fn row_to_identity(r: &sqlx::postgres::PgRow) -> Result<Identity> {
+fn row_to_identity(r: &rusqlite::Row) -> rusqlite::Result<Identity> {
     Ok(Identity {
-        id: r.try_get("id")?,
-        platform: r.try_get("platform")?,
-        platform_id: r.try_get("platform_id")?,
-        actor: r.try_get("actor")?,
-        created_at: r.try_get("created_at")?,
+        id: r.get("id")?,
+        platform: r.get("platform")?,
+        platform_id: r.get("platform_id")?,
+        actor: r.get("actor")?,
+        created_at: r.get("created_at")?,
     })
 }

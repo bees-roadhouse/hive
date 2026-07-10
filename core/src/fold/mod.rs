@@ -150,6 +150,32 @@
 // alias — { from, to, namespace, created_at? }: identifier remapping (the
 //   1.7 importer emits these for re-keyed blob hashes). Upsert into aliases
 //   keyed (namespace, from); created_at defaults to the record ts.
+//
+// ── v2 (the PR 1.6 cutover; FOLD_VERSION 2) ────────────────────────────────
+//
+// The record KINDS are unchanged (frozen at 1.4); v2 widens what
+// entity.create/entity.update/tombstone can address, because the cutover
+// re-expresses every remaining UPDATE/DELETE path as records (D18):
+//
+//   - inbox is a built-in entity kind → the inbox table. entity.create
+//     {kind:"inbox"} is the standalone inbox_add path (journal.append's
+//     `inbox` array remains the fan-out path); entity.update {kind:"inbox",
+//     fields:{read_at}} is the mark-read path; tombstone {kind:"inbox"}
+//     removes a notification (actor cascade/merge cleanup).
+//   - identity is a built-in entity kind → the identities table
+//     (platform/platform_id/actor mappings; create/update/tombstone).
+//   - journal is addressable by entity.update and ONLY entity.update —
+//     creation stays journal.append (entity.create {kind:"journal"} is an
+//     error), deletion stays tombstone. This carries actor merge/delete
+//     (author reassignment, mentions scrubs) as records. Parity note: like
+//     the Postgres merge path, a journal entity.update does NOT re-index FTS
+//     (the search title keeps the append-time author).
+//   - the FTS5 tokenizer becomes `porter unicode61` (index DDL): the golden
+//     retrieval fixture was captured under Postgres `to_tsvector('english')`,
+//     which stems — unstemmed unicode61 drops fixture hits ("tomatoes" must
+//     match "tomato"). Cross-backend parity is the whole point of the oracle.
+//
+// Everything else in the v1 contract above is unchanged.
 // ────────────────────────────────────────────────────────────────────────────
 
 use anyhow::{bail, Context, Result};
@@ -163,7 +189,10 @@ use crate::oplog::{kind, Record};
 /// Stored in the index's `PRAGMA user_version`; bumping it makes every
 /// existing index rebuild by replay at next open. Bump on ANY change to the
 /// schemas above, the DDL, or handler behavior.
-pub const FOLD_VERSION: u32 = 1;
+///
+/// v2 = the PR 1.6 cutover set: inbox/identity built-ins, journal
+/// entity.update, and the porter FTS tokenizer (see the v2 header section).
+pub const FOLD_VERSION: u32 = 2;
 
 /// Apply one record to the derived state inside the caller's transaction,
 /// advancing the per-device watermark in the same transaction. See the
@@ -380,6 +409,39 @@ const ENTITIES: Spec = &[
     ("updated_at", Ty::Text),
 ];
 
+/// v2: standalone inbox rows (journal.append's `inbox` array stays the
+/// fan-out path; this spec serves entity.create/update/tombstone).
+const INBOX: Spec = &[
+    ("recipient", Ty::Text),
+    ("from", Ty::Text),
+    ("reason", Ty::Text),
+    ("ref_kind", Ty::Text),
+    ("ref_id", Ty::Text),
+    ("entry_id", Ty::Text),
+    ("snippet", Ty::Text),
+    ("created_at", Ty::Text),
+    ("read_at", Ty::Text),
+];
+
+/// v2: platform identity mappings (Discord/Telegram/Slack ids → actor slug).
+const IDENTITIES: Spec = &[
+    ("platform", Ty::Text),
+    ("platform_id", Ty::Text),
+    ("actor", Ty::Text),
+    ("created_at", Ty::Text),
+];
+
+/// v2: journal columns entity.update may set (actor merge/delete recipes:
+/// author reassignment, mentions scrubs). Creation is journal.append ONLY.
+const JOURNAL: Spec = &[
+    ("author", Ty::Text),
+    ("body", Ty::Text),
+    ("tags", Ty::JsonText),
+    ("mentions", Ty::JsonText),
+    ("user_scope", Ty::Text),
+    ("created_at", Ty::Text),
+];
+
 const MAIL_ACCOUNTS: Spec = &[
     ("owner", Ty::Text),
     ("address", Ty::Text),
@@ -487,6 +549,10 @@ const BUILTIN_ENTITIES: &[(&str, &str, &str, Spec)] = &[
         IDENTITY_ARTIFACTS,
     ),
     ("source", "sources", "id", SOURCES),
+    // v2 additions (see the header's v2 section).
+    ("inbox", "inbox", "id", INBOX),
+    ("identity", "identities", "id", IDENTITIES),
+    ("journal", "journal", "id", JOURNAL),
 ];
 
 fn builtin(kind: &str) -> Option<(&'static str, &'static str, Spec)> {
@@ -951,6 +1017,9 @@ fn entity_create_inner(tx: &Transaction, payload: &Json) -> Result<()> {
     let m = obj(payload, "entity.create payload")?;
     reject_unknown(m, &["kind", "id", "fields", "inbox"], "entity.create")?;
     let kind_s = need_str(m, "kind")?;
+    if kind_s == "journal" {
+        bail!("journal rows are created by journal.append, never entity.create");
+    }
     let id = need_str(m, "id")?;
     let empty = serde_json::Map::new();
     let fields = match m.get("fields") {
@@ -1132,7 +1201,7 @@ fn tombstone(tx: &Transaction, rec: &Record, payload: &Json) -> Result<()> {
             embeddings_delete(tx, kind_s, id)?;
         }
         "topic" | "project" | "phase" | "person" | "entity_type" | "entity_field"
-        | "identity_artifact" | "source" => {
+        | "identity_artifact" | "source" | "inbox" | "identity" => {
             let table = builtin(kind_s).expect("built-in").0;
             tx.execute(&format!("DELETE FROM {table} WHERE id = ?1"), params![id])?;
         }

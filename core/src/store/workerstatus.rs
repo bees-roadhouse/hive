@@ -1,50 +1,63 @@
 // Worker heartbeat + status composition (store.ts setHeartbeat/setLastRun/
-// workerStatus). Owned by the admin workstream.
+// workerStatus). worker_status is RUNTIME state — written directly, never
+// through the fold (see index/mod.rs).
 
 use anyhow::Result;
 use hive_shared::{WorkerEmbeddingCounts, WorkerLastRun, WorkerSourceCounts, WorkerStatus};
+use rusqlite::OptionalExtension;
 
 use super::{now_iso, Store};
 
 impl Store {
     pub async fn worker_set_heartbeat(&self) -> Result<()> {
-        crate::pgq::query(
-            "INSERT INTO worker_status (id, heartbeat) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET heartbeat = excluded.heartbeat",
-        )
-        .bind(now_iso())
-        .execute(self.db())
-        .await?;
-        Ok(())
+        self.run(move |core| {
+            core.conn().execute(
+                "INSERT INTO worker_status (id, heartbeat) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET heartbeat = excluded.heartbeat",
+                rusqlite::params![now_iso()],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn worker_set_last_run(&self, stats: &WorkerLastRun) -> Result<()> {
-        crate::pgq::query(
-            "INSERT INTO worker_status (id, last_run) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET last_run = excluded.last_run",
-        )
-        .bind(serde_json::to_string(stats)?)
-        .execute(self.db())
-        .await?;
-        Ok(())
+        let raw = serde_json::to_string(stats)?;
+        self.run(move |core| {
+            core.conn().execute(
+                "INSERT INTO worker_status (id, last_run) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET last_run = excluded.last_run",
+                rusqlite::params![raw],
+            )?;
+            Ok(())
+        })
+        .await
     }
 
     pub async fn worker_status(&self) -> Result<WorkerStatus> {
-        let row: Option<(Option<String>, Option<String>)> =
-            crate::pgq::query_as("SELECT heartbeat, last_run FROM worker_status WHERE id = 1")
-                .fetch_optional(self.db())
-                .await?;
-        let (heartbeat, last_run_raw) = row.unwrap_or((None, None));
+        let (heartbeat, last_run_raw, count) = self
+            .run(|core| {
+                let row: Option<(Option<String>, Option<String>)> = core
+                    .conn()
+                    .query_row(
+                        "SELECT heartbeat, last_run FROM worker_status WHERE id = 1",
+                        [],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                let (heartbeat, last_run_raw) = row.unwrap_or((None, None));
+                let count: i64 =
+                    core.conn()
+                        .query_row("SELECT count(*) FROM embeddings", [], |r| r.get(0))?;
+                Ok((heartbeat, last_run_raw, count))
+            })
+            .await?;
         let all = self.sources_list(None).await?;
         let outbox = self.outbox_counts().await?;
-        let count: i64 = crate::pgq::query_scalar("SELECT count(*) FROM embeddings")
-            .fetch_one(self.db())
-            .await?;
         let last_run: Option<WorkerLastRun> =
             last_run_raw.and_then(|s| serde_json::from_str(&s).ok());
         // The worker persists its latch per cycle (a separate process — its
         // in-memory latch is invisible here); OR in this process's own latch
         // so a query-time model failure surfaces too.
-        let latched =
-            last_run.as_ref().is_some_and(|r| r.latched) || hive_embed::transformers_latched();
+        let latched = last_run.as_ref().is_some_and(|r| r.latched) || self.embedder().latched();
         Ok(WorkerStatus {
             heartbeat,
             last_run,
@@ -55,7 +68,7 @@ impl Store {
             outbox,
             embeddings: WorkerEmbeddingCounts {
                 count,
-                model: hive_embed::embed_model().to_string(),
+                model: self.embedder().model(),
             },
             latched,
         })

@@ -4,12 +4,18 @@
 // sync driver needs the real secret. The key derives from HIVE_CRED_KEY (any
 // string; SHA-256 → 32-byte key). Named cc_credentials for hosted-era
 // reasons; Phase 3 replaces it with the OS keychain.
+//
+// Cutover decision (PR 1.6): this stays a RUNTIME table in the derived index
+// (see index/mod.rs) rather than becoming records — least churn, and the
+// whole vault is scheduled to die in Phase 3. The AES-GCM layer is kept on
+// top of SQLCipher so the trust story is unchanged from the Postgres era.
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rand::RngCore;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -37,8 +43,8 @@ pub struct CcCredentialView {
     pub last_used_at: Option<String>,
 }
 
-/// Save-a-credential request. `secret` is plaintext on the wire (TLS) and is
-/// encrypted server-side immediately; it is never persisted in the clear.
+/// Save-a-credential request. `secret` is plaintext in memory and is
+/// encrypted immediately; it is never persisted in the clear.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewCcCredential {
     pub kind: String, // e.g. "api_key" | "oauth_token" | "subscription_login" | "provider_config"
@@ -46,13 +52,6 @@ pub struct NewCcCredential {
     pub provider: Option<String>,
     pub label: Option<String>,
     pub secret: String,
-}
-
-#[derive(sqlx::FromRow)]
-struct CredSecretRow {
-    id: String,
-    ciphertext: String,
-    nonce: String,
 }
 
 fn cred_key() -> Result<[u8; 32]> {
@@ -116,29 +115,7 @@ impl Store {
             .map(str::to_string);
         let label = input.label.unwrap_or_default();
         let tail = tail_of(&input.secret);
-        crate::pgq::query(
-            "INSERT INTO cc_credentials (id, owner, kind, runtime, provider, label, ciphertext, nonce, tail, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&id)
-        .bind(owner)
-        .bind(&input.kind)
-        .bind(&runtime)
-        .bind(&provider)
-        .bind(&label)
-        .bind(&ciphertext)
-        .bind(&nonce)
-        .bind(&tail)
-        .bind(&ts)
-        .execute(self.db())
-        .await?;
-        self.emit(
-            "credential.saved",
-            owner,
-            serde_json::json!({"id": id, "kind": input.kind, "runtime": runtime, "provider": provider}),
-        )
-        .await?;
-        Ok(CcCredentialView {
+        let view = CcCredentialView {
             id,
             owner: owner.to_string(),
             kind: input.kind,
@@ -148,7 +125,27 @@ impl Store {
             tail,
             created_at: ts,
             last_used_at: None,
+        };
+        let row = view.clone();
+        self.run(move |core| {
+            core.conn().execute(
+                "INSERT INTO cc_credentials (id, owner, kind, runtime, provider, label, ciphertext, nonce, tail, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    row.id, row.owner, row.kind, row.runtime, row.provider, row.label,
+                    ciphertext, nonce, row.tail, row.created_at
+                ],
+            )?;
+            Ok(())
         })
+        .await?;
+        self.emit(
+            "credential.saved",
+            owner,
+            serde_json::json!({"id": view.id, "kind": view.kind, "runtime": view.runtime, "provider": view.provider}),
+        )
+        .await?;
+        Ok(view)
     }
 
     /// Decrypt one credential by row id (INTERNAL only). Mail accounts name
@@ -156,19 +153,29 @@ impl Store {
     /// runtime picker above would be wrong the moment a second account
     /// exists.
     pub async fn cc_cred_decrypt_by_id(&self, id: &str) -> Result<Option<String>> {
-        let row = crate::pgq::query_as::<CredSecretRow>(
-            "SELECT id, ciphertext, nonce FROM cc_credentials WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(self.db())
-        .await?;
-        let Some(row) = row else { return Ok(None) };
-        let secret = decrypt(&row.ciphertext, &row.nonce)?;
-        crate::pgq::query("UPDATE cc_credentials SET last_used_at = ? WHERE id = ?")
-            .bind(now_iso())
-            .bind(&row.id)
-            .execute(self.db())
+        let id = id.to_string();
+        let row: Option<(String, String, String)> = self
+            .run(move |core| {
+                let row = core
+                    .conn()
+                    .query_row(
+                        "SELECT id, ciphertext, nonce FROM cc_credentials WHERE id = ?1",
+                        rusqlite::params![id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?;
+                if let Some((rid, _, _)) = &row {
+                    core.conn().execute(
+                        "UPDATE cc_credentials SET last_used_at = ?1 WHERE id = ?2",
+                        rusqlite::params![now_iso(), rid],
+                    )?;
+                }
+                Ok(row)
+            })
             .await?;
-        Ok(Some(secret))
+        let Some((_, ciphertext, nonce)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(decrypt(&ciphertext, &nonce)?))
     }
 }

@@ -1,12 +1,15 @@
 // Worker feed sources CRUD + poll/ingest (store.ts `sources`, `pollSources`,
-// `ingest`, `ingestScrape`; feed.ts; scrape.ts). Owned by the admin workstream.
+// `ingest`, `ingestScrape`; feed.ts; scrape.ts). CRUD is entity.create/
+// entity.update/tombstone records on the source built-in kind; poll results
+// land as wire events (bus + ring — the wire table died with Postgres, so
+// feed dedup is per-process, scoped to the ring).
 
 use anyhow::Result;
 use hive_shared::{EntityKind, InboxReason, NewSource, Severity, Source, SourceKind, SourcePatch};
+use rusqlite::OptionalExtension;
 use serde_json::json;
-use sqlx::Row;
 
-use super::{new_id, now_iso, Store};
+use super::{new_id, now_iso, Core, Draft, Store};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PollOutcome {
@@ -35,25 +38,23 @@ impl Store {
     /// List sources. With an owner, returns global (owner=null) + that actor's;
     /// `None` returns all (the worker path).
     pub async fn sources_list(&self, owner: Option<&str>) -> Result<Vec<Source>> {
-        let rows = crate::pgq::query("SELECT * FROM sources ORDER BY created_at")
-            .fetch_all(self.db())
-            .await?;
-        let all = rows.iter().map(row_to_source).collect::<Result<Vec<_>>>()?;
-        Ok(match owner {
-            None => all,
-            Some(o) => all
-                .into_iter()
-                .filter(|s| s.owner.is_none() || s.owner.as_deref() == Some(o))
-                .collect(),
+        let owner = owner.map(str::to_string);
+        self.run(move |core| {
+            let all = sources_all(core)?;
+            Ok(match owner {
+                None => all,
+                Some(o) => all
+                    .into_iter()
+                    .filter(|s| s.owner.is_none() || s.owner.as_deref() == Some(o.as_str()))
+                    .collect(),
+            })
         })
+        .await
     }
 
     pub async fn sources_get(&self, source_id: &str) -> Result<Option<Source>> {
-        let row = crate::pgq::query("SELECT * FROM sources WHERE id = ?")
-            .bind(source_id)
-            .fetch_optional(self.db())
-            .await?;
-        row.as_ref().map(row_to_source).transpose()
+        let source_id = source_id.to_string();
+        self.run(move |core| source_get(core, &source_id)).await
     }
 
     pub async fn sources_create(&self, input: NewSource, actor: &str) -> Result<Source> {
@@ -72,23 +73,20 @@ impl Store {
             last_status: None,
             created_at: now_iso(),
         };
-        crate::pgq::query(
-            "INSERT INTO sources (id, name, url, kind, category, severity, interval_secs, notify, enabled, owner, last_polled_at, last_status, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
-        )
-        .bind(&s.id)
-        .bind(&s.name)
-        .bind(&s.url)
-        .bind(s.kind.as_str())
-        .bind(&s.category)
-        .bind(s.severity.as_str())
-        .bind(s.interval_secs)
-        .bind(&s.notify)
-        .bind(s.enabled)
-        .bind(&s.owner)
-        .bind(&s.created_at)
-        .execute(self.db())
-        .await?;
+        let draft = Draft::new(
+            crate::oplog::kind::ENTITY_CREATE,
+            actor,
+            &s.created_at,
+            json!({"kind": "source", "id": s.id, "fields": {
+                "name": s.name, "url": s.url, "kind": s.kind.as_str(),
+                "category": s.category, "severity": s.severity.as_str(),
+                "interval_secs": s.interval_secs, "notify": s.notify,
+                "enabled": s.enabled, "owner": s.owner,
+                "last_polled_at": null, "last_status": null,
+                "created_at": s.created_at,
+            }}),
+        );
+        self.run(move |core| core.commit(vec![draft])).await?;
         self.emit(
             "source.added",
             actor,
@@ -104,52 +102,65 @@ impl Store {
         patch: SourcePatch,
         actor: &str,
     ) -> Result<Option<Source>> {
-        let Some(cur) = self.sources_get(source_id).await? else {
-            return Ok(None);
-        };
-        // {...cur, ...patch} — present keys override; double-Option fields can null.
-        let next = Source {
-            id: cur.id,
-            name: patch.name.unwrap_or(cur.name),
-            url: patch.url.unwrap_or(cur.url),
-            kind: patch.kind.unwrap_or(cur.kind),
-            category: patch.category.unwrap_or(cur.category),
-            severity: patch.severity.unwrap_or(cur.severity),
-            interval_secs: patch.interval_secs.unwrap_or(cur.interval_secs),
-            notify: patch.notify.unwrap_or(cur.notify),
-            enabled: patch.enabled.unwrap_or(cur.enabled),
-            owner: patch.owner.unwrap_or(cur.owner),
-            last_polled_at: cur.last_polled_at,
-            last_status: cur.last_status,
-            created_at: cur.created_at,
-        };
-        crate::pgq::query(
-            "UPDATE sources SET name=?, url=?, kind=?, category=?, severity=?, interval_secs=?, notify=?, enabled=?, owner=? WHERE id=?",
-        )
-        .bind(&next.name)
-        .bind(&next.url)
-        .bind(next.kind.as_str())
-        .bind(&next.category)
-        .bind(next.severity.as_str())
-        .bind(next.interval_secs)
-        .bind(&next.notify)
-        .bind(next.enabled)
-        .bind(&next.owner)
-        .bind(&next.id)
-        .execute(self.db())
-        .await?;
+        let source_id_s = source_id.to_string();
+        let actor_s = actor.to_string();
+        let next = self
+            .run(move |core| {
+                let Some(cur) = source_get(core, &source_id_s)? else {
+                    return Ok(None);
+                };
+                // {...cur, ...patch} — present keys override; double-Option fields can null.
+                let next = Source {
+                    id: cur.id,
+                    name: patch.name.unwrap_or(cur.name),
+                    url: patch.url.unwrap_or(cur.url),
+                    kind: patch.kind.unwrap_or(cur.kind),
+                    category: patch.category.unwrap_or(cur.category),
+                    severity: patch.severity.unwrap_or(cur.severity),
+                    interval_secs: patch.interval_secs.unwrap_or(cur.interval_secs),
+                    notify: patch.notify.unwrap_or(cur.notify),
+                    enabled: patch.enabled.unwrap_or(cur.enabled),
+                    owner: patch.owner.unwrap_or(cur.owner),
+                    last_polled_at: cur.last_polled_at,
+                    last_status: cur.last_status,
+                    created_at: cur.created_at,
+                };
+                core.commit(vec![Draft::new(
+                    crate::oplog::kind::ENTITY_UPDATE,
+                    &actor_s,
+                    &now_iso(),
+                    json!({"kind": "source", "id": next.id, "fields": {
+                        "name": next.name, "url": next.url, "kind": next.kind.as_str(),
+                        "category": next.category, "severity": next.severity.as_str(),
+                        "interval_secs": next.interval_secs, "notify": next.notify,
+                        "enabled": next.enabled, "owner": next.owner,
+                    }}),
+                )])?;
+                Ok(Some(next))
+            })
+            .await?;
+        let Some(next) = next else { return Ok(None) };
         self.emit("source.updated", actor, json!({"id": next.id}))
             .await?;
         Ok(Some(next))
     }
 
     pub async fn sources_remove(&self, source_id: &str, actor: &str) -> Result<bool> {
-        let ok = crate::pgq::query("DELETE FROM sources WHERE id = ?")
-            .bind(source_id)
-            .execute(self.db())
-            .await?
-            .rows_affected()
-            > 0;
+        let source_id_s = source_id.to_string();
+        let ok = self
+            .run(move |core| {
+                if source_get(core, &source_id_s)?.is_none() {
+                    return Ok(false);
+                }
+                core.commit(vec![Draft::new(
+                    crate::oplog::kind::TOMBSTONE,
+                    "system",
+                    &now_iso(),
+                    json!({"kind": "source", "id": source_id_s}),
+                )])?;
+                Ok(true)
+            })
+            .await?;
         if ok {
             self.emit("source.removed", actor, json!({"id": source_id}))
                 .await?;
@@ -176,13 +187,18 @@ impl Store {
     }
 
     pub async fn sources_mark_polled(&self, source_id: &str, status: &str) -> Result<()> {
-        crate::pgq::query("UPDATE sources SET last_polled_at = ?, last_status = ? WHERE id = ?")
-            .bind(now_iso())
-            .bind(status)
-            .bind(source_id)
-            .execute(self.db())
-            .await?;
-        Ok(())
+        let (source_id, status) = (source_id.to_string(), status.to_string());
+        self.run(move |core| {
+            core.commit(vec![Draft::new(
+                crate::oplog::kind::ENTITY_UPDATE,
+                "system",
+                &now_iso(),
+                json!({"kind": "source", "id": source_id, "fields": {
+                    "last_polled_at": now_iso(), "last_status": status,
+                }}),
+            )])
+        })
+        .await
     }
 
     /// Poll feed/scrape sources into wire events (store.ts pollSources). With no
@@ -239,11 +255,12 @@ impl Store {
         Ok(PollOutcome { polled, ingested })
     }
 
-    /// Ingest fetched feed items into wire events (deduped by guid).
+    /// Ingest fetched feed items into wire events (deduped by guid — ring-
+    /// scoped since the wire table died; a restart may re-announce items).
     pub async fn ingest_feed(&self, source: &Source, items: &[FeedItem]) -> Result<i64> {
         let mut added = 0;
         for it in items {
-            if self.wire_has_guid("feed.item", &it.guid).await? {
+            if self.wire_ring_has_guid("feed.item", &it.guid) {
                 continue;
             }
             self.emit(
@@ -281,7 +298,7 @@ impl Store {
     pub async fn ingest_scrape(&self, source: &Source, items: &[ScrapeItem]) -> Result<i64> {
         let mut added = 0;
         for it in items {
-            if self.wire_has_guid("scrape.item", &it.guid).await? {
+            if self.wire_ring_has_guid("scrape.item", &it.guid) {
                 continue;
             }
             self.emit(
@@ -313,37 +330,42 @@ impl Store {
         }
         Ok(added)
     }
-
-    /// Node's dedup: the guid (JSON-escaped, unquoted) appears in a stored payload.
-    async fn wire_has_guid(&self, kind: &str, guid: &str) -> Result<bool> {
-        let escaped = serde_json::to_string(guid)?;
-        let pattern = format!("%{}%", &escaped[1..escaped.len() - 1]);
-        Ok(
-            crate::pgq::query("SELECT 1 FROM wire WHERE kind = ? AND payload LIKE ? LIMIT 1")
-                .bind(kind)
-                .bind(pattern)
-                .fetch_optional(self.db())
-                .await?
-                .is_some(),
-        )
-    }
 }
 
-fn row_to_source(r: &sqlx::postgres::PgRow) -> Result<Source> {
+pub(crate) fn sources_all(core: &Core) -> Result<Vec<Source>> {
+    let mut stmt = core
+        .conn()
+        .prepare("SELECT * FROM sources ORDER BY created_at")?;
+    let rows = stmt.query_map([], row_to_source)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub(crate) fn source_get(core: &Core, source_id: &str) -> Result<Option<Source>> {
+    Ok(core
+        .conn()
+        .query_row(
+            "SELECT * FROM sources WHERE id = ?1",
+            rusqlite::params![source_id],
+            row_to_source,
+        )
+        .optional()?)
+}
+
+fn row_to_source(r: &rusqlite::Row) -> rusqlite::Result<Source> {
     Ok(Source {
-        id: r.try_get("id")?,
-        name: r.try_get("name")?,
-        url: r.try_get("url")?,
-        kind: SourceKind::from_str_lossy(r.try_get::<String, _>("kind")?.as_str()),
-        category: r.try_get("category")?,
-        severity: Severity::from_str_lossy(r.try_get::<String, _>("severity")?.as_str()),
-        interval_secs: r.try_get("interval_secs")?,
-        notify: r.try_get("notify")?,
-        enabled: r.try_get::<bool, _>("enabled")?,
-        owner: r.try_get("owner")?,
-        last_polled_at: r.try_get("last_polled_at")?,
-        last_status: r.try_get("last_status")?,
-        created_at: r.try_get("created_at")?,
+        id: r.get("id")?,
+        name: r.get("name")?,
+        url: r.get("url")?,
+        kind: SourceKind::from_str_lossy(r.get::<_, String>("kind")?.as_str()),
+        category: r.get("category")?,
+        severity: Severity::from_str_lossy(r.get::<_, String>("severity")?.as_str()),
+        interval_secs: r.get("interval_secs")?,
+        notify: r.get("notify")?,
+        enabled: r.get::<_, bool>("enabled")?,
+        owner: r.get("owner")?,
+        last_polled_at: r.get("last_polled_at")?,
+        last_status: r.get("last_status")?,
+        created_at: r.get("created_at")?,
     })
 }
 
@@ -603,14 +625,14 @@ fn min_opt(a: Option<usize>, b: Option<usize>) -> Option<usize> {
 mod tests {
     use super::*;
 
-    const FIXTURE_XML: &str = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>Bee feed</title><item><guid>bee-rss-1</guid><title>pgvector 0.8 released</title><link>https://example.com/bee-rss-1</link><description>Postgres vector search gets faster ANN indexes.</description></item><item><guid>bee-rss-2</guid><title>Solid 2.0 roadmap</title><link>https://example.com/bee-rss-2</link><description>Fine-grained reactivity, same tiny runtime.</description></item><item><guid>bee-rss-3</guid><title>SQLite ships native JSON5</title><link>https://example.com/bee-rss-3</link><description>Looser JSON parsing lands in the amalgamation.</description></item></channel></rss>"#;
+    const FIXTURE_XML: &str = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>Bee feed</title><item><guid>bee-rss-1</guid><title>sqlite-vec 0.8 released</title><link>https://example.com/bee-rss-1</link><description>Postgres vector search gets faster ANN indexes.</description></item><item><guid>bee-rss-2</guid><title>Solid 2.0 roadmap</title><link>https://example.com/bee-rss-2</link><description>Fine-grained reactivity, same tiny runtime.</description></item><item><guid>bee-rss-3</guid><title>SQLite ships native JSON5</title><link>https://example.com/bee-rss-3</link><description>Looser JSON parsing lands in the amalgamation.</description></item></channel></rss>"#;
 
     #[test]
     fn parses_rss_fixture() {
         let items = parse_feed(FIXTURE_XML);
         assert_eq!(items.len(), 3);
         assert_eq!(items[0].guid, "bee-rss-1");
-        assert_eq!(items[0].title, "pgvector 0.8 released");
+        assert_eq!(items[0].title, "sqlite-vec 0.8 released");
         assert_eq!(
             items[0].url.as_deref(),
             Some("https://example.com/bee-rss-1")

@@ -283,17 +283,18 @@ async fn recall_filters_kinds_in_search_and_unknown_kinds_drop() {
     // A top-scoring embeddings row of a kind this build doesn't know must not
     // starve the result: it fails hydration and drops before the final cut.
     let alien = hive_embed::embed_query("alpha hive inspection notes");
-    hive_core::pgq::query(
-        "INSERT INTO embeddings (ref_kind, ref_id, model, dim, vec, hash, created_at) \
-         VALUES ('document', 'doc_alien', ?, ?, ?, 'alien', ?)",
-    )
-    .bind(hive_embed::embed_model())
-    .bind(alien.len() as i64)
-    .bind(hive_embed::to_blob(&alien))
-    .bind(hive_core::store::now_iso())
-    .execute(store.db())
-    .await
-    .expect("alien embedding row");
+    store
+        .upsert_embedding_raw(
+            "document",
+            "doc_alien",
+            0,
+            hive_embed::embed_model(),
+            None,
+            alien,
+            "alien",
+        )
+        .await
+        .expect("alien embedding row");
     let hits = store
         .semantic_search(
             "alpha hive inspection notes",

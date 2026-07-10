@@ -1,9 +1,12 @@
 // Search query side — parity port of store.ts `search` (keyword),
 // `semanticSearch` (the standard/precision hybrid cascade), `embeddableItems`,
-// and `embeddingStats`. Single-user: the viewer ACL machinery (visibility
-// index, scope_hits, owner filtering) died in the Phase 1 teardown — reads are
-// unscoped. Writes still stamp `embeddings.owner` (see embeddable_items) so
-// the storage shape stays stable for the 1.6 cutover and 1.7 importer.
+// and `embeddingStats`, on the SQLite index. Keyword search rides
+// SqliteIndex::keyword_search (FTS5 MATCH + bm25 + snippet — the successor of
+// tsvector/ts_rank/ts_headline); vector candidates ride the AnnIndex seam for
+// the 384-dim model and the brute-force BYTEA-style scan for everything else
+// (the 256-dim hash provider in dev/CI), so the whole cascade stays exercised
+// without ONNX and hash-provider scores stay bit-identical to the Postgres
+// brute-force path (same vectors, same Rust cosine).
 //
 // Decoupling note: journal/tasks/decisions/events/links data is read via
 // private SQL here (not via those store modules) — the orchestrator dedups at
@@ -13,9 +16,8 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 use hive_shared::{EmbeddingKindCount, EmbeddingModelCount, EmbeddingStats, EntityKind, SearchHit};
-use sqlx::Row;
 
-use super::{placeholders_or_never, Store};
+use super::{placeholders_or_never, Core, Store};
 
 /// Options for `semantic_search` — mirrors store.ts `SemanticOptions` (every
 /// field optional; defaults applied inside, exactly as the Node code does).
@@ -68,18 +70,6 @@ struct HydratedHit {
     title: String,
     text: String,
     snippet: String,
-}
-
-/// `hnsw.ef_search` for the ANN candidate probes. Default 80 — above
-/// pgvector's 40 because the WHERE clauses post-filter the index stream and a
-/// LIMIT can starve below k otherwise. Clamped to pgvector's accepted range.
-fn vec_ef_search() -> u32 {
-    std::env::var("HIVE_VEC_EF_SEARCH")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .filter(|v| *v >= 1)
-        .unwrap_or(80)
-        .min(1000)
 }
 
 /// Kinds whose sheer row count could flood an unrestricted candidate pool
@@ -150,24 +140,6 @@ fn split_key(k: &str) -> (&str, &str) {
         Some(ix) => (&k[..ix], &k[ix + 1..]),
         None => (k, ""),
     }
-}
-
-/// store.ts `toMatchQuery`, Postgres tsquery form: per-term strip
-/// non-alphanumerics + lowercase, append `:*` (prefix match), drop empty/1-char
-/// stems, join with ` & ` (AND). Feeds `to_tsquery('english', …)`.
-fn to_match_query(q: &str) -> String {
-    q.split_whitespace()
-        .map(|term| {
-            let stem: String = term
-                .chars()
-                .filter(|c| c.is_alphanumeric())
-                .flat_map(|c| c.to_lowercase())
-                .collect();
-            format!("{stem}:*")
-        })
-        .filter(|t| t.encode_utf16().count() > 2) // drop empty stems (":*"), keep 1-char+
-        .collect::<Vec<_>>()
-        .join(" & ")
 }
 
 /// Per-candidate blend components (store.ts `Score`).
@@ -242,254 +214,93 @@ fn origin_table(kind: &str) -> Option<&'static str> {
 }
 
 impl Store {
-    /// Keyword search (store.ts `search`), unscoped.
+    /// Keyword search (store.ts `search`), unscoped. FTS5 bm25 ranking,
+    /// snippet() excerpts — SqliteIndex::keyword_search.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
         if query.trim().is_empty() {
             return Ok(vec![]);
         }
-        let match_q = to_match_query(query);
-        if match_q.is_empty() {
-            return Ok(vec![]);
-        }
-        // Postgres FTS: tsvector @@ tsquery, ts_rank for ranking (higher = better,
-        // so DESC), ts_headline for the snippet. Replaces FTS5 MATCH/bm25/snippet.
-        let rows = crate::pgq::query(
-            "SELECT kind, ref_id, title, \
-                    ts_headline('english', body, to_tsquery('english', ?), \
-                      'StartSel=[, StopSel=], MaxFragments=2, MaxWords=14, MinWords=4, ShortWord=0') AS snip, \
-                    ts_rank(tsv, to_tsquery('english', ?)) AS rank \
-             FROM search WHERE tsv @@ to_tsquery('english', ?) ORDER BY rank DESC LIMIT ?",
-        )
-        .bind(&match_q)
-        .bind(&match_q)
-        .bind(&match_q)
-        .bind(limit as i64)
-        .fetch_all(self.db())
-        .await?;
-        let mut hits: Vec<SearchHit> = rows
-            .iter()
-            .map(|r| -> Result<SearchHit> {
-                // ts_rank is f32 and higher = better; clamp to a 0..1 score.
-                let rank: f32 = r.try_get("rank")?;
-                Ok(SearchHit {
-                    kind: r.try_get("kind")?,
-                    id: r.try_get("ref_id")?,
-                    title: r.try_get("title")?,
-                    snippet: r.try_get("snip")?,
-                    score: ((rank.clamp(0.0, 1.0) as f64) * 1000.0).round() / 1000.0,
-                })
-            })
-            .collect::<Result<_>>()?;
-        hits.truncate(limit);
-        Ok(hits)
+        let query = query.to_string();
+        self.run(move |core| {
+            let mut hits = core.index.keyword_search(&query, None, limit)?;
+            hits.truncate(limit);
+            Ok(hits)
+        })
+        .await
     }
 
     /// Every item worth embedding (store.ts `embeddableItems`). Public: the
-    /// worker's backfill iterates this exactly like Node's worker does.
+    /// backfill iterates this exactly like Node's worker did.
     pub async fn embeddable_items(&self) -> Result<Vec<EmbeddableItem>> {
-        let mut out: Vec<EmbeddableItem> = Vec::new();
-        let mut push =
-            |kind: &str, id: String, title: String, text: String, owner: Option<String>| {
-                let embed_text = format!("[{kind}] {title}\n\n{text}");
-                let hash = hive_embed::content_hash(&embed_text);
-                out.push(EmbeddableItem {
-                    kind: kind.to_string(),
-                    id,
-                    title,
-                    text,
-                    embed_text,
-                    hash,
-                    owner,
-                });
-            };
-
-        // Window + `id` tiebreak match the reaper's journal sweep exactly
-        // (store/maintenance.rs) — a nondeterministic boundary row would
-        // churn embed/reap forever.
-        let journal = crate::pgq::query(
-            "SELECT id, author, body, user_scope FROM journal ORDER BY created_at DESC, id DESC LIMIT ?",
-        )
-        .bind(JOURNAL_EMBED_WINDOW)
-        .fetch_all(self.db())
-        .await?;
-        for r in &journal {
-            let id: String = r.try_get("id")?;
-            let author: String = r.try_get("author")?;
-            let body: String = r.try_get("body")?;
-            let owner: Option<String> = r.try_get("user_scope")?;
-            push(
-                "journal",
-                id,
-                format!("{author}: {}", js_slice(&body, 40)),
-                body,
-                owner,
-            );
-        }
-
-        // Anchored entities inherit their origin entry's scope — resolved in
-        // the same query (one LEFT JOIN per table, no per-item lookups).
-        // Rows without an origin entry (or with a global one) stay global.
-        let tasks = crate::pgq::query(
-            "SELECT t.id, t.title, t.body, j.user_scope AS owner FROM tasks t \
-             LEFT JOIN journal j ON j.id = t.origin_entry_id \
-             ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, t.created_at DESC",
-        )
-        .fetch_all(self.db())
-        .await?;
-        for r in &tasks {
-            let id: String = r.try_get("id")?;
-            let title: String = r.try_get("title")?;
-            let body: String = r.try_get("body")?;
-            let owner: Option<String> = r.try_get("owner")?;
-            let text = format!("{title} {body}");
-            push("task", id, title, text, owner);
-        }
-
-        let decisions = crate::pgq::query(
-            "SELECT d.id, d.title, d.context, d.decision, d.consequences, j.user_scope AS owner \
-             FROM decisions d LEFT JOIN journal j ON j.id = d.origin_entry_id \
-             ORDER BY d.created_at DESC",
-        )
-        .fetch_all(self.db())
-        .await?;
-        for r in &decisions {
-            let id: String = r.try_get("id")?;
-            let title: String = r.try_get("title")?;
-            let context: String = r.try_get("context")?;
-            let decision: String = r.try_get("decision")?;
-            let consequences: String = r.try_get("consequences")?;
-            let owner: Option<String> = r.try_get("owner")?;
-            let text = format!("{title} {context} {decision} {consequences}");
-            push("decision", id, title, text, owner);
-        }
-
-        let events = crate::pgq::query(
-            "SELECT e.id, e.title, e.body, j.user_scope AS owner FROM events e \
-             LEFT JOIN journal j ON j.id = e.origin_entry_id \
-             ORDER BY COALESCE(e.at, e.created_at) DESC",
-        )
-        .fetch_all(self.db())
-        .await?;
-        for r in &events {
-            let id: String = r.try_get("id")?;
-            let title: String = r.try_get("title")?;
-            let body: String = r.try_get("body")?;
-            let owner: Option<String> = r.try_get("owner")?;
-            let text = format!("{title} {body}");
-            push("event", id, title, text, owner);
-        }
-
-        Ok(out)
+        self.run(|core| embeddable_items_core(core)).await
     }
 
     /// Admin view of the embedding corpus (store.ts `embeddingStats`).
     pub async fn embedding_stats(&self) -> Result<EmbeddingStats> {
-        let items = self.embeddable_items().await?;
-        let stored_rows = crate::pgq::query("SELECT ref_kind, ref_id, hash FROM embeddings")
-            .fetch_all(self.db())
-            .await?;
-        let mut stored: HashMap<String, String> = HashMap::new();
-        for r in &stored_rows {
-            stored.insert(
-                ref_key(
-                    r.try_get::<String, _>("ref_kind")?.as_str(),
-                    r.try_get::<String, _>("ref_id")?.as_str(),
-                ),
-                r.try_get("hash")?,
-            );
-        }
-        let pending = items
-            .iter()
-            .filter(|it| stored.get(&ref_key(&it.kind, &it.id)) != Some(&it.hash))
-            .count();
+        let model = self.embedder().model();
+        self.run(move |core| {
+            let items = embeddable_items_core(core)?;
+            let mut stored: HashMap<String, String> = HashMap::new();
+            {
+                let mut stmt = core
+                    .conn()
+                    .prepare("SELECT ref_kind, ref_id, hash FROM embeddings")?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (kind, id, hash) = row?;
+                    stored.insert(ref_key(&kind, &id), hash);
+                }
+            }
+            let pending = items
+                .iter()
+                .filter(|it| stored.get(&ref_key(&it.kind, &it.id)) != Some(&it.hash))
+                .count();
 
-        let total: i64 = crate::pgq::query_scalar("SELECT count(*) FROM embeddings")
-            .fetch_one(self.db())
-            .await?;
-        let by_kind = crate::pgq::query(
-            "SELECT ref_kind AS kind, count(*) AS count FROM embeddings GROUP BY ref_kind ORDER BY count DESC",
-        )
-        .fetch_all(self.db())
-        .await?
-        .iter()
-        .map(|r| -> Result<EmbeddingKindCount> {
-            Ok(EmbeddingKindCount {
-                kind: r.try_get("kind")?,
-                count: r.try_get("count")?,
+            let total: i64 = core
+                .conn()
+                .query_row("SELECT count(*) FROM embeddings", [], |r| r.get(0))?;
+            let by_kind: Vec<EmbeddingKindCount> = {
+                let mut stmt = core.conn().prepare(
+                    "SELECT ref_kind AS kind, count(*) AS count FROM embeddings GROUP BY ref_kind ORDER BY count DESC",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok(EmbeddingKindCount {
+                        kind: r.get(0)?,
+                        count: r.get(1)?,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let by_model: Vec<EmbeddingModelCount> = {
+                let mut stmt = core.conn().prepare(
+                    "SELECT model, dim, count(*) AS count FROM embeddings GROUP BY model, dim ORDER BY count DESC",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok(EmbeddingModelCount {
+                        model: r.get(0)?,
+                        dim: r.get(1)?,
+                        count: r.get(2)?,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+
+            Ok(EmbeddingStats {
+                total,
+                model,
+                embeddable: items.len() as i64,
+                pending: pending as i64,
+                by_kind,
+                by_model,
             })
         })
-        .collect::<Result<_>>()?;
-        let by_model = crate::pgq::query(
-            "SELECT model, dim, count(*) AS count FROM embeddings GROUP BY model, dim ORDER BY count DESC",
-        )
-        .fetch_all(self.db())
-        .await?
-        .iter()
-        .map(|r| -> Result<EmbeddingModelCount> {
-            Ok(EmbeddingModelCount {
-                model: r.try_get("model")?,
-                dim: r.try_get("dim")?,
-                count: r.try_get("count")?,
-            })
-        })
-        .collect::<Result<_>>()?;
-
-        Ok(EmbeddingStats {
-            total,
-            model: hive_embed::embed_model().to_string(),
-            embeddable: items.len() as i64,
-            pending: pending as i64,
-            by_kind,
-            by_model,
-        })
-    }
-
-    /// The actors associated with a hit (store.ts `hitActors`): journal →
-    /// author + mentions; task/decision/event → assignees.
-    async fn hit_actors(&self, kind: &str, ref_id: &str) -> Result<Vec<String>> {
-        if kind == "journal" {
-            let row = crate::pgq::query("SELECT author, mentions FROM journal WHERE id = ?")
-                .bind(ref_id)
-                .fetch_optional(self.db())
-                .await?;
-            let Some(r) = row else { return Ok(vec![]) };
-            let mut actors = vec![r.try_get::<String, _>("author")?];
-            actors.extend(super::json_vec(&r.try_get::<String, _>("mentions")?));
-            return Ok(actors);
-        }
-        let Some(table) = origin_table(kind) else {
-            return Ok(vec![]);
-        };
-        let assignees: Option<String> =
-            crate::pgq::query_scalar(&format!("SELECT assignees FROM {table} WHERE id = ?"))
-                .bind(ref_id)
-                .fetch_optional(self.db())
-                .await?;
-        Ok(assignees.map(|a| super::json_vec(&a)).unwrap_or_default())
-    }
-
-    /// Neighbors of an entity in the links graph, either direction (store.ts
-    /// `blanketNeighbors` — the Markov blanket).
-    async fn blanket_neighbors(&self, kind: &str, id: &str) -> Result<Vec<String>> {
-        let rows = crate::pgq::query(
-            "SELECT target_kind AS k, target_id AS i FROM links WHERE source_kind = ? AND source_id = ? \
-             UNION \
-             SELECT source_kind AS k, source_id AS i FROM links WHERE target_kind = ? AND target_id = ?",
-        )
-        .bind(kind)
-        .bind(id)
-        .bind(kind)
-        .bind(id)
-        .fetch_all(self.db())
-        .await?;
-        rows.iter()
-            .map(|r| -> Result<String> {
-                Ok(ref_key(
-                    r.try_get::<String, _>("k")?.as_str(),
-                    r.try_get::<String, _>("i")?.as_str(),
-                ))
-            })
-            .collect()
+        .await
     }
 
     /// Per-kind rank weights: defaults ← `search.kind_weights` config JSON ←
@@ -506,281 +317,6 @@ impl Store {
             }
         }
         w
-    }
-
-    /// ANN candidate stage (plan B5): HNSW index probes over the native
-    /// `vec_v` column instead of loading the whole BYTEA table. Returns
-    /// chunk-level `(kind:id, sim)` rows, NOT yet collapsed.
-    ///
-    /// When `kinds` is None a second probe excludes the bulk kinds so mail
-    /// volume can never evict journal/tasks from the candidate set — union'd
-    /// and deduped by the caller's collapse.
-    ///
-    /// Raw sqlx (not pgq): the query vector binds via the pgvector crate and
-    /// `$1` is reused in SELECT + ORDER BY, which the `?` rewriter can't
-    /// express.
-    async fn ann_candidates(
-        &self,
-        q: &[f32],
-        kinds: Option<&[EntityKind]>,
-        chunk_k: i64,
-        bulk: &[String],
-    ) -> Result<Vec<(String, f64)>> {
-        let qv = pgvector::Vector::from(q.to_vec());
-        let model = hive_embed::embed_model();
-        // ef_search is SET LOCAL (transaction-scoped) — never leaks into the
-        // pooled connection. Formatted, not bound: SET takes no parameters;
-        // the value is a parsed+clamped integer.
-        let ef = vec_ef_search();
-        let mut tx = self.db().begin().await?;
-        sqlx::query(&format!("SET LOCAL hnsw.ef_search = {ef}"))
-            .execute(&mut *tx)
-            .await?;
-
-        const BASE: &str = "SELECT ref_kind, ref_id, chunk_idx, 1 - (vec_v <=> $1) AS sim \
-             FROM embeddings \
-             WHERE model = $2 AND vec_v IS NOT NULL";
-        let mut rows: Vec<(String, f64)> = Vec::new();
-        let mut push_rows = |fetched: Vec<sqlx::postgres::PgRow>| -> Result<()> {
-            for r in &fetched {
-                let key = ref_key(
-                    r.try_get::<String, _>("ref_kind")?.as_str(),
-                    r.try_get::<String, _>("ref_id")?.as_str(),
-                );
-                rows.push((key, r.try_get::<f64, _>("sim")?));
-            }
-            Ok(())
-        };
-
-        match kinds {
-            Some(ks) => {
-                let arr: Vec<String> = ks.iter().map(|k| k.as_str().to_string()).collect();
-                let sql = format!("{BASE} AND ref_kind = ANY($3) ORDER BY vec_v <=> $1 LIMIT $4");
-                let fetched = sqlx::query(&sql)
-                    .bind(&qv)
-                    .bind(model)
-                    .bind(&arr)
-                    .bind(chunk_k)
-                    .fetch_all(&mut *tx)
-                    .await?;
-                push_rows(fetched)?;
-            }
-            None => {
-                let sql = format!("{BASE} ORDER BY vec_v <=> $1 LIMIT $3");
-                let fetched = sqlx::query(&sql)
-                    .bind(&qv)
-                    .bind(model)
-                    .bind(chunk_k)
-                    .fetch_all(&mut *tx)
-                    .await?;
-                push_rows(fetched)?;
-                if !bulk.is_empty() {
-                    let sql =
-                        format!("{BASE} AND ref_kind <> ALL($3) ORDER BY vec_v <=> $1 LIMIT $4");
-                    let fetched = sqlx::query(&sql)
-                        .bind(&qv)
-                        .bind(model)
-                        .bind(bulk)
-                        .bind(chunk_k)
-                        .fetch_all(&mut *tx)
-                        .await?;
-                    push_rows(fetched)?;
-                }
-            }
-        }
-        tx.commit().await?;
-        Ok(rows)
-    }
-
-    /// Brute-force BYTEA candidate stage — the pre-pgvector path, kept for
-    /// non-384-dim providers (the 256-dim hash embedder in dev/CI) so the
-    /// whole cascade stays exercised without ONNX. Full scan of model-matched
-    /// rows, cosine in Rust. Returns chunk-level rows for the same collapse.
-    async fn brute_candidates(
-        &self,
-        q: &[f32],
-        kinds: Option<&[EntityKind]>,
-    ) -> Result<Vec<(String, f64)>> {
-        let kind_clause = match kinds {
-            Some(ks) => format!(" AND ref_kind IN ({})", placeholders_or_never(ks.len())),
-            None => String::new(),
-        };
-        let sql = format!(
-            "SELECT ref_kind, ref_id, vec FROM embeddings \
-             WHERE model = ? AND dim = ? AND vec IS NOT NULL{kind_clause}"
-        );
-        let mut q_db = crate::pgq::query(&sql)
-            .bind(hive_embed::embed_model())
-            .bind(q.len() as i64);
-        for k in kinds.unwrap_or(&[]) {
-            q_db = q_db.bind(k.as_str());
-        }
-        let rows = q_db.fetch_all(self.db()).await?;
-        rows.iter()
-            .map(|r| -> Result<(String, f64)> {
-                let key = ref_key(
-                    r.try_get::<String, _>("ref_kind")?.as_str(),
-                    r.try_get::<String, _>("ref_id")?.as_str(),
-                );
-                let vec = hive_embed::from_blob(&r.try_get::<Vec<u8>, _>("vec")?);
-                Ok((key, hive_embed::cosine(q, &vec)))
-            })
-            .collect()
-    }
-
-    /// Keyed hydration for ranked hits — one IN-query per kind present,
-    /// replacing the old query-time `embeddable_items()` corpus scan. A key
-    /// that doesn't resolve (orphaned embedding, deleted mail, unknown kind)
-    /// is simply absent from the map: callers DROP those hits rather than
-    /// surfacing raw-id titles.
-    async fn hydrate_hits(&self, keys: &[String]) -> Result<HashMap<String, HydratedHit>> {
-        let mut by_kind: HashMap<&str, Vec<&str>> = HashMap::new();
-        for k in keys {
-            let (kind, id) = split_key(k);
-            if !id.is_empty() {
-                by_kind.entry(kind).or_default().push(id);
-            }
-        }
-        let mut out: HashMap<String, HydratedHit> = HashMap::new();
-        let mut custom_ids: Vec<&str> = Vec::new();
-        for (kind, ids) in by_kind {
-            let sql_in = placeholders_or_never(ids.len());
-            match kind {
-                "journal" => {
-                    let sql =
-                        format!("SELECT id, author, body FROM journal WHERE id IN ({sql_in})");
-                    let mut q = crate::pgq::query(&sql);
-                    for id in &ids {
-                        q = q.bind(*id);
-                    }
-                    for r in &q.fetch_all(self.db()).await? {
-                        let id: String = r.try_get("id")?;
-                        let author: String = r.try_get("author")?;
-                        let body: String = r.try_get("body")?;
-                        out.insert(
-                            ref_key("journal", &id),
-                            HydratedHit {
-                                title: format!("{author}: {}", js_slice(&body, 40)),
-                                text: body,
-                                snippet: String::new(),
-                            },
-                        );
-                    }
-                }
-                "task" | "event" => {
-                    let table = if kind == "task" { "tasks" } else { "events" };
-                    let sql = format!("SELECT id, title, body FROM {table} WHERE id IN ({sql_in})");
-                    let mut q = crate::pgq::query(&sql);
-                    for id in &ids {
-                        q = q.bind(*id);
-                    }
-                    for r in &q.fetch_all(self.db()).await? {
-                        let id: String = r.try_get("id")?;
-                        let title: String = r.try_get("title")?;
-                        let body: String = r.try_get("body")?;
-                        out.insert(
-                            ref_key(kind, &id),
-                            HydratedHit {
-                                text: format!("{title} {body}"),
-                                title,
-                                snippet: String::new(),
-                            },
-                        );
-                    }
-                }
-                "decision" => {
-                    let sql = format!(
-                        "SELECT id, title, context, decision, consequences \
-                         FROM decisions WHERE id IN ({sql_in})"
-                    );
-                    let mut q = crate::pgq::query(&sql);
-                    for id in &ids {
-                        q = q.bind(*id);
-                    }
-                    for r in &q.fetch_all(self.db()).await? {
-                        let id: String = r.try_get("id")?;
-                        let title: String = r.try_get("title")?;
-                        let context: String = r.try_get("context")?;
-                        let decision: String = r.try_get("decision")?;
-                        let consequences: String = r.try_get("consequences")?;
-                        out.insert(
-                            ref_key("decision", &id),
-                            HydratedHit {
-                                text: format!("{title} {context} {decision} {consequences}"),
-                                title,
-                                snippet: String::new(),
-                            },
-                        );
-                    }
-                }
-                "mail" => {
-                    // Tombstoned mail hydrates as a miss on purpose — the
-                    // embeddings row may outlive the message until the reaper
-                    // sweeps it.
-                    let sql = format!(
-                        "SELECT id, subject, from_name, from_addr, snippet, body_text \
-                         FROM mail_messages WHERE id IN ({sql_in}) AND deleted_at IS NULL"
-                    );
-                    let mut q = crate::pgq::query(&sql);
-                    for id in &ids {
-                        q = q.bind(*id);
-                    }
-                    for r in &q.fetch_all(self.db()).await? {
-                        let id: String = r.try_get("id")?;
-                        let subject: String = r.try_get("subject")?;
-                        let from_name: Option<String> = r.try_get("from_name")?;
-                        let from_addr: String = r.try_get("from_addr")?;
-                        let snippet: String = r.try_get("snippet")?;
-                        let body: String = r.try_get("body_text")?;
-                        let from = from_name
-                            .filter(|s| !s.trim().is_empty())
-                            .unwrap_or(from_addr);
-                        let title = if subject.trim().is_empty() {
-                            from.clone()
-                        } else {
-                            subject.clone()
-                        };
-                        out.insert(
-                            ref_key("mail", &id),
-                            HydratedHit {
-                                title,
-                                text: format!("From: {from}\nSubject: {subject}\n\n{body}"),
-                                snippet,
-                            },
-                        );
-                    }
-                }
-                _ => custom_ids.extend(ids),
-            }
-        }
-        // Everything else may be a custom entity type slug — one batched
-        // query keyed by the row's actual slug, so a kind/slug mismatch stays
-        // a miss (fail closed, same as the old admit() contract).
-        if !custom_ids.is_empty() {
-            let sql = format!(
-                "SELECT e.id, t.slug, e.title FROM entities e \
-                 JOIN entity_types t ON t.id = e.type_id WHERE e.id IN ({})",
-                placeholders_or_never(custom_ids.len())
-            );
-            let mut q = crate::pgq::query(&sql);
-            for id in &custom_ids {
-                q = q.bind(*id);
-            }
-            for r in &q.fetch_all(self.db()).await? {
-                let id: String = r.try_get("id")?;
-                let slug: String = r.try_get("slug")?;
-                let title: String = r.try_get("title")?;
-                out.insert(
-                    ref_key(&slug, &id),
-                    HydratedHit {
-                        text: title.clone(),
-                        title,
-                        snippet: String::new(),
-                    },
-                );
-            }
-        }
-        Ok(out)
     }
 
     /// Semantic search — store.ts `semanticSearch`, the full standard|precision
@@ -801,7 +337,8 @@ impl Store {
         // Precision forces the cross-encoder on; standard honors the flag.
         // Either way it only engages when a reranker is actually available, so
         // precision degrades to the standard blend under hash/CI (#47).
-        let rerank_avail = tokio::task::spawn_blocking(hive_embed::rerank_available).await?;
+        let embedder = self.embedder().clone();
+        let rerank_avail = tokio::task::spawn_blocking(move || embedder.rerank_available()).await?;
         let use_rerank = (precision || opts.rerank.unwrap_or(false)) && rerank_avail;
         if query.trim().is_empty() {
             return Ok(vec![]);
@@ -820,22 +357,36 @@ impl Store {
         };
 
         // 1. Vector candidate pass. Provider dispatch: the 384-dim model uses
-        // the HNSW ANN probes over vec_v; anything else (the 256-dim hash
-        // provider in dev/CI) keeps the brute-force BYTEA scan so the whole
-        // cascade below stays exercised without ONNX. The q.len() guard
-        // covers the transformers latch: a mid-flight model failure degrades
-        // embed_query to 256-dim hash vectors, which must not bind against
-        // vector(384).
+        // the ANN seam; anything else (the 256-dim hash provider in dev/CI)
+        // keeps the brute-force scan so the whole cascade below stays
+        // exercised without ONNX. The q.len() guard covers the transformers
+        // latch: a mid-flight model failure degrades embed_query to 256-dim
+        // hash vectors, which must not probe a 384-dim structure.
+        let embedder = self.embedder().clone();
         let owned_query = query.to_string();
-        let q = tokio::task::spawn_blocking(move || hive_embed::embed_query(&owned_query)).await?;
+        let q = tokio::task::spawn_blocking(move || embedder.embed_query(&owned_query)).await?;
         let chunk_k = (stage1_pool * 4).max(limit) as i64;
         let bulk = bulk_kinds();
-        let raw_rows = if hive_embed::embed_dim() == 384 && q.len() == 384 {
-            self.ann_candidates(&q, opts.kinds.as_deref(), chunk_k, &bulk)
-                .await?
-        } else {
-            self.brute_candidates(&q, opts.kinds.as_deref()).await?
-        };
+        let model = self.embedder().model();
+        let use_ann = self.embedder().dim() == 384 && q.len() == 384;
+        let kinds_owned = opts.kinds.clone();
+        let bulk_for_probe = bulk.clone();
+        let raw_rows: Vec<(String, f64)> = self
+            .run(move |core| {
+                if use_ann {
+                    ann_candidate_rows(
+                        core,
+                        &model,
+                        &q,
+                        kinds_owned.as_deref(),
+                        chunk_k as usize,
+                        &bulk_for_probe,
+                    )
+                } else {
+                    brute_candidate_rows(core, &model, &q, kinds_owned.as_deref())
+                }
+            })
+            .await?;
         // Chunked rows share one `kind:id` key — collapse to the item's best
         // chunk (MAX sim) so pool slots, the fallback, and the final hit list
         // stay one-entry-per-item. Everything downstream works on parent keys.
@@ -929,14 +480,24 @@ impl Store {
         // neighbor with a vector hit that missed the cut (+0.02, cap 0.06).
         if use_blanket {
             let scored_keys: HashSet<String> = scores.keys().iter().cloned().collect();
+            let keys = scores.keys().to_vec();
+            let neighbor_map = self
+                .run(move |core| {
+                    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+                    for kk in &keys {
+                        let (k, id) = split_key(kk);
+                        out.insert(kk.clone(), blanket_neighbors_core(core, k, id)?);
+                    }
+                    Ok(out)
+                })
+                .await?;
             for kk in scores.keys().to_vec() {
-                let (k, id) = split_key(&kk);
                 let mut strong = 0usize;
                 let mut weak = 0usize;
-                for nk in self.blanket_neighbors(k, id).await? {
-                    if scored_keys.contains(&nk) {
+                for nk in neighbor_map.get(&kk).map(Vec::as_slice).unwrap_or(&[]) {
+                    if scored_keys.contains(nk) {
                         strong += 1;
-                    } else if raw_hit_keys.contains(&nk) {
+                    } else if raw_hit_keys.contains(nk) {
                         weak += 1;
                     }
                 }
@@ -961,10 +522,24 @@ impl Store {
         // applied exactly once) and then the identity/peer soft boost (+0.1 —
         // a nudge, not a filter).
         let weights = self.kind_weights().await;
-        let focus: HashSet<&str> = [opts.identity.as_deref(), opts.peer.as_deref()]
+        let focus: HashSet<String> = [opts.identity.clone(), opts.peer.clone()]
             .into_iter()
             .flatten()
             .collect();
+        let actor_map: HashMap<String, Vec<String>> = if focus.is_empty() {
+            HashMap::new()
+        } else {
+            let keys = scores.keys().to_vec();
+            self.run(move |core| {
+                let mut out = HashMap::new();
+                for kk in &keys {
+                    let (kind, id) = split_key(kk);
+                    out.insert(kk.clone(), hit_actors_core(core, kind, id)?);
+                }
+                Ok(out)
+            })
+            .await?
+        };
         let (w_vec, w_kw) = if precision { (0.55, 0.25) } else { (0.7, 0.2) };
         let pre_rerank_n = if precision && use_rerank {
             (limit * 2).max(limit)
@@ -974,12 +549,13 @@ impl Store {
         let mut ranked: Vec<(String, f64)> = Vec::with_capacity(scores.len());
         for kk in scores.keys().to_vec() {
             let s = *scores.get(&kk).unwrap();
-            let (kind, id) = split_key(&kk);
+            let (kind, _id) = split_key(&kk);
             let scoped = if focus.is_empty() {
                 0.0
-            } else if self
-                .hit_actors(kind, id)
-                .await?
+            } else if actor_map
+                .get(&kk)
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
                 .iter()
                 .any(|a| focus.contains(a.as_str()))
             {
@@ -1010,7 +586,7 @@ impl Store {
         // pre-rerank cut, so an orphaned embedding can't hold a result slot
         // OR starve the survivors out of theirs.
         let keys: Vec<String> = ranked.iter().map(|(k, _)| k.clone()).collect();
-        let hydrated = self.hydrate_hits(&keys).await?;
+        let hydrated = self.run(move |core| hydrate_hits_core(core, &keys)).await?;
         ranked.retain(|(k, _)| hydrated.contains_key(k));
         ranked.truncate(pre_rerank_n);
 
@@ -1020,9 +596,10 @@ impl Store {
                 .iter()
                 .map(|(k, _)| hydrated.get(k).map(|h| h.text.clone()).unwrap_or_default())
                 .collect();
+            let embedder = self.embedder().clone();
             let owned_query = query.to_string();
-            let rr = tokio::task::spawn_blocking(move || hive_embed::rerank(&owned_query, &docs))
-                .await?;
+            let rr =
+                tokio::task::spawn_blocking(move || embedder.rerank(&owned_query, &docs)).await?;
             if let Some(rr) = rr {
                 let mut reranked: Vec<(String, f64)> = ranked
                     .into_iter()
@@ -1054,18 +631,435 @@ impl Store {
     }
 }
 
+// ── core-level pieces (run on the writer thread) ─────────────────────────────
+
+pub(crate) fn embeddable_items_core(core: &Core) -> Result<Vec<EmbeddableItem>> {
+    let conn = core.conn();
+    let mut out: Vec<EmbeddableItem> = Vec::new();
+    let mut push = |kind: &str, id: String, title: String, text: String, owner: Option<String>| {
+        let embed_text = format!("[{kind}] {title}\n\n{text}");
+        let hash = hive_embed::content_hash(&embed_text);
+        out.push(EmbeddableItem {
+            kind: kind.to_string(),
+            id,
+            title,
+            text,
+            embed_text,
+            hash,
+            owner,
+        });
+    };
+
+    // Window + `id` tiebreak match the reaper's journal sweep exactly
+    // (store/maintenance.rs) — a nondeterministic boundary row would
+    // churn embed/reap forever.
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, author, body, user_scope FROM journal ORDER BY created_at DESC, id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![JOURNAL_EMBED_WINDOW], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, author, body, owner) = row?;
+            push(
+                "journal",
+                id,
+                format!("{author}: {}", js_slice(&body, 40)),
+                body,
+                owner,
+            );
+        }
+    }
+
+    // Anchored entities inherit their origin entry's scope — resolved in
+    // the same query (one LEFT JOIN per table, no per-item lookups).
+    // Rows without an origin entry (or with a global one) stay global.
+    {
+        let mut stmt = conn.prepare(
+            "SELECT t.id, t.title, t.body, j.user_scope AS owner FROM tasks t \
+             LEFT JOIN journal j ON j.id = t.origin_entry_id \
+             ORDER BY CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, t.created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, title, body, owner) = row?;
+            let text = format!("{title} {body}");
+            push("task", id, title, text, owner);
+        }
+    }
+
+    {
+        let mut stmt = conn.prepare(
+            "SELECT d.id, d.title, d.context, d.decision, d.consequences, j.user_scope AS owner \
+             FROM decisions d LEFT JOIN journal j ON j.id = d.origin_entry_id \
+             ORDER BY d.created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, title, context, decision, consequences, owner) = row?;
+            let text = format!("{title} {context} {decision} {consequences}");
+            push("decision", id, title, text, owner);
+        }
+    }
+
+    {
+        let mut stmt = conn.prepare(
+            "SELECT e.id, e.title, e.body, j.user_scope AS owner FROM events e \
+             LEFT JOIN journal j ON j.id = e.origin_entry_id \
+             ORDER BY COALESCE(e.at, e.created_at) DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, title, body, owner) = row?;
+            let text = format!("{title} {body}");
+            push("event", id, title, text, owner);
+        }
+    }
+
+    Ok(out)
+}
+
+/// The actors associated with a hit (store.ts `hitActors`): journal →
+/// author + mentions; task/decision/event → assignees.
+fn hit_actors_core(core: &Core, kind: &str, ref_id: &str) -> Result<Vec<String>> {
+    use rusqlite::OptionalExtension;
+    let conn = core.conn();
+    if kind == "journal" {
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT author, mentions FROM journal WHERE id = ?1",
+                rusqlite::params![ref_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((author, mentions)) = row else {
+            return Ok(vec![]);
+        };
+        let mut actors = vec![author];
+        actors.extend(super::json_vec(&mentions));
+        return Ok(actors);
+    }
+    let Some(table) = origin_table(kind) else {
+        return Ok(vec![]);
+    };
+    let assignees: Option<String> = conn
+        .query_row(
+            &format!("SELECT assignees FROM {table} WHERE id = ?1"),
+            rusqlite::params![ref_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(assignees.map(|a| super::json_vec(&a)).unwrap_or_default())
+}
+
+/// Neighbors of an entity in the links graph, either direction (store.ts
+/// `blanketNeighbors` — the Markov blanket).
+fn blanket_neighbors_core(core: &Core, kind: &str, id: &str) -> Result<Vec<String>> {
+    let mut stmt = core.conn().prepare(
+        "SELECT target_kind AS k, target_id AS i FROM links WHERE source_kind = ?1 AND source_id = ?2 \
+         UNION \
+         SELECT source_kind AS k, source_id AS i FROM links WHERE target_kind = ?1 AND target_id = ?2",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![kind, id], |r| {
+        Ok(ref_key(
+            r.get::<_, String>(0)?.as_str(),
+            r.get::<_, String>(1)?.as_str(),
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// ANN candidate stage over the AnnIndex seam. Returns chunk-level
+/// `(kind:id, sim)` rows, NOT yet collapsed.
+///
+/// When `kinds` is None a second probe excludes the bulk kinds so mail
+/// volume can never evict journal/tasks from the candidate set — union'd
+/// and deduped by the caller's collapse. The seam has no kind filter, so
+/// filtered probes fetch the whole candidate list and post-filter — exact
+/// (the 1.5 ANN is a brute-force scan) and personal-scale cheap.
+fn ann_candidate_rows(
+    core: &Core,
+    model: &str,
+    q: &[f32],
+    kinds: Option<&[EntityKind]>,
+    chunk_k: usize,
+    bulk: &[String],
+) -> Result<Vec<(String, f64)>> {
+    let all = core.index.ann_len(model);
+    let to_rows = |cands: Vec<crate::index::AnnCandidate>| -> Vec<(String, f64)> {
+        cands
+            .into_iter()
+            .map(|c| (ref_key(&c.ref_kind, &c.ref_id), c.score as f64))
+            .collect()
+    };
+    match kinds {
+        Some(ks) => {
+            let want: HashSet<&str> = ks.iter().map(|k| k.as_str()).collect();
+            let cands = core.index.ann_candidates(model, q, all)?;
+            let mut rows = to_rows(cands);
+            rows.retain(|(k, _)| {
+                let (kind, _) = split_key(k);
+                want.contains(kind)
+            });
+            rows.truncate(chunk_k);
+            Ok(rows)
+        }
+        None => {
+            let mut rows = to_rows(core.index.ann_candidates(model, q, chunk_k)?);
+            if !bulk.is_empty() {
+                let cands = core.index.ann_candidates(model, q, all)?;
+                let mut non_bulk = to_rows(cands);
+                non_bulk.retain(|(k, _)| {
+                    let (kind, _) = split_key(k);
+                    !bulk.iter().any(|b| b == kind)
+                });
+                non_bulk.truncate(chunk_k);
+                rows.extend(non_bulk);
+            }
+            Ok(rows)
+        }
+    }
+}
+
+/// Brute-force candidate stage — full scan of model-matched rows, cosine in
+/// Rust (bit-identical to the Postgres BYTEA path for the hash provider).
+fn brute_candidate_rows(
+    core: &Core,
+    model: &str,
+    q: &[f32],
+    kinds: Option<&[EntityKind]>,
+) -> Result<Vec<(String, f64)>> {
+    let kind_clause = match kinds {
+        Some(ks) => format!(" AND ref_kind IN ({})", placeholders_or_never(ks.len())),
+        None => String::new(),
+    };
+    let sql = format!(
+        "SELECT ref_kind, ref_id, vec FROM embeddings \
+         WHERE model = ? AND dim = ? AND vec IS NOT NULL{kind_clause}"
+    );
+    let mut binds: Vec<Box<dyn rusqlite::types::ToSql>> =
+        vec![Box::new(model.to_string()), Box::new(q.len() as i64)];
+    for k in kinds.unwrap_or(&[]) {
+        binds.push(Box::new(k.as_str().to_string()));
+    }
+    let mut stmt = core.conn().prepare(&sql)?;
+    let rows = stmt.query_map(
+        rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref())),
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Vec<u8>>(2)?,
+            ))
+        },
+    )?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (kind, id, blob) = row?;
+        let vec = hive_embed::from_blob(&blob);
+        out.push((ref_key(&kind, &id), hive_embed::cosine(q, &vec)));
+    }
+    Ok(out)
+}
+
+/// Keyed hydration for ranked hits — one IN-query per kind present,
+/// replacing the old query-time `embeddable_items()` corpus scan. A key
+/// that doesn't resolve (orphaned embedding, deleted mail, unknown kind)
+/// is simply absent from the map: callers DROP those hits rather than
+/// surfacing raw-id titles.
+fn hydrate_hits_core(core: &Core, keys: &[String]) -> Result<HashMap<String, HydratedHit>> {
+    let conn = core.conn();
+    let mut by_kind: HashMap<&str, Vec<&str>> = HashMap::new();
+    for k in keys {
+        let (kind, id) = split_key(k);
+        if !id.is_empty() {
+            by_kind.entry(kind).or_default().push(id);
+        }
+    }
+    let mut out: HashMap<String, HydratedHit> = HashMap::new();
+    let mut custom_ids: Vec<&str> = Vec::new();
+    for (kind, ids) in by_kind {
+        let sql_in = placeholders_or_never(ids.len());
+        let binds = rusqlite::params_from_iter(ids.iter());
+        match kind {
+            "journal" => {
+                let sql = format!("SELECT id, author, body FROM journal WHERE id IN ({sql_in})");
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(binds, |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, author, body) = row?;
+                    out.insert(
+                        ref_key("journal", &id),
+                        HydratedHit {
+                            title: format!("{author}: {}", js_slice(&body, 40)),
+                            text: body,
+                            snippet: String::new(),
+                        },
+                    );
+                }
+            }
+            "task" | "event" => {
+                let table = if kind == "task" { "tasks" } else { "events" };
+                let sql = format!("SELECT id, title, body FROM {table} WHERE id IN ({sql_in})");
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(binds, |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, title, body) = row?;
+                    out.insert(
+                        ref_key(kind, &id),
+                        HydratedHit {
+                            text: format!("{title} {body}"),
+                            title,
+                            snippet: String::new(),
+                        },
+                    );
+                }
+            }
+            "decision" => {
+                let sql = format!(
+                    "SELECT id, title, context, decision, consequences \
+                     FROM decisions WHERE id IN ({sql_in})"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(binds, |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, title, context, decision, consequences) = row?;
+                    out.insert(
+                        ref_key("decision", &id),
+                        HydratedHit {
+                            text: format!("{title} {context} {decision} {consequences}"),
+                            title,
+                            snippet: String::new(),
+                        },
+                    );
+                }
+            }
+            "mail" => {
+                // Tombstoned mail hydrates as a miss on purpose — the
+                // embeddings row may outlive the message until the reaper
+                // sweeps it.
+                let sql = format!(
+                    "SELECT id, subject, from_name, from_addr, snippet, body_text \
+                     FROM mail_messages WHERE id IN ({sql_in}) AND deleted_at IS NULL"
+                );
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map(binds, |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, subject, from_name, from_addr, snippet, body) = row?;
+                    let from = from_name
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or(from_addr);
+                    let title = if subject.trim().is_empty() {
+                        from.clone()
+                    } else {
+                        subject.clone()
+                    };
+                    out.insert(
+                        ref_key("mail", &id),
+                        HydratedHit {
+                            title,
+                            text: format!("From: {from}\nSubject: {subject}\n\n{body}"),
+                            snippet,
+                        },
+                    );
+                }
+            }
+            _ => custom_ids.extend(ids),
+        }
+    }
+    // Everything else may be a custom entity type slug — one batched
+    // query keyed by the row's actual slug, so a kind/slug mismatch stays
+    // a miss (fail closed, same as the old admit() contract).
+    if !custom_ids.is_empty() {
+        let sql = format!(
+            "SELECT e.id, t.slug, e.title FROM entities e \
+             JOIN entity_types t ON t.id = e.type_id WHERE e.id IN ({})",
+            placeholders_or_never(custom_ids.len())
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(custom_ids.iter()), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, slug, title) = row?;
+            out.insert(
+                ref_key(&slug, &id),
+                HydratedHit {
+                    text: title.clone(),
+                    title,
+                    snippet: String::new(),
+                },
+            );
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn match_query_strips_and_stars() {
-        assert_eq!(to_match_query("hello world"), "hello:* & world:*");
-        assert_eq!(to_match_query("c++ rocks!"), "c:* & rocks:*");
-        assert_eq!(to_match_query("!!! ..."), "");
-        // Single-char stems survive as `a:*` (prefix match, AND-joined).
-        assert_eq!(to_match_query("a bee"), "a:* & bee:*");
-    }
 
     #[test]
     fn js_slice_counts_utf16_units() {

@@ -1,11 +1,13 @@
-// Decisions list/get/update (store.ts `decisions`). Owned by core-stores.
+// Decisions list/get/update (store.ts `decisions`). Creates/updates are
+// records; the supersedes side effect (prior decision → superseded + link)
+// rides the same batch as separate records.
 
 use anyhow::Result;
 use hive_shared::{Decision, DecisionPatch, DecisionStatus, EntityKind};
+use rusqlite::OptionalExtension;
 use serde_json::json;
-use sqlx::Row;
 
-use super::{json_vec, new_id, now_iso, to_json, Store};
+use super::{json_vec, new_id, now_iso, to_json, Core, Draft, Store};
 
 /// Inputs for the internal creation path (store.ts `decisions.create` input shape).
 #[derive(Debug, Clone)]
@@ -25,98 +27,35 @@ pub struct DecisionCreate {
 
 impl Store {
     pub async fn decisions_list(&self, status: Option<&str>) -> Result<Vec<Decision>> {
-        let rows = crate::pgq::query("SELECT * FROM decisions ORDER BY created_at DESC")
-            .fetch_all(self.db())
-            .await?;
-        let decisions: Vec<Decision> = rows
-            .iter()
-            .map(row_to_decision)
-            .collect::<Result<Vec<_>>>()?;
-        Ok(decisions
-            .into_iter()
-            .filter(|d| status.is_none_or(|s| d.status.as_str() == s))
-            .collect())
+        let status = status.map(str::to_string);
+        self.run(move |core| {
+            let mut stmt = core
+                .conn()
+                .prepare("SELECT * FROM decisions ORDER BY created_at DESC")?;
+            let rows = stmt.query_map([], row_to_decision)?;
+            let decisions = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(decisions
+                .into_iter()
+                .filter(|d| status.as_deref().is_none_or(|s| d.status.as_str() == s))
+                .collect())
+        })
+        .await
     }
 
     pub async fn decisions_get(&self, decision_id: &str) -> Result<Option<Decision>> {
-        let row = crate::pgq::query("SELECT * FROM decisions WHERE id = ?")
-            .bind(decision_id)
-            .fetch_optional(self.db())
-            .await?;
-        row.as_ref().map(row_to_decision).transpose()
+        let decision_id = decision_id.to_string();
+        self.run(move |core| decision_get(core, &decision_id)).await
     }
 
     pub async fn decisions_create(&self, input: DecisionCreate, actor: &str) -> Result<Decision> {
-        if let Some(project) = &input.project {
-            if self.projects_get(project).await?.is_none() {
-                self.projects_ensure(project).await?;
-            }
-        }
-        let ts = now_iso();
-        let d = Decision {
-            id: new_id("dec"),
-            title: input.title,
-            context: input.context,
-            decision: input.decision,
-            consequences: input.consequences,
-            status: input.status,
-            tags: input.tags,
-            assignees: input.assignees,
-            project: input.project,
-            supersedes: input.supersedes,
-            origin_entry_id: input.origin_entry_id,
-            anchor_text: input.anchor_text,
-            created_at: ts.clone(),
-            updated_at: ts,
-        };
-        crate::pgq::query(
-            "INSERT INTO decisions (id, title, context, decision, consequences, status, tags, assignees, \
-             project, supersedes, origin_entry_id, anchor_text, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&d.id)
-        .bind(&d.title)
-        .bind(&d.context)
-        .bind(&d.decision)
-        .bind(&d.consequences)
-        .bind(d.status.as_str())
-        .bind(to_json(&d.tags))
-        .bind(to_json(&d.assignees))
-        .bind(&d.project)
-        .bind(&d.supersedes)
-        .bind(&d.origin_entry_id)
-        .bind(&d.anchor_text)
-        .bind(&d.created_at)
-        .bind(&d.updated_at)
-        .execute(self.db())
-        .await?;
-        self.index_entity(
-            "decision",
-            &d.id,
-            &d.title,
-            &format!("{} {} {}", d.context, d.decision, d.consequences),
-            &d.tags,
-        )
-        .await?;
-        if let Some(supersedes) = &d.supersedes {
-            if let Some(prior) = self.decisions_get(supersedes).await? {
-                crate::pgq::query(
-                    "UPDATE decisions SET status='superseded', updated_at=? WHERE id=?",
-                )
-                .bind(now_iso())
-                .bind(&prior.id)
-                .execute(self.db())
-                .await?;
-                self.links_create(
-                    EntityKind::Decision.as_str(),
-                    &d.id,
-                    EntityKind::Decision.as_str(),
-                    &prior.id,
-                    "supersedes",
-                )
-                .await?;
-            }
-        }
+        let actor_s = actor.to_string();
+        let d = self
+            .run(move |core| {
+                let (d, drafts) = decision_create_plan(core, input, &actor_s)?;
+                core.commit(drafts)?;
+                Ok(d)
+            })
+            .await?;
         self.emit(
             "decision.created",
             actor,
@@ -132,42 +71,40 @@ impl Store {
         patch: DecisionPatch,
         actor: &str,
     ) -> Result<Option<Decision>> {
-        let Some(current) = self.decisions_get(decision_id).await? else {
-            return Ok(None);
-        };
-        let next = Decision {
-            title: patch.title.unwrap_or(current.title),
-            context: patch.context.unwrap_or(current.context),
-            decision: patch.decision.unwrap_or(current.decision),
-            consequences: patch.consequences.unwrap_or(current.consequences),
-            status: patch.status.unwrap_or(current.status),
-            tags: patch.tags.unwrap_or(current.tags),
-            assignees: patch.assignees.unwrap_or(current.assignees),
-            updated_at: now_iso(),
-            ..current
-        };
-        crate::pgq::query(
-            "UPDATE decisions SET title=?, context=?, decision=?, consequences=?, status=?, tags=?, assignees=?, updated_at=? WHERE id=?",
-        )
-        .bind(&next.title)
-        .bind(&next.context)
-        .bind(&next.decision)
-        .bind(&next.consequences)
-        .bind(next.status.as_str())
-        .bind(to_json(&next.tags))
-        .bind(to_json(&next.assignees))
-        .bind(&next.updated_at)
-        .bind(&next.id)
-        .execute(self.db())
-        .await?;
-        self.index_entity(
-            "decision",
-            &next.id,
-            &next.title,
-            &format!("{} {} {}", next.context, next.decision, next.consequences),
-            &next.tags,
-        )
-        .await?;
+        let decision_id_s = decision_id.to_string();
+        let actor_s = actor.to_string();
+        let next = self
+            .run(move |core| {
+                let Some(current) = decision_get(core, &decision_id_s)? else {
+                    return Ok(None);
+                };
+                let next = Decision {
+                    title: patch.title.unwrap_or(current.title),
+                    context: patch.context.unwrap_or(current.context),
+                    decision: patch.decision.unwrap_or(current.decision),
+                    consequences: patch.consequences.unwrap_or(current.consequences),
+                    status: patch.status.unwrap_or(current.status),
+                    tags: patch.tags.unwrap_or(current.tags),
+                    assignees: patch.assignees.unwrap_or(current.assignees),
+                    updated_at: now_iso(),
+                    ..current
+                };
+                core.commit(vec![Draft::new(
+                    crate::oplog::kind::ENTITY_UPDATE,
+                    &actor_s,
+                    &next.updated_at,
+                    json!({"kind": "decision", "id": next.id, "fields": {
+                        "title": next.title, "context": next.context,
+                        "decision": next.decision, "consequences": next.consequences,
+                        "status": next.status.as_str(),
+                        "tags": to_json(&next.tags), "assignees": to_json(&next.assignees),
+                        "updated_at": next.updated_at,
+                    }}),
+                )])?;
+                Ok(Some(next))
+            })
+            .await?;
+        let Some(next) = next else { return Ok(None) };
         self.emit(
             "decision.updated",
             actor,
@@ -178,21 +115,109 @@ impl Store {
     }
 }
 
-pub(crate) fn row_to_decision(r: &sqlx::postgres::PgRow) -> Result<Decision> {
+pub(crate) fn decision_get(core: &Core, decision_id: &str) -> Result<Option<Decision>> {
+    Ok(core
+        .conn()
+        .query_row(
+            "SELECT * FROM decisions WHERE id = ?1",
+            rusqlite::params![decision_id],
+            row_to_decision,
+        )
+        .optional()?)
+}
+
+/// The entity.create payload for one decision (also journal.append's
+/// `emerged` element shape).
+pub(crate) fn decision_create_payload(d: &Decision) -> serde_json::Value {
+    json!({"kind": "decision", "id": d.id, "fields": {
+        "title": d.title, "context": d.context, "decision": d.decision,
+        "consequences": d.consequences, "status": d.status.as_str(),
+        "tags": to_json(&d.tags), "assignees": to_json(&d.assignees),
+        "project": d.project, "supersedes": d.supersedes,
+        "origin_entry_id": d.origin_entry_id, "anchor_text": d.anchor_text,
+        "created_at": d.created_at, "updated_at": d.updated_at,
+    }})
+}
+
+/// Build the Decision + record drafts: optional project ensure, the create,
+/// and — when `supersedes` names an existing decision — the prior decision's
+/// status flip plus the supersedes link, all in one batch.
+pub(crate) fn decision_create_plan(
+    core: &Core,
+    input: DecisionCreate,
+    actor: &str,
+) -> Result<(Decision, Vec<Draft>)> {
+    let mut drafts: Vec<Draft> = Vec::new();
+    if let Some(project) = &input.project {
+        if super::projects::project_get(core.conn(), project)?.is_none() {
+            let (_p, draft) = super::projects::project_ensure_plan(core, project)?;
+            if let Some(d) = draft {
+                drafts.push(d);
+            }
+        }
+    }
+    let ts = now_iso();
+    let d = Decision {
+        id: new_id("dec"),
+        title: input.title,
+        context: input.context,
+        decision: input.decision,
+        consequences: input.consequences,
+        status: input.status,
+        tags: input.tags,
+        assignees: input.assignees,
+        project: input.project,
+        supersedes: input.supersedes,
+        origin_entry_id: input.origin_entry_id,
+        anchor_text: input.anchor_text,
+        created_at: ts.clone(),
+        updated_at: ts.clone(),
+    };
+    drafts.push(Draft::new(
+        crate::oplog::kind::ENTITY_CREATE,
+        actor,
+        &ts,
+        decision_create_payload(&d),
+    ));
+    if let Some(supersedes) = &d.supersedes {
+        if let Some(prior) = decision_get(core, supersedes)? {
+            let ts2 = now_iso();
+            drafts.push(Draft::new(
+                crate::oplog::kind::ENTITY_UPDATE,
+                actor,
+                &ts2,
+                json!({"kind": "decision", "id": prior.id, "fields": {
+                    "status": "superseded", "updated_at": ts2,
+                }}),
+            ));
+            drafts.push(super::links::link_draft(
+                EntityKind::Decision.as_str(),
+                &d.id,
+                EntityKind::Decision.as_str(),
+                &prior.id,
+                "supersedes",
+                &ts2,
+            ));
+        }
+    }
+    Ok((d, drafts))
+}
+
+pub(crate) fn row_to_decision(r: &rusqlite::Row) -> rusqlite::Result<Decision> {
     Ok(Decision {
-        id: r.try_get("id")?,
-        title: r.try_get("title")?,
-        context: r.try_get("context")?,
-        decision: r.try_get("decision")?,
-        consequences: r.try_get("consequences")?,
-        status: DecisionStatus::from_str_lossy(r.try_get::<String, _>("status")?.as_str()),
-        tags: json_vec(r.try_get::<String, _>("tags")?.as_str()),
-        assignees: json_vec(r.try_get::<String, _>("assignees")?.as_str()),
-        project: r.try_get("project")?,
-        supersedes: r.try_get("supersedes")?,
-        origin_entry_id: r.try_get("origin_entry_id")?,
-        anchor_text: r.try_get("anchor_text")?,
-        created_at: r.try_get("created_at")?,
-        updated_at: r.try_get("updated_at")?,
+        id: r.get("id")?,
+        title: r.get("title")?,
+        context: r.get("context")?,
+        decision: r.get("decision")?,
+        consequences: r.get("consequences")?,
+        status: DecisionStatus::from_str_lossy(r.get::<_, String>("status")?.as_str()),
+        tags: json_vec(r.get::<_, String>("tags")?.as_str()),
+        assignees: json_vec(r.get::<_, String>("assignees")?.as_str()),
+        project: r.get("project")?,
+        supersedes: r.get("supersedes")?,
+        origin_entry_id: r.get("origin_entry_id")?,
+        anchor_text: r.get("anchor_text")?,
+        created_at: r.get("created_at")?,
+        updated_at: r.get("updated_at")?,
     })
 }

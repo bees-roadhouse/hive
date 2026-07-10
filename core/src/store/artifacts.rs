@@ -1,17 +1,14 @@
 // Claude Code artifacts (skills / agents / slash-commands) stored per AI
-// identity. The plugin pulls an identity's ENABLED artifacts via the sync
-// endpoint, authenticated by the AI-identity token — keyed on the AI actor
-// (people.slug), NOT the per-user memory namespace.
-//
-// Skills are modeled as a single SKILL.md `content` for v1; multi-file skills
-// (bundled scripts / references) are out of scope for now.
+// identity, keyed on the AI actor (people.slug). Upserts split into
+// entity.create / entity.update records in the command layer (the fold does
+// strict inserts); (actor, kind, name) uniqueness is command-layer law.
 
 use anyhow::Result;
 use hive_shared::IdentityArtifact;
+use rusqlite::OptionalExtension;
 use serde_json::json;
-use sqlx::Row;
 
-use super::{new_id, now_iso, Store};
+use super::{new_id, now_iso, Draft, Store};
 
 const ARTIFACT_COLS: &str =
     "id, actor, kind, name, content, description, enabled, created_at, updated_at";
@@ -29,30 +26,75 @@ impl Store {
         description: &str,
         enabled: bool,
     ) -> Result<IdentityArtifact> {
-        let now = now_iso();
-        let id = new_id("iart");
-        let row = crate::pgq::query(&format!(
-            "INSERT INTO identity_artifacts (id, actor, kind, name, content, description, enabled, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT (actor, kind, name) DO UPDATE SET \
-               content = excluded.content, \
-               description = excluded.description, \
-               enabled = excluded.enabled, \
-               updated_at = excluded.updated_at \
-             RETURNING {ARTIFACT_COLS}"
-        ))
-        .bind(&id)
-        .bind(actor)
-        .bind(kind)
-        .bind(name)
-        .bind(content)
-        .bind(description)
-        .bind(enabled)
-        .bind(&now)
-        .bind(&now)
-        .fetch_one(self.db())
-        .await?;
-        let artifact = row_to_artifact(&row)?;
+        let (actor_s, kind_s, name_s, content_s, desc_s) = (
+            actor.to_string(),
+            kind.to_string(),
+            name.to_string(),
+            content.to_string(),
+            description.to_string(),
+        );
+        let artifact = self
+            .run(move |core| {
+                let now = now_iso();
+                let existing = core
+                    .conn()
+                    .query_row(
+                        &format!(
+                            "SELECT {ARTIFACT_COLS} FROM identity_artifacts \
+                             WHERE actor = ?1 AND kind = ?2 AND name = ?3"
+                        ),
+                        rusqlite::params![actor_s, kind_s, name_s],
+                        row_to_artifact,
+                    )
+                    .optional()?;
+                match existing {
+                    Some(prior) => {
+                        let next = IdentityArtifact {
+                            content: content_s.clone(),
+                            description: desc_s.clone(),
+                            enabled,
+                            updated_at: now.clone(),
+                            ..prior
+                        };
+                        core.commit(vec![Draft::new(
+                            crate::oplog::kind::ENTITY_UPDATE,
+                            &actor_s,
+                            &now,
+                            json!({"kind": "identity_artifact", "id": next.id, "fields": {
+                                "content": next.content, "description": next.description,
+                                "enabled": next.enabled, "updated_at": next.updated_at,
+                            }}),
+                        )])?;
+                        Ok(next)
+                    }
+                    None => {
+                        let next = IdentityArtifact {
+                            id: new_id("iart"),
+                            actor: actor_s.clone(),
+                            kind: kind_s.clone(),
+                            name: name_s.clone(),
+                            content: content_s.clone(),
+                            description: desc_s.clone(),
+                            enabled,
+                            created_at: now.clone(),
+                            updated_at: now.clone(),
+                        };
+                        core.commit(vec![Draft::new(
+                            crate::oplog::kind::ENTITY_CREATE,
+                            &actor_s,
+                            &now,
+                            json!({"kind": "identity_artifact", "id": next.id, "fields": {
+                                "actor": next.actor, "kind": next.kind, "name": next.name,
+                                "content": next.content, "description": next.description,
+                                "enabled": next.enabled,
+                                "created_at": next.created_at, "updated_at": next.updated_at,
+                            }}),
+                        )])?;
+                        Ok(next)
+                    }
+                }
+            })
+            .await?;
         self.emit(
             "artifact.upserted",
             actor,
@@ -65,57 +107,80 @@ impl Store {
     /// The sync payload: every ENABLED artifact for an actor, ordered for stable
     /// output. This is what the plugin pulls with the identity token.
     pub async fn artifacts_for_actor(&self, actor: &str) -> Result<Vec<IdentityArtifact>> {
-        let rows = crate::pgq::query(&format!(
-            "SELECT {ARTIFACT_COLS} FROM identity_artifacts \
-             WHERE actor = ? AND enabled = TRUE ORDER BY kind, name"
-        ))
-        .bind(actor)
-        .fetch_all(self.db())
-        .await?;
-        rows.iter().map(row_to_artifact).collect()
+        let actor = actor.to_string();
+        self.run(move |core| {
+            let mut stmt = core.conn().prepare(&format!(
+                "SELECT {ARTIFACT_COLS} FROM identity_artifacts \
+                 WHERE actor = ?1 AND enabled = TRUE ORDER BY kind, name"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params![actor], row_to_artifact)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
     }
 
     /// All artifacts for an actor (including disabled) — the management listing.
     pub async fn artifacts_list(&self, actor: &str) -> Result<Vec<IdentityArtifact>> {
-        let rows = crate::pgq::query(&format!(
-            "SELECT {ARTIFACT_COLS} FROM identity_artifacts \
-             WHERE actor = ? ORDER BY kind, name"
-        ))
-        .bind(actor)
-        .fetch_all(self.db())
-        .await?;
-        rows.iter().map(row_to_artifact).collect()
+        let actor = actor.to_string();
+        self.run(move |core| {
+            let mut stmt = core.conn().prepare(&format!(
+                "SELECT {ARTIFACT_COLS} FROM identity_artifacts \
+                 WHERE actor = ?1 ORDER BY kind, name"
+            ))?;
+            let rows = stmt.query_map(rusqlite::params![actor], row_to_artifact)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
     }
 
     pub async fn artifacts_get(&self, id: &str) -> Result<Option<IdentityArtifact>> {
-        let row = crate::pgq::query(&format!(
-            "SELECT {ARTIFACT_COLS} FROM identity_artifacts WHERE id = ?"
-        ))
-        .bind(id)
-        .fetch_optional(self.db())
-        .await?;
-        row.as_ref().map(row_to_artifact).transpose()
+        let id = id.to_string();
+        self.run(move |core| {
+            Ok(core
+                .conn()
+                .query_row(
+                    &format!("SELECT {ARTIFACT_COLS} FROM identity_artifacts WHERE id = ?1"),
+                    rusqlite::params![id],
+                    row_to_artifact,
+                )
+                .optional()?)
+        })
+        .await
     }
 
     pub async fn artifacts_remove(&self, id: &str) -> Result<bool> {
-        let res = crate::pgq::query("DELETE FROM identity_artifacts WHERE id = ?")
-            .bind(id)
-            .execute(self.db())
-            .await?;
-        Ok(res.rows_affected() > 0)
+        let id = id.to_string();
+        self.run(move |core| {
+            let exists: bool = core.conn().query_row(
+                "SELECT EXISTS(SELECT 1 FROM identity_artifacts WHERE id = ?1)",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Ok(false);
+            }
+            core.commit(vec![Draft::new(
+                crate::oplog::kind::TOMBSTONE,
+                "system",
+                &now_iso(),
+                json!({"kind": "identity_artifact", "id": id}),
+            )])?;
+            Ok(true)
+        })
+        .await
     }
 }
 
-fn row_to_artifact(r: &sqlx::postgres::PgRow) -> Result<IdentityArtifact> {
+fn row_to_artifact(r: &rusqlite::Row) -> rusqlite::Result<IdentityArtifact> {
     Ok(IdentityArtifact {
-        id: r.try_get("id")?,
-        actor: r.try_get("actor")?,
-        kind: r.try_get("kind")?,
-        name: r.try_get("name")?,
-        content: r.try_get("content")?,
-        description: r.try_get("description")?,
-        enabled: r.try_get("enabled")?,
-        created_at: r.try_get("created_at")?,
-        updated_at: r.try_get("updated_at")?,
+        id: r.get("id")?,
+        actor: r.get("actor")?,
+        kind: r.get("kind")?,
+        name: r.get("name")?,
+        content: r.get("content")?,
+        description: r.get("description")?,
+        enabled: r.get("enabled")?,
+        created_at: r.get("created_at")?,
+        updated_at: r.get("updated_at")?,
     })
 }

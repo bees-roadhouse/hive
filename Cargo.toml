@@ -24,10 +24,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 
 # --- Database ---
-# postgres is the datastore until the Phase 1 SQLite cutover (PR 1.6).
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "migrate", "chrono", "uuid", "json"] }
-# Native `vector` column binding (embeddings.vec_v). 0.4 pairs with sqlx 0.8.
-pgvector = { version = "0.4", features = ["sqlx"] }
+# Postgres left the workspace at the PR 1.6 cutover. The PR 1.7 importer crate
+# (the one remaining Postgres reader) declares its own sqlx dependency so
+# "no Postgres in the app" stays grep-auditable.
 
 # --- Crypto (credential vault: reversible encryption of mail credentials) ---
 rand = "0.8"
@@ -36,7 +35,6 @@ base64 = "0.22"
 
 # --- Time / IDs ---
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.11", features = ["v4", "serde"] }
 nanoid = "0.4"
 
 # --- Embeddings / ML (the hive-embed crate wraps these) ---
@@ -79,13 +77,12 @@ keyring = { version = "3.6", features = ["apple-native", "windows-native", "asyn
 # base32 recovery codes + lowercase-hex block filenames.
 data-encoding = "2"
 
-# --- Derived index (PR 1.5: SQLite fold + FTS5; the 1.6 cutover store) ---
+# --- Derived index (PR 1.5/1.6: the SQLite store) ---
 # Bundled SQLCipher (SQLite 3.45, FTS5 compiled in, JSON core) with vendored
 # OpenSSL so mac/Windows need no system crypto lib — the exact feature combo
-# the PR 1.4 spike proved (core/tests/sqlcipher_spike.rs). Pinned to 0.32:
-# its libsqlite3-sys (0.30) is the one sqlx-sqlite also resolves — cargo's
-# `links = "sqlite3"` uniqueness is checked over optional deps too, so
-# rusqlite can only float once sqlx leaves core at the 1.6 cutover.
+# the PR 1.4 spike proved (core/tests/sqlcipher_spike.rs). The 0.32 pin dates
+# from the sqlx-sqlite `links = "sqlite3"` collision; sqlx left the workspace
+# at the 1.6 cutover, so the pin can lift whenever convenient.
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 
 # --- Dev/test only ---

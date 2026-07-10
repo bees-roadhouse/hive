@@ -12,25 +12,10 @@ on:
 jobs:
   rust:
     runs-on: ubuntu-latest
-    # The store layer is Postgres now; the test suite runs each test in an
-    # isolated schema against this service (DATABASE_URL below).
-    services:
-      postgres:
-        # pgvector-capable Postgres so CREATE EXTENSION vector works in tests.
-        image: pgvector/pgvector:pg17
-        env:
-          POSTGRES_USER: hive
-          POSTGRES_PASSWORD: hive
-          POSTGRES_DB: hive
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U hive -d hive"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    env:
-      DATABASE_URL: postgres://hive:hive@localhost:5432/hive
+    # No database service: the store is op-log + SQLite since the PR 1.6
+    # cutover — every test runs against tempdir data dirs. PR 1.7 re-adds a
+    # Postgres service scoped to the importer's own tests (the importer is
+    # the one remaining Postgres reader).
     steps:
       - uses: actions/checkout@v4
 
@@ -61,8 +46,10 @@ jobs:
         run: cargo build --workspace --all-targets
 
       - name: Cargo test
-        # Hash embedder keeps CI offline + fast (the transformers provider would
-        # try to download BGE models from the HF hub on first embed).
+        # Belt and braces: hive-core injects the hash embedder in tests, but
+        # hive-embed's own default (no HIVE_EMBED) is the transformers
+        # provider, whose lazy ONNX engine would try to download BGE models
+        # from the HF hub on a stray first embed. Pin CI offline + fast.
         env:
           HIVE_EMBED: hash
         run: cargo test --workspace

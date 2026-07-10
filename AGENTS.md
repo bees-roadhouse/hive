@@ -8,27 +8,32 @@ GitHub `main` is canonical (the old `development`/`release` pair collapsed into
 it on 2026-07-05). This repo is mid-pivot to a personal P2P desktop app
 (docs/DIRECTION.md D16+; teardown/rebuild sequence in docs/PLAN.md):
 
-- Rust workspace: `shared`, `embed`, `core`, and `jmap-sync`. There is no
-  Node/pnpm workspace anymore — the Solid SPA, the legacy Node packages, the
-  worker/mail daemons (PR 1.2), and the api crate with its REST/auth/OAuth
-  surface (PR 1.3) were deleted in Phase 1 teardown. No binary exists in the
-  workspace right now — that is per plan (hive-import arrives in PR 1.7,
-  hive-bridge in PR 1.8). Do not treat the old Node/SQLite README framing as
-  the source of truth for new work.
-- Postgres is the active datastore for the Rust store layer (until the Phase 1
-  SQLite cutover in PR 1.6).
+- Rust workspace: `shared`, `embed`, `core`, `jmap-sync`, and the `app`
+  scaffold. There is no Node/pnpm workspace anymore — the Solid SPA, the
+  legacy Node packages, the worker/mail daemons (PR 1.2), and the api crate
+  with its REST/auth/OAuth surface (PR 1.3) were deleted in Phase 1 teardown.
+  No usable binary exists yet — that is per plan (hive-import arrives in
+  PR 1.7, hive-bridge in PR 1.8). Do not treat the old Node/SQLite README
+  framing as the source of truth for new work.
+- The datastore is the append-only op log + SQLCipher SQLite index under a
+  local data dir (the PR 1.6 cutover; D18). Postgres left the workspace —
+  the PR 1.7 importer is the one remaining Postgres reader and brings its
+  own client dependency.
 
 When docs disagree with code, workflows, or compose files, trust code and CI,
 then update the stale doc in the same change. `README.md` and parts of
-`RUST_REWRITE.md` may lag the current Rust/Postgres reality.
+`RUST_REWRITE.md` may lag the current Rust/SQLite reality.
 
 ## Architecture
 
-- `core/`: hive-core — the store layer (Postgres store, schema/migrations,
-  pgq helpers, embedding backfill) plus the MCP tool layer (`core/src/mcp.rs`,
-  transport-free: request/response over serde_json values; the PR 1.8 stdio
-  bridge is its transport). `mcp::LocalCtx { actor }` supplies the acting
-  identity — there is no authentication layer (single user, D16).
+- `core/`: hive-core — the op log (`oplog`), blockstore, key custody
+  (`keys`), the SQLCipher index + fold projector (`index`, `fold`), and the
+  store layer riding ONE writer thread (`store/core.rs`: mpsc commands,
+  oneshot replies; the public `Store` surface stays async), plus the MCP tool
+  layer (`core/src/mcp.rs`, transport-free: request/response over serde_json
+  values; the PR 1.8 stdio bridge is its transport). `mcp::LocalCtx { actor }`
+  supplies the acting identity — there is no authentication layer (single
+  user, D16).
 - `shared/`: Rust shared domain types.
 - `embed/`: embedding seam, ONNX/BGE implementation, and hash fallback.
 - `jmap-sync/`: JMAP mailbox sync library (kept through the pause; its offline
@@ -40,18 +45,28 @@ then update the stale doc in the same change. `README.md` and parts of
   and links derive from anchored spans or explicit structured operations.
 - Old journal entries are history. Do not rewrite old bodies to reflect status
   changes; render from canonical state instead.
-- hive-core reaches Postgres through `DATABASE_URL`.
+- Writes are RECORDS (D18): the command layer (store modules) mints ids and
+  timestamps, pre-computes emergence, and commits one record batch per
+  logical write — LogWriter::append_batch (fsync), then fold::apply in one
+  SQLite transaction. The fold (`core/src/fold`) is deterministic and never
+  mints anything; its module header is the payload contract. Never write
+  fold-owned tables directly from production code (the raw_sql seam is
+  tests/diagnostics only — direct writes do not survive a rebuild-by-replay).
 - Single user, single human (D16): there are no accounts, sessions, tokens,
   scopes, or admin gates. Reads are unscoped. Do not reintroduce viewer/ACL
   parameters. The `user_scope`/`owner` COLUMNS and the values writes stamp
   are load-bearing — old data must stay readable and shape-stable for the
   PR 1.6 cutover and the PR 1.7 importer; only the filtering was removed.
-- `db.rs::init` must stay idempotent against an EXISTING old-shape database:
-  the deleted hosted-era tables are simply no longer created or read — never
-  add DROPs for them (the 1.7 importer reads old instances itself).
+- (Historical: the Postgres `db.rs::init`/no-DROP rule died with the PR 1.6
+  cutover. Old Postgres instances remain untouched on their servers for the
+  PR 1.7 importer to read.) Schema changes now mean bumping
+  `fold::FOLD_VERSION` — the index drops derived tables and rebuilds by
+  replaying the op log at next open.
 - Every hive-core integration test constructs its store through
-  `core/tests/common/mod.rs::test_store()` — the seam PR 1.6 swaps to SQLite.
-  No test body touches Postgres construction outside common/.
+  `core/tests/common/mod.rs::test_store()` (tempdir data dir + in-memory keys
+  + the injected hash embedder; `test_store_with` for mock 384-dim engines).
+  No test body constructs a store any other way, and core never reads
+  HIVE_EMBED — the embedder is injected at `Store::new`.
 - `core/tests/golden_retrieval.rs` + its checked-in fixture are the
   cross-backend parity oracle. Regenerate only consciously
   (`HIVE_GOLDEN_REGEN=1`) and diff; PR 1.6 may relax the score tolerance but
@@ -76,12 +91,9 @@ target dir outside the repo for Rust builds:
 $env:CARGO_TARGET_DIR = "$env:USERPROFILE\.cargo-target\hive"
 ```
 
-Tests expect Postgres (pgvector-capable) unless `DATABASE_URL` points
-elsewhere; any pgvector/pgvector:pg17 container works:
-
-```powershell
-$env:DATABASE_URL = "postgres://hive:hive@localhost:5432/hive"
-```
+Tests are hermetic: tempdir data dirs, in-memory keys, the hash embedder —
+no database service, no network. Nothing consults a Postgres connection
+string anymore (the grep gate: zero `sqlx`/`pgvector` tokens in core).
 
 There is no compose path or shippable image between the PR 1.3 teardown and
 the PR 1.8 bridge / Phase 2 app bundles.
@@ -115,9 +127,12 @@ or verify it exists.
 `.github/workflows/ci.yml` is the only workflow, with one job, triggered on
 PRs to `main`:
 
-- `rust`: starts Postgres 17 (pgvector), runs `cargo fmt --all --check`,
+- `rust`: runs `cargo fmt --all --check`,
   `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo build --workspace --all-targets`, and `HIVE_EMBED=hash cargo test --workspace`.
+  No database service (PR 1.7 re-adds Postgres scoped to importer tests);
+  `HIVE_EMBED=hash` stays as belt-and-braces against hive-embed's default
+  provider downloading models.
 
 There is no release workflow: nothing shippable exists between the PR 1.3
 teardown and the PR 1.8 bridge / Phase 2.5 app bundles — releases return
@@ -128,17 +143,15 @@ then. The version of record is the `[workspace.package]` version in the root
 
 - Keep store logic in `core/src/store/*` and the MCP tool layer in
   `core/src/mcp.rs` (pure — no transport/HTTP types in core).
-- Use sqlx with explicit queries that match the existing style.
-- Migrations in `core/src/db.rs` must be idempotent and safe when concurrent
-  processes race at startup. Schema management is hybrid: the inline DDL constants in
-  `core/src/db.rs` are the base schema, and `core/migrations/` holds sqlx
-  migrations reserved for reshapes the inline style cannot express. `migrate()`
-  runs the sqlx migrator first, so every migration must tolerate both a fresh
-  database (inline DDL has not run yet — guard with `IF EXISTS` or
-  `information_schema` probes qualified by `table_schema = current_schema()`)
-  and an existing database on the old shape. The PR that adds a reshape
-  migration also updates the inline constants to the final shape. Never edit an
-  applied migration (sqlx checksums them); add a new file instead.
+- Use rusqlite with explicit queries that match the existing style; reads
+  run inside `Store::run` closures on the writer thread, writes go through
+  record drafts + `Core::commit`.
+- The derived schema lives in `core/src/index/mod.rs` (`DDL`), owned by the
+  fold contract: any change to it, to payload interpretation, or to handler
+  behavior bumps `fold::FOLD_VERSION` (drop-and-replay is the migration
+  story, D14/D18). The op-log record ENVELOPE and encodings stay frozen
+  (PR 1.4) — widening payload semantics is a documented fold-contract
+  amendment, not a drive-by.
 - Preserve the established wire/API shapes (inherited from the Node stack)
   unless intentionally changing the public contract.
 - Add comments only for non-obvious reasons, invariants, or security-sensitive

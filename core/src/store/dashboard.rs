@@ -1,7 +1,9 @@
 // Dashboard stats + knowledge graph + typeahead autocomplete — parity port of
 // store.ts `dashboard`/`graph`/`autocomplete`. Private SQL for journal/tasks/
 // decisions/links/topics/phases per the decoupling rule (people/projects go
-// through their owned store modules).
+// through their owned row mappers). `recent` reads the in-memory wire ring
+// (the wire table died with Postgres); mail blob bytes come from the
+// blob_refs runtime table.
 
 use std::collections::{HashMap, HashSet};
 
@@ -11,333 +13,359 @@ use hive_shared::{
     DecisionCounts, EntityKind, GraphData, GraphEdge, GraphNode, InboxStat, MailDashboardStats,
     PersonCallout, TaskCounts, TaskStatus, TaskWithDue, ACTORS,
 };
-use sqlx::Row;
 
-use super::{json_vec, Store};
+use super::{json_vec, Core, Store};
+
+fn count(core: &Core, sql: &str) -> Result<i64> {
+    Ok(core.conn().query_row(sql, [], |r| r.get(0))?)
+}
+
+fn count_by(core: &Core, sql: &str, arg: &str) -> Result<i64> {
+    Ok(core
+        .conn()
+        .query_row(sql, rusqlite::params![arg], |r| r.get(0))?)
+}
 
 impl Store {
     pub async fn dashboard(&self) -> Result<DashboardStats> {
-        let count = |sql: &'static str| async move {
-            crate::pgq::query_scalar::<i64>(sql)
-                .fetch_one(self.db())
-                .await
-        };
-        let count_by = |sql: &'static str, arg: String| async move {
-            crate::pgq::query_scalar::<i64>(sql)
-                .bind(arg)
-                .fetch_one(self.db())
-                .await
-        };
+        let recent = self.wire_log(12).await?;
+        self.run(move |core| {
+            let tasks = TaskCounts {
+                total: count(core, "SELECT count(*) FROM tasks")?,
+                todo: count_by(core, "SELECT count(*) FROM tasks WHERE status=?1", "todo")?,
+                doing: count_by(core, "SELECT count(*) FROM tasks WHERE status=?1", "doing")?,
+                blocked: count_by(
+                    core,
+                    "SELECT count(*) FROM tasks WHERE status=?1",
+                    "blocked",
+                )?,
+                done: count_by(core, "SELECT count(*) FROM tasks WHERE status=?1", "done")?,
+            };
+            let decisions = DecisionCounts {
+                total: count(core, "SELECT count(*) FROM decisions")?,
+                proposed: count_by(
+                    core,
+                    "SELECT count(*) FROM decisions WHERE status=?1",
+                    "proposed",
+                )?,
+                accepted: count_by(
+                    core,
+                    "SELECT count(*) FROM decisions WHERE status=?1",
+                    "accepted",
+                )?,
+                rejected: count_by(
+                    core,
+                    "SELECT count(*) FROM decisions WHERE status=?1",
+                    "rejected",
+                )?,
+                superseded: count_by(
+                    core,
+                    "SELECT count(*) FROM decisions WHERE status=?1",
+                    "superseded",
+                )?,
+            };
 
-        let tasks = TaskCounts {
-            total: count("SELECT count(*) FROM tasks").await?,
-            todo: count_by("SELECT count(*) FROM tasks WHERE status=?", "todo".into()).await?,
-            doing: count_by("SELECT count(*) FROM tasks WHERE status=?", "doing".into()).await?,
-            blocked: count_by(
-                "SELECT count(*) FROM tasks WHERE status=?",
-                "blocked".into(),
-            )
-            .await?,
-            done: count_by("SELECT count(*) FROM tasks WHERE status=?", "done".into()).await?,
-        };
-        let decisions = DecisionCounts {
-            total: count("SELECT count(*) FROM decisions").await?,
-            proposed: count_by(
-                "SELECT count(*) FROM decisions WHERE status=?",
-                "proposed".into(),
-            )
-            .await?,
-            accepted: count_by(
-                "SELECT count(*) FROM decisions WHERE status=?",
-                "accepted".into(),
-            )
-            .await?,
-            rejected: count_by(
-                "SELECT count(*) FROM decisions WHERE status=?",
-                "rejected".into(),
-            )
-            .await?,
-            superseded: count_by(
-                "SELECT count(*) FROM decisions WHERE status=?",
-                "superseded".into(),
-            )
-            .await?,
-        };
+            let by_author: Vec<AuthorCount> = {
+                let mut stmt = core.conn().prepare(
+                    "SELECT author, count(*) AS entries FROM journal GROUP BY author ORDER BY entries DESC",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok(AuthorCount {
+                        author: r.get(0)?,
+                        entries: r.get(1)?,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
 
-        let by_author = crate::pgq::query(
-            "SELECT author, count(*) AS entries FROM journal GROUP BY author ORDER BY entries DESC",
-        )
-        .fetch_all(self.db())
-        .await?
-        .iter()
-        .map(|r| -> Result<AuthorCount> {
-            Ok(AuthorCount {
-                author: r.try_get("author")?,
-                entries: r.try_get("entries")?,
-            })
-        })
-        .collect::<Result<_>>()?;
-
-        let mut inbox: Vec<InboxStat> = Vec::with_capacity(ACTORS.len());
-        for (name, kind) in ACTORS {
-            inbox.push(InboxStat {
-                recipient: name.to_string(),
-                kind: *kind,
-                unread: count_by(
-                    "SELECT count(*) FROM inbox WHERE recipient=? AND read_at IS NULL",
-                    name.to_string(),
-                )
-                .await?,
-                total: count_by(
-                    "SELECT count(*) FROM inbox WHERE recipient=?",
-                    name.to_string(),
-                )
-                .await?,
-            });
-        }
-
-        // Open tasks with a due date (for calendar overlay).
-        let tasks_with_due = crate::pgq::query(
-            "SELECT id, title, due, status, assignees FROM tasks WHERE due IS NOT NULL AND status != 'done' ORDER BY due ASC",
-        )
-        .fetch_all(self.db())
-        .await?
-        .iter()
-        .map(|r| -> Result<TaskWithDue> {
-            Ok(TaskWithDue {
-                id: r.try_get("id")?,
-                title: r.try_get("title")?,
-                due: r.try_get("due")?,
-                status: TaskStatus::from_str_lossy(r.try_get::<String, _>("status")?.as_str()),
-                assignees: json_vec(&r.try_get::<String, _>("assignees")?),
-            })
-        })
-        .collect::<Result<_>>()?;
-
-        // Entry counts per day for last 30 days (substr gives YYYY-MM-DD).
-        // created_at is an ISO-8601 TEXT column, so compare against a
-        // Rust-computed cutoff string (lexicographic order matches chronological).
-        let cutoff = (chrono::Utc::now() - chrono::Duration::days(30))
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
-        let entries_by_day = crate::pgq::query(
-            "SELECT substr(created_at, 1, 10) AS day, count(*) AS count \
-             FROM journal \
-             WHERE created_at >= ? \
-             GROUP BY day ORDER BY day ASC",
-        )
-        .bind(&cutoff)
-        .fetch_all(self.db())
-        .await?
-        .iter()
-        .map(|r| -> Result<DayCount> {
-            Ok(DayCount {
-                day: r.try_get("day")?,
-                count: r.try_get("count")?,
-            })
-        })
-        .collect::<Result<_>>()?;
-
-        let entries_by_author = crate::pgq::query(
-            "SELECT author, count(*) AS count FROM journal GROUP BY author ORDER BY count DESC",
-        )
-        .fetch_all(self.db())
-        .await?
-        .iter()
-        .map(|r| -> Result<AuthorEntryCount> {
-            Ok(AuthorEntryCount {
-                author: r.try_get("author")?,
-                count: r.try_get("count")?,
-            })
-        })
-        .collect::<Result<_>>()?;
-
-        // Callouts: how often each person is referenced via links.
-        let callout_rows = crate::pgq::query(
-            "SELECT target_id, count(*) AS count FROM links WHERE target_kind = 'person' \
-             GROUP BY target_id ORDER BY count DESC",
-        )
-        .fetch_all(self.db())
-        .await?;
-        let mut callouts_by_person: Vec<PersonCallout> = Vec::new();
-        for r in &callout_rows {
-            let target_id: String = r.try_get("target_id")?;
-            if let Some(p) = self.people_get(&target_id).await? {
-                callouts_by_person.push(PersonCallout {
-                    name: p.name,
-                    slug: p.slug,
-                    count: r.try_get("count")?,
+            let mut inbox: Vec<InboxStat> = Vec::with_capacity(ACTORS.len());
+            for (name, kind) in ACTORS {
+                inbox.push(InboxStat {
+                    recipient: name.to_string(),
+                    kind: *kind,
+                    unread: count_by(
+                        core,
+                        "SELECT count(*) FROM inbox WHERE recipient=?1 AND read_at IS NULL",
+                        name,
+                    )?,
+                    total: count_by(core, "SELECT count(*) FROM inbox WHERE recipient=?1", name)?,
                 });
             }
-        }
 
-        // Mail archive totals — cheap COUNT/SUM scans, all zero pre-mail.
-        let mail = MailDashboardStats {
-            messages: count("SELECT count(*) FROM mail_messages WHERE deleted_at IS NULL").await?,
-            accounts: count("SELECT count(*) FROM mail_accounts").await?,
-            blob_bytes: count("SELECT COALESCE(SUM(size), 0)::BIGINT FROM blobs").await?,
-            search: count("SELECT count(*) FROM search WHERE kind = 'mail'").await?,
-        };
+            // Open tasks with a due date (for calendar overlay).
+            let tasks_with_due: Vec<TaskWithDue> = {
+                let mut stmt = core.conn().prepare(
+                    "SELECT id, title, due, status, assignees FROM tasks WHERE due IS NOT NULL AND status != 'done' ORDER BY due ASC",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok(TaskWithDue {
+                        id: r.get(0)?,
+                        title: r.get(1)?,
+                        due: r.get(2)?,
+                        status: TaskStatus::from_str_lossy(r.get::<_, String>(3)?.as_str()),
+                        assignees: json_vec(&r.get::<_, String>(4)?),
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
 
-        Ok(DashboardStats {
-            entries: count("SELECT count(*) FROM journal").await?,
-            events: count("SELECT count(*) FROM events").await?,
-            tasks,
-            decisions,
-            inbox,
-            by_author,
-            recent: self.wire_log(12).await?,
-            tasks_with_due,
-            entries_by_day,
-            entries_by_author,
-            callouts_by_person,
-            mail,
+            // Entry counts per day for last 30 days (substr gives YYYY-MM-DD).
+            // created_at is an ISO-8601 TEXT column, so compare against a
+            // Rust-computed cutoff string (lexicographic order matches chronological).
+            let cutoff = (chrono::Utc::now() - chrono::Duration::days(30))
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string();
+            let entries_by_day: Vec<DayCount> = {
+                let mut stmt = core.conn().prepare(
+                    "SELECT substr(created_at, 1, 10) AS day, count(*) AS count \
+                     FROM journal \
+                     WHERE created_at >= ?1 \
+                     GROUP BY day ORDER BY day ASC",
+                )?;
+                let rows = stmt.query_map(rusqlite::params![cutoff], |r| {
+                    Ok(DayCount {
+                        day: r.get(0)?,
+                        count: r.get(1)?,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+
+            let entries_by_author: Vec<AuthorEntryCount> = {
+                let mut stmt = core.conn().prepare(
+                    "SELECT author, count(*) AS count FROM journal GROUP BY author ORDER BY count DESC",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok(AuthorEntryCount {
+                        author: r.get(0)?,
+                        count: r.get(1)?,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+
+            // Callouts: how often each person is referenced via links.
+            let callout_rows: Vec<(String, i64)> = {
+                let mut stmt = core.conn().prepare(
+                    "SELECT target_id, count(*) AS count FROM links WHERE target_kind = 'person' \
+                     GROUP BY target_id ORDER BY count DESC",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut callouts_by_person: Vec<PersonCallout> = Vec::new();
+            for (target_id, n) in &callout_rows {
+                if let Some(p) = super::people::person_get(core.conn(), target_id)? {
+                    callouts_by_person.push(PersonCallout {
+                        name: p.name,
+                        slug: p.slug,
+                        count: *n,
+                    });
+                }
+            }
+
+            // Mail archive totals — cheap COUNT/SUM scans, all zero pre-mail.
+            // blob bytes now live in the blockstore; blob_refs carries sizes.
+            let mail = MailDashboardStats {
+                messages: count(
+                    core,
+                    "SELECT count(*) FROM mail_messages WHERE deleted_at IS NULL",
+                )?,
+                accounts: count(core, "SELECT count(*) FROM mail_accounts")?,
+                blob_bytes: count(core, "SELECT COALESCE(SUM(size), 0) FROM blob_refs")?,
+                search: count(core, "SELECT count(*) FROM search WHERE kind = 'mail'")?,
+            };
+
+            Ok(DashboardStats {
+                entries: count(core, "SELECT count(*) FROM journal")?,
+                events: count(core, "SELECT count(*) FROM events")?,
+                tasks,
+                decisions,
+                inbox,
+                by_author,
+                recent,
+                tasks_with_due,
+                entries_by_day,
+                entries_by_author,
+                callouts_by_person,
+                mail,
+            })
         })
+        .await
     }
 
     /// The whole knowledge graph (store.ts `graph`): every linked entity as a
     /// node, every link as an edge, plus derived edges — per-author journal
     /// chains, project→task, project→phase, phase→task.
     pub async fn graph(&self) -> Result<GraphData> {
-        // Title resolution: embeddable items + people/topics/projects/phases.
-        let mut title_of: HashMap<String, String> = HashMap::new();
-        for it in self.embeddable_items().await? {
-            title_of.insert(format!("{}:{}", it.kind, it.id), it.title);
-        }
-        for p in self.people_list().await? {
-            title_of.insert(format!("person:{}", p.id), p.name);
-        }
-        let topics = crate::pgq::query("SELECT id, name FROM topics ORDER BY name")
-            .fetch_all(self.db())
-            .await?;
-        for r in &topics {
-            title_of.insert(
-                format!("topic:{}", r.try_get::<String, _>("id")?),
-                r.try_get("name")?,
-            );
-        }
-        for p in self.projects_list().await? {
-            title_of.insert(format!("project:{}", p.id), p.name);
-        }
-        let phases = crate::pgq::query(
-            "SELECT id, project, name FROM phases ORDER BY project, position, created_at",
-        )
-        .fetch_all(self.db())
-        .await?;
-        for r in &phases {
-            title_of.insert(
-                format!("phase:{}", r.try_get::<String, _>("id")?),
-                r.try_get("name")?,
-            );
-        }
-
-        let mut nodes: Vec<GraphNode> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut add_node = |nodes: &mut Vec<GraphNode>, kind: EntityKind, ref_id: &str| {
-            let key = format!("{}:{ref_id}", kind.as_str());
-            if seen.insert(key.clone()) {
-                nodes.push(GraphNode {
-                    id: key.clone(),
-                    kind: kind.as_str().to_string(),
-                    title: title_of
-                        .get(&key)
-                        .cloned()
-                        .unwrap_or_else(|| ref_id.to_string()),
-                });
+        self.run(|core| {
+            // Title resolution: embeddable items + people/topics/projects/phases.
+            let mut title_of: HashMap<String, String> = HashMap::new();
+            for it in super::semantic::embeddable_items_core(core)? {
+                title_of.insert(format!("{}:{}", it.kind, it.id), it.title);
             }
-        };
-
-        let link_rows = crate::pgq::query(
-            "SELECT source_kind, source_id, target_kind, target_id, rel FROM links ORDER BY created_at",
-        )
-        .fetch_all(self.db())
-        .await?;
-        let mut edges: Vec<GraphEdge> = Vec::new();
-        for r in &link_rows {
-            let sk: String = r.try_get("source_kind")?;
-            let si: String = r.try_get("source_id")?;
-            let tk: String = r.try_get("target_kind")?;
-            let ti: String = r.try_get("target_id")?;
-            // Fail closed: skip links whose endpoint kinds this build doesn't
-            // know rather than graphing them under a wrong kind.
-            let (Some(sk), Some(tk)) = (EntityKind::parse(&sk), EntityKind::parse(&tk)) else {
-                continue;
+            {
+                let mut stmt = core
+                    .conn()
+                    .prepare("SELECT id, name FROM people ORDER BY kind, slug")?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (id, name) = row?;
+                    title_of.insert(format!("person:{id}"), name);
+                }
+            }
+            {
+                let mut stmt = core
+                    .conn()
+                    .prepare("SELECT id, name FROM topics ORDER BY name")?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (id, name) = row?;
+                    title_of.insert(format!("topic:{id}"), name);
+                }
+            }
+            {
+                let mut stmt = core
+                    .conn()
+                    .prepare("SELECT id, name FROM projects ORDER BY name")?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (id, name) = row?;
+                    title_of.insert(format!("project:{id}"), name);
+                }
+            }
+            let phases: Vec<(String, String, String)> = {
+                let mut stmt = core.conn().prepare(
+                    "SELECT id, project, name FROM phases ORDER BY project, position, created_at",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
-            add_node(&mut nodes, sk, &si);
-            add_node(&mut nodes, tk, &ti);
-            edges.push(GraphEdge {
-                source: format!("{}:{si}", sk.as_str()),
-                target: format!("{}:{ti}", tk.as_str()),
-                rel: r.try_get("rel")?,
-            });
-        }
+            for (id, _project, name) in &phases {
+                title_of.insert(format!("phase:{id}"), name.clone());
+            }
 
-        // Derived: per-author journal chain edges.
-        let journal_rows =
-            crate::pgq::query("SELECT id, author FROM journal ORDER BY author, created_at ASC")
-                .fetch_all(self.db())
-                .await?;
-        let mut prev_author: Option<String> = None;
-        let mut prev_id: Option<String> = None;
-        for r in &journal_rows {
-            let id: String = r.try_get("id")?;
-            let author: String = r.try_get("author")?;
-            if prev_author.as_deref() == Some(author.as_str()) {
-                if let Some(prev) = &prev_id {
-                    add_node(&mut nodes, EntityKind::Journal, prev);
-                    add_node(&mut nodes, EntityKind::Journal, &id);
-                    edges.push(GraphEdge {
-                        source: format!("journal:{prev}"),
-                        target: format!("journal:{id}"),
-                        rel: "chain".to_string(),
+            let mut nodes: Vec<GraphNode> = Vec::new();
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut add_node = |nodes: &mut Vec<GraphNode>, kind: EntityKind, ref_id: &str| {
+                let key = format!("{}:{ref_id}", kind.as_str());
+                if seen.insert(key.clone()) {
+                    nodes.push(GraphNode {
+                        id: key.clone(),
+                        kind: kind.as_str().to_string(),
+                        title: title_of
+                            .get(&key)
+                            .cloned()
+                            .unwrap_or_else(|| ref_id.to_string()),
                     });
                 }
-            } else {
-                prev_author = Some(author);
-            }
-            prev_id = Some(id);
-        }
+            };
 
-        // Derived: project→task and project→phase edges from column values.
-        let task_rows = crate::pgq::query(
-            "SELECT id, project, phase FROM tasks ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC",
-        )
-        .fetch_all(self.db())
-        .await?;
-        for r in &task_rows {
-            let id: String = r.try_get("id")?;
-            if let Some(project) = r.try_get::<Option<String>, _>("project")? {
-                add_node(&mut nodes, EntityKind::Project, &project);
-                add_node(&mut nodes, EntityKind::Task, &id);
+            let link_rows: Vec<(String, String, String, String, String)> = {
+                let mut stmt = core.conn().prepare(
+                    "SELECT source_kind, source_id, target_kind, target_id, rel FROM links ORDER BY created_at",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut edges: Vec<GraphEdge> = Vec::new();
+            for (sk, si, tk, ti, rel) in &link_rows {
+                // Fail closed: skip links whose endpoint kinds this build doesn't
+                // know rather than graphing them under a wrong kind.
+                let (Some(sk), Some(tk)) = (EntityKind::parse(sk), EntityKind::parse(tk)) else {
+                    continue;
+                };
+                add_node(&mut nodes, sk, si);
+                add_node(&mut nodes, tk, ti);
+                edges.push(GraphEdge {
+                    source: format!("{}:{si}", sk.as_str()),
+                    target: format!("{}:{ti}", tk.as_str()),
+                    rel: rel.clone(),
+                });
+            }
+
+            // Derived: per-author journal chain edges.
+            let journal_rows: Vec<(String, String)> = {
+                let mut stmt = core
+                    .conn()
+                    .prepare("SELECT id, author FROM journal ORDER BY author, created_at ASC")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let mut prev_author: Option<String> = None;
+            let mut prev_id: Option<String> = None;
+            for (id, author) in &journal_rows {
+                if prev_author.as_deref() == Some(author.as_str()) {
+                    if let Some(prev) = &prev_id {
+                        add_node(&mut nodes, EntityKind::Journal, prev);
+                        add_node(&mut nodes, EntityKind::Journal, id);
+                        edges.push(GraphEdge {
+                            source: format!("journal:{prev}"),
+                            target: format!("journal:{id}"),
+                            rel: "chain".to_string(),
+                        });
+                    }
+                } else {
+                    prev_author = Some(author.clone());
+                }
+                prev_id = Some(id.clone());
+            }
+
+            // Derived: project→task and project→phase edges from column values.
+            let task_rows: Vec<(String, Option<String>, Option<String>)> = {
+                let mut stmt = core.conn().prepare(
+                    "SELECT id, project, phase FROM tasks ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC",
+                )?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (id, project, phase) in &task_rows {
+                if let Some(project) = project {
+                    add_node(&mut nodes, EntityKind::Project, project);
+                    add_node(&mut nodes, EntityKind::Task, id);
+                    edges.push(GraphEdge {
+                        source: format!("project:{project}"),
+                        target: format!("task:{id}"),
+                        rel: "has_task".to_string(),
+                    });
+                }
+                if let Some(phase) = phase {
+                    add_node(&mut nodes, EntityKind::Phase, phase);
+                    add_node(&mut nodes, EntityKind::Task, id);
+                    edges.push(GraphEdge {
+                        source: format!("phase:{phase}"),
+                        target: format!("task:{id}"),
+                        rel: "has_task".to_string(),
+                    });
+                }
+            }
+            for (id, project, _name) in &phases {
+                add_node(&mut nodes, EntityKind::Project, project);
+                add_node(&mut nodes, EntityKind::Phase, id);
                 edges.push(GraphEdge {
                     source: format!("project:{project}"),
-                    target: format!("task:{id}"),
-                    rel: "has_task".to_string(),
+                    target: format!("phase:{id}"),
+                    rel: "has_phase".to_string(),
                 });
             }
-            if let Some(phase) = r.try_get::<Option<String>, _>("phase")? {
-                add_node(&mut nodes, EntityKind::Phase, &phase);
-                add_node(&mut nodes, EntityKind::Task, &id);
-                edges.push(GraphEdge {
-                    source: format!("phase:{phase}"),
-                    target: format!("task:{id}"),
-                    rel: "has_task".to_string(),
-                });
-            }
-        }
-        for r in &phases {
-            let id: String = r.try_get("id")?;
-            let project: String = r.try_get("project")?;
-            add_node(&mut nodes, EntityKind::Project, &project);
-            add_node(&mut nodes, EntityKind::Phase, &id);
-            edges.push(GraphEdge {
-                source: format!("project:{project}"),
-                target: format!("phase:{id}"),
-                rel: "has_phase".to_string(),
-            });
-        }
 
-        Ok(GraphData { nodes, edges })
+            Ok(GraphData { nodes, edges })
+        })
+        .await
     }
 
     /// Typeahead autocomplete (store.ts `autocomplete`): matching people, open
@@ -348,97 +376,130 @@ impl Store {
         kinds: Option<Vec<String>>,
     ) -> Result<Vec<AutocompleteItem>> {
         let lower = q.to_lowercase();
-        let want = kinds.unwrap_or_else(|| {
-            ["person", "task", "project", "topic", "phase"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        });
-        let wants = |k: &str| want.iter().any(|w| w == k);
-        let mut results: Vec<AutocompleteItem> = Vec::new();
+        self.run(move |core| {
+            let want = kinds.unwrap_or_else(|| {
+                ["person", "task", "project", "topic", "phase"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect()
+            });
+            let wants = |k: &str| want.iter().any(|w| w == k);
+            let mut results: Vec<AutocompleteItem> = Vec::new();
 
-        if wants("person") {
-            for p in self.people_list().await? {
-                if p.name.to_lowercase().contains(&lower) {
-                    results.push(AutocompleteItem {
-                        kind: EntityKind::Person,
-                        id: p.id,
-                        slug: p.slug,
-                        label: p.name,
-                    });
-                }
-            }
-        }
-        if wants("project") {
-            for p in self.projects_list().await? {
-                if p.name.to_lowercase().contains(&lower) {
-                    results.push(AutocompleteItem {
-                        kind: EntityKind::Project,
-                        id: p.id,
-                        slug: p.slug,
-                        label: p.name,
-                    });
-                }
-            }
-        }
-        if wants("topic") {
-            let rows = crate::pgq::query("SELECT id, name, slug FROM topics ORDER BY name")
-                .fetch_all(self.db())
-                .await?;
-            for r in &rows {
-                let name: String = r.try_get("name")?;
-                if name.to_lowercase().contains(&lower) {
-                    results.push(AutocompleteItem {
-                        kind: EntityKind::Topic,
-                        id: r.try_get("id")?,
-                        slug: r.try_get("slug")?,
-                        label: name,
-                    });
-                }
-            }
-        }
-        if wants("phase") {
-            let rows = crate::pgq::query(
-                "SELECT id, name FROM phases ORDER BY project, position, created_at",
-            )
-            .fetch_all(self.db())
-            .await?;
-            for r in &rows {
-                let name: String = r.try_get("name")?;
-                if name.to_lowercase().contains(&lower) {
-                    results.push(AutocompleteItem {
-                        kind: EntityKind::Phase,
-                        id: r.try_get("id")?,
-                        slug: slugify(&name),
-                        label: name,
-                    });
-                }
-            }
-        }
-        if wants("task") {
-            // Node: tasks.list({status:'todo'}).concat(tasks.list({status:'doing'})).
-            for status in ["todo", "doing"] {
-                let rows = crate::pgq::query(
-                    "SELECT id, title FROM tasks WHERE status = ? ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC",
-                )
-                .bind(status)
-                .fetch_all(self.db())
-                .await?;
-                for r in &rows {
-                    let title: String = r.try_get("title")?;
-                    if title.to_lowercase().contains(&lower) {
+            if wants("person") {
+                let mut stmt = core
+                    .conn()
+                    .prepare("SELECT id, slug, name FROM people ORDER BY kind, slug")?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, slug, name) = row?;
+                    if name.to_lowercase().contains(&lower) {
                         results.push(AutocompleteItem {
-                            kind: EntityKind::Task,
-                            id: r.try_get("id")?,
-                            slug: slugify(&title),
-                            label: title,
+                            kind: EntityKind::Person,
+                            id,
+                            slug,
+                            label: name,
                         });
                     }
                 }
             }
-        }
+            if wants("project") {
+                let mut stmt = core
+                    .conn()
+                    .prepare("SELECT id, slug, name FROM projects ORDER BY name")?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, slug, name) = row?;
+                    if name.to_lowercase().contains(&lower) {
+                        results.push(AutocompleteItem {
+                            kind: EntityKind::Project,
+                            id,
+                            slug,
+                            label: name,
+                        });
+                    }
+                }
+            }
+            if wants("topic") {
+                let mut stmt = core
+                    .conn()
+                    .prepare("SELECT id, name, slug FROM topics ORDER BY name")?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (id, name, slug) = row?;
+                    if name.to_lowercase().contains(&lower) {
+                        results.push(AutocompleteItem {
+                            kind: EntityKind::Topic,
+                            id,
+                            slug,
+                            label: name,
+                        });
+                    }
+                }
+            }
+            if wants("phase") {
+                let mut stmt = core.conn().prepare(
+                    "SELECT id, name FROM phases ORDER BY project, position, created_at",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?;
+                for row in rows {
+                    let (id, name) = row?;
+                    if name.to_lowercase().contains(&lower) {
+                        results.push(AutocompleteItem {
+                            kind: EntityKind::Phase,
+                            id,
+                            slug: slugify(&name),
+                            label: name,
+                        });
+                    }
+                }
+            }
+            if wants("task") {
+                // Node: tasks.list({status:'todo'}).concat(tasks.list({status:'doing'})).
+                for status in ["todo", "doing"] {
+                    let mut stmt = core.conn().prepare(
+                        "SELECT id, title FROM tasks WHERE status = ?1 ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, created_at DESC",
+                    )?;
+                    let rows = stmt.query_map(rusqlite::params![status], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                    })?;
+                    for row in rows {
+                        let (id, title) = row?;
+                        if title.to_lowercase().contains(&lower) {
+                            results.push(AutocompleteItem {
+                                kind: EntityKind::Task,
+                                id,
+                                slug: slugify(&title),
+                                label: title,
+                            });
+                        }
+                    }
+                }
+            }
 
-        results.truncate(8);
-        Ok(results)
+            results.truncate(8);
+            Ok(results)
+        })
+        .await
     }
 }

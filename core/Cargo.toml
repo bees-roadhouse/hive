@@ -13,8 +13,6 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
-sqlx = { workspace = true }
-pgvector = { workspace = true }
 reqwest = { workspace = true }
 
 hive-shared = { workspace = true }
@@ -30,7 +28,6 @@ rss = { workspace = true }
 
 # Misc
 nanoid = { workspace = true }
-uuid = { workspace = true }
 # Credential vault: reversible encryption of mail credentials at rest
 # (Phase 3 replaces this with the OS keychain).
 aes-gcm = "0.10"
@@ -44,11 +41,12 @@ argon2 = { workspace = true }
 keyring = { workspace = true }
 data-encoding = { workspace = true }
 
-# Derived index (PR 1.5): the SQLCipher-encrypted SQLite projection (fold +
-# FTS5 + ANN) the 1.6 cutover moves the Store onto. Graduated from
-# dev-dependency (the 1.4 spike) to a real one.
+# The store (PR 1.6 cutover): the SQLCipher-encrypted SQLite index the fold
+# projects into. sqlx/pgvector left core here (the PR 1.7 importer crate
+# re-adds sqlx for itself), so the `links = "sqlite3"` collision that pinned
+# rusqlite to 0.32 is gone — the pin can lift whenever convenient.
 rusqlite = { workspace = true }
 
 [dev-dependencies]
-# Hermetic tempdir stores for the oplog/blockstore/keys tests.
+# Hermetic tempdir stores for the oplog/blockstore/keys/store tests.
 tempfile = { workspace = true }
