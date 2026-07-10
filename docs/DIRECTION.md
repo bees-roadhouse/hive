@@ -1,577 +1,393 @@
-# Hive Direction: Mail as Substrate
+# Hive Direction v2: Personal P2P Desktop
 
-Status: reviewed and decided, 2026-07-01. Written from a full read of the codebase at
-0.5.0 (branch `feat/hosted-claude-code-workspaces`), a five-position design panel, and
-an adversarial verification pass against the code. Nothing in this document was taken
-from the README or older design docs on faith; every load-bearing claim carries a
-file:line citation.
+Status: decided 2026-07-10. Supersedes the 2026-07-01 record "Hive Direction: Mail as
+Substrate" (preserved in git history at this file's prior revision, and on BookStack as
+"Hive Direction: Mail as Substrate", page 2360, to be marked historical). Written
+against origin/main after the v0.6.0 train (PRs #74-#91 merged; the train closes
+untagged by decision D28), from the v1 record, a mapped read of the codebase, and
+Nate's decisions of 2026-07-10. Citations are file-level; v1's file:line rigor applies
+again once Phase 1 code review starts.
 
 ## Summary
 
-The mail vision survives review. The mental model it was written against does not.
+Hive becomes a personal, single-user, local-first desktop app in pure Rust. Dioxus
+for the UI: Rust components (no JS framework, no Node, no Electron) rendered through
+the system webview now, with Blitz native rendering as the tracked future option.
+Storage is append-only and event-sourced: per-device op
+logs are the source of truth, SQLite is a rebuildable derived index, and payload bytes
+live in a content-addressed block store with a manifest layer. Devices sync peer to
+peer over iroh through a relay Bee's Roadhouse operates and anyone can self-host.
+Ingestion is pluggable through WASM modules configured in the app: mail (JMAP),
+filesystem, CalDAV calendar, CardDAV contacts, and a real-time browser capture
+extension. The entity core shrinks to a PIM: contacts, mail, calendar, tasks, plus the
+journal substrate and user-defined custom types. The only external API is MCP, served
+to Claude Code and Claude Desktop through a single bridge binary. A dreaming skill
+reviews ingestion activity and writes journal entries that materialize structured data
+through the normal emergence language. Privacy is the top constraint: everything
+encrypted at rest, E2E in transit, embeddings computed locally, hard delete via
+crypto-shredding, and zero telemetry of any kind.
 
-Mail as an ingested corpus is the right move and Hive can carry it, but the design has
-to target the system that exists: a journal-first entity store on PostgreSQL with
-nanoid TEXT ids, brute-force BYTEA vector search, and a Solid.js SPA. There is no
-block model, no UUIDv7, no pgvector, no client-side SQLite, and no Makepad anywhere in
-the repo. The phrase "JMAP-to-blocks bridge" describes a bridge to a system that was
-never built.
+Retired with this pivot: multi-user and multi-tenant operation, the entire auth stack
+(sessions, PATs, OAuth 2.1 server, OIDC, onboarding), hosted Claude Code workspaces
+and the runner, the REST API, the Solid.js SPA, and the Node packages.
 
-The decisions, in one paragraph: mail becomes a new first-class entity with its own
-tables (not journal entries, not wire events, not a generic documents table), synced
-by a third long-lived binary (`hive-mail`) that shares the api crate's Store, deduped
-by a real `UNIQUE(account_id, jmap_id)` constraint, indexed into the existing FTS
-`search` table, and embedded into the shared vector space only behind a gate until a
-pgvector migration lands. Attachments go content-addressed by blake3 into a Postgres
-`blobs` table. Phase 2 compose rides the existing outbox with a narrowed worker claim.
-The public crate is `jmap-sync`, not a blocks bridge. The schema stays concrete;
-the generalization budget goes into the polymorphic seams Hive already has.
+## Lineage
 
-## Where the brief and the codebase disagree
+v1's D15 retired the Zibaldone design (append-only blocks, native client, local-first)
+as an architecture target and asked, in open question 6, whether that vision would
+return as its own project consuming Hive's API or forking its storage. This document
+answers it: the native local-first client does not consume Hive, it becomes Hive. The
+surviving Zibaldone ideas return on Hive's substrate and vocabulary: the emergence
+language, the entity seams, jmap-sync, and the retrieval pipeline all carry forward
+unchanged in spirit. What does not return: Makepad (Dioxus instead), UUIDv7 (nanoid
+prefix TEXT ids stay), and a generic blocks table for entities (records stay concrete,
+per D12's grain; blocks exist only in the blobstore, where content-addressing earns
+its keep).
 
-The review brief described Hive as "block-based append-only data model, UUIDv7 block
-IDs, PostgreSQL + pgvector server-side, SQLite + sqlite-vec client-side, Makepad UI."
-That is the Zibaldone paper design (BookStack, Zibaldone book, architecture decided
-2026-05-06, "currently pre-scaffolding"). It is not this codebase, and the two were
-never the same project in git:
+## Carry-forward map (v1 decisions D1-D15)
 
-| Brief claim | Reality in the repo |
-| --- | --- |
-| Repo may still say "zibaldone" in places | Zero occurrences. `git log --all -i --grep=zibaldone` over all 132 commits on all refs: nothing. `git grep -i zibaldone` over every historical blob: nothing. The repo has always been `hive`. There is no rename pass to execute. |
-| Block-based data model | No blocks table, no block concept. The closest token is `TaskStatus::Blocked` (shared/src/lib.rs:425). The model is immutable journal prose rows plus materialized tasks/decisions/events. |
-| UUIDv7 block IDs | Every id is `prefix_<nanoid(12)>` TEXT via `new_id()` (api/src/store/mod.rs:126-129). The only uuid call in the workspace is `Uuid::new_v4()` naming throwaway test schemas (api/src/db.rs:483). |
-| pgvector server-side | Embeddings are packed little-endian f32 BYTEA rows; every semantic query loads all model-matched vectors and computes cosine in Rust (api/src/store/semantic.rs:474-491). |
-| SQLite + sqlite-vec client-side | No client persistence beyond one localStorage key (packages/web/src/api.ts:55-64). SQLite exists only so the legacy import path can read an uploaded old `hive.db`. sqlite-vec appears nowhere. |
-| Makepad UI | The only UI is the Solid.js SPA served by the Rust binary (api/src/routes/spa.rs). No Makepad, Tauri, Electron, egui, or iced anywhere. |
-| Append-only | Convention, not enforcement. `UPDATE journal SET user_scope` exists (store/journal.rs:93), actor merge rewrites authorship (store/actors.rs:377), actor delete hard-DELETEs journal rows with a full cascade (actors.rs:191-241). |
-
-What "Zibaldone has been renamed to Hive" actually means: the Zibaldone project
-vision was re-homed onto the Hive codebase. The repo needs no rename. The BookStack
-Zibaldone book still describes the unbuilt paper design and should be marked
-historical or rewritten; this document supersedes it as the direction of record.
-See decision D15.
-
-## Current state, as built
-
-**Data model.** PostgreSQL, one database shared by the `hive-api` and `hive-worker`
-binaries. The schema is two inline raw-SQL constants run idempotently at boot
-(`CREATE TABLE IF NOT EXISTS` plus `ADD COLUMN IF NOT EXISTS`, api/src/db.rs:34-435).
-There is no migration framework. Core tables: `journal` (append-only prose, the source
-of truth), `anchors` (a `{start,end}` span of an entry that produced an entity),
-`tasks`/`decisions`/`events` (materialized from anchors, carrying `origin_entry_id` +
-`anchor_text` provenance), `links` (free-string rel between typed endpoints), `inbox`
-(per-actor notifications), `wire` (append-only event log doubling as the SSE bus),
-`sources`/`outbox` (worker config and job queue), `embeddings`, `search`, plus people,
-shares, users, auth, and the hosted Claude Code workspace tables (`cc_sessions`,
-`cc_messages`, `cc_credentials` with AES-256-GCM reversible encryption).
-
-**Write path.** `journal_append` is "the one write path" (store/journal.rs:112).
-It inserts the entry, indexes it into FTS, materializes anchors into entities, parses
-bracket tokens (`[person:]`, `[task:]`, ...), fans inbox notifications, auto-creates
-shares for mentions, and emits a wire event. Author is pinned to the authenticated
-principal. Steps run sequentially with no wrapping transaction, though real
-transactions exist elsewhere (actors.rs `remove_in_tx`), so transactional writes are
-proven feasible in this codebase.
-
-**Search.** FTS is a `search` table with a STORED generated tsvector and GIN index
-(db.rs:388-398), maintained by app-level DELETE+INSERT from journal, tasks, decisions,
-events, and import. Semantic search is a hybrid cascade (semantic.rs:430-641): cosine
-over all BYTEA vectors in Rust, FTS blend, Markov-blanket boost from the links graph,
-optional cross-encoder rerank, then viewer ACL filtering. Two ordering defects matter
-for mail: the vector pass scores every user's vectors and filters visibility after the
-fact, and it truncates to `limit` before applying the viewer scope (semantic.rs:616
-then :637), unlike FTS which over-fetches 5x first.
-
-**Embeddings.** Local ONNX (`Xenova/bge-small-en-v1.5`, 384 dims) behind the
-hive-embed crate, with a deterministic hash-ngram fallback. One vector per item, no
-chunking; the tokenizer truncates at model max length (~512 tokens, embed/src/onnx.rs:92-95).
-The worker re-embeds when content hash or model tag changes, with one skip-check
-SELECT per item per 30s cycle (worker/src/lib.rs:110-162). The embeddable corpus is
-journal (newest 1000 only), tasks, decisions, events (semantic.rs:256-314). One ONNX
-failure latches the process to the 256-dim hash embedder until restart, and the model
-tag change then re-embeds the whole corpus as low-quality vectors.
-
-**Sync layer (what exists).** There is no general sync layer. The worker tick loop
-(30s, five sequential stages, any stage error aborts the cycle, worker/src/lib.rs:79-105)
-polls RSS/scrape `sources` into `wire` events. That path has no cursor state, no
-conditional fetch, dedup by SQL LIKE substring over JSON payloads (sources.rs:317-329),
-and a 2000-row wire prune that doubles as dedup memory (worker/src/lib.rs:171-176).
-Feed content never enters FTS, embeddings, or recall. It is a notification bus, not an
-archive, and it is disqualified as a template for mail.
-
-**Visibility.** `journal.user_scope` NULL means global; non-NULL means that user plus
-admins. `visible_entry_ids` (journal.rs:903-960) is the single ACL boundary; non-journal
-search hits scope through their `origin_entry_id`. AIs act inside their grantor's
-namespace. Several MCP list tools (notably `inbox_list`, mcp.rs:1116-1125) take an
-arbitrary recipient with no viewer gate today.
-
-**Clients.** The Solid.js SPA (16 tabs, SSE revision-bump refetching), a stateless
-CLI, the agent memory adapter (`/api/recall` session briefs + journal writes), three
-agent memory plugins (Claude Code, Codex, Hermes), and on this branch the hosted
-Claude Code workspace runner. Untrusted content renders through marked + DOMPurify
-with one exception: search hit snippets are injected with raw innerHTML
-(packages/web/src/Boards.tsx:454) from unescaped `ts_headline` output (semantic.rs:204-209).
-
-**Deployment.** Docker compose: postgres:17, hive-api, hive-worker from one image,
-behind Traefik. Credentials user/pass/db all "hive" on a plaintext volume. Backups are
-the pgdata volume / pg_dump, unencrypted as far as the repo shows.
-
-## Target architecture
-
-### New tables
-
-All inline in the db.rs SCHEMA constant, same idempotent style, nanoid prefix ids,
-TEXT ISO-8601 UTC timestamps normalized to the exact `%Y-%m-%dT%H:%M:%S%.3fZ` shape
-`now_iso` produces, so lexicographic ordering holds.
-
-```
-mail_accounts   id 'macct_' PK, owner (people.slug, the ACL key), address,
-                jmap_url, jmap_account_id, cred_id (cc_credentials-pattern row,
-                AES-256-GCM reversible), email_state, mailbox_state,
-                backfill_status, backfill_cursor (JSON {received_at, jmap_id}),
-                attempts, next_attempt_at, last_error, last_synced_at,
-                last_status, enabled, created_at
-
-mail_mailboxes  id, account_id, jmap_id, name, role, ingest BOOL DEFAULT FALSE
-                (per-mailbox opt-in is the spam gate)
-
-mail_messages   id 'mail_' PK, account_id, jmap_id, jmap_thread_id (indexed),
-                message_id_hdr, in_reply_to, references_json,
-                from_addr, from_name, to_json, cc_json, reply_to_json, subject,
-                sent_at, received_at (authoritative sort key), mailbox_ids_json,
-                keywords_json, body_text (sanitized plaintext, never HTML),
-                body_source ('plain'|'html2text'), snippet, size,
-                has_attachments, embed_state, user_scope NOT NULL (= owner,
-                never NULL: there is no global mail), deleted_at,
-                created_at, updated_at
-                UNIQUE(account_id, jmap_id); INDEX (user_scope, received_at),
-                (account_id, jmap_thread_id), (message_id_hdr)
-
-mail_attachments id 'att_' PK, message_id, blob_hash NULL, jmap_blob_id
-                (always stored), filename, mime, size, content_id,
-                disposition, skipped_reason, created_at
-                UNIQUE NULLS NOT DISTINCT (message_id, jmap_blob_id, content_id)
-                so cannotCalculateChanges replays and crash-retries cannot
-                duplicate metadata rows
-
-blobs           hash TEXT PK (lowercase blake3 hex), size, mime,
-                data BYTEA (STORAGE EXTERNAL), created_at
-```
-
-### The sync daemon
-
-`hive-mail` is a third long-lived binary in the workspace, depending on the api crate
-exactly as hive-worker does, deployed as a third compose service from the same image.
-It is not a worker tick stage: the tick loop is single-instance, sequential, and
-aborts whole cycles on error; a permanently open JMAP EventSource cannot live in it,
-and a multi-year backfill inside a stage would starve heartbeat, feeds, and outbox for
-hours. It is not per-device: there is no device data layer to sync to.
-
-Steady state per account: hold a jmap-client EventSource on Stalwart
-`/jmap/eventsource` as a doorbell only. On wake, or every `HIVE_MAIL_POLL_SECS`
-(default 300) when the stream is down, run `Email/changes` from the stored state
-string, `Email/get` the created/updated ids with text bodyValues, upsert on
-`(account_id, jmap_id)`, apply metadata updates for moves and flag changes, tombstone
-destroys, and persist the new state string only after the batch commits. Correctness
-comes from state-string polling; push is latency sugar.
-
-`cannotCalculateChanges` (Stalwart can invalidate state strings after upgrades or
-compaction) triggers a full reconciliation: paged `Email/query` diffed against stored
-jmap_ids. The unique index makes it idempotent. This path gets exercised in CI against
-a Stalwart container, because an unimplemented resync path means an account that
-silently stalls forever, the same failure shape as sources whose `last_polled_at`
-becomes unparseable.
-
-Backfill: newest-first `Email/query` sorted receivedAt DESC, pages of 200, bodyValues
-capped at 256KB, one transaction per batch with `ON CONFLICT DO NOTHING`, committed
-`(received_at, jmap_id)` cursor for resumability, 250ms politeness sleep between
-pages. Wire and inbox emission are suppressed during backfill (see D10). Message-level
-parse failures store a stub row with a parse error and advance the cursor; per-message
-index failures are isolated the same way so one oversized email cannot wedge the
-account's replay loop.
-
-Retry: outbox arithmetic at the account level (`min(2^attempts * 30s, 3600s)`), and
-after 8 attempts the account flips disabled and notifies its owner through inbox plus
-a wire event. Sources' silent retry-forever is the known-bad pattern; the outbox's
-silent poison is only half-right. Fail loud.
-
-### Seam registrations
-
-This is the actual multi-corpus door, all additive:
-
-1. `EntityKind` gains `Mail`, string `"mail"`, everywhere in lockstep (shared crate,
-   api, web, MCP). Note the deployment hazard: `EntityKind::from_str_lossy` defaults
-   unknown strings to Task (shared/src/lib.rs:586-597), so mail rows reaching `search`
-   before the enum lands would surface mislabeled. Land the enum first, and make
-   `from_str_lossy` fail closed for unknown kinds while in there.
-2. `index_entity('mail', id, subject, body_text)` on ingest, with body truncated to
-   ~200KB before indexing (tsvector has a hard ~1MB limit a large newsletter can hit).
-   Tombstones and moves out of ingested mailboxes delete the search row.
-3. Embeddings: a `mail` arm driven by the `embed_state` queue column, never by an
-   `embeddable_items()` full scan (200k messages would mean 200k skip-check SELECTs
-   per 30s tick before any real work). Gated per D8. Add the missing reaper while in
-   there: nothing in the codebase deletes embedding rows that age out of eligibility
-   (the only `DELETE FROM embeddings` is the actor-delete cascade, actors.rs:131), so
-   messages leaving the newest-N window would orphan vectors that still get scanned
-   on every query and, because hydration misses them, surface as hits titled by raw
-   id (semantic.rs:601,630). A maintenance sweep deletes embedding rows whose ref is
-   tombstoned or no longer embed-eligible; the same sweep serves journal's existing
-   1000-entry window, which has the same latent leak today.
-4. Visibility: refactor `scope_hits` from journal-centric routing into a per-kind
-   resolver. journal resolves via `visible_entry_ids`; task/decision/event via
-   `origin_entry_id` (unchanged); mail via `user_scope == viewer || admin`, no share
-   or mention piercing in v1. This resolver is the seam every future corpus needs.
-5. Embeddings ACL moves into SQL: `ADD COLUMN owner TEXT` on `embeddings`, candidate
-   loading becomes `WHERE model=? AND dim=? AND (owner IS NULL OR owner=?)`, and the
-   scope filter runs before truncation, not after. This fixes the cross-user memory
-   cost, the privacy smell of scoring everyone's vectors on every query, and the
-   result-starvation defect where mail dominance would empty other users' semantic
-   results.
-6. Wire gets `mail.received` with an ids-only payload. Content never lives in wire.
-
-### Text extraction
-
-Plaintext-first holds, and the stack requires no HTML engine: mail-parser 0.11
-`body_text()` as the default (it converts HTML-only messages automatically), html2text
-0.17 (html5ever parsing only) when structure matters. Raw HTML is never stored in
-`body_text` and never rendered; the SPA renders mail like the Workspaces transcript
-pane, plain text only. Quoted-reply stripping (leading `>` blocks, "On ... wrote:",
-Outlook header blocks, `-- ` signatures, unsubscribe footers) runs before embedding
-but not before storage. No mature Rust crate does this; budget roughly 300 lines of
-heuristics with a test corpus. Without it, every message in a thread embeds
-near-identically and recall returns one conversation N times.
-
-### Attachments
-
-Content-addressed blake3, as leaned, but the bytes live in Postgres, not a filesystem
-CAS directory. The deciding constraint is the real deployment: two app containers and
-a postgres volume, backup story = pg_dump/pgdata. A filesystem CAS needs a new shared
-volume mounted into two services and splits the backup into artifacts that can drift;
-S3/minio adds a service to a deliberately small box. The `blobs` table reuses existing
-plumbing (BYTEA precedent in `embeddings.vec`), keeps blob+row insert transactional,
-and dedup is the primary key itself (`ON CONFLICT (hash) DO NOTHING`). Mail corpora
-are pathologically duplicated (signature images, re-attached PDFs down reply chains);
-expect 30-60% byte dedup.
-
-Policy: 15MB per-part cap (`HIVE_MAIL_MAX_ATTACHMENT_BYTES`); over-cap parts store
-metadata plus `jmap_blob_id` with `skipped_reason='oversize'`, and Stalwart remains
-the byte source of record for them. Store everything under cap including inline
-images and text/calendar parts. `cid:` references resolve to attachment chips in
-Phase 1; inline rendering of an image-type allowlist can come later via the
-authenticated route. Serving is `GET /api/mail/attachments/{att_id}`, ACL-checked
-through the owning message's namespace. Never serve by bare hash: in a multi-namespace
-system a hash URL is an unscoped capability that pierces the ACL. Response headers:
-nosniff, attachment disposition by default, ETag = hash, immutable private cache.
-
-GC is a weekly refcount sweep (delete blobs with no referencing attachment row, 24h
-grace). The actor-delete cascade (actors.rs:191-241) must extend to mail_accounts,
-mail_messages, mail_attachments, and orphaned blobs, and an admin redact-message route
-exists from day one: mail, unlike journal prose, routinely contains things you are
-obligated to purge.
-
-### Phase 2 send
-
-One queue, one drainer, one relay. Compose enqueues an outbox row kind `mail.send`;
-`hive-mail` drains that kind with the existing backoff/poison helpers. Precondition:
-narrow the worker's outbox claim to its known kinds first, because `drain_outbox`
-currently marks unknown kinds as successful no-ops (outbox.rs:142-145) and would
-silently swallow every send. Relay through Stalwart's smart-host to smtp2go rather
-than calling smtp2go directly: Stalwart keeps the Sent copy and JMAP sync ingests it
-back automatically, with the unique index making that idempotent. mail-send direct to
-smtp2go is the documented fallback.
-
-Scope: plain-text body, To/Cc, subject, and correct `In-Reply-To`/`References` headers
-on replies. Reply headers are not scope creep; without them every recipient sees
-broken threading, and adding two headers does not make a mail client. No drafts, no
-attachments in compose v1, no address book, no HTML composition. Each of those is the
-event horizon. Surface: one MCP tool `mail_send` plus a thin SPA pane.
-
-### The public crate
-
-`jmap-sync` (not "JMAP-to-blocks"; there are no blocks): session discovery, the
-EventSource loop with reconnect, `Email/changes` delta driving, `Email/query` backfill
-pagination, body fetch, and plaintext extraction, emitting a `NormalizedMessage`
-struct through two traits: `CursorStore` (load/save state strings and backfill anchor)
-and `MailSink` (`upsert_batch`, `tombstone`), with save-cursor-after-sink-Ok as the
-at-least-once contract. No Hive types, no Postgres in the crate; hive-mail implements
-both traits over Store and adds the FTS/wire/inbox side effects in its sink. This seam
-is real, not aspirational, and it also isolates the jmap-client dependency (dormant
-2024-01 through 2025-09, revived since, 0.4.2 as of 2026-06-19) behind one internal
-module sized for a reqwest+serde rewrite if it goes dark again.
+- D1 mail as first-class entity: carries. Mail stays a concrete corpus, now fed by a
+  module instead of a fourth binary.
+- D2 surrogate ids + UNIQUE(account_id, jmap_id) idempotency: carries verbatim.
+- D3 threads stay queries: carries.
+- D4 separate hive-mail binary: amended by D22. The isolation rationale (EventSource
+  lifetime, backfill starvation) is satisfied by the module host's task model inside
+  the app process; a separate OS process is no longer the right isolation boundary.
+- D5 sync state on account rows with loud poisoning: carries as module cursor state.
+- D6 mutable mirror with tombstones: amended by D18. Mutation semantics survive at
+  the derived-index layer; the durable layer beneath becomes append-only records.
+- D7 blake3 blobs in Postgres: amended by D20. Content addressing and dedup carry;
+  the backing store becomes a chunked block store, not a BYTEA table.
+- D8 embeddings gated until pgvector: retired. The corpus is one person's; the
+  multi-user starvation and ACL arithmetic that forced the gate no longer exist. The
+  ANN work from PR #91 (HNSW candidates, kind weights, keyed hydration) carries
+  conceptually; its index rebuilds in-process over the local store.
+- D9 owner-only ACL in SQL: retired with multi-user. The actor concept survives for
+  authorship and @mentions; visibility resolution is deleted, not ported.
+- D10 wire and inbox carry ids only: carries. The inbox remains (mail arrivals,
+  mentions from your AIs, dream output). The wire table's durable role is absorbed by
+  the op log, which is what wire always gestured at; its SSE-bus role becomes
+  in-process notification.
+- D11 compose as outbox kind mail.send through the Stalwart smart-host: carries,
+  drained by the mail module.
+- D12 concrete tables, generic seams: carries as the record-schema principle. Corpora
+  are concrete record types registered at the same seams (search, embeddings, links,
+  citations); no generic documents table.
+- D13 jmap-sync as the public crate with CursorStore/MailSink traits: carries, and is
+  promoted: those traits are the seed of the module SPI.
+- D14 sqlx migrations: carries in spirit. Destructive reshapes get cheap under D18:
+  derived indexes are rebuilt by log replay, so "migration" mostly means bumping the
+  fold version.
+- D15 Zibaldone retirement: partially reversed, per Lineage above.
 
 ## Decision log
 
-D1. **Mail is a new first-class entity.** Not journal entries: `journal_append` pins
-authorship to an authenticated principal, third-party mail has none, and an archive
-stored as journal would evict actual memory from the capped embed corpus. Not wire:
-LIKE dedup, 2000-row retention, and no FTS/embedding path disqualify it. Not a generic
-documents table: the entity tables here are deliberately concrete per kind, and the
-wire experiment already proved that corpus membership comes from seam registration,
-not from which table rows sit in.
+D16. **Product: a personal P2P desktop app.** Single user, single human. No hosted
+deployment, no tenancy, no accounts. Delete: api/src/auth.rs, routes/auth.rs,
+routes/oauth.rs, sessions, onboarding, the Visibility/user_scope machinery in
+middleware and stores, hosted workspaces (store/workspaces.rs, routes/workspaces.rs,
+cc_sessions/cc_messages/runtime_oauth_states), packages/runner, and the Node mirrors
+(packages/api, packages/worker, packages/cli, packages/agent). The deletions are also
+the security argument: v1's sharpest structural risks (the ACL ordering defects, the
+benign exfiltration loop where an agent journals private mail into global scope) die
+with their surfaces rather than getting fixed; the untrusted-content rendering class
+does not die and is governed by explicit policy in D17. Mobile comes later; hive-core
+(D17) is the layer it will reuse.
 
-D2. **Identity: surrogate `mail_<nanoid12>` PK; idempotency via
-`UNIQUE(account_id, jmap_id)`; Message-ID is provenance, not identity.** UUIDv7 is
-irrelevant (no UUIDs exist here) and UUIDv5-from-Message-ID is wrong on the merits:
-Message-ID is attacker-supplied (forgery would silently suppress distinct messages),
-sometimes absent, and legitimately duplicated across accounts whose rows must stay
-separate because their `user_scope` differs. Keep `message_id_hdr` indexed for
-threading and export.
+D17. **UI: Dioxus, all Rust; webview-rendered now, native-rendered later.** The app
+is one process: a Dioxus shell over a new hive-core crate (store, emergence parser,
+retrieval, module host, sync). Components are Rust (RSX and signals); event handlers
+call hive-core directly in-process. There is no JS framework, no npm, no Node, no
+Electron, and no IPC or serialization boundary between UI and core, which is also why
+this is not a Tauri-plus-SPA revival: the retired SPA was a separate program talking
+to a server, and this is one program. Rendering goes through the system webview
+(dioxus-desktop on wry: WebView2, WKWebView, WebKitGTK), which is what earns document
+fidelity everywhere hive is a document app: the journal editor (contenteditable, with
+DOM selections mapping to byte-offset anchors), sanitized HTML mail, reader-mode page
+captures, the calendar grid, plus IME, clipboard, accessibility, and find-in-page for
+free. egui was evaluated first and rejected on this axis: it cannot render HTML at
+all, and a native-webview overlay hack forfeits its simplicity without gaining
+fidelity. The Solid SPA, Tiptap, and force-graph still do not port; screens are
+rebuilt in RSX, and the graph view is a canvas.
 
-D3. **Threads stay queries in Phase 1.** JMAP `threadId` is a server-computed grouping
-key; a `mail_threads` table would cache a GROUP BY and add an entity kind with no
-Phase 1 consumer. Materialize lazily if thread-level linking or thread-level
-embedding ever needs a durable id.
+Rendering untrusted content is an explicit policy, replacing v1's plaintext-only
+rule: mail bodies and page captures are sanitized at ingest and again at render
+(ammonia allowlist; scripts, forms, and event handlers stripped), displayed inside
+sandboxed frames under a strict no-network CSP (the webview serves only the app's
+custom protocol; content frames get script-src none), remote content is blocked by
+default with per-sender opt-in placeholders, links open in the system browser, and
+plaintext extraction remains the stored, indexed, and embedded form. Blitz (Dioxus's
+native HTML/CSS renderer on Servo's Stylo and Vello) is the tracked future option:
+when it matures, the same components drop the system webview without a rewrite,
+which is the end state "no web frameworks" was reaching for. dioxus-mobile (webview
+on iOS and Android) is the credible path for the later mobile app.
 
-D4. **Sync runs in a separate `hive-mail` binary.** Three of five panel positions
-mandated this and the dissent (a worker tick stage) failed adversarial review on
-EventSource lifetime and backfill starvation. Single daemon per deployment, matching
-the single-writer assumptions already baked into outbox claiming.
+D18. **Storage: append-only, event-sourced, never overwrite.** This applies to all
+storage, not just ingested data. The source of truth is a set of per-device,
+single-writer, append-only op logs. Every record is immutable: journal appends,
+entity creates and field updates, module-ingested documents, config changes,
+tombstones, redactions. Updates append superseding records; deletes append
+tombstones; nothing rewrites history. SQLite (SQLCipher, D27) holds only derived
+state: current-entity tables, FTS5, and the vector/ANN index, all rebuildable by
+replaying the logs through a versioned fold. Materialization resolves concurrent
+field edits last-writer-wins per field, ordered by (device, seq) with a logical
+clock. v1 documented honestly that append-only was "convention, not enforcement"
+(journal user_scope rewrites, actor merge rewriting authorship, cascade hard
+deletes); those paths get re-expressed as records (merge = a merge record the fold
+applies) rather than carried as UPDATEs. Compaction, snapshotting, and GC are
+deliberately deferred ("we'll figure out how to maintain this later"); the arithmetic
+that makes deferral safe: personal text corpora are small (a 200k-message mailbox is
+low single-digit GB of text; browser capture is tens of MB per month), so logs grow
+slowly and replay stays cheap for a long time.
 
-D5. **Sync state lives on `mail_accounts` rows**: JMAP state strings as the cursor,
-backfill cursor for resumability, outbox-style backoff with loud poisoning. The
-sources table contributed the anti-pattern list, not the template.
+D19. **Hard delete: crypto-shredding.** Append-only and privacy collide exactly at
+deletion, and hive will hold the most sensitive corpus a person has (mail, files,
+browsing). Resolution: payload bodies (mail bodies, file text, page captures,
+attachment bytes) are stored in the blobstore encrypted under per-blob content keys;
+log records carry the blob reference plus the key wrapped by the master key. Hard
+delete destroys the wrapped key everywhere and appends a tombstone; the log and DAG
+structure remain intact and verifiable while the content becomes unrecoverable. The
+tombstone propagates through sync so deleted content cannot resurrect from another
+device, which generalizes the attachment redaction replay-resurrection invariant from
+the v0.6.0 train into a storage-wide rule. Small metadata records are encrypted in
+segment units; the shredding granularity users see (delete this page capture, this
+message, this file) is the blob.
 
-D6. **Mutation semantics: mail is a mutable mirror with tombstones.** Moves and flag
-changes update metadata and re-evaluate index membership (a message moved to Junk or
-Trash leaves FTS and embeddings). JMAP destroys set `deleted_at` and delete the search
-row and embedding row in the same batch, immediately; deleted mail must not remain
-searchable until a sweep. Append-only purity would make mail more rigid than the
-journal actually is.
+D20. **Blobstore: content-addressed blocks with a manifest layer.** blake3 ids over
+encrypted blocks; FastCDC content-defined chunking for large payloads; manifest
+objects (a tree of chunk hashes, itself a blob) assemble files, which gives the store
+its virtual-filesystem shape. Small payloads are single-block. What this buys:
+dedup (v1's 30-60% mail-attachment dedup carries), verifiable transfer, and
+resumability: sync and backfill negotiate have/want by hash and restart mid-object
+after failures instead of over. One addressing scheme covers attachments, file
+captures, page snapshots, log segments, and embedding model files. The design aligns
+with iroh-blobs (BLAKE3 verified streaming) so the store's unit is also the sync
+protocol's unit.
 
-D7. **Attachments: blake3 content-addressed `blobs` table in Postgres**, 15MB cap,
-eager fetch under cap, metadata-plus-blobId above, serve by attachment id through the
-message ACL, never by hash. GC by refcount sweep. `blob_put`/`blob_get`/`blob_stat` is
-the seam for a future backend swap if the corpus outgrows the box.
+D21. **Sync: iroh, with a BR relay anyone can replace.** Each device holds a keypair;
+pairing is a ticket/QR exchange; transport is QUIC, E2E encrypted, hole-punched, with
+relay fallback. BR operates the default relay and discovery service; both are small
+self-hostable binaries, and a settings field points a hive at your own. Relays
+forward ciphertext and see only node ids and IP addresses; we run them with no
+logging, and the threat-model doc (D27) states exactly what a relay operator can
+observe. Replication is the exchange of log segments and referenced blobs (resumable
+per D20). Every record carries an author (actor and device), so person-to-person
+sharing remains buildable later without reshaping the log; for now the peer set is
+one human's devices.
 
-D8. **Embeddings are gated until pgvector.** Phase 1 embeds only ingest-enabled
-mailboxes, newest-N per account (default 5,000), quote-stripped, driven by
-`embed_state`. Arithmetic: 100k unbounded messages means ~150MB of BYTEA loaded and
-cosine-scored per query on the current path, plus a full-corpus text load at query
-time (semantic.rs:449); the wall arrives around 25-50k vectors. The 5k gate adds
-roughly 7.5MB per query, which the current scan absorbs. Lifting the gate requires
-the Phase 1.5 pgvector migration (HNSW, chunked rows, SQL-side ACL). Chunking arrives
-with pgvector, because a chunk column changes the `(ref_kind, ref_id)` PK shape and
-should not fork the table twice. Name the consequence of the gate honestly: mail that
-is FTS-indexed but not embedded is invisible to `semantic_search`, because the hybrid
-blend drops keyword-only hits as noise (vector==0 with keyword>0, semantic.rs:548-555).
-Until Phase 1.5, the bulk of the archive is reachable through plain keyword `search`
-and the mail MCP tools, and semantically only for the gated slice. That is a fork in
-the retrieval surface, accepted deliberately, removed by Phase 1.5.
+D22. **Ingestion: WASM modules, implemented now.** The host is wasmtime with the
+component model; the SPI is a WIT world (hive:module). A module exports: describe
+(identity, config JSON schema for the settings UI, citation namespace, capability
+requests), tick(cursor) for pull-based sync, and handle-push(payload) for push-fed
+modules. The host provides capability-scoped imports, granted per module in settings:
+http, sink-emit (records into the ingest pipeline: extract, chunk, embed, index,
+provenance), cursor get/set, secret get (keychain-mediated, D27), log, and
+subscriptions: long-lived streams like the JMAP EventSource are owned by the host,
+which wakes the module's tick, satisfying D4's old isolation rationale inside one
+process. Modules are sandboxed by construction, hot-loadable from files, and
+enable/pause/configure at runtime in the UI. First-party modules are built as
+components to prove the SPI, in order: mail (jmap-sync core intact, backfill cursors
+and state strings per D5, compose per D11), filesystem (user-chosen roots, notify
+watcher, ignore rules, MIME allowlist, extraction, [file:<id>] citations), caldav and
+carddav (D23), browser (push receiver for D24, [web:<id>] citations). Fallback named
+up front: if component-model tooling friction blows the budget, extism is the
+replacement host with the same SPI shape.
 
-D9. **ACL: owner-only, enforced in SQL, fail closed.** `user_scope` is never NULL for
-mail. The per-kind visibility resolver plus the embeddings owner column move scoping
-into the query. Recall stays journal-only, and its kind filter moves into the
-semantic_search call rather than post-filtering the returned pool (today recall
-filters to Journal after the limit-8 pool is formed, recall.rs:129-146, so mail would
-silently crowd agent memory briefs toward empty). No mail sharing in v1; when it
-comes, `ShareScope` needs a real enum variant because `from_str_lossy` coerces unknown
-scopes to Entry.
+D23. **Entities: a PIM core plus custom types.** Built-ins shrink to: journal (the
+substrate, unchanged), task, mail, event upgraded to a real calendar entity (start,
+end, timezone, RRULE recurrence, reminders), and contact, new. person splits: actor
+stays as the slim authorship identity (you and your AIs, @mentions, dream authorship)
+while contact carries the address-book payload (emails, phones, orgs), enriched from
+mail correspondents and CardDAV. decision, topic, project, and phase leave the core
+and ship as custom entity-type presets on the existing entity_types registry, one
+click to restore; the emergence language keeps working for them through the custom
+seams. We build no CalDAV or CardDAV server: the mail server (Stalwart) already
+provides both, and hive connects as a client through the caldav/carddav modules.
+Custom types and the pluggable-source SPI are the extension story; the core surface
+is exactly contacts, mail, calendar, tasks.
 
-D10. **Wire and inbox carry ids only.** `mail.received` payload is message id plus
-owner, nothing else: wire is globally readable (GET /api/wire, dashboard, SSE) and
-pruned to 2000 rows. Both wire and inbox emission are suppressed or batched during
-backfill, or a 100k-message import floods the activity log and drives every open SPA
-client into refetch storms. Mail inbox notifications carry no subject or sender
-snippet until `inbox_list` is viewer-gated; that MCP tool currently returns any
-recipient's inbox to any authenticated actor.
+D24. **Browser capture: real-time only, in-session.** An MV3 WebExtension (Chrome and
+Firefox) captures readable text from the live DOM at visit time, inside the user's
+existing session and cookies. It never re-fetches a URL, and there is no history
+backfill of any kind: what you browse while it runs is what gets captured. A capture
+stores extracted text (the indexed and embedded form) plus a Readability-simplified
+HTML snapshot, sanitized at ingest, for display under D17's rendering policy. Delivery
+is native messaging into hive-bridge (D25), so the app never opens a listening port
+for it. Policy surface in settings: domain allow/deny lists, never in private
+windows, a global pause, and an audit view of everything captured with one-click
+delete (a crypto-shred, D19).
 
-D11. **Phase 2 send: outbox kind `mail.send`, drained by hive-mail, relayed through
-Stalwart's smart-host to smtp2go**, after narrowing the worker's outbox claim.
-Plain text, reply headers correct, nothing else. The send capability is the single
-largest risk step in the whole program (a leaked PAT or a prompt-injected agent can
-then send mail as the user), which is why it stays a phase behind the archive.
+D25. **The only external API is MCP.** The Dioxus shell calls hive-core in-process; the
+REST routes are deleted. One auxiliary binary, hive-bridge, provides every external
+doorway: stdio MCP for Claude Code (the plugin repoints to it) and Claude Desktop
+(the .mcpb repoints to it), and the native-messaging host entry for the browser
+extension. The bridge proxies to the running app over a unix domain socket with
+peer-credential checks; if the app is not running it says so rather than growing its
+own store access. The MCP tool layer (api/src/mcp.rs) survives over hive-core minus
+the auth, admin-multiuser, and workspace tools, plus new tools: ingest_activity
+(D26), module management, and capture audit.
 
-D12. **Schema strategy: concrete tables, generic seams.** No corpus/document
-abstraction now. The `(kind, ref_id)` sidecars (search, embeddings, links) plus the
-per-kind visibility resolver are the multi-corpus substrate; a third corpus arrives
-the way mail does, a concrete table registered at the seams. The wire experiment is
-the evidence: generic storage without seam registration produced a second-class
-corpus. This repo's history (Python to Rust to Node to Rust to Postgres, a 9-phase
-auth program written off) prices speculative architecture at total loss; build with
-that grain.
+D26. **Dreaming.** A Claude Code skill, distributed through the existing
+identity-artifacts system, plus one new MCP tool: ingest_activity(since), returning
+per-module digests of what arrived (counts, notable items, spans) since the last
+dream. The dream reviews that activity and writes journal entries tagged as dreams
+using the standard emergence language: bracket tokens, anchors, and [mail:]/[file:]/
+[web:] citations, so contacts, tasks, and events materialize through the one write
+path (store/journal.rs) exactly as human prose does. The reflector generalizes into
+this. Trigger is /dream in Claude Code, with an optional scheduled headless run
+later. Everything a dream reads is module-fed content and stays framed as untrusted
+input (see Risks).
 
-D13. **The public artifact is `jmap-sync`** with the `MailSink`/`CursorStore` trait
-boundary. The design keeps it cleanly extractable: nothing in the sync loop imports
-Hive types.
+D27. **Privacy: encryption everywhere, collection zero.** At rest: SQLCipher for the
+derived database, per-blob keys for payloads (D19), master key in the OS keychain
+with an optional passphrase (Argon2id) and a printed recovery code; losing the master
+key must be survivable by design, not by luck (v1's HIVE_CRED_KEY lesson,
+generalized). Module credentials (JMAP, CalDAV) move from env-var encryption keys to
+keychain-wrapped storage. In transit: iroh E2E (D21). Embeddings remain local ONNX
+(bge-small via hive-embed; the cross-encoder reranker ports into hive-embed as the
+Node path dies), so content never leaves the machine to be indexed. No telemetry, no
+analytics, no crash reporting by default, identifier-free update checks. A
+threat-model document ships with Phase 1 and is honest about what remains observable:
+relay operators see node ids and IPs; your mail server sees your mail; Anthropic sees
+what your Claude sessions read through MCP when you use them.
 
-D14. **Adopt sqlx migrations at Phase 1.5.** The inline idempotent schema has reached
-its limit; the pgvector cutover rewrites the embeddings table and needs a rollback
-story. Mail's Phase 1 tables can still ride the inline pattern; the migration
-framework lands before the first destructive reshape.
-
-D15. **Zibaldone reconciliation.** Hive-as-built is the substrate going forward. The
-Zibaldone block/event-sourced/Makepad design is retired as an architecture target;
-its surviving ideas (append-only discipline, AI-collaborative journaling, local-first
-ambitions) either already exist here in different clothes or belong to a possible
-future native client project that is out of scope for this document. There is no
-repo rename to execute; the BookStack Zibaldone book gets marked historical. If a
-hive-to-something rename is ever wanted for branding, know the cost up front: ~29
-HIVE_* env vars, crate/binary/image/npm names, the Postgres identity, and critically
-the `hive_pat_`/`hive_sess` credential prefixes and `hive_session` cookie name, which
-invalidate every issued token on change.
+D28. **Closeout and migration.** v0.6.0 ends untagged; the hosted era stops at the
+merge of PR #91 and the sha can be tagged retroactively if ever needed. Phase 1
+includes a one-shot importer: point it at the existing Postgres instance and a chosen
+namespace, and it exports journal you authored (including formerly global entries you
+wrote), your entities, links among imported items, your actors (you and your AIs),
+and your mail accounts, messages, and attachments, re-expressed as authored records
+with original ids preserved as aliases for citation continuity. Cross-human shares do
+not migrate; there is no one to share with in a personal hive.
 
 ## Phased build plan
 
-### Phase 0: hardening preconditions (small, mostly independent, all required before mail rows land)
+### Phase 1: hive-core
 
-1. Fix the stored-XSS sink: escape or sanitize search snippets before innerHTML
-   (Boards.tsx:454) and HTML-escape ts_headline input (semantic.rs:204-216). Mail is
-   attacker-controlled content; indexing it turns this from theoretical into certain.
-2. Apply viewer scope before truncation in semantic_search (semantic.rs:616 vs :637),
-   and pass recall's journal filter into the search call instead of post-filtering.
-3. Gate `inbox_list` (and audit the other MCP list tools) by viewer.
-4. Guard the embedding latch: when TRANSFORMERS_FAILED trips, pause backfill instead
-   of re-embedding the corpus as 256-dim hash vectors. ~20 lines.
-5. Land `EntityKind::Mail` in lockstep across shared/api/web/MCP; make
-   `from_str_lossy` fail closed.
-6. Narrow the worker outbox claim to known kinds (needed for Phase 2, one line, do it
-   now).
+- Extract hive-core from the api crate: store, the emergence parser verbatim
+  (parse_bracket_tokens, materialise_anchor, parse_mentions), retrieval, inbox.
+- Implement the durable layer: op-log record format and fold, SQLite/SQLCipher
+  derived index, FTS5 (replacing tsvector), blockstore (blake3, FastCDC, manifests),
+  key management (keychain, per-blob keys, recovery code).
+- Port retrieval: hybrid blend and rerank over FTS5 plus an in-process ANN index,
+  carrying PR #91's shape (candidates, kind weights, keyed hydration).
+- Delete D16's list. The Rust workspace becomes: core, embed, shared, jmap-sync, app
+  (Phase 2), bridge, modules/.
+- Build the Postgres importer (D28) and import the real namespace.
 
-Milestone: a hostile email body indexed into search cannot execute script, leak
-across namespaces, or wedge the pipeline.
+Milestone: the ported store/search test suite passes against an imported real
+namespace; journal to emergence to search behaves identically to v0.6.0 for one user.
 
-### Phase 1: read-only archive
+### Phase 2: the shell
 
-- `mail_accounts`/`mail_mailboxes`/`mail_messages`/`mail_attachments`/`blobs` tables.
-- `hive-mail` binary: backfill (resumable, newest-first) plus incremental sync
-  (state strings, EventSource doorbell, cannotCalculateChanges resync), account-level
-  backoff, per-message failure isolation.
-- FTS indexing with the 200KB pre-tsvector truncation; tombstone and move handling.
-- Gated embeddings per D8, quote-stripping heuristics with a test corpus.
-- Attachment ingest with blake3 dedup and the authenticated serving route.
-- SPA Mail tab rendering plaintext (Workspaces transcript pattern); mail chips in
-  search results.
-- MCP: `mail_search`, `mail_thread_get`, `mail_accounts_list`, all viewer-gated from
-  day one. Mail excluded from recall's default brief.
-- `[mail:<id>]` bracket token in journal_append creating journal-to-mail links, so
-  tasks emerge from journal entries that cite messages. Anchors stay journal spans;
-  a task does not anchor to an email.
-- Ops: LUKS on the host, encrypted backups, and the runbook sentence that an
-  unencrypted pg_dump is now a copy of the mailbox. Read-only JMAP credential for the
-  sync account if Stalwart supports it. `HIVE_CRED_KEY` becomes a hard runtime
-  dependency for the first time: the credential vault errors when it is unset
-  (cc_credentials.rs:57-64), no compose file sets it today, and hive-mail cannot
-  start without it. Document it, generate it, and back it up separately from the
-  database, since losing it orphans every stored mail credential.
+- Dioxus app: journal (editor, anchor selection, autocomplete), search, tasks,
+  dashboard, settings; wire the in-process notification path (the old SSE bus).
+- Embed the MCP tool layer over core; ship hive-bridge (stdio MCP + UDS proxy);
+  repoint the Claude Code plugin and the .mcpb.
 
-Milestone: the full mailbox is searchable next to the journal, agents can cite mail
-in context, deleting mail in Stalwart removes it from search here, and re-running
-backfill from zero produces zero duplicates.
+Milestone: daily-drivable on one device; Claude Code and Claude Desktop both connect
+through the bridge and journal_append/recall/semantic_search round-trip.
 
-### Phase 1.5: retrieval at scale
+### Phase 3: modules, PIM, dreaming
 
-- Adopt sqlx migrations (D14).
-- pgvector + HNSW; chunked embedding rows (~450 tokens with overlap); owner/kind
-  filtering in the index query; migrate the existing few thousand vectors; rewrite
-  the vector pass as `ORDER BY vec <=> $q LIMIT k` with ACL in the WHERE clause,
-  and replace the per-query `embeddable_items()` text hydration with a keyed fetch
-  of only the top-N hits.
-- The extension is an ops change, not just SQL: the deployed `postgres:17` image
-  does not ship pgvector. Move compose to `pgvector/pgvector:pg17` (same Postgres
-  major, same `hive-pgdata` volume) before `CREATE EXTENSION vector` can run.
-- Lift the mail embedding gate; per-kind rank weights in the hybrid blend so 200k
-  mail documents cannot drown ~1k journal entries.
+- wasmtime host, WIT SPI, capability grants, settings UI rendering config schemas.
+- Port mail onto the SPI (jmap-sync intact), including compose (outbox mail.send
+  through the smart-host).
+- Filesystem module; caldav and carddav modules; calendar and contact entities with
+  their native views; decision/topic/project/phase become presets.
+- ingest_activity tool and the dreaming skill.
 
-Milestone: semantic search stays sub-100ms with the full archive embedded, and one
-user's corpus size cannot degrade another user's results.
+Milestone: mailbox, chosen directories, calendar, and contacts are all searchable and
+citable; /dream produces journal entries whose anchors materialize entities.
 
-### Phase 2: compose
+### Phase 4: sync
 
-- Outbox `mail.send`, hive-mail drainer, Stalwart smart-host relay to smtp2go.
-- MCP `mail_send` plus the thin SPA pane. Plain text, correct reply headers, hard
-  stop there.
+- iroh transport, pairing UX (ticket/QR), log-segment and blob replication,
+  tombstone/shred propagation.
+- Deploy the public relay and discovery service; write the self-host doc.
 
-Milestone: a reply sent from Hive threads correctly in the recipient's client, the
-Sent copy appears in the archive via sync without duplication, and a failed relay
-retries with backoff and poisons loudly.
+Milestone: two devices converge from cold; a transfer interrupted mid-blob resumes
+where it left off; a crypto-shred on one device renders the content unrecoverable on
+both.
 
-### Phase 3, when earned: extraction and the next corpus
+### Phase 5: browser
 
-- Extract `jmap-sync` to its own repo/crates.io once a second consumer or the
-  stability of the trait seam justifies it.
-- Apply the mail template (concrete table + seam registration) to the next corpus
-  (documents, agent memory) if and when one is commissioned.
+- MV3 extension, native-messaging host entry in hive-bridge, capture policy UI,
+  audit and delete.
+
+Milestone: pages captured in real time are searchable with [web:] citations, and the
+audit view's delete verifiably shreds.
+
+Ordering rationale: sync waits for the record schema to settle (Phase 3 adds record
+types), and the extension waits for the module host and policy surface. Dreaming
+rides Phase 3 because it needs ingest activity to dream about.
 
 ## Risks and tar pits
 
-**Numbers first.** A 100-200k message mailbox: backfill fetch a few hours at polite
-paging; gated embedding of 5k messages 15-25 minutes of CPU; full-archive embedding
-4-16 hours one-time (Phase 1.5, acceptable) but catastrophic if ever re-triggered by
-the model-tag latch. `search` table footprint at that scale roughly 1.5-3GB including
-the tsvector and GIN; attachment blobs 3-15GB post-dedup under the 15MB cap. All fine
-on disk; all material to pg_dump duration and backup size, so surface totals on the
-dashboard.
+**The UI rebuild is the schedule risk.** Sixteen SPA tabs get rebuilt in RSX, and
+Dioxus is younger than the stack it replaces: expect framework friction, and note
+that the Linux leg renders through WebKitGTK, the roughest of the three system
+webviews and the daily-driver platform here, so it gets tested first, not last. The
+journal editor stays the one genuinely hard widget (contenteditable is powerful and
+fiddly); the calendar grid stops being hard in a DOM. Resist pixel-parity with the
+old SPA.
 
-**Prompt injection into agent memory.** Recall briefs and semantic results feed Claude
-Code sessions as additionalContext, and this branch's runner executes with
-bypassPermissions in non-isolated sandboxes. Inbound spam becomes attacker
-instructions inside agent sessions. Mitigations: mailbox allowlist ingest, spam-flag
-exclusion, mail out of recall's default brief, untrusted-content framing on any
-agent-facing mail surface. None is complete; treat every mail string an agent reads
-as hostile input.
+**Sanitization discipline is back.** v1's XSS lesson (raw ts_headline output reaching
+innerHTML) applies again the moment a webview renders mail or captured pages. The
+rule is structural, not situational: content HTML never reaches the DOM unsanitized
+(ammonia at ingest and at render), sandboxed frames and the no-network CSP backstop
+it, and there is no just-this-once path around the sanitizer. This is the price of
+D17, paid deliberately.
 
-**The benign exfiltration loop.** The sanctioned dreaming/memory-write pattern has
-agents summarize what they read into journal prose, and a system-principal
-journal_append lands with `user_scope = NULL`, which is globally visible. An agent
-with mail access that journals a mail summary publishes private correspondence to
-everyone. Phase 1 ships a policy rule in the memory-write protocol (mail-derived
-prose must carry the owner's scope); enforcement options stay an open question below.
+**Append-only is a design constraint, not a checkbox.** Several v1 paths literally
+rewrite (actor merge, scope changes). Re-expressing each as a record the fold
+understands is real work, and the fold's versioning discipline (replay must stay
+deterministic across releases) is the part that bites late if skipped early.
 
-**At-rest posture.** pgcrypto column encryption is rejected: it is incompatible with
-the generated tsvector column and with embedding (plaintext must exist at index time,
-and the key would sit on the same box). The honest posture is disk encryption plus
-encrypted offsite backups plus the AES-GCM credential store for secrets, and saying
-plainly that extracted text is plaintext inside Postgres.
+**Key management is now load-bearing.** Crypto-shredding means key destruction is
+deletion; it also means key loss is total loss. The keychain plus passphrase plus
+recovery-code story ships in Phase 1 or the encryption story is theater.
 
-**Deliverability and ops.** Outbound is solved (smtp2go smart-host). Inbound MX
-behind DDNS is not solvable in code: ISP port-25 policy, dynamic-IP lapses, rDNS
-mismatch. Accept it as stated risk or front it with an MX relay. Stalwart moves fast
-(0.16.11 fixed a JMAP query bug in June 2026); pin and test upgrades, and keep the
-cannotCalculateChanges path healthy since compactions invalidate cursors.
+**WASM friction is real.** Component-model tooling is young; guests are tick-driven
+because guest-side async is not worth fighting; host-owned subscriptions add host
+complexity. The extism fallback is named in D22 so a mid-phase host swap is a
+contained decision, not a redesign.
 
-**Dependency bus factor.** jmap-client went dormant for 21 months before its 2025-09
-revival and has ~60k downloads. The jmap-sync internal client module is the
-containment: hand-rolling JMAP over reqwest+serde is a realistic escape hatch.
+**Prompt injection survives the pivot.** Mail, files, and web captures feeding Claude
+sessions are attacker-influenced input; the single-user model removes the cross-user
+leak, not the injection. Every module-fed MCP surface keeps untrusted-content
+framing, and dreams treat ingested text as quotes, not instructions.
 
-**Compose scope creep.** The panel's sharpest self-observation: minimum viable
-compose that threads correctly is slightly larger than "thin pane," and everything
-past it (drafts, quoting UI, attachments, address book) is the full-mail-client event
-horizon. The line is drawn at reply headers. Hold it.
+**iroh and relay ops are a new operational surface.** Pin versions, write the relay
+runbook, and decide the relay domain early: pairing tickets embed relay defaults, and
+changing them later churns every paired device.
 
-**Timestamp discipline.** All ordering is lexicographic TEXT comparison, and
-`...:00Z` sorts differently from `...:00.000Z`. Normalize every mail timestamp to the
-exact now_iso shape at the crate boundary or merged feeds silently mis-order.
+**Mobile stays deliberately unresolved.** dioxus-mobile (webview on iOS and Android)
+makes shared components credible, but its tooling is young. hive-core stays
+shell-agnostic so the mobile decision is free when it arrives. Do not let desktop
+code grow Dioxus types below core.
 
 ## Open questions (not blockers)
 
-1. Enforcement for the dreaming write-back leak: policy only, or should
-   journal_append refuse global-scope entries containing `[mail:]` references
-   authored by non-human principals?
-2. Does Stalwart support a read-only JMAP credential for the Phase 1 sync account,
-   and is scoping it worth the setup friction?
-3. Should recall ever include mail (opt-in flag with quoted-untrusted framing), or is
-   journal-only permanent policy?
-4. Mail sharing semantics: when someone wants to share a thread into another
-   namespace, is it a `ShareScope::Mail` grant or a journal entry quoting the mail?
-5. The Correspondence book in BookStack currently captures important email threads by
-   hand. Does mail-in-Hive replace that workflow, feed it, or leave it alone?
-6. Does the local-first native client ambition (the surviving Zibaldone UI vision:
-   Makepad, Apple Pencil, offline SQLite) get its own project charter later, and if
-   so does it consume Hive's API or fork the storage design?
-7. Sent-mail identity: which From addresses/aliases does Phase 2 permit, and where
-   does that allowlist live (mail_accounts vs Stalwart config)?
-8. Multi-account future: the schema supports N accounts per owner; does the household
-   (Maggie) onboard in Phase 1 or after Phase 1.5 scaling?
+1. Recall and dreams reading mail/web/file content: default-on for a personal hive,
+   or a per-module "visible to AI" toggle? (Leaning toggle, default on for mail,
+   off for browser.)
+2. Which v1 mail questions still matter: read-only JMAP credential (still worth it),
+   sent-identity allowlist for compose (carries to Phase 3).
+3. Branding: does "hive" survive the pivot? A rename is cheaper now (tokens and
+   cookies die with auth) but still touches crates, binaries, env vars, and images.
+4. Relay and discovery domain, and where their ops live (same box as mail, or apart).
+5. Importer scope for Maggie or other household members: a second personal hive
+   imports its own namespace from the same Postgres; confirm that is the model rather
+   than any shared instance surviving.
 
 ## Next steps
 
-1. Review this document; contest any decision in the log before code starts.
-2. Ship Phase 0 as one small hardening PR series (XSS fix first; it is exploitable
-   today without mail).
-3. Stand up Stalwart at the Roadhouse with the smtp2go smart-host and a test mailbox;
-   wire a Stalwart container into CI for the resync test.
-4. Build Phase 1 behind `HIVE_MAIL_ENABLED`, backfill a real mailbox, and measure:
-   backfill wall-clock, search latency with mail indexed, dashboard blob/search
-   totals.
-5. Mark the BookStack Zibaldone book historical and point it at this document.
-6. Decide open question 1 (write-back enforcement) before agents get mail tools.
+1. Review this record; contest any decision in the log before Phase 1 code starts.
+2. Open the Phase 1 PR series on this branch: hive-core extraction first (pure move),
+   then the record format and fold, then the FTS5 port, then the importer.
+3. Mark the BookStack "Hive Direction: Mail as Substrate" page historical with a
+   pointer here; update the Zibaldone book note, since D18 revives its append-only
+   idea on hive's substrate.
+4. Decide the relay domain (open question 4) before Phase 4 so pairing defaults are
+   stable from the first build.
