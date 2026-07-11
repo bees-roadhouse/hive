@@ -362,6 +362,91 @@ async fn artifact_sync_excludes_disabled_and_other_actors() {
     assert_eq!(store.artifacts_list("pia").await.unwrap().len(), 2);
 }
 
+/// identity_create mints an authorable actor through the normal fold (survives
+/// an index rebuild, appears in people_list) and is find-or-create by slug.
+#[tokio::test]
+async fn identity_create_roundtrips_and_is_idempotent() {
+    let store = test_store().await;
+
+    let cera = store
+        .identity_create("Cera", ActorKind::Ai)
+        .await
+        .expect("create ai identity");
+    assert_eq!(cera.kind, ActorKind::Ai);
+    assert_eq!(cera.slug, "cera");
+
+    // Shows up in the roster the Identities pane lists.
+    let listed = store.people_list().await.unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|p| p.slug == "cera" && p.kind == ActorKind::Ai),
+        "new AI identity must appear in people_list: {listed:?}"
+    );
+
+    // Same slug again finds the existing row (no duplicate person).
+    let again = store.identity_create("cera", ActorKind::Ai).await.unwrap();
+    assert_eq!(
+        again.id, cera.id,
+        "identity_create is find-or-create by slug"
+    );
+    assert_eq!(
+        store.people_list().await.unwrap().len(),
+        listed.len(),
+        "no duplicate row on re-create"
+    );
+
+    // A human identity works the same way.
+    let nate = store
+        .identity_create("Nate", ActorKind::Human)
+        .await
+        .unwrap();
+    assert_eq!(nate.kind, ActorKind::Human);
+}
+
+/// journal_list_by_author filters to one author in SQL — it must NOT drop
+/// entries that fall past a page boundary (the bug a client-side filter of a
+/// paginated page would cause).
+#[tokio::test]
+async fn journal_list_by_author_filters_in_sql() {
+    let store = test_store().await;
+    store.identity_create("pia", ActorKind::Ai).await.unwrap();
+
+    // Interleave two authors so nate's entries are scattered through the log.
+    for i in 0..5 {
+        store
+            .journal_append(journal_input(&format!("nate note {i}")), Some("nate"), None)
+            .await
+            .unwrap();
+        store
+            .journal_append(journal_input(&format!("pia note {i}")), Some("pia"), None)
+            .await
+            .unwrap();
+    }
+
+    let nate_all = store.journal_list_by_author("nate", 100, 0).await.unwrap();
+    assert_eq!(nate_all.len(), 5, "exactly nate's entries");
+    assert!(nate_all.iter().all(|v| v.entry.author == "nate"));
+
+    let pia_all = store.journal_list_by_author("pia", 100, 0).await.unwrap();
+    assert_eq!(pia_all.len(), 5);
+    assert!(pia_all.iter().all(|v| v.entry.author == "pia"));
+
+    // The filter runs BEFORE the limit: a small page still returns only this
+    // author's rows (a client-side filter of the mixed page would drop some).
+    let page = store.journal_list_by_author("nate", 3, 0).await.unwrap();
+    assert_eq!(page.len(), 3, "limit applies after the author filter");
+    assert!(page.iter().all(|v| v.entry.author == "nate"));
+
+    // Newest-first, and offset paginates within the author.
+    let next = store.journal_list_by_author("nate", 3, 3).await.unwrap();
+    assert_eq!(next.len(), 2, "remaining nate entries after offset");
+
+    // An unknown author is empty, not an error.
+    let none = store.journal_list_by_author("nobody", 10, 0).await.unwrap();
+    assert!(none.is_empty());
+}
+
 fn fields(v: Value) -> Map<String, Value> {
     v.as_object().expect("fields object").clone()
 }

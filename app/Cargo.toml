@@ -26,3 +26,13 @@ anyhow = { workspace = true }
 # The import runs on its own OS thread under a dedicated current-thread
 # runtime (the CLI's exact shape); the UI awaits a oneshot for the result.
 tokio = { workspace = true }
+# Journal bodies render as GFM Markdown (task lists, tables, strikethrough,
+# autolinks, fenced code — hive's Obsidian-style conventions). comrak has GFM
+# built in and is pure Rust (no C, clean for the flatpak build). The rendered
+# HTML is authored by the user AND by AI identities and displays inside the
+# app's own WebKit context, so it MUST be sanitized (D17) before it reaches
+# dangerous_inner_html: ammonia strips <script>, event handlers, and remote
+# resource loads against a strict allowlist. Both are already in the lock
+# (present transitively), so this pins the versions we render through.
+comrak = { version = "0.39", default-features = false }
+ammonia = "4"
