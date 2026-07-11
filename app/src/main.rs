@@ -91,7 +91,7 @@ impl Section {
         match self {
             Section::Journal => "✍",
             Section::Mail => "✉",
-            Section::Contacts => "person",
+            Section::Contacts => "☺",
             Section::Calendar => "▦",
             Section::Identities => "⬡",
             Section::Settings => "⚙",
