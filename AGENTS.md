@@ -8,16 +8,17 @@ GitHub `main` is canonical (the old `development`/`release` pair collapsed into
 it on 2026-07-05). This repo is mid-pivot to a personal P2P desktop app
 (docs/DIRECTION.md D16+; teardown/rebuild sequence in docs/PLAN.md):
 
-- Rust workspace: `shared`, `embed`, `core`, `jmap-sync`, `app`, and
-  `bridge`. There is no Node/pnpm workspace anymore — the Solid SPA, the
-  legacy Node packages, the worker/mail daemons (PR 1.2), and the api crate
-  with its REST/auth/OAuth surface (PR 1.3) were deleted in Phase 1 teardown.
-  The shipping binaries are the app and `hive-bridge` (PR 1.8); the
-  `hive-import` one-shot arrives with PR 1.7.
+- Rust workspace: `shared`, `embed`, `core`, `jmap-sync`, `app`, `bridge`,
+  and `importer`. There is no Node/pnpm workspace anymore — the Solid SPA,
+  the legacy Node packages, the worker/mail daemons (PR 1.2), and the api
+  crate with its REST/auth/OAuth surface (PR 1.3) were deleted in Phase 1
+  teardown. The shipping binaries are the app, `hive-bridge` (PR 1.8), and
+  the `hive-import` one-shot (PR 1.7).
 - The datastore is the append-only op log + SQLCipher SQLite index under a
   local data dir (the PR 1.6 cutover; D18). Postgres left the workspace —
-  the PR 1.7 importer is the one remaining Postgres reader and brings its
-  own client dependency.
+  the PR 1.7 importer is the one remaining Postgres reader and declares its
+  own sqlx (never in `[workspace.dependencies]`; the grep gate in
+  `importer/tests/no_postgres_gate.rs` enforces it).
 
 When docs disagree with code, workflows, or compose files, trust code and CI,
 then update the stale doc in the same change. `README.md` and parts of
@@ -40,6 +41,14 @@ then update the stale doc in the same change. `README.md` and parts of
   data-dir/keychain/actor resolution; Phase 2.4 flips it to a UDS proxy.
   `HIVE_DATA_DIR` and `HIVE_MEMORY_KEY_HEX` are bridge-only escape hatches —
   never teach core or the app to read them.
+- `importer/`: the `hive-import` binary (PR 1.7) — one-shot migration of a
+  hosted-era Postgres into a fresh data dir (refuses a non-empty one).
+  Records ride the `#[doc(hidden)]` `Store::import_batch` seam
+  (`core/src/store/import.rs`): original nanoid ids and timestamps preserved,
+  `origin` provenance on every payload (fold v3), commits still flow through
+  `Core::commit`. Honors `HIVE_DATA_DIR`; its keychain escape hatch is
+  `HIVE_IMPORT_KEY_HEX` (importer-only, mirroring the bridge's — each binary
+  names its own). Embeds nothing: the app backfills embeddings later.
 - `shared/`: Rust shared domain types.
 - `embed/`: embedding seam, ONNX/BGE implementation, and hash fallback.
 - `jmap-sync/`: JMAP mailbox sync library (kept through the pause; its offline
@@ -111,8 +120,18 @@ $env:CARGO_TARGET_DIR = "$env:USERPROFILE\.cargo-target\hive"
 ```
 
 Tests are hermetic: tempdir data dirs, in-memory keys, the hash embedder —
-no database service, no network. Nothing consults a Postgres connection
-string anymore (the grep gate: zero `sqlx`/`pgvector` tokens in core).
+no database service, no network — with ONE deliberate exception: the
+importer's fixture tests are DATABASE_URL-gated (they skip loudly and pass
+without it, so `cargo test --workspace` stays green offline). To run them
+for real, point them at a pgvector Postgres:
+
+```bash
+DATABASE_URL=postgres://hive:hive@localhost:5432/hive cargo test -p hive-import
+```
+
+Everything else stays Postgres-free by construction — the grep gate
+(`importer/tests/no_postgres_gate.rs`) fails on any `sqlx`/`pgvector` token
+outside `importer/`.
 
 There is no compose path or shippable image anymore. The local binaries are
 the app (`cargo run -p hive-app`) and the bridge
@@ -144,15 +163,18 @@ or verify it exists.
 
 ## CI And Release
 
-`.github/workflows/ci.yml` is the only workflow, with one job, triggered on
+`.github/workflows/ci.yml` is the only workflow, with two jobs, triggered on
 PRs to `main`:
 
 - `rust`: runs `cargo fmt --all --check`,
   `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo build --workspace --all-targets`, and `HIVE_EMBED=hash cargo test --workspace`.
-  No database service (PR 1.7 re-adds Postgres scoped to importer tests);
-  `HIVE_EMBED=hash` stays as belt-and-braces against hive-embed's default
-  provider downloading models.
+  No database service and no DATABASE_URL — that absence is the invariant
+  (the importer's DB tests self-skip); `HIVE_EMBED=hash` stays as
+  belt-and-braces against hive-embed's default provider downloading models.
+- `importer`: the PR 1.7 exception — a `pgvector/pgvector:pg17` service +
+  DATABASE_URL, running `cargo test -p hive-import` only. The only Postgres
+  anywhere in CI.
 
 There is no release workflow: the bridge installs from the repo
 (`cargo install --path bridge`) and app bundles land with Phase 2.5 —

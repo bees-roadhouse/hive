@@ -33,6 +33,7 @@ pub mod entity_types;
 pub mod entity_validation;
 pub mod events;
 pub mod identities;
+pub mod import;
 pub mod inbox;
 pub mod journal;
 pub mod links;

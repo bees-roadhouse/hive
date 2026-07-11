@@ -176,6 +176,18 @@
 //     match "tomato"). Cross-backend parity is the whole point of the oracle.
 //
 // Everything else in the v1 contract above is unchanged.
+//
+// ── v3 (the PR 1.7 importer; FOLD_VERSION 3) ───────────────────────────────
+//
+// One amendment, uniform across all 11 kinds: the TOP-LEVEL payload map may
+// carry an optional `origin` key — provenance the 1.7 importer stamps on
+// every record it writes ({source: "hosted-v0.6", table: <postgres table>}).
+// The fold strips it before dispatch and projects nothing from it: the op
+// log is where provenance lives; the derived state doesn't need it. Records
+// without `origin` (all 1.6 command-layer writes) are untouched, so v2-built
+// state replays identically under v3.
+//
+// Everything else in the v1/v2 contract above is unchanged.
 // ────────────────────────────────────────────────────────────────────────────
 
 use anyhow::{bail, Context, Result};
@@ -192,7 +204,9 @@ use crate::oplog::{kind, Record};
 ///
 /// v2 = the PR 1.6 cutover set: inbox/identity built-ins, journal
 /// entity.update, and the porter FTS tokenizer (see the v2 header section).
-pub const FOLD_VERSION: u32 = 2;
+/// v3 = the PR 1.7 importer's optional top-level `origin` provenance key,
+/// accepted on every kind and ignored (see the v3 header section).
+pub const FOLD_VERSION: u32 = 3;
 
 /// Apply one record to the derived state inside the caller's transaction,
 /// advancing the per-device watermark in the same transaction. See the
@@ -215,12 +229,18 @@ pub fn apply(tx: &Transaction, rec: &Record) -> Result<()> {
         );
     }
 
-    let payload: Json = serde_json::to_value(&rec.payload).with_context(|| {
+    let mut payload: Json = serde_json::to_value(&rec.payload).with_context(|| {
         format!(
             "record {}#{} payload is not JSON-representable",
             rec.device, rec.seq
         )
     })?;
+    // v3: strip the optional top-level `origin` provenance key (the 1.7
+    // importer stamps it) before the fail-closed field checks below — the
+    // op log keeps it; the projection ignores it.
+    if let Some(m) = payload.as_object_mut() {
+        m.remove("origin");
+    }
 
     match rec.kind.as_str() {
         kind::JOURNAL_APPEND => journal_append(tx, rec, &payload)?,
