@@ -1,5 +1,5 @@
 {
-  "description": "Inject Hive session memory at Claude Code startup and capture the transcript into Hive Conversations at session end.",
+  "description": "Inject Hive session memory at Claude Code startup. (Transcript capture at session end paused with the hosted teardown; it returns as an MCP-fed source in Phase 3 — docs/PLAN.md PR 3.6.)",
   "hooks": {
     "SessionStart": [
       {
@@ -7,16 +7,6 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks-handlers/session-start.mjs\""
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks-handlers/session-end.mjs\""
           }
         ]
       }

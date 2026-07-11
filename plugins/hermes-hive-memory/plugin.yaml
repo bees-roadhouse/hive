@@ -1,3 +1,0 @@
-name: hive
-version: 0.1.0
-description: "Hive journal memory provider with session-start recall, semantic search, and durable prose saves."

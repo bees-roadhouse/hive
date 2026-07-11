@@ -47,6 +47,13 @@ data-encoding = { workspace = true }
 # rusqlite to 0.32 is gone — the pin can lift whenever convenient.
 rusqlite = { workspace = true }
 
+# Single-writer data-dir lock (PR 1.8): flock semantics so a second open in
+# the SAME process conflicts too (fcntl record locks are per-process and
+# would not). Already in the tree via keyring→zbus→async-io; Windows uses
+# std's share_mode(0) instead, so this stays unix-scoped.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
 [dev-dependencies]
 # Hermetic tempdir stores for the oplog/blockstore/keys/store tests.
 tempfile = { workspace = true }

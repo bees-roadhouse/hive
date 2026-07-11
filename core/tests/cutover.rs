@@ -8,6 +8,11 @@
 //   - single-writer serialization: many concurrent async writers all land
 //     (no SQLITE_BUSY — there is exactly one connection, owned by the writer
 //     thread);
+//   - single-writer exclusion (PR 1.8): a second Store on the same data dir
+//     is refused while the first holds the `lock` file, and admitted after
+//     shutdown releases it;
+//   - rebuild-by-replay (PR 1.8): deleting the derived index and reopening
+//     reproduces byte-identical canonical state from the op log alone;
 //   - the read_at record path (fold contract v2) survives replay;
 //   - none of it consults the Postgres connection env var (Postgres left
 //     core at this PR).
@@ -239,6 +244,115 @@ async fn inbox_read_at_rides_records_and_survives_replay() {
         "read_at must rebuild from records alone"
     );
     assert_eq!(store.inbox_unread_count("pia").await.unwrap(), 0);
+    store.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn second_store_on_the_same_data_dir_is_refused_until_the_first_closes() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+
+    // While the first store lives (app OR bridge), a second opener — even in
+    // the same process, which is why the lock is flock and not fcntl — gets
+    // the documented error instead of a second writer on the same log/index.
+    let err = match Store::new(dir.path(), keys(), Arc::new(hive_embed::HashEmbedder)) {
+        Ok(_) => panic!("a second store on a held data dir must be refused"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("another hive process"),
+        "unexpected refusal text: {err:#}"
+    );
+
+    // The refused open must not have disturbed the holder.
+    store
+        .journal_append(
+            serde_json::from_value(json!({"body": "still writing fine"})).unwrap(),
+            Some("nate"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Shutdown joins the writer thread and releases the lock: next opener in.
+    store.shutdown().await.unwrap();
+    let store = open(dir.path());
+    assert_eq!(store.journal_list(10, 0).await.unwrap().len(), 1);
+    store.shutdown().await.unwrap();
+}
+
+/// The rebuild-derived-state proof (PLAN.md PR 1.8), through Store::new
+/// rather than a bare SqliteIndex: seed varied state through the real write
+/// paths, snapshot the canonical dump, DELETE the derived index entirely,
+/// reopen the dir (crash-heal replays the whole log), and require the dump
+/// byte-identical. This is the "drop SQLite, replay" recovery story (D18)
+/// exercised in CI on every test run.
+#[tokio::test]
+async fn deleting_the_index_and_reopening_rebuilds_identical_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+
+    // Varied seed: journal prose with emergence (topic/person/task tokens),
+    // an anchored decision, config, inbox traffic (@mention), a task status
+    // flip, and a custom entity type + instance.
+    store
+        .journal_append(
+            serde_json::from_value(json!({
+                "body": "Planning [project: Rebuild] with @pia — [task: Verify replay] \
+                         under [topic: Durability].",
+                "tags": ["cutover"],
+            }))
+            .unwrap(),
+            Some("nate"),
+            Some("nate"),
+        )
+        .await
+        .unwrap();
+    store
+        .journal_append(
+            serde_json::from_value(json!({
+                "body": "We choose replay over backups for derived state.",
+                "anchors": [{"start": 3, "end": 32, "kind": "decision",
+                             "fields": {"title": "Replay is the migration story"}}],
+            }))
+            .unwrap(),
+            Some("nate"),
+            Some("nate"),
+        )
+        .await
+        .unwrap();
+    store.config_set("rebuild.smoke", "yes").await.unwrap();
+    let task = &store.tasks_list(Default::default()).await.unwrap()[0];
+    store
+        .tasks_update(
+            &task.id,
+            hive_shared::TaskPatch {
+                status: hive_shared::TaskStatus::parse("doing"),
+                ..Default::default()
+            },
+            "nate",
+        )
+        .await
+        .unwrap();
+    let dump_before = store.canonical_dump().await.unwrap();
+    assert!(!dump_before.is_empty());
+    store.shutdown().await.unwrap();
+
+    // Drop the ENTIRE derived index (+ WAL leftovers). Only the op log,
+    // device file, and blockstore remain.
+    std::fs::remove_file(dir.path().join("index.db")).unwrap();
+    let _ = std::fs::remove_file(dir.path().join("index.db-wal"));
+    let _ = std::fs::remove_file(dir.path().join("index.db-shm"));
+
+    let store = open(dir.path());
+    let dump_after = store.canonical_dump().await.unwrap();
+    assert_eq!(
+        dump_before, dump_after,
+        "full replay must reproduce the derived state byte-identically"
+    );
+    // And the rebuilt index is live, not just shaped right: FTS answers.
+    let hits = store.search("durability", 10).await.unwrap();
+    assert!(!hits.is_empty(), "rebuilt FTS must serve queries");
     store.shutdown().await.unwrap();
 }
 

@@ -8,13 +8,12 @@ GitHub `main` is canonical (the old `development`/`release` pair collapsed into
 it on 2026-07-05). This repo is mid-pivot to a personal P2P desktop app
 (docs/DIRECTION.md D16+; teardown/rebuild sequence in docs/PLAN.md):
 
-- Rust workspace: `shared`, `embed`, `core`, `jmap-sync`, and the `app`
-  scaffold. There is no Node/pnpm workspace anymore — the Solid SPA, the
+- Rust workspace: `shared`, `embed`, `core`, `jmap-sync`, `app`, and
+  `bridge`. There is no Node/pnpm workspace anymore — the Solid SPA, the
   legacy Node packages, the worker/mail daemons (PR 1.2), and the api crate
   with its REST/auth/OAuth surface (PR 1.3) were deleted in Phase 1 teardown.
-  No usable binary exists yet — that is per plan (hive-import arrives in
-  PR 1.7, hive-bridge in PR 1.8). Do not treat the old Node/SQLite README
-  framing as the source of truth for new work.
+  The shipping binaries are the app and `hive-bridge` (PR 1.8); the
+  `hive-import` one-shot arrives with PR 1.7.
 - The datastore is the append-only op log + SQLCipher SQLite index under a
   local data dir (the PR 1.6 cutover; D18). Postgres left the workspace —
   the PR 1.7 importer is the one remaining Postgres reader and brings its
@@ -34,6 +33,13 @@ then update the stale doc in the same change. `README.md` and parts of
   values; the PR 1.8 stdio bridge is its transport). `mcp::LocalCtx { actor }`
   supplies the acting identity — there is no authentication layer (single
   user, D16).
+- `bridge/`: the `hive-bridge` binary — the ONLY external doorway (D25).
+  A thin stdio transport over `core::mcp` (serve mode: JSON-RPC 2.0, one
+  message per line; `call` mode: one tool call for hooks/scripts). Interim
+  mode opens the store directly via `Store::new` with the app's exact
+  data-dir/keychain/actor resolution; Phase 2.4 flips it to a UDS proxy.
+  `HIVE_DATA_DIR` and `HIVE_MEMORY_KEY_HEX` are bridge-only escape hatches —
+  never teach core or the app to read them.
 - `shared/`: Rust shared domain types.
 - `embed/`: embedding seam, ONNX/BGE implementation, and hash fallback.
 - `jmap-sync/`: JMAP mailbox sync library (kept through the pause; its offline
@@ -62,6 +68,18 @@ then update the stale doc in the same change. `README.md` and parts of
   PR 1.7 importer to read.) Schema changes now mean bumping
   `fold::FOLD_VERSION` — the index drops derived tables and rebuilds by
   replaying the op log at next open.
+- ONE hive process per data dir: `Store::new` takes an exclusive advisory
+  flock on `<data_dir>/lock` and holds it until shutdown/exit, so the app
+  and an interim-mode bridge can never co-write the log/index. The refusal
+  message contains "another hive process" (tests and the plugin's soft-fail
+  matching depend on that text). flock, not fcntl, deliberately: a second
+  open in the same process must conflict too. `Store::shutdown` releasing
+  the lock is what lets reopen-style tests (and users switching between app
+  and bridge) proceed.
+- The bridge's stdout is the MCP protocol channel — frames only, one JSON
+  message per line. Every diagnostic goes to stderr. Never add a print to
+  stdout in `bridge/` (and keep HTTP stacks out of it: no reqwest/hyper/
+  axum — stdio is the transport, grep-auditably).
 - Every hive-core integration test constructs its store through
   `core/tests/common/mod.rs::test_store()` (tempdir data dir + in-memory keys
   + the injected hash embedder; `test_store_with` for mock 384-dim engines).
@@ -79,8 +97,9 @@ then update the stale doc in the same change. `README.md` and parts of
 - Work branches start from `main` and use `feature/{slug}`, `bug/{slug}`,
   `improvement/{slug}`, or `refactor/{slug}`, merging back via PR.
 - Releases are tag-driven: bump versions in a release PR, merge, then push
-  `v{version}` on the merge commit. (Dormant until PR 1.8 — Phase 1 lands
-  untagged and no release workflow exists right now.)
+  `v{version}` on the merge commit. (Dormant until Phase 2.5 rebuilds the
+  release pipeline — Phase 1 lands untagged and no release workflow exists
+  right now.)
 
 ## Setup
 
@@ -95,8 +114,9 @@ Tests are hermetic: tempdir data dirs, in-memory keys, the hash embedder —
 no database service, no network. Nothing consults a Postgres connection
 string anymore (the grep gate: zero `sqlx`/`pgvector` tokens in core).
 
-There is no compose path or shippable image between the PR 1.3 teardown and
-the PR 1.8 bridge / Phase 2 app bundles.
+There is no compose path or shippable image anymore. The local binaries are
+the app (`cargo run -p hive-app`) and the bridge
+(`cargo install --path bridge`); packaged bundles arrive with Phase 2.5.
 
 ## Verification
 
@@ -134,10 +154,10 @@ PRs to `main`:
   `HIVE_EMBED=hash` stays as belt-and-braces against hive-embed's default
   provider downloading models.
 
-There is no release workflow: nothing shippable exists between the PR 1.3
-teardown and the PR 1.8 bridge / Phase 2.5 app bundles — releases return
-then. The version of record is the `[workspace.package]` version in the root
-`Cargo.toml`.
+There is no release workflow: the bridge installs from the repo
+(`cargo install --path bridge`) and app bundles land with Phase 2.5 —
+releases return then. The version of record is the `[workspace.package]`
+version in the root `Cargo.toml`.
 
 ## Rust Code Style
 
@@ -182,12 +202,14 @@ Prioritize these when reviewing before real use:
 
 ## Known Documentation Drift
 
-- `README.md` still describes the retired hosted system in places (full
-  rewrite lands at the end of Phase 1).
 - `RUST_REWRITE.md` contains useful Rust architecture notes but predates the
   P2P pivot and the Phase 1 teardown.
-- `plugins/` and `integrations/` still point at the retired HTTP `/mcp`
-  endpoint; they repoint to the stdio bridge in PR 1.8. Do not "fix" them
-  earlier — there is nothing to point them at yet.
+- `docs/mail-ops.md` describes hosted-era mail operations; mail returns as a
+  module in Phase 3 and the runbook gets rewritten then.
+
+(`README.md`, `plugins/`, and `integrations/` were rewritten for the pivot
+in PR 1.8 — the plugin and the `.mcpb` run through the stdio `hive-bridge`;
+the hosted-era Codex/Hermes adapters were deleted with the server they
+called.)
 
 Fix these docs when touching the related area.

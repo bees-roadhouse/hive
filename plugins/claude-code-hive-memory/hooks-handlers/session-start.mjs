@@ -1,17 +1,20 @@
 #!/usr/bin/env node
 // SessionStart hook: boot the session Hive-aware, zero dependencies.
 //
-//   1. POST /api/recall -> the server-composed memory brief (profile cards,
-//      open tasks, unread inbox, relevant journal, recent events, touched
+//   1. `recall` tool -> the composed memory brief (profile cards, open
+//      tasks, unread inbox, relevant journal, recent events, touched
 //      projects) injected into the session as additionalContext.
-//   2. GET /api/identity/artifacts -> the identity's ENABLED skills/agents/
-//      commands, synced into <cwd>/.claude so Claude Code discovers them.
-//      .claude/.hive-synced.json records what WE wrote; pruning only ever
-//      touches paths listed there — user-authored files are never deleted.
+//   2. `identity_artifacts_sync` tool -> the identity's ENABLED skills/
+//      agents/commands, synced into <cwd>/.claude so Claude Code discovers
+//      them. .claude/.hive-synced.json records what WE wrote; pruning only
+//      ever touches paths listed there — user-authored files are never
+//      deleted.
 //
-// The server derives identity + namespace from the bearer token; the client
-// never asserts who it is. Unconfigured -> silent no-op. Any failure ->
-// stderr + exit 0 (a broken Hive must never block a session).
+// Both calls run through `hive-bridge call` against the local store; the
+// acting identity is HIVE_ACTOR (default $USER, the app's author default).
+// No bridge on PATH -> silent no-op (don't nag machines without hive). Any
+// other failure -> stderr + exit 0 (a broken hive must never block a
+// session) — including the interim-mode lock when the hive app is open.
 
 import {
   existsSync,
@@ -22,10 +25,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
-import { hive, hiveConfig, readHookInput, softFail } from "./lib.mjs";
+import { hiveCall, hiveConfig, readHookInput, softFail } from "./lib.mjs";
 
 const MANAGED_INDEX = ".hive-synced.json"; // under .claude/, tracks what we wrote
-const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/; // server data, but never a path escape
+const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/; // store data, but never a path escape
 
 function projectDir(input) {
   return input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
@@ -100,28 +103,29 @@ function syncArtifacts(claudeDir, artifacts) {
 
 async function main() {
   const cfg = hiveConfig();
-  if (!cfg) process.exit(0); // not configured — stay silent, don't nag every session
   const input = readHookInput();
 
-  // Recall: the server composes the ready-to-inject markdown brief.
+  // Recall: the store composes the ready-to-inject markdown brief.
   let brief = "";
-  let offline = false;
+  let unavailable = false;
   try {
     const peer = (process.env.HIVE_PEER || "").trim();
-    const recall = await hive(cfg, "POST", "/api/recall", peer ? { peer } : {});
+    const args = { identity: cfg.actor, ...(peer ? { peer } : {}) };
+    const recall = hiveCall(cfg, "recall", args);
     brief = (recall?.brief || "").trim();
   } catch (err) {
+    if (err.notInstalled) process.exit(0); // no hive here — stay silent
     process.stderr.write(`[hive-memory] recall failed: ${err.message}\n`);
-    offline = Boolean(err.network);
+    unavailable = Boolean(err.unavailable);
   }
 
-  // Artifact sync — skipped when the server is unreachable (one line, not two).
+  // Artifact sync — skipped when the store is unreachable (one line, not two).
   let synced = 0;
-  if (!offline) {
+  if (!unavailable) {
     try {
-      const artifacts = await hive(cfg, "GET", "/api/identity/artifacts");
-      if (Array.isArray(artifacts)) {
-        synced = syncArtifacts(join(projectDir(input), ".claude"), artifacts);
+      const payload = hiveCall(cfg, "identity_artifacts_sync", {});
+      if (Array.isArray(payload?.artifacts)) {
+        synced = syncArtifacts(join(projectDir(input), ".claude"), payload.artifacts);
       }
     } catch (err) {
       process.stderr.write(`[hive-memory] artifact sync failed: ${err.message}\n`);
