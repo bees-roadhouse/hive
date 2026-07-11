@@ -1,0 +1,25 @@
+[package]
+name = "hive-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Thin by design (D25): the MCP tool layer lives in hive-core and is
+# transport-free; this binary is stdio framing plus store bootstrap. No HTTP
+# stack of any kind — stdout is the protocol channel, stderr is the log.
+hive-core = { path = "../core" }
+hive-embed = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+# HIVE_MEMORY_KEY_HEX decoding (the keychain-free test/headless escape hatch).
+data-encoding = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,11 +1,8 @@
 {
   "mcpServers": {
     "hive": {
-      "type": "http",
-      "url": "${HIVE_API_URL}/mcp",
-      "headers": {
-        "Authorization": "Bearer ${HIVE_API_TOKEN}"
-      }
+      "command": "hive-bridge",
+      "args": []
     }
   }
 }

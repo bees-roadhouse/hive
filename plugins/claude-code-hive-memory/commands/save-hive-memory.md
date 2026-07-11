@@ -13,7 +13,7 @@ Call the Hive MCP tool `journal_append` with:
 - `tags`: include `session`, plus anything topical.
 
 Mention actors with `@name` when the memory should fan out to their inbox.
-If the memory cites archived mail, reference messages as `[mail:<id>]` and
-never write mail-derived content into a globally-scoped entry.
+If the memory cites archived mail, reference messages as `[mail:<id>]` —
+cite, never quote or copy mail content into the entry.
 
 Memory to save: $ARGUMENTS

@@ -1,81 +1,51 @@
 # Claude Desktop
 
-Two ways to point Claude at a hive: a **custom connector** (remote MCP over
-OAuth — works in claude.ai and Claude Desktop) or the **`hive.mcpb` extension**
-(a bearer API token over plain HTTP(S) — Claude Desktop only). Both land on the
-same stateless MCP endpoint, `POST /mcp`, with the same tool surface.
+One way to point Claude Desktop at hive now: the **`hive.mcpb` extension**,
+which launches the `hive-bridge` binary over MCP's stdio transport against
+the hive store on this machine. The hosted-era paths (OAuth custom
+connector, bearer tokens, `POST /mcp`) died with the P2P pivot — there is no
+server to connect to ([DIRECTION.md](../../docs/DIRECTION.md) D25).
 
-|                       | Custom connector                          | `hive.mcpb` extension                    |
-| --------------------- | ----------------------------------------- | ---------------------------------------- |
-| Works in              | claude.ai + Claude Desktop                | Claude Desktop                           |
-| Auth                  | OAuth 2.1 (PKCE + dynamic client registration) | Bearer API token                    |
-| Hive must be reachable | over public HTTPS — for claude.ai the connection comes from Anthropic's servers | from your machine only — LAN / Tailscale / localhost all fine |
-| Token minted by       | you, on hive's consent screen             | an admin (Account → API tokens)          |
+## Requirements
 
-## Custom connector (remote MCP)
+- `hive-bridge` on `PATH`. From a hive checkout:
 
-1. **Settings → Connectors → Add custom connector**, URL:
-   `https://<hive-host>/mcp`.
-2. Claude discovers the OAuth server itself: the endpoint's 401 carries an
-   RFC 9728 `www-authenticate` pointer to
-   `/.well-known/oauth-protected-resource`, Claude registers via RFC 7591
-   dynamic client registration (`POST /oauth/register`), and your browser opens
-   hive's authorization page.
-3. **Consent screen** (served by the SPA): sign in as yourself if you aren't
-   already, then the card shows *"Claude wants to connect to hive as one of
-   your AI identities."* Pick the identity under **Connect as**, pick a token
-   lifetime under **Access lasts** (7 days – 1 year; "Never" when the server
-   allows non-expiring tokens), and **Approve**.
-4. Done. Claude now holds an MCP token that identifies every action as that AI
-   identity. Revoke it anytime under **Account → Connected apps → Disconnect**
-   (revokes all of that client's tokens).
+  ```bash
+  cargo install --path bridge
+  ```
 
-Constraints, honestly stated:
+  The `.mcpb` does not bundle the binary yet — real packaging (bundled
+  per-platform binaries) arrives with the Phase 2 app bundles
+  ([PLAN.md](../../docs/PLAN.md) PR 2.4/2.5).
 
-- The hive host must be reachable **over HTTPS by whatever runs the
-  connector**. For claude.ai that's Anthropic's servers — public DNS, real
-  certificate. A LAN-only or Tailscale-only hive can't be a connector; use the
-  `.mcpb` path below.
-- Registration accepts HTTPS redirect URIs on any host and HTTP only on
-  loopback (`localhost` / `127.0.0.1` / `::1`). Claude's callbacks are plain
-  HTTPS, so this only ever bites hand-rolled dev clients.
-- Dynamic client registration is unauthenticated and capped at **200
-  registered clients** (`429 too_many_clients` past that). It's an abuse bound,
-  not a lifecycle: disconnecting an app revokes its tokens but keeps the
-  registration row.
+- The hive desktop app **closed**. Interim-mode caveat: the bridge opens the
+  same data dir as the app under a single-writer lock, so only one of them
+  can run at a time. The Phase 2.4 proxy (bridge talks to the running app
+  over a unix socket) removes this restriction.
 
-## `hive.mcpb` (bearer token, LAN-friendly)
+## Install
 
-1. Grab `hive.mcpb` from the
-   [latest release](https://github.com/bees-roadhouse/hive/releases) — or build
-   it yourself: `./scripts/build-mcpb.sh` → `dist/hive.mcpb`.
+1. Build the extension: `./scripts/build-mcpb.sh` → `dist/hive.mcpb`
+   (releases attach it once the Phase 2 release pipeline returns).
 2. Claude Desktop → **Settings → Extensions**, then drag `hive.mcpb` in (or
-   open the file). Desktop for macOS/Windows bundles a Node runtime for `node`
-   extensions; elsewhere have Node ≥ 18 on PATH.
-3. In the extension settings, set **Hive URL** (base URL — `/mcp` is appended
-   automatically, and a pasted `…/mcp` URL is also accepted) and **API token**.
-4. The token comes from hive → **Account → API tokens** (admin-only): mint one
-   for the AI identity this Claude should act as, and copy it at mint time —
-   it's shown once. Non-admins connect via the consent flow above instead.
+   open the file). There is nothing to configure — no URL, no token.
 
-Under the hood: `manifest.json` wires up `server/bridge.mjs`, a
-zero-dependency Node bridge that forwards Claude Desktop's stdio JSON-RPC
-(newline-delimited) to `POST <hive-url>/mcp` with the Bearer header.
-Notifications forward without a reply (hive answers `202`), upstream errors
-come back as JSON-RPC error responses carrying hive's detail, and stderr —
-which Claude Desktop collects into its MCP log files — carries the bridge's
-logs. Hive's `/mcp` is stateless, so there is no session plumbing to break.
+Under the hood: `manifest.json` tells Claude Desktop to run `hive-bridge`,
+which speaks MCP's stdio framing (one JSON-RPC message per line), opens the
+data dir (`$XDG_DATA_HOME/hive`, fallback `~/.local/share/hive`), resolves
+the master key from the OS keychain once at startup, and dispatches tool
+calls to hive-core's MCP layer. stdout carries protocol frames only; the
+bridge's logs go to stderr, which Claude Desktop collects into its MCP log
+files.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 | ------- | --- |
-| `401` / "Unauthorized — authorize via OAuth or provide a Bearer API token." | The token is mistyped, revoked, or expired — mint a fresh one (Account → API tokens) and update the extension settings. A brand-new hive also 401s `/mcp` until first-run onboarding completes. |
-| Connector add fails before the consent screen | Open `https://<hive-host>/.well-known/oauth-authorization-server` in a browser. If that isn't reachable (from the public internet, for claude.ai), the connector can't reach it either — check DNS, certificate, and reverse-proxy routing for `/.well-known/*`, `/oauth/*`, and `/authorize`. |
-| Consent page: "You don't own any AI identities to grant." | Your user has no AI identities assigned — an admin assigns one, then reconnect. |
-| `429 too_many_clients` on connect | The 200-registration cap. Disconnecting apps only revokes tokens; clearing stale registrations is a DB operation today (`DELETE FROM oauth_clients WHERE …`). |
-| Extension tools fail with "hive unreachable at …" | The URL isn't reachable from **your machine**. `curl -s -o /dev/null -w '%{http_code}\n' -X POST <hive-url>/mcp` should print `401` (or `406`) — anything else is network/proxy/port (`:7878` by default). |
-| Wrong identity, or rotating a token | Tokens pin their AI identity when minted/granted. Mint a new one (or reconnect and pick again), update the client, then revoke the old token. |
+| "spawn hive-bridge ENOENT" / extension fails to start | `hive-bridge` isn't on the PATH Claude Desktop sees. `cargo install --path bridge`, then restart Claude Desktop. GUI apps don't always inherit your shell PATH — on macOS, install to a standard location or launch Desktop from a terminal to verify. |
+| "another hive process has this data dir open" | The hive desktop app (or another bridge) is running. Close it and retry — one process per data dir in interim mode. |
+| "OS keychain unavailable" | The bridge resolves the master key from the OS keychain (Secret Service / macOS Keychain / Windows Credential Manager) exactly like the app. Make sure a keychain/secret service is available to your session; run the hive app once first so the key exists. |
+| Tools answer but the store looks empty | The bridge opened a different data dir than the app. Both use `$XDG_DATA_HOME/hive` (fallback `~/.local/share/hive`); a flatpak-installed app uses `~/.var/app/com.beesroadhouse.Hive/data/hive`, which the bridge doesn't see yet — bridge/flatpak alignment lands with Phase 2 packaging. |
 
 Bridge logs land in Claude Desktop's MCP logs (the `mcp-server-*.log` files —
 macOS: `~/Library/Logs/Claude/`, Windows: `%APPDATA%\Claude\logs\`).

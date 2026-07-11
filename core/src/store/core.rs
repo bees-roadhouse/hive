@@ -39,6 +39,9 @@ use crate::oplog::{LogReader, LogWriter, Record};
 /// File inside the data dir holding this installation's device id.
 pub const DEVICE_FILE: &str = "device";
 
+/// File inside the data dir carrying the single-writer advisory lock.
+pub const LOCK_FILE: &str = "lock";
+
 /// Crash-heal replay batch size (bounds memory on a long unfolded tail).
 const HEAL_BATCH: usize = 512;
 
@@ -50,6 +53,10 @@ pub(crate) struct Core {
     pub blocks: BlockStore,
     pub keys: Arc<dyn KeySource + Send + Sync>,
     pub device: String,
+    /// The data-dir lock (PR 1.8): held for the Core's lifetime — the OS
+    /// releases it when the writer thread drops the Core (Store::shutdown or
+    /// process exit). Never read; holding the handle IS the exclusion.
+    _lock: std::fs::File,
 }
 
 /// One record-to-be: the command layer's output. `Core::commit` turns drafts
@@ -118,6 +125,9 @@ impl Core {
 pub(crate) fn open_core(data_dir: &Path, keys: Arc<dyn KeySource + Send + Sync>) -> Result<Core> {
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("creating data dir {}", data_dir.display()))?;
+    // Mutual exclusion FIRST: nothing below may touch the log or index while
+    // another process (the app, or a hive-bridge in interim mode) has them.
+    let lock = acquire_dir_lock(data_dir)?;
     let device = read_or_mint_device(data_dir)?;
     let mut index = SqliteIndex::open(data_dir, keys.as_ref())?;
     // LogWriter::open runs the torn-tail repair for OUR device before the
@@ -131,7 +141,63 @@ pub(crate) fn open_core(data_dir: &Path, keys: Arc<dyn KeySource + Send + Sync>)
         blocks,
         keys,
         device,
+        _lock: lock,
     })
+}
+
+/// Take the single-writer lock: an exclusive, non-blocking advisory lock on
+/// `<data_dir>/lock`. One hive process per data dir — the store's writer
+/// thread owns the SQLite connection and the op-log tail, and a second
+/// writer (app + bridge at once) would corrupt the seq chain. flock, not
+/// fcntl, on unix: flock locks the open file description, so a second open
+/// in the SAME process conflicts too (fcntl record locks are per-process
+/// and would silently succeed). Advisory by nature — it fences hive
+/// processes, not hostile ones (see docs/THREAT-MODEL.md).
+fn acquire_dir_lock(data_dir: &Path) -> Result<std::fs::File> {
+    let path = data_dir.join(LOCK_FILE);
+    let busy = |detail: &dyn std::fmt::Display| {
+        anyhow::anyhow!(
+            "another hive process has this data dir open (the app and hive-bridge \
+             can't run at once yet — close the other one): {} ({detail})",
+            path.display()
+        )
+    };
+    // truncate(false) everywhere: the file carries no content, only the lock.
+    #[cfg(unix)]
+    {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening lock file {}", path.display()))?;
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .map_err(|e| busy(&e))?;
+        Ok(file)
+    }
+    #[cfg(windows)]
+    {
+        // Windows: share_mode(0) refuses every concurrent open of the file —
+        // mandatory rather than advisory, which is fine (stricter).
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(&path)
+            .map_err(|e| busy(&e))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = busy; // unsupported target: open without exclusion
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening lock file {}", path.display()))
+    }
 }
 
 /// Replay every device log's unfolded tail into the index. Scans from the

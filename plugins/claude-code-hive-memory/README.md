@@ -1,21 +1,43 @@
 # Hive Memory for Claude Code
 
-Claude Code plugin for Hive-backed AI memory. Zero dependencies — the hooks
-talk to the Hive API directly with Node's built-in `fetch`, so the plugin
-works from the marketplace cache with no Hive repo checkout.
+Claude Code plugin for Hive-backed AI memory — against the hive store on
+**this machine**. Zero JS dependencies: the MCP server entry and the hooks
+both run the `hive-bridge` binary, which opens the local data dir directly.
+There is no server, no URL, and no API token (hive is personal and
+local-first — [DIRECTION.md](../../docs/DIRECTION.md) D25); the OS user
+boundary is the auth.
 
 It provides:
 
-- a `SessionStart` hook that injects the Hive recall brief (identity profile,
-  open tasks, unread inbox, relevant journal, recent events, projects) and
-  syncs the identity's enabled skills/agents/commands into the project's
-  `.claude/` directory;
-- a `SessionEnd` hook that captures the session transcript into Hive
-  Conversations for later reflection;
-- an HTTP MCP config for Hive's `/mcp` endpoint (journal, tasks, search,
-  recall, mail, conversations tools);
+- an MCP server entry (`hive-bridge` on stdio) exposing Hive's tools —
+  journal, tasks, search, semantic search, recall, entities, dashboard;
+- a `SessionStart` hook that injects the Hive recall brief (identity
+  profile, open tasks, unread inbox, relevant journal, recent events,
+  projects) and syncs the identity's enabled skills/agents/commands into the
+  project's `.claude/` directory;
 - a skill and a `/save-hive-memory` command teaching Claude to save durable
   memory as Hive journal prose.
+
+Transcript capture at session end is paused: it died with the hosted
+teardown and returns as an MCP-fed source in Phase 3
+([PLAN.md](../../docs/PLAN.md) PR 3.6).
+
+## Requirements
+
+`hive-bridge` must be on `PATH`. From a hive checkout:
+
+```bash
+cargo install --path bridge
+```
+
+(Release packaging that bundles the binary lands with the Phase 2 app
+bundles; until then, installing from the repo is the supported path.)
+
+**Interim-mode caveat:** the bridge opens the same data dir as the hive
+desktop app, under a single-writer lock. The app and the bridge can't run at
+once — while the app is open, MCP calls and hooks fail with "another hive
+process has this data dir open". Close the app to use Claude Code with hive
+(the Phase 2.4 proxy removes this restriction).
 
 ## Install
 
@@ -34,50 +56,36 @@ claude --plugin-dir /path/to/hive/plugins/claude-code-hive-memory
 
 ## Environment
 
-| Variable | Required | Default | Purpose |
-|---|---|---|---|
-| `HIVE_API_URL` | yes | — | Hive base URL, e.g. `https://hive.example.com` (no trailing `/`) |
-| `HIVE_API_TOKEN` | yes | — | Identity bearer token (`hive_pat_...` or an OAuth access token) |
-| `HIVE_SESSION_CAPTURE` | no | on | Set `0` to disable SessionEnd transcript capture |
-| `HIVE_PEER` | no | — | Optional focus actor for the recall brief (e.g. the human in the session) |
-| `HIVE_HOOK_TIMEOUT_MS` | no | `10000` | Per-request timeout for hook API calls |
+All optional:
 
-`HIVE_URL` and `HIVE_TOKEN` are accepted as legacy aliases by the hooks; the
-MCP config uses `HIVE_API_URL` and `HIVE_API_TOKEN`.
-
-The server derives your identity and memory namespace from the token — the
-client never asserts who it is.
+| Variable | Default | Purpose |
+|---|---|---|
+| `HIVE_ACTOR` | `$USER` | Acting identity for hook calls (authorship pin) — matches the app's author default |
+| `HIVE_BRIDGE_BIN` | `hive-bridge` | Path to the bridge binary when it isn't on `PATH` |
+| `HIVE_PEER` | — | Optional focus actor for the recall brief |
+| `HIVE_HOOK_TIMEOUT_MS` | `10000` | Per-call timeout for hook bridge calls |
 
 ## Hook behavior
 
-**SessionStart** posts `/api/recall` and injects the server-composed brief as
-session context, then pulls `/api/identity/artifacts` and writes the enabled
-artifacts into the session cwd: `.claude/skills/<name>/SKILL.md`,
-`.claude/agents/<name>.md`, `.claude/commands/<name>.md`. The sync records
-what it wrote in `.claude/.hive-synced.json` and prunes only files listed
-there when they leave the enabled set — it never touches files you authored.
+**SessionStart** runs `hive-bridge call recall` and injects the composed
+brief as session context, then `hive-bridge call identity_artifacts_sync`
+and writes the enabled artifacts into the session cwd:
+`.claude/skills/<name>/SKILL.md`, `.claude/agents/<name>.md`,
+`.claude/commands/<name>.md`. The sync records what it wrote in
+`.claude/.hive-synced.json` and prunes only files listed there when they
+leave the enabled set — it never touches files you authored.
 
-**SessionEnd** parses the session transcript (thinking blocks are dropped —
-chain-of-thought is never persisted), upserts a conversation keyed on the
-Claude Code session id, and replaces its stored transcript with the full one
-(resumed sessions re-fire SessionEnd with the whole transcript, so replace
-keeps the capture idempotent).
+The hook soft-fails: no `hive-bridge` on `PATH` means a silent no-op, and
+any other failure (store locked by the app, keychain unavailable) costs one
+stderr line — a broken hive never blocks a session.
 
-Both hooks soft-fail: unconfigured means a silent no-op, and an unreachable
-Hive costs one stderr line — a broken Hive never blocks a session.
-
-## Capture → reflection
-
-Captured conversations land in your namespace with `origin='captured'` and
-queue for reflection (`GET /api/conversations/pending`). The Hive reflector
-drains that queue, distills each transcript into owner-scoped journal prose,
-and stamps the reflection cursor — so what you did in Claude Code today
-becomes memory the next session recalls. Nothing is journal-mirrored at
-capture time; reflection is the only path from transcript to journal.
+Note: the brief's *relevant journal* section rides the semantic index, whose
+backfill daemon is paused until the Phase 2/3 app loop — profile, tasks,
+inbox, and events populate regardless.
 
 ## Uninstall
 
-Removing the plugin stops the hooks; it does not remove artifacts already
+Removing the plugin stops the hook; it does not remove artifacts already
 synced into projects. To clean a project, delete the files listed in
 `.claude/.hive-synced.json` (and the index itself) — everything else under
 `.claude/` is yours, not the plugin's.

@@ -2,9 +2,9 @@
   "manifest_version": "0.2",
   "name": "hive",
   "display_name": "Hive",
-  "version": "0.6.0",
-  "description": "Hive memory over MCP — journal, tasks, decisions, search, and recall from Claude Desktop.",
-  "long_description": "Connects Claude Desktop to a hive instance's stateless MCP server (`POST /mcp`) using a bearer API token. This is the LAN-friendly path: a bundled zero-dependency Node bridge forwards MCP stdio traffic to your hive over HTTP(S), so it works against hosts that aren't reachable from the public internet (Tailscale, LAN, localhost). If your hive is on public HTTPS, prefer adding it as a custom connector instead — see integrations/claude-desktop/README.md in the repo.",
+  "version": "0.7.0",
+  "description": "Hive memory over MCP — journal, tasks, search, and recall from Claude Desktop, against the hive store on this machine.",
+  "long_description": "Connects Claude Desktop to the hive on THIS machine: the extension launches the `hive-bridge` binary (stdio MCP), which opens the local hive data dir directly. No server, no URL, no token — hive is personal and local-first (DIRECTION.md D25). Requires `hive-bridge` on PATH: `cargo install --path bridge` from the hive repo (the Phase 2 app bundles take over real packaging, including bundling the binary into this extension). Interim-mode caveat: the data dir takes a single-writer lock, so the hive desktop app and this extension can't run at the same time — close the app while Claude Desktop is connected. The Phase 2.4 proxy removes that restriction.",
   "author": {
     "name": "Bee's Roadhouse",
     "url": "https://github.com/bees-roadhouse"
@@ -14,38 +14,16 @@
     "url": "https://github.com/bees-roadhouse/hive"
   },
   "license": "MIT",
-  "keywords": ["hive", "memory", "journal", "mcp"],
+  "keywords": ["hive", "memory", "journal", "mcp", "local-first"],
   "server": {
-    "type": "node",
-    "entry_point": "server/bridge.mjs",
+    "type": "binary",
+    "entry_point": "hive-bridge",
     "mcp_config": {
-      "command": "node",
-      "args": ["${__dirname}/server/bridge.mjs"],
-      "env": {
-        "HIVE_URL": "${user_config.hive_url}",
-        "HIVE_TOKEN": "${user_config.hive_token}"
-      }
-    }
-  },
-  "user_config": {
-    "hive_url": {
-      "type": "string",
-      "title": "Hive URL",
-      "description": "Base URL of your hive instance, e.g. https://hive.example.com or http://100.64.0.7:7878 — /mcp is appended automatically.",
-      "required": true
-    },
-    "hive_token": {
-      "type": "string",
-      "title": "API token",
-      "description": "Bearer token for the AI identity this Claude should act as — minted in hive under Account → API tokens.",
-      "sensitive": true,
-      "required": true
+      "command": "hive-bridge",
+      "args": []
     }
   },
   "compatibility": {
-    "platforms": ["darwin", "win32", "linux"],
-    "runtimes": {
-      "node": ">=18.0.0"
-    }
+    "platforms": ["darwin", "win32", "linux"]
   }
 }

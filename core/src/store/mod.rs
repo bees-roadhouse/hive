@@ -245,6 +245,16 @@ impl Store {
 
     // ── diagnostics / test seams ────────────────────────────────────────────
 
+    /// Canonical text dump of every fold-owned table (fixed table order,
+    /// primary-key row order, stable rendering — see
+    /// `SqliteIndex::canonical_dump`). The rebuild-verification oracle: two
+    /// stores folded from the same op log must dump byte-identically.
+    /// Test/diagnostic seam.
+    #[doc(hidden)]
+    pub async fn canonical_dump(&self) -> Result<String> {
+        self.run(|core| core.index.canonical_dump()).await
+    }
+
     /// Run one SQL statement on the derived index, binding JSON params
     /// (strings/numbers/bools/null). SELECTs return rows as JSON values;
     /// other statements return one row holding rows_affected. Test/diagnostic
