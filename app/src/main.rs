@@ -18,7 +18,7 @@ use dioxus::desktop::{use_wry_event_handler, Config, WindowBuilder};
 use dioxus::prelude::*;
 use hive_core::keys::{KeySource, KeychainKeySource, MemoryKeySource};
 use hive_core::store::Store;
-use hive_embed::HashEmbedder;
+use hive_embed::{Backend, EmbedConfig, Embedder, RuntimeEmbedder};
 use hive_import::{Plan, RunOutcome, Summary};
 use hive_shared::{ActorKind, JournalEntryView, NewJournalEntry, Person, SearchHit};
 
@@ -35,33 +35,34 @@ const IDENTITY_OWNER_KEY: &str = "identity.owner";
 /// `actor_override`.
 const IDENTITY_ACTIVE_KEY: &str = "identity.active";
 
-// ── embedder / retrieval config contract ─────────────────────────────────────
+// ── embedder / retrieval config ──────────────────────────────────────────────
 //
-// SCAFFOLD (Phase 2.1): these keys are WRITTEN by Settings and READ by the
-// NEXT PR (the retrieval/embedder swap). This PR only persists them — the live
-// engine stays the offline hash embedder (see boot()). The retrieval PR is the
-// consumer of this exact schema; the keys and their value domains are the
-// contract, so they're named here deliberately and must not drift silently.
+// These keys are now LIVE: boot() builds the actual engine from them (via the
+// plaintext `embedder.json` sidecar the store can't hold pre-open — see
+// hive_embed::EmbedConfig and the module note in embed/src/runtime.rs). They're
+// written to BOTH the encrypted config table (durable, greppable) and the
+// sidecar (readable at boot). The device is NO LONGER a key — it's auto-detected
+// at model load and reported truthfully; there is no user device dropdown.
 //
-//   embedder.backend    "hash" (current) | "onnx-local" | "ollama"
-//   embedder.model      free text — e.g. "BAAI/bge-small-en-v1.5" (onnx) or an
-//                       ollama model tag ("nomic-embed-text"). Empty = backend default.
-//   embedder.device     "cpu" | "cuda" | "rocm" | "auto" — ONNX execution
-//                       provider (GPU on BOTH NVIDIA (cuda) and AMD (rocm)).
-//                       Only meaningful for onnx-local.
-//   embedder.ollama_url ollama server base URL (default http://localhost:11434).
-//                       Only meaningful for ollama.
+//   embedder.backend    "native" (default, on-device ONNX BGE) | "ollama".
+//                       Legacy scaffolds may hold "onnx-local" (→ native) or
+//                       "hash"; Backend::parse folds those. The CI/test hash
+//                       path is forced by HIVE_EMBED=hash, not by this key.
+//   embedder.model      ollama model tag (e.g. "nomic-embed-text"); only
+//                       meaningful for ollama. The native model is the BGE
+//                       default (or $HIVE_EMBED_MODEL).
+//   embedder.ollama_url ollama server base URL (default http://localhost:11434);
+//                       only meaningful for ollama.
 //   reranker.enabled    "true" | "false" — cross-encoder rerank stage on/off.
+//                       Honored by search when a reranker is actually loaded
+//                       (native + reranker model); a no-op otherwise, labeled so.
 //   reranker.model      free text — cross-encoder model id. Only meaningful when enabled.
 const EMBEDDER_BACKEND_KEY: &str = "embedder.backend";
 const EMBEDDER_MODEL_KEY: &str = "embedder.model";
-const EMBEDDER_DEVICE_KEY: &str = "embedder.device";
 const EMBEDDER_OLLAMA_URL_KEY: &str = "embedder.ollama_url";
 const RERANKER_ENABLED_KEY: &str = "reranker.enabled";
 const RERANKER_MODEL_KEY: &str = "reranker.model";
 
-/// The engine boot() actually wires today — the honest "current" backend value.
-const CURRENT_BACKEND: &str = "hash";
 const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 
 /// Which top-level section the main pane shows. A root signal drives it; the
@@ -186,18 +187,36 @@ fn boot() -> Boot {
     if !hive_import::data_dir_holds_store(&dir) {
         return Boot::Fresh { master, dir };
     }
-    // Hash embedder: offline and deterministic. The ONNX model becomes a
-    // settings choice in Phase 2 — it wants a model download this build
-    // doesn't do, and keyword FTS is the primary retrieval path meanwhile
-    // (the network hole exists now, but solely for user-initiated import;
-    // see docs/THREAT-MODEL.md).
+    // The real engine, resolved from the sidecar config: native ONNX BGE by
+    // default (auto CPU/GPU), or the manually-configured Ollama backend. CI/
+    // tests still force the hash path via HIVE_EMBED=hash. The model download
+    // (BGE via hf-hub) defers to first embed; the flatpak now has the network
+    // hole for it (docs/THREAT-MODEL.md) and it caches under the data dir.
     match Store::new(
         &dir,
         Arc::new(MemoryKeySource(master)),
-        Arc::new(HashEmbedder),
+        build_embedder(&dir),
     ) {
         Ok(store) => Boot::Ready(store),
         Err(e) => Boot::Failed(format!("{e:#}")),
+    }
+}
+
+/// Build the injected embedder from the sidecar config beside `data_dir`, after
+/// pinning the ONNX model cache under the data dir (so BGE downloads land in the
+/// app's own writable space, not the container-era `/data/models` default).
+fn build_embedder(data_dir: &std::path::Path) -> Arc<dyn Embedder> {
+    ensure_model_cache_env(data_dir);
+    let cfg = EmbedConfig::load(data_dir);
+    Arc::new(RuntimeEmbedder::from_config_or_env(&cfg))
+}
+
+/// Point `$HIVE_MODEL_CACHE` at `<data_dir>/models` unless the operator already
+/// set it. hive-embed's default is the container path `/data/models`, wrong for
+/// the desktop app; this keeps model downloads inside the app's writable dir.
+fn ensure_model_cache_env(data_dir: &std::path::Path) {
+    if std::env::var_os("HIVE_MODEL_CACHE").is_none() {
+        std::env::set_var("HIVE_MODEL_CACHE", data_dir.join("models"));
     }
 }
 
@@ -363,7 +382,7 @@ async fn enter_journal(
     let store = Store::new(
         &dir,
         Arc::new(MemoryKeySource(master)),
-        Arc::new(HashEmbedder),
+        build_embedder(&dir),
     )
     .map_err(|e| format!("{e:#}"))?;
     let name = name.trim();
@@ -1129,6 +1148,15 @@ fn JournalPane(store: ReadOnlySignal<Store>, active: Signal<String>) -> Element 
                     draft.set(String::new());
                     status.set(None);
                     committed += 1;
+                    // Embed-on-write: make the new entry searchable without a
+                    // manual re-embed. Fire-and-forget and OFF the composer's
+                    // path — the backfill only touches missing/stale items (so
+                    // it just embeds this one) and embeds off the writer thread.
+                    // A latched model no-ops cleanly; failure is non-fatal to
+                    // writing, so we don't surface it here.
+                    spawn(async move {
+                        let _ = store.backfill_embeddings().await;
+                    });
                 }
                 Err(e) => status.set(Some(format!("append failed: {e:#}"))),
             }
@@ -1655,38 +1683,58 @@ fn render_markdown(md: &str) -> String {
 
 // ── settings pane ────────────────────────────────────────────────────────────
 
-/// The Settings section: the owner display name (identity.owner), and the
-/// retrieval/embeddings config the NEXT PR consumes (saved-as-config scaffold;
-/// the live engine is unchanged this PR). See the EMBEDDER_* key block at the
-/// top of this file for the exact schema the retrieval PR reads.
+/// Progress of a "Re-embed everything" run. Streamed to the UI off-thread.
+#[derive(Clone, PartialEq)]
+enum ReembedState {
+    Idle,
+    /// A pass is running; `done`/`total` come from embedding_stats between the
+    /// backfill's time-boxed cycles.
+    Running {
+        done: i64,
+        total: i64,
+    },
+    /// Finished a full drain (no pending items left). `embedded` counts what
+    /// this run (re)computed across all cycles.
+    Done {
+        embedded: i64,
+    },
+    /// The engine degraded to the hash fallback mid-run (model unavailable):
+    /// nothing was persisted under the real model tag; search stays keyword-only
+    /// until the next launch. Honest, not a silent no-op.
+    Latched,
+    Failed(String),
+}
+
+/// The Settings section: the owner display name (identity.owner), a TRUTHFUL
+/// readout of the embedder actually running, the backend config (native ONNX
+/// with auto CPU/GPU, or optional manual Ollama), and a working "Re-embed
+/// everything" action. Device is automatic — there is no device dropdown.
 #[component]
 fn SettingsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
-    // Load every persisted value once, into editable signals.
+    // Load every persisted value once, into editable signals. Backend defaults
+    // to native (the engine's own default) so a fresh store reads as native.
     let mut owner = use_signal(String::new);
-    let mut backend = use_signal(|| CURRENT_BACKEND.to_string());
+    let mut backend = use_signal(|| Backend::Native.as_str().to_string());
     let mut model = use_signal(String::new);
-    let mut device = use_signal(|| "auto".to_string());
     let mut ollama_url = use_signal(|| DEFAULT_OLLAMA_URL.to_string());
     let mut rerank_on = use_signal(|| false);
     let mut rerank_model = use_signal(String::new);
     let mut saved = use_signal(|| false);
+    let mut reembed = use_signal(|| ReembedState::Idle);
+    // Bumped after a re-embed cycle to re-pull the embedded/total stat.
+    let mut stats_tick = use_signal(|| 0u32);
 
     let _load = use_resource(move || {
         let store = store();
         async move {
             owner.set(owner_name(&store).await);
             if let Ok(Some(v)) = store.config_get(EMBEDDER_BACKEND_KEY).await {
-                if !v.is_empty() {
-                    backend.set(v);
-                }
+                // Normalize legacy/scaffold values ("onnx-local", "hash") to the
+                // live domain so the dropdown reflects a real choice.
+                backend.set(Backend::parse(&v).as_str().to_string());
             }
             if let Ok(Some(v)) = store.config_get(EMBEDDER_MODEL_KEY).await {
                 model.set(v);
-            }
-            if let Ok(Some(v)) = store.config_get(EMBEDDER_DEVICE_KEY).await {
-                if !v.is_empty() {
-                    device.set(v);
-                }
             }
             if let Ok(Some(v)) = store.config_get(EMBEDDER_OLLAMA_URL_KEY).await {
                 if !v.is_empty() {
@@ -1702,20 +1750,34 @@ fn SettingsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
         }
     });
 
+    // The TRUTH about the running engine (backend/device/model/latched) — shown
+    // in the readout, never the pending pick.
+    let running = store().embedder_state();
+
     // Embedding corpus truth: total embedded vs embeddable (cheap; one stat).
+    // Re-pulled when `stats_tick` bumps so the readout tracks a re-embed.
     let stats = use_resource(move || {
         let store = store();
-        async move { store.embedding_stats().await.ok() }
+        async move {
+            let _ = stats_tick();
+            store.embedding_stats().await.ok()
+        }
     });
 
     let save = move || {
         let store = store();
         let mut refresh = refresh;
+        let data_dir = store.data_dir().to_path_buf();
+        let backend_parsed = Backend::parse(&backend());
+        let cfg = EmbedConfig {
+            backend: backend_parsed,
+            ollama_model: model().trim().to_string(),
+            ollama_url: ollama_url().trim().to_string(),
+        };
         let vals = [
             (IDENTITY_OWNER_KEY, owner().trim().to_string()),
-            (EMBEDDER_BACKEND_KEY, backend()),
+            (EMBEDDER_BACKEND_KEY, backend_parsed.as_str().to_string()),
             (EMBEDDER_MODEL_KEY, model().trim().to_string()),
-            (EMBEDDER_DEVICE_KEY, device()),
             (EMBEDDER_OLLAMA_URL_KEY, ollama_url().trim().to_string()),
             (
                 RERANKER_ENABLED_KEY,
@@ -1727,15 +1789,80 @@ fn SettingsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
             for (k, v) in vals {
                 let _ = store.config_set(k, &v).await;
             }
+            // Also write the plaintext sidecar boot() reads before the store
+            // opens — this is what makes the backend choice take effect (on the
+            // next launch). Best-effort: a failed sidecar write just means the
+            // durable config table still holds the choice for a later reconcile.
+            let _ = cfg.save(&data_dir);
             saved.set(true);
             // Owner may have changed — nudge the shell to re-read the roster/name.
             refresh += 1;
         });
     };
 
+    // Kick off a full re-embed: repeatedly call the time-boxed backfill (which
+    // already embeds OFF the writer's critical path via spawn_blocking) until
+    // no items are pending, streaming done/total between cycles. All async on
+    // the UI's runtime — each await yields, so the window never freezes.
+    let mut start_reembed = move || {
+        if matches!(reembed(), ReembedState::Running { .. }) {
+            return; // already running
+        }
+        let store = store();
+        reembed.set(ReembedState::Running { done: 0, total: 0 });
+        spawn(async move {
+            let mut embedded_total: i64 = 0;
+            loop {
+                // Progress snapshot before the next cycle.
+                if let Ok(s) = store.embedding_stats().await {
+                    let done = (s.embeddable - s.pending).max(0);
+                    reembed.set(ReembedState::Running {
+                        done,
+                        total: s.embeddable,
+                    });
+                    if s.pending == 0 {
+                        reembed.set(ReembedState::Done {
+                            embedded: embedded_total,
+                        });
+                        stats_tick += 1;
+                        break;
+                    }
+                }
+                match store.backfill_embeddings().await {
+                    Ok(n) => {
+                        embedded_total += n;
+                        stats_tick += 1;
+                        // The engine degraded to the hash fallback: the backfill
+                        // pauses (returns 0 and latches) rather than poison the
+                        // corpus. Say so instead of spinning forever.
+                        if store.embedder_state().latched {
+                            reembed.set(ReembedState::Latched);
+                            break;
+                        }
+                        // A cycle that did nothing AND left items pending with no
+                        // latch shouldn't happen, but guard against an infinite
+                        // loop: treat it as done.
+                        if n == 0 {
+                            reembed.set(ReembedState::Done {
+                                embedded: embedded_total,
+                            });
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        reembed.set(ReembedState::Failed(format!("{e:#}")));
+                        break;
+                    }
+                }
+            }
+        });
+    };
+
     let backend_val = backend();
-    let is_onnx = backend_val == "onnx-local";
     let is_ollama = backend_val == "ollama";
+    // Does the saved/pending backend differ from what's actually running? If so
+    // the readout says "restart to apply" — honesty over pretending it's live.
+    let pending_restart = saved() && running.backend != Backend::parse(&backend_val).as_str();
 
     rsx! {
         div {
@@ -1764,67 +1891,62 @@ fn SettingsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
                 style: settings_card_style(),
                 div { style: "font-weight: 700; font-size: 1.02rem;", "Retrieval & Embeddings" }
 
-                // honest current state
+                // TRUTHFUL running state — the actual engine, device, and count.
                 div {
                     id: "embedder-current-state",
                     style: "background: {BG}; border: 1px solid {EDGE}; border-radius: 8px; \
                             padding: 0.7rem 0.85rem; margin-top: 0.6rem; font-size: 0.85rem; \
                             line-height: 1.55; color: {DIM};",
                     div {
-                        "Current engine: "
-                        span { style: "color: {INK}; font-weight: 600;", "keyword search + hash vectors, running on CPU." }
+                        "Running now: "
+                        span { style: "color: {INK}; font-weight: 600;", "{running_engine_label(&running)}" }
                     }
-                    div {
-                        style: "margin-top: 0.3rem;",
-                        "Your imported entries are "
-                        span { style: "color: {INK}; font-weight: 600;", "not semantically embedded yet." }
+                    if let Some(why) = running_engine_why(&running) {
+                        div { style: "margin-top: 0.3rem; color: {FAINT};", "{why}" }
                     }
                     if let Some(Some(s)) = stats() {
                         div {
                             style: "margin-top: 0.4rem; color: {FAINT};",
-                            "Embedded: {s.total} of {s.embeddable} embeddable item(s)."
+                            "Embedded: {s.total} vector row(s) across {embedded_items(&s)} of {s.embeddable} item(s)"
+                            if s.pending > 0 { " · {s.pending} pending" }
                         }
                     }
                 }
 
-                // forward config — the contract the retrieval PR reads
+                // Re-embed everything — runs the backfill to completion off-thread.
+                div {
+                    style: "display: flex; align-items: center; gap: 0.8rem; margin-top: 0.8rem;",
+                    button {
+                        id: "settings-reembed",
+                        style: "background: {EDGE}; color: {INK}; border: 1px solid {FAINT}; \
+                                border-radius: 8px; padding: 0.5rem 1.1rem; font-weight: 600; \
+                                font-size: 0.88rem; cursor: pointer;",
+                        disabled: matches!(reembed(), ReembedState::Running { .. }),
+                        onclick: move |_| start_reembed(),
+                        "Re-embed everything"
+                    }
+                    {reembed_status(&reembed())}
+                }
+
                 {field_label("Embedding backend")}
                 select {
                     id: "settings-embedder-backend",
                     style: text_input_style(),
                     value: "{backend_val}",
                     onchange: move |e| { backend.set(e.value()); saved.set(false); },
-                    option { value: "hash", "Hash vectors (current — offline, CPU)" }
-                    option { value: "onnx-local", "Local ONNX model (on-device, GPU-capable)" }
-                    option { value: "ollama", "Ollama (local server)" }
-                }
-
-                if is_onnx || is_ollama {
-                    {field_label("Model")}
-                    input {
-                        id: "settings-embedder-model",
-                        style: text_input_style(),
-                        placeholder: if is_ollama { "e.g. nomic-embed-text" } else { "e.g. BAAI/bge-small-en-v1.5" },
-                        value: "{model}",
-                        oninput: move |e| { model.set(e.value()); saved.set(false); },
-                    }
-                }
-
-                if is_onnx {
-                    {field_label("Device")}
-                    select {
-                        id: "settings-embedder-device",
-                        style: text_input_style(),
-                        value: "{device}",
-                        onchange: move |e| { device.set(e.value()); saved.set(false); },
-                        option { value: "auto", "Auto (detect GPU, fall back to CPU)" }
-                        option { value: "cpu", "CPU" }
-                        option { value: "cuda", "NVIDIA GPU (CUDA)" }
-                        option { value: "rocm", "AMD GPU (ROCm)" }
-                    }
+                    option { value: "native", "On-device (ONNX BGE — auto GPU, CPU fallback)" }
+                    option { value: "ollama", "Ollama (local server — uses its own GPU)" }
                 }
 
                 if is_ollama {
+                    {field_label("Ollama model")}
+                    input {
+                        id: "settings-embedder-model",
+                        style: text_input_style(),
+                        placeholder: "e.g. nomic-embed-text",
+                        value: "{model}",
+                        oninput: move |e| { model.set(e.value()); saved.set(false); },
+                    }
                     {field_label("Ollama server URL")}
                     input {
                         id: "settings-embedder-ollama-url",
@@ -1832,6 +1954,15 @@ fn SettingsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
                         placeholder: "{DEFAULT_OLLAMA_URL}",
                         value: "{ollama_url}",
                         oninput: move |e| { ollama_url.set(e.value()); saved.set(false); },
+                    }
+                }
+
+                if pending_restart {
+                    div {
+                        id: "settings-restart-hint",
+                        style: "font-size: 0.82rem; color: {GOLD}; line-height: 1.5; margin-top: 0.6rem;",
+                        "Saved. Restart hive to switch the engine to your new backend — "
+                        "the readout above keeps showing what's actually running until then."
                     }
                 }
 
@@ -1859,12 +1990,10 @@ fn SettingsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
                         value: "{rerank_model}",
                         oninput: move |e| { rerank_model.set(e.value()); saved.set(false); },
                     }
-                }
-
-                div {
-                    style: "font-size: 0.8rem; color: {FAINT}; line-height: 1.55; margin-top: 0.9rem; \
-                            border-top: 1px solid {EDGE}; padding-top: 0.7rem;",
-                    "Saved now; the engine switches to your choice in the next update."
+                    div {
+                        style: "font-size: 0.78rem; color: {FAINT}; line-height: 1.5; margin-top: 0.4rem;",
+                        {reranker_note(&running)}
+                    }
                 }
             }
 
@@ -1887,6 +2016,117 @@ fn SettingsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
                 }
             }
         }
+    }
+}
+
+/// A friendly model name for the readout: "BGE-small" for the default BGE repo,
+/// the ollama tag for ollama, "hash vectors" for the fallback, else the raw id.
+fn friendly_model(state: &hive_core::store::EmbedderState) -> String {
+    let m = &state.model;
+    if state.backend == "hash" {
+        return "hash vectors".to_string();
+    }
+    if let Some(tag) = m.strip_prefix("ollama:") {
+        return tag.to_string();
+    }
+    let low = m.to_lowercase();
+    if low.contains("bge-small") {
+        "BGE-small".to_string()
+    } else if low.contains("bge-large") {
+        "BGE-large".to_string()
+    } else if low.contains("bge-base") {
+        "BGE-base".to_string()
+    } else {
+        // Strip an org prefix ("Xenova/…") for display.
+        m.rsplit('/').next().unwrap_or(m).to_string()
+    }
+}
+
+/// The truthful one-line running-engine label, e.g. "BGE-small on CPU",
+/// "Ollama: nomic-embed-text", or "keyword search (hash vectors)".
+fn running_engine_label(state: &hive_core::store::EmbedderState) -> String {
+    if state.latched {
+        return "keyword search only (model unavailable)".to_string();
+    }
+    match state.backend.as_str() {
+        "ollama" => format!("Ollama: {}", friendly_model(state)),
+        "hash" => "keyword search + hash vectors (CPU)".to_string(),
+        _ => format!("{} on {}", friendly_model(state), state.device),
+    }
+}
+
+/// The honest "why" line under the label when the running state might surprise
+/// the user (latched, or CPU where they might expect GPU in-sandbox).
+fn running_engine_why(state: &hive_core::store::EmbedderState) -> Option<String> {
+    if state.latched {
+        return Some(
+            "The configured model couldn't load, so search fell back to keywords. \
+             Restart to retry the model, or switch to Ollama."
+                .to_string(),
+        );
+    }
+    if state.backend == "native" && state.device == "CPU" {
+        return Some(
+            "Running on CPU. A native GPU isn't reachable from the sandbox; \
+             for GPU, enable Ollama below (it runs on your GPU)."
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Items whose current embedding is present and fresh (the readout's "of N
+/// items" numerator). `total` counts vector ROWS (chunks), not items, so the
+/// truthful item count is embeddable minus pending.
+fn embedded_items(s: &hive_shared::EmbeddingStats) -> i64 {
+    (s.embeddable - s.pending).max(0)
+}
+
+/// The reranker-note truth: whether the toggle actually does anything right now.
+fn reranker_note(state: &hive_core::store::EmbedderState) -> String {
+    if state.backend == "native" && !state.latched {
+        "Active when a reranker model is loaded on the native engine.".to_string()
+    } else {
+        "No effect with the current backend — reranking needs the native ONNX engine.".to_string()
+    }
+}
+
+/// The re-embed progress/done indicator beside the button.
+fn reembed_status(state: &ReembedState) -> Element {
+    match state {
+        ReembedState::Idle => rsx! {},
+        ReembedState::Running { done, total } => rsx! {
+            span {
+                id: "settings-reembed-progress",
+                style: "font-size: 0.85rem; color: {DIM};",
+                if *total > 0 {
+                    "Embedding… {done} / {total}"
+                } else {
+                    "Embedding…"
+                }
+            }
+        },
+        ReembedState::Done { embedded } => rsx! {
+            span {
+                id: "settings-reembed-done",
+                style: "font-size: 0.85rem; color: {GOLD}; font-weight: 600;",
+                "Done — {embedded} item(s) (re)embedded."
+            }
+        },
+        ReembedState::Latched => rsx! {
+            span {
+                id: "settings-reembed-latched",
+                style: "font-size: 0.85rem; color: #e07a5f;",
+                "Paused: the model is unavailable, so search stays on keywords."
+            }
+        },
+        ReembedState::Failed(err) => rsx! {
+            span {
+                id: "settings-reembed-error",
+                style: "font-size: 0.85rem; color: #e07a5f;",
+                "Re-embed failed: {err}"
+            }
+        },
     }
 }
 

@@ -45,6 +45,9 @@ ndarray = { version = "0.16", features = ["serde"] }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # 0.4+: huggingface.co serves relative redirect Locations that 0.3 can't follow.
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "default-tls"] }
+# The optional manual Ollama embedder posts to a LOCAL server; ureq is the same
+# blocking client hf-hub already links (2.x line to share that build), + json.
+ureq = { version = "2.12", features = ["json"] }
 
 # --- Feeds ---
 rss = "2.0"

@@ -21,6 +21,14 @@ finish-args:
   # null display then segfaults in libX11 (verified via coredumpctl).
   - --socket=wayland
   - --socket=x11
+  # --device=dri is for the WebKit GL surface (graphics), NOT GPU compute. The
+  # embedder's native ONNX engine runs on CPU inside the sandbox: ort-CUDA/ROCm
+  # need the CUDA/ROCm COMPUTE runtime, which the GNOME runtime doesn't ship and
+  # the org.freedesktop.Platform.GL.nvidia extension does NOT provide (it's GL,
+  # not CUDA). The engine detects this and reports "CPU" honestly — it never
+  # fakes GPU. The GPU route today is Ollama (Settings → Ollama backend): it
+  # runs OUTSIDE the sandbox on the host and uses the host GPU. A native in-
+  # sandbox GPU path is a host-side sidecar deferred to a follow-on.
   - --device=dri
   - --share=ipc
   # The master key lives in the OS keychain (kwallet/gnome-keyring): the
