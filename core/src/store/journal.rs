@@ -43,6 +43,11 @@ struct Emergence {
     phases: HashMap<(String, String), String>,   // (project id, lower name) -> id
     people: HashMap<String, Person>,             // slug -> person
     phase_next_pos: HashMap<String, i64>,        // project id -> next position
+    contacts: HashMap<String, (String, String)>, // contact slug -> (instance id, name)
+    /// Memoized contact `type_id` for this batch: `None` until the first
+    /// [contact:] token ensures the type. Its ensure-payloads (type + fields)
+    /// are pushed into `emerged` at most once, ahead of any instance.
+    contact_type_id: Option<String>,
 }
 
 impl Emergence {
@@ -57,6 +62,8 @@ impl Emergence {
             phases: HashMap::new(),
             people: HashMap::new(),
             phase_next_pos: HashMap::new(),
+            contacts: HashMap::new(),
+            contact_type_id: None,
         }
     }
 
@@ -580,10 +587,83 @@ fn ensure_person(core: &Core, em: &mut Emergence, name: &str, kind: ActorKind) -
     Ok(p)
 }
 
-/// Parse [person:], [topic:], [project:], [phase:], [task:] tokens from an
-/// entry body. Find-or-create each entity, add a links record, and fan to
-/// inboxes where relevant. Context tracking: if the entry mentions a
-/// [project:] and/or [phase:], any [task:] that emerges is related to it.
+/// Batch-aware find-or-create of a CONTACT CARD (a custom entity of the
+/// built-in `contact` type). Mirrors `ensure_person`, but the entity lives in
+/// the `entities` table under the contact type: so it first ensures the
+/// contact type exists (pushing its type + field entity.create payloads into
+/// `emerged` at most once per batch, ahead of any instance — the emerged
+/// array applies in order), then reuses a pending/indexed instance by slug or
+/// mints a fresh one. Returns (instance id, display name). No fold change:
+/// every payload is an existing entity.create shape (custom-slug routing).
+fn ensure_contact(
+    core: &Core,
+    entry: &JournalEntry,
+    em: &mut Emergence,
+    name: &str,
+) -> Result<(String, String)> {
+    let slug = slugify(name);
+    if let Some(hit) = em.contacts.get(&slug) {
+        return Ok(hit.clone());
+    }
+    // Ensure the contact type (once per batch). When it already exists in the
+    // index, `contact_type_ensure_payloads` returns no payloads and its id.
+    let type_id = match &em.contact_type_id {
+        Some(id) => id.clone(),
+        None => {
+            let (type_id, payloads) = super::contacts::contact_type_ensure_payloads(core)?;
+            for p in payloads {
+                em.emerged.push(p);
+            }
+            em.contact_type_id = Some(type_id.clone());
+            type_id
+        }
+    };
+    // Reuse an existing card whose title slugifies to the same handle. Scan in
+    // Rust (household scale) so slugify parity holds exactly (the entity title
+    // is free text; there is no stored slug column on instances).
+    let existing: Option<(String, String)> = {
+        let mut stmt = core
+            .conn()
+            .prepare("SELECT id, title FROM entities WHERE type_id = ?1")?;
+        let rows = stmt.query_map(rusqlite::params![type_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let mut found = None;
+        for row in rows {
+            let (id, title) = row?;
+            if slugify(&title) == slug {
+                found = Some((id, title));
+                break;
+            }
+        }
+        found
+    };
+    if let Some(hit) = existing {
+        em.contacts.insert(slug, hit.clone());
+        return Ok(hit);
+    }
+    // Mint a new card. The emerged payload is exactly a custom-instance
+    // entity.create (entities columns): empty `fields`, title = display name,
+    // origin_entry_id stamped to the entry that named them.
+    let id = new_id("ent");
+    let ts = now_iso();
+    em.emerged.push(
+        json!({"kind": super::contacts::CONTACT_TYPE_SLUG, "id": id, "fields": {
+            "type_id": type_id, "title": name,
+            "fields": "{}",
+            "user_scope": entry.user_scope, "origin_entry_id": entry.id,
+            "created_by": entry.author, "created_at": ts, "updated_at": ts,
+        }}),
+    );
+    let hit = (id, name.to_string());
+    em.contacts.insert(slug, hit.clone());
+    Ok(hit)
+}
+
+/// Parse [person:], [topic:], [project:], [phase:], [task:], [contact:]
+/// tokens from an entry body. Find-or-create each entity, add a links record,
+/// and fan to inboxes where relevant. Context tracking: if the entry mentions
+/// a [project:] and/or [phase:], any [task:] that emerges is related to it.
 fn parse_bracket_tokens_into(
     core: &Core,
     entry: &JournalEntry,
@@ -646,6 +726,22 @@ fn parse_bracket_tokens_into(
                         &entry.body,
                     );
                 }
+            }
+            "contact" => {
+                // Find-or-create the contact CARD and link the entry to it, so
+                // the card's "Related in your journal" surfaces this entry. The
+                // target_kind is the custom contact slug (links carry kinds as
+                // plain strings). No inbox fan: a contact is a record of a
+                // person, not necessarily an actor who reads inboxes.
+                let (contact_id, _) = ensure_contact(core, entry, em, &t.name)?;
+                em.extra.push(super::links::link_draft(
+                    EntityKind::Journal.as_str(),
+                    &entry.id,
+                    super::contacts::CONTACT_TYPE_SLUG,
+                    &contact_id,
+                    "mentions",
+                    &now_iso(),
+                ));
             }
             "topic" => {
                 let (topic_id, _) = ensure_topic(core, em, &t.name)?;
@@ -890,6 +986,11 @@ pub(crate) fn refs_for_conn(core: &Core, body: &str) -> Result<Vec<JournalRef>> 
                     };
                     (id.clone(), id, name)
                 }),
+            // contact — a custom-slug card, not a closed EntityKind. Its
+            // backlinks surface in the detail view via links_for_entity, so
+            // read-time ref resolution is intentionally a no-op here (skip the
+            // task-title fallthrough below, which would mis-resolve).
+            "contact" => None,
             // task — find the most recent task with matching title
             _ => conn
                 .query_row(
@@ -904,8 +1005,9 @@ pub(crate) fn refs_for_conn(core: &Core, body: &str) -> Result<Vec<JournalRef>> 
                 .optional()?,
         };
         if let Some((id, slug, name)) = resolved {
-            // TOKEN_KINDS is a subset of EntityKind strings, so this never
-            // skips today; parse keeps it fail-closed if they ever drift.
+            // Most TOKEN_KINDS map onto a closed EntityKind; `contact` does
+            // not (it is a custom slug, resolved to None above and never
+            // reaching here). parse keeps this fail-closed if they ever drift.
             if let Some(kind) = EntityKind::parse(t.kind) {
                 refs.push(JournalRef {
                     kind,
@@ -978,10 +1080,13 @@ struct BracketToken {
     end_byte: usize,
 }
 
-const TOKEN_KINDS: &[&str] = &["person", "topic", "project", "phase", "task", "mail"];
+const TOKEN_KINDS: &[&str] = &[
+    "person", "contact", "topic", "project", "phase", "task", "mail",
+];
 
-/// Node TOKEN_RE, plus the Rust-side `mail` addition (id-addressed):
-/// /\[(person|topic|project|phase|task|mail):([^\]]+)\]/g
+/// Node TOKEN_RE, plus the Rust-side `mail` (id-addressed) and `contact`
+/// (contact-card, Phase 3) additions:
+/// /\[(person|contact|topic|project|phase|task|mail):([^\]]+)\]/g
 fn scan_tokens(body: &str) -> Vec<BracketToken> {
     let bytes = body.as_bytes();
     let mut out = Vec::new();

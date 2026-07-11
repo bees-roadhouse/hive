@@ -741,3 +741,146 @@ async fn custom_entity_types_full_flow() {
     let hits = store.search("sourdough", 25).await.unwrap();
     assert!(hits.iter().all(|h| h.id != sourdough.id));
 }
+
+/// The built-in contact type seeds exactly once: a second ensure returns the
+/// same type id and never duplicates the standard fields. This is the D23-style
+/// idempotent preset the Contacts pane relies on running on every mount.
+#[tokio::test]
+async fn contact_type_seed_is_idempotent() {
+    let store = test_store().await;
+    let first = store.ensure_contact_type().await.unwrap();
+    assert_eq!(first.slug, "contact");
+    // Standard fields are present, in order, all optional.
+    let slugs: Vec<&str> = first.fields.iter().map(|f| f.slug.as_str()).collect();
+    assert_eq!(
+        slugs,
+        vec![
+            "birthday",
+            "birth_name",
+            "nickname",
+            "additional_names",
+            "email",
+            "phone",
+            "address",
+            "organization",
+            "title",
+            "notes",
+        ]
+    );
+    assert!(first.fields.iter().all(|f| !f.required));
+    let birthday = first.fields.iter().find(|f| f.slug == "birthday").unwrap();
+    assert_eq!(birthday.field_type, hive_shared::FieldType::Date);
+
+    // Second call: same id, same field count — no duplication.
+    let second = store.ensure_contact_type().await.unwrap();
+    assert_eq!(second.id, first.id, "same type row");
+    assert_eq!(
+        second.fields.len(),
+        first.fields.len(),
+        "no duplicate fields"
+    );
+    // And the registry itself holds a single contact type.
+    let types = store.entity_types_list(false).await.unwrap();
+    assert_eq!(
+        types.iter().filter(|t| t.slug == "contact").count(),
+        1,
+        "exactly one contact type"
+    );
+}
+
+/// A `[contact: Name]` token in a journal entry emerges a contact CARD (a
+/// custom entity of the contact type), links the entry to it, and the card's
+/// backlink (links_for_entity) resolves to that entry — the "related journal
+/// entries emerge" contract. Two tokens for the same name in one entry emerge
+/// ONE card; a later entry naming her accrues a second backlink.
+#[tokio::test]
+async fn contact_token_emerges_card_and_backlink_resolves() {
+    let store = test_store().await;
+
+    // Writing [contact:] TWICE in one entry must still emerge a single card.
+    let first = store
+        .journal_append(
+            journal_input("Met [contact: Jane Doe] today; [contact: Jane Doe] is great."),
+            Some("nate"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Exactly one contact card exists, titled by the token name.
+    let cards = store
+        .custom_entities_list(&EntityFilter {
+            type_slug: "contact".into(),
+            limit: 100,
+            offset: 0,
+            sort: None,
+            desc: false,
+            fields: vec![],
+        })
+        .await
+        .unwrap_or_else(|_| panic!("list failed"));
+    assert_eq!(cards.len(), 1, "one card despite two tokens: {cards:?}");
+    let jane = &cards[0];
+    assert_eq!(jane.title, "Jane Doe");
+    assert_eq!(jane.type_slug, "contact");
+    // It carries its emergence origin.
+    assert_eq!(
+        jane.origin_entry_id.as_deref(),
+        Some(first.entry.id.as_str())
+    );
+
+    // The backlink resolves: an edge ties the entry to the card, and
+    // links_for_entity(card) surfaces the entry.
+    let links = store.links_for_entity(&jane.id).await.unwrap();
+    assert!(
+        links.iter().any(|l| {
+            l.rel == "mentions"
+                && l.source_kind == "journal"
+                && l.source_id == first.entry.id
+                && l.target_kind == "contact"
+                && l.target_id == jane.id
+        }),
+        "journal→contact mention edge missing: {links:?}"
+    );
+
+    // A second entry naming her REUSES the same card and adds a backlink.
+    let second = store
+        .journal_append(
+            journal_input("Coffee with [contact: Jane Doe] again."),
+            Some("nate"),
+            None,
+        )
+        .await
+        .unwrap();
+    let cards2 = store
+        .custom_entities_list(&EntityFilter {
+            type_slug: "contact".into(),
+            limit: 100,
+            offset: 0,
+            sort: None,
+            desc: false,
+            fields: vec![],
+        })
+        .await
+        .unwrap_or_else(|_| panic!("list failed"));
+    assert_eq!(cards2.len(), 1, "still one card after the second mention");
+
+    // Both entries resolve as backlinks of the card (the app renders these).
+    let entry_ids: std::collections::HashSet<String> = store
+        .links_for_entity(&jane.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|l| l.source_kind == "journal")
+        .map(|l| l.source_id)
+        .collect();
+    assert!(entry_ids.contains(&first.entry.id));
+    assert!(entry_ids.contains(&second.entry.id));
+
+    // The card is a real, keyword-searchable entity under its slug kind.
+    let hits = store.search("Jane", 25).await.unwrap();
+    assert!(
+        hits.iter().any(|h| h.kind == "contact" && h.id == jane.id),
+        "fts: {hits:?}"
+    );
+}

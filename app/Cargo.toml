@@ -36,3 +36,7 @@ tokio = { workspace = true }
 # (present transitively), so this pins the versions we render through.
 comrak = { version = "0.39", default-features = false }
 ammonia = "4"
+# Contact/task detail views stage typed field values as JSON (the same
+# serde_json::Map<String, Value> the custom-entity store speaks). Already in
+# the lock transitively (hive-core/hive-shared); this pins it as a direct dep.
+serde_json = { workspace = true }

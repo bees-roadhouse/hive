@@ -17,10 +17,17 @@ use dioxus::desktop::tao::event::{Event, WindowEvent};
 use dioxus::desktop::{use_wry_event_handler, Config, WindowBuilder};
 use dioxus::prelude::*;
 use hive_core::keys::{KeySource, KeychainKeySource, MemoryKeySource};
+use hive_core::store::custom_entities::EntityFilter;
+use hive_core::store::tasks::TaskFilter;
 use hive_core::store::Store;
 use hive_embed::{Backend, EmbedConfig, Embedder, RuntimeEmbedder};
 use hive_import::{Plan, RunOutcome, Summary};
-use hive_shared::{ActorKind, JournalEntryView, NewJournalEntry, Person, SearchHit};
+use hive_shared::{
+    ActorKind, CustomEntity, CustomEntityPatch, EntityField, EntityTypePatch, FieldType,
+    JournalEntryView, Link, NewCustomEntity, NewEntityField, NewJournalEntry, Person, Priority,
+    SearchHit, Task, TaskPatch, TaskStatus, PRIORITIES, TASK_STATUSES,
+};
+use serde_json::Value;
 
 /// Config key naming the human behind the hive — the owner display name. The
 /// onboarding identity step writes it; Settings edits it; it's the fallback
@@ -70,6 +77,7 @@ const DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
     Journal,
+    Tasks,
     Mail,
     Contacts,
     Calendar,
@@ -79,8 +87,9 @@ enum Section {
 
 impl Section {
     /// Sidebar order + the (icon, label) each row renders.
-    const ALL: [Section; 6] = [
+    const ALL: [Section; 7] = [
         Section::Journal,
+        Section::Tasks,
         Section::Mail,
         Section::Contacts,
         Section::Calendar,
@@ -91,6 +100,10 @@ impl Section {
     fn icon(self) -> &'static str {
         match self {
             Section::Journal => "✍",
+            // Tasks: a ballot-box-with-check glyph — a single symbol in the
+            // same block as its siblings (NOT a word; the Contacts-icon-was-
+            // the-literal-word bug is exactly what this avoids).
+            Section::Tasks => "☑",
             Section::Mail => "✉",
             Section::Contacts => "☺",
             Section::Calendar => "▦",
@@ -102,6 +115,7 @@ impl Section {
     fn label(self) -> &'static str {
         match self {
             Section::Journal => "Journal",
+            Section::Tasks => "Tasks",
             Section::Mail => "Mail",
             Section::Contacts => "Contacts",
             Section::Calendar => "Calendar",
@@ -114,6 +128,7 @@ impl Section {
     fn nav_id(self) -> &'static str {
         match self {
             Section::Journal => "nav-journal",
+            Section::Tasks => "nav-tasks",
             Section::Mail => "nav-mail",
             Section::Contacts => "nav-contacts",
             Section::Calendar => "nav-calendar",
@@ -121,6 +136,18 @@ impl Section {
             Section::Settings => "nav-settings",
         }
     }
+}
+
+/// What the detail pane is showing, when anything. A root signal in the Shell
+/// holds `Option<Selected>`; while it is `Some`, the main pane renders the
+/// reusable `EntityDetail` over the section pane (no relaunch, no route
+/// change). Both variants carry just an id — the detail view loads the rest.
+#[derive(Clone, PartialEq)]
+enum Selected {
+    /// A contact card: a custom entity of the `contact` type.
+    Contact(String),
+    /// A task row.
+    Task(String),
 }
 
 /// What main() hands the UI: a live store, a fresh data dir awaiting
@@ -881,6 +908,11 @@ fn Shell(store: ReadOnlySignal<Store>) -> Element {
     // create/switch, without a relaunch.
     let active = use_signal(String::new);
     let refresh = use_signal(|| 0u32);
+    // `selected` opens the reusable detail view IN the main pane over the
+    // current section (no relaunch, no route). Contacts/Tasks set it to a
+    // card/task; the detail's Back button clears it. Kept at the Shell root so
+    // it survives section switches and the section pane stays mounted behind.
+    let selected = use_signal(|| Option::<Selected>::None);
 
     // Resolve the active identity once: identity.active if set, else the owner
     // (identity.owner, itself defaulting to $USER). Writes it back into the
@@ -903,36 +935,38 @@ fn Shell(store: ReadOnlySignal<Store>) -> Element {
             // Scoped styling for the Markdown-rendered journal bodies.
             style { "{MD_CSS}" }
 
-            Sidebar { store, section, active, refresh }
+            Sidebar { store, section, active, refresh, selected }
 
-            // Main pane — scrolls independently of the sidebar.
+            // Main pane — scrolls independently of the sidebar. When a card or
+            // task is selected, the reusable detail view takes over here; the
+            // section pane renders otherwise.
             div {
                 id: "main-pane",
                 style: "flex: 1; min-width: 0; height: 100%; overflow-y: auto;",
-                match section() {
-                    Section::Journal => rsx! { JournalPane { store, active } },
-                    Section::Identities => rsx! {
-                        IdentitiesPane { store, section, active, refresh }
-                    },
-                    Section::Settings => rsx! { SettingsPane { store, refresh } },
-                    Section::Mail => placeholder_pane(
-                        Section::Mail,
-                        "Connect your mail server and give each identity its own mailbox — \
-                         send and receive as any of your identities, with every message \
-                         woven into the same searchable memory as your journal.",
-                    ),
-                    Section::Contacts => placeholder_pane(
-                        Section::Contacts,
-                        "A CardDAV client: your address book synced from the servers you \
-                         already use, with people linked to the journal entries, tasks, and \
-                         mail they appear in.",
-                    ),
-                    Section::Calendar => placeholder_pane(
-                        Section::Calendar,
-                        "A CalDAV client: your calendars synced from the servers you already \
-                         use, events sitting alongside the journal so your week and your \
-                         writing share one timeline.",
-                    ),
+                if let Some(sel) = selected() {
+                    EntityDetail { store, selected, refresh, target: sel }
+                } else {
+                    match section() {
+                        Section::Journal => rsx! { JournalPane { store, active } },
+                        Section::Tasks => rsx! { TasksPane { store, selected } },
+                        Section::Contacts => rsx! { ContactsPane { store, selected, refresh } },
+                        Section::Identities => rsx! {
+                            IdentitiesPane { store, section, active, refresh }
+                        },
+                        Section::Settings => rsx! { SettingsPane { store, refresh } },
+                        Section::Mail => placeholder_pane(
+                            Section::Mail,
+                            "Connect your mail server and give each identity its own mailbox — \
+                             send and receive as any of your identities, with every message \
+                             woven into the same searchable memory as your journal.",
+                        ),
+                        Section::Calendar => placeholder_pane(
+                            Section::Calendar,
+                            "A CalDAV client: your calendars synced from the servers you already \
+                             use, events sitting alongside the journal so your week and your \
+                             writing share one timeline.",
+                        ),
+                    }
                 }
             }
         }
@@ -950,6 +984,7 @@ fn Sidebar(
     section: Signal<Section>,
     active: Signal<String>,
     refresh: Signal<u32>,
+    selected: Signal<Option<Selected>>,
 ) -> Element {
     let current = section();
     let active_name = active();
@@ -995,7 +1030,7 @@ fn Sidebar(
             div {
                 style: "flex: 1; padding: 0.2rem 0.5rem;",
                 for s in Section::ALL {
-                    {sidebar_row(s, s == current, section)}
+                    {sidebar_row(s, s == current, section, selected)}
                 }
             }
 
@@ -1006,7 +1041,10 @@ fn Sidebar(
                         margin: 0.5rem; padding: 0.55rem 0.65rem; border-radius: 10px; \
                         background: {BG}; border: 1px solid {EDGE}; cursor: pointer; \
                         color: {INK}; font: inherit;",
-                onclick: move |_| section.set(Section::Identities),
+                onclick: move |_| {
+                    selected.set(None);
+                    section.set(Section::Identities);
+                },
                 span {
                     style: "display: inline-flex; align-items: center; justify-content: center; \
                             width: 1.9rem; height: 1.9rem; border-radius: 50%; background: {EDGE}; \
@@ -1033,8 +1071,14 @@ fn Sidebar(
     }
 }
 
-/// One sidebar navigation row.
-fn sidebar_row(s: Section, active: bool, mut section: Signal<Section>) -> Element {
+/// One sidebar navigation row. Selecting a section also clears any open
+/// detail view, so the section's own pane shows.
+fn sidebar_row(
+    s: Section,
+    active: bool,
+    mut section: Signal<Section>,
+    mut selected: Signal<Option<Selected>>,
+) -> Element {
     let (fg, bg, weight) = if active {
         (INK, EDGE, "700")
     } else {
@@ -1047,7 +1091,10 @@ fn sidebar_row(s: Section, active: bool, mut section: Signal<Section>) -> Elemen
                     padding: 0.5rem 0.6rem; margin-bottom: 0.15rem; border: none; border-radius: 8px; \
                     background: {bg}; color: {fg}; font: inherit; font-size: 0.92rem; \
                     font-weight: {weight}; cursor: pointer;",
-            onclick: move |_| section.set(s),
+            onclick: move |_| {
+                selected.set(None);
+                section.set(s);
+            },
             span { style: "width: 1.2rem; text-align: center; color: {GOLD};", "{s.icon()}" }
             span { "{s.label()}" }
         }
@@ -1681,6 +1728,1102 @@ fn render_markdown(md: &str) -> String {
         .to_string()
 }
 
+// ── contacts + tasks + the reusable entity-detail view (Phase 3, slice 1) ─────
+//
+// A contact card is the canonical rich person record: a custom entity of the
+// built-in `contact` type (core seeds it via ensure_contact_type). The Tasks
+// pane groups the task table by status. Both open the SAME EntityDetail view
+// (typed fields + "Related in your journal" backlinks), so the structure is
+// built once. slice 2: identities link to a contact card via a Ref field.
+
+/// The `contact` type slug, mirrored from hive_core::store::contacts. The
+/// Contacts pane filters instances by it and the detail view saves against it.
+const CONTACT_TYPE_SLUG: &str = "contact";
+
+/// Years between a `YYYY-MM-DD` birthday and a `YYYY-MM-DD` "today", or None if
+/// the birthday isn't a plain date (an ISO timestamp, empty, or malformed).
+/// Pure and total: integer calendar math, no chrono, so it unit-tests without
+/// a clock. The birthday hasn't-occurred-yet-this-year case subtracts one.
+fn age_years(birthday: &str, today: &str) -> Option<i64> {
+    let ymd = |s: &str| -> Option<(i64, i64, i64)> {
+        let b = s.as_bytes();
+        if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+            return None;
+        }
+        let n = |a: usize, z: usize| s.get(a..z)?.parse::<i64>().ok();
+        Some((n(0, 4)?, n(5, 7)?, n(8, 10)?))
+    };
+    let (by, bm, bd) = ymd(birthday)?;
+    let (ty, tm, td) = ymd(today)?;
+    let mut age = ty - by;
+    if (tm, td) < (bm, bd) {
+        age -= 1; // birthday hasn't come round yet this year
+    }
+    if age < 0 {
+        None // a future birthday has no age
+    } else {
+        Some(age)
+    }
+}
+
+/// Today as `YYYY-MM-DD` (UTC), from the store's ISO clock — the age fn's
+/// second argument at the call site.
+fn today_ymd() -> String {
+    hive_core::store::now_iso()
+        .get(0..10)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A JSON field value as the string an `<input>`/`<textarea>` shows: strings
+/// verbatim, numbers/bools stringified, everything else empty.
+fn value_str(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::Bool(b)) => b.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// The contact card's display name (its entity title), with a fallback so a
+/// blank card is still targetable.
+fn contact_display(e: &CustomEntity) -> String {
+    if e.title.trim().is_empty() {
+        "(unnamed contact)".to_string()
+    } else {
+        e.title.clone()
+    }
+}
+
+/// The one-line hint under a contact row: org / title / nickname if present.
+fn contact_hint(e: &CustomEntity) -> Option<String> {
+    for key in ["organization", "title", "nickname"] {
+        let v = value_str(e.fields.get(key));
+        if !v.trim().is_empty() {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// The Contacts section: the card list + a create field. Selecting a row (or
+/// creating a card) opens the reusable detail view. The `contact` type is
+/// seeded idempotently on mount (ensure_contact_type), so the very first use
+/// works with no setup.
+#[component]
+fn ContactsPane(
+    store: ReadOnlySignal<Store>,
+    selected: Signal<Option<Selected>>,
+    refresh: Signal<u32>,
+) -> Element {
+    let mut new_name = use_signal(String::new);
+    let mut err = use_signal(|| Option::<String>::None);
+
+    // Seed the type, then list its instances. `refresh` re-pulls after a
+    // create (here or via journal [contact:] emergence). ensure_contact_type
+    // is idempotent, so running it every load is cheap and self-healing.
+    let contacts = use_resource(move || {
+        let store = store();
+        async move {
+            let _ = refresh();
+            store
+                .ensure_contact_type()
+                .await
+                .map_err(|e| format!("{e:#}"))?;
+            store
+                .custom_entities_list(&EntityFilter {
+                    type_slug: CONTACT_TYPE_SLUG.to_string(),
+                    limit: 500,
+                    offset: 0,
+                    sort: Some("title".to_string()),
+                    desc: false,
+                    fields: Vec::new(),
+                })
+                .await
+                .map_err(entity_err)
+        }
+    });
+
+    let create = move || {
+        let name = new_name().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let store = store();
+        let mut refresh = refresh;
+        spawn(async move {
+            // Ensure the type first (a fresh store may not have it yet), then
+            // create the card and open it.
+            if let Err(e) = store.ensure_contact_type().await {
+                err.set(Some(format!("{e:#}")));
+                return;
+            }
+            match store
+                .custom_entities_create(
+                    NewCustomEntity {
+                        type_slug: CONTACT_TYPE_SLUG.to_string(),
+                        title: name,
+                        fields: serde_json::Map::new(),
+                        scope: None,
+                    },
+                    "system",
+                    None,
+                )
+                .await
+            {
+                Ok(e) => {
+                    new_name.set(String::new());
+                    err.set(None);
+                    refresh += 1;
+                    selected.set(Some(Selected::Contact(e.id)));
+                }
+                Err(e) => err.set(Some(entity_err(e))),
+            }
+        });
+    };
+
+    rsx! {
+        div {
+            id: "contacts-pane",
+            style: "max-width: 760px; margin: 0 auto; padding: 1.6rem 1.2rem 3rem;",
+            {pane_header("Contacts", "The people you know. Each contact is a card — standard \
+                                     details plus any fields you add — and the journal entries \
+                                     that mention them gather on the card automatically.")}
+
+            // create a contact
+            div {
+                style: "background: {PANEL}; border: 1px solid {EDGE}; border-radius: 12px; \
+                        padding: 1rem 1.1rem; margin: 1rem 0 1.3rem;",
+                div { style: "font-weight: 700; font-size: 1rem;", "New contact" }
+                div {
+                    style: "display: flex; gap: 0.6rem; margin-top: 0.8rem;",
+                    input {
+                        id: "contact-new-name",
+                        style: "flex: 1; box-sizing: border-box; background: {BG}; color: {INK}; \
+                                border: 1px solid {EDGE}; border-radius: 8px; padding: 0.6rem 0.75rem; \
+                                font: inherit; font-size: 0.92rem; outline: none;",
+                        placeholder: "Full name, e.g. Jane Doe",
+                        value: "{new_name}",
+                        oninput: move |e| new_name.set(e.value()),
+                        onkeydown: move |e| {
+                            if e.key() == Key::Enter {
+                                create();
+                            }
+                        },
+                    }
+                    button {
+                        id: "contact-create",
+                        style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                                padding: 0.6rem 1.3rem; font-weight: 700; font-size: 0.9rem; cursor: pointer;",
+                        onclick: move |_| create(),
+                        "Create"
+                    }
+                }
+                if let Some(e) = err() {
+                    div {
+                        style: "color: #e07a5f; font-size: 0.85rem; margin-top: 0.6rem;",
+                        "{e}"
+                    }
+                }
+            }
+
+            // the card list
+            match contacts() {
+                None => muted("loading contacts…"),
+                Some(Err(e)) => muted(&format!("contacts unavailable: {e}")),
+                Some(Ok(list)) if list.is_empty() => muted(
+                    "No contacts yet. Add the first one above — or write [contact: a name] in \
+                     a journal entry and a card appears here, already holding that entry.",
+                ),
+                Some(Ok(list)) => rsx! {
+                    div {
+                        id: "contact-list",
+                        for c in list.iter() {
+                            {contact_row(c, selected)}
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// One contact row: name + optional hint, opening the detail view. Plain fn:
+/// CustomEntity lacks the PartialEq component props need.
+fn contact_row(c: &CustomEntity, mut selected: Signal<Option<Selected>>) -> Element {
+    let id = c.id.clone();
+    let hint = contact_hint(c);
+    rsx! {
+        button {
+            id: "contact-row-{c.id}",
+            style: "display: flex; align-items: center; gap: 0.7rem; width: 100%; text-align: left; \
+                    background: {PANEL}; border: 1px solid {EDGE}; border-radius: 10px; \
+                    padding: 0.7rem 0.9rem; margin-bottom: 0.6rem; color: {INK}; font: inherit; \
+                    cursor: pointer;",
+            onclick: move |_| selected.set(Some(Selected::Contact(id.clone()))),
+            span {
+                style: "display: inline-flex; align-items: center; justify-content: center; \
+                        width: 2.1rem; height: 2.1rem; border-radius: 50%; background: {EDGE}; \
+                        color: {GOLD}; font-size: 1rem; flex-shrink: 0;",
+                "☺"
+            }
+            div {
+                style: "flex: 1; min-width: 0;",
+                div { style: "font-weight: 700; font-size: 0.98rem;", "{contact_display(c)}" }
+                if let Some(h) = hint {
+                    div {
+                        style: "font-size: 0.78rem; color: {FAINT}; margin-top: 0.15rem; \
+                                overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                        "{h}"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A friendly one-liner for an entity write error (the detail/create paths
+/// surface it verbatim).
+fn entity_err(e: hive_core::store::custom_entities::EntityWriteError) -> String {
+    use hive_core::store::custom_entities::EntityWriteError as E;
+    match e {
+        E::Issues(issues) => issues
+            .iter()
+            .map(|i| i.message.clone())
+            .collect::<Vec<_>>()
+            .join("; "),
+        E::UnknownType => "that type no longer exists".to_string(),
+        E::ArchivedType => "that type is archived".to_string(),
+        E::Other(err) => format!("{err:#}"),
+    }
+}
+
+// ── tasks pane ────────────────────────────────────────────────────────────────
+
+/// The four status columns, in board order.
+const STATUS_COLUMNS: [TaskStatus; 4] = [
+    TaskStatus::Todo,
+    TaskStatus::Doing,
+    TaskStatus::Blocked,
+    TaskStatus::Done,
+];
+
+/// Group tasks into the four status buckets, preserving each bucket's incoming
+/// order (tasks_list already sorts priority-then-recency). Pure, so the
+/// grouping is unit-tested without a store.
+fn group_by_status(tasks: Vec<Task>) -> Vec<(TaskStatus, Vec<Task>)> {
+    let mut out: Vec<(TaskStatus, Vec<Task>)> =
+        STATUS_COLUMNS.iter().map(|s| (*s, Vec::new())).collect();
+    for t in tasks {
+        if let Some(slot) = out.iter_mut().find(|(s, _)| *s == t.status) {
+            slot.1.push(t);
+        }
+    }
+    out
+}
+
+/// The Tasks section: the task table grouped into status columns. Each row
+/// opens the reusable detail view; an inline status control changes status in
+/// place. Tasks emerge from journal [task:] tokens and anchors (there is no
+/// manual create here — that stays the journal's job).
+#[component]
+fn TasksPane(store: ReadOnlySignal<Store>, selected: Signal<Option<Selected>>) -> Element {
+    // Re-list whenever a detail edit bumps the shared tick (status changes from
+    // a row, or a save in the detail view). `selected` going back to None after
+    // an edit also re-runs this via the tick.
+    let tick = use_signal(|| 0u32);
+    let tasks = use_resource(move || {
+        let store = store();
+        async move {
+            let _ = tick();
+            store
+                .tasks_list(TaskFilter::default())
+                .await
+                .map_err(|e| format!("{e:#}"))
+        }
+    });
+
+    rsx! {
+        div {
+            id: "tasks-pane",
+            style: "max-width: 900px; margin: 0 auto; padding: 1.6rem 1.2rem 3rem;",
+            {pane_header("Tasks", "Everything that emerged as a task from your journal — write \
+                                  [task: …] or anchor a line, and it lands here, grouped by \
+                                  where it stands.")}
+            div { style: "height: 1rem;" }
+            match tasks() {
+                None => muted("loading tasks…"),
+                Some(Err(e)) => muted(&format!("tasks unavailable: {e}")),
+                Some(Ok(list)) if list.is_empty() => muted(
+                    "No tasks yet. In the journal, wrap an intention in [task: …] or anchor a \
+                     sentence, and it shows up here to track.",
+                ),
+                Some(Ok(list)) => rsx! {
+                    div {
+                        style: "display: flex; gap: 0.8rem; align-items: flex-start; flex-wrap: wrap;",
+                        for (status, items) in group_by_status(list) {
+                            {task_column(status, items, store, selected, tick)}
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// One status column with its task rows. Plain fn: Task lacks PartialEq.
+fn task_column(
+    status: TaskStatus,
+    items: Vec<Task>,
+    store: ReadOnlySignal<Store>,
+    selected: Signal<Option<Selected>>,
+    tick: Signal<u32>,
+) -> Element {
+    rsx! {
+        div {
+            style: "flex: 1; min-width: 190px; background: {PANEL}; border: 1px solid {EDGE}; \
+                    border-radius: 12px; padding: 0.7rem 0.7rem 0.9rem;",
+            div {
+                style: "display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.6rem; \
+                        font-size: 0.72rem; font-weight: 700; letter-spacing: 0.07em; \
+                        text-transform: uppercase; color: {DIM};",
+                span { style: "color: {GOLD};", "{status_label(status)}" }
+                span { style: "color: {FAINT};", "{items.len()}" }
+            }
+            if items.is_empty() {
+                div {
+                    style: "color: {FAINT}; font-size: 0.8rem; padding: 0.4rem 0.2rem;",
+                    "—"
+                }
+            }
+            for t in items.iter() {
+                {task_row(t, store, selected, tick)}
+            }
+        }
+    }
+}
+
+fn status_label(s: TaskStatus) -> &'static str {
+    match s {
+        TaskStatus::Todo => "To do",
+        TaskStatus::Doing => "Doing",
+        TaskStatus::Blocked => "Blocked",
+        TaskStatus::Done => "Done",
+    }
+}
+
+/// One task card in a column: title, optional due/assignee, an inline status
+/// select, and a click-through to the detail view. Plain fn (Task: no
+/// PartialEq). The status select lives on the row so a quick status flip needs
+/// no drill-in; it bumps `tick` so the board re-groups.
+fn task_row(
+    t: &Task,
+    store: ReadOnlySignal<Store>,
+    mut selected: Signal<Option<Selected>>,
+    mut tick: Signal<u32>,
+) -> Element {
+    let id = t.id.clone();
+    let id_for_status = t.id.clone();
+    let due = t.due.clone().filter(|d| !d.trim().is_empty());
+    let assignee = t.assignees.first().cloned();
+    let current = t.status;
+    rsx! {
+        div {
+            id: "task-row-{t.id}",
+            style: "background: {BG}; border: 1px solid {EDGE}; border-radius: 9px; \
+                    padding: 0.55rem 0.6rem; margin-bottom: 0.5rem;",
+            button {
+                style: "display: block; width: 100%; text-align: left; background: none; \
+                        border: none; color: {INK}; font: inherit; font-size: 0.9rem; \
+                        font-weight: 600; cursor: pointer; padding: 0;",
+                onclick: move |_| selected.set(Some(Selected::Task(id.clone()))),
+                "{t.title}"
+            }
+            if due.is_some() || assignee.is_some() {
+                div {
+                    style: "display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.3rem; \
+                            font-size: 0.72rem; color: {FAINT};",
+                    if let Some(d) = due {
+                        span { "due {d}" }
+                    }
+                    if let Some(a) = assignee {
+                        span { "· {a}" }
+                    }
+                }
+            }
+            select {
+                id: "task-status-{t.id}",
+                style: "margin-top: 0.45rem; width: 100%; box-sizing: border-box; background: {PANEL}; \
+                        color: {INK}; border: 1px solid {EDGE}; border-radius: 7px; \
+                        padding: 0.3rem 0.4rem; font: inherit; font-size: 0.78rem; cursor: pointer;",
+                value: "{current.as_str()}",
+                onchange: move |e| {
+                    let want = e.value();
+                    let id = id_for_status.clone();
+                    let store = store();
+                    spawn(async move {
+                        if let Some(status) = TaskStatus::parse(&want) {
+                            let patch = TaskPatch {
+                                status: Some(status),
+                                ..Default::default()
+                            };
+                            let _ = store.tasks_update(&id, patch, "system").await;
+                            tick += 1;
+                        }
+                    });
+                },
+                for s in TASK_STATUSES.iter() {
+                    option { value: "{s.as_str()}", "{status_label(*s)}" }
+                }
+            }
+        }
+    }
+}
+
+// ── the reusable entity-detail view (contacts + tasks share it) ──────────────
+
+/// What the detail view loaded: the display name, the ordered field specs, the
+/// current field values, and the id to resolve journal backlinks against. A
+/// contact carries its type slug (for saves + add-field); a task carries None
+/// (its fields are synthesized and saved via tasks_update). Built once per
+/// target load, then the editors stage into a working copy.
+#[derive(Clone)]
+struct DetailData {
+    name: String,
+    /// The chip beside the name: "contact" or "task".
+    kind_label: String,
+    specs: Vec<EntityField>,
+    values: serde_json::Map<String, Value>,
+}
+
+/// Synthesize the editable field specs for a task, so the SAME field editors
+/// (and the same detail scaffold) render a task as they do a contact. Status
+/// and priority are choices; due is a date; title/body are text; assignees is
+/// a comma-list text field. Slugs match the TaskPatch mapping in `save`.
+fn task_field_specs() -> Vec<EntityField> {
+    let f = |slug: &str, label: &str, ft: FieldType, options: Vec<String>| EntityField {
+        id: format!("taskfield_{slug}"),
+        slug: slug.to_string(),
+        label: label.to_string(),
+        field_type: ft,
+        required: false,
+        position: 0,
+        options,
+        ref_kind: None,
+        archived: false,
+    };
+    vec![
+        f("title", "Title", FieldType::Text, Vec::new()),
+        f(
+            "status",
+            "Status",
+            FieldType::Choice,
+            TASK_STATUSES
+                .iter()
+                .map(|s| s.as_str().to_string())
+                .collect(),
+        ),
+        f(
+            "priority",
+            "Priority",
+            FieldType::Choice,
+            PRIORITIES.iter().map(|p| p.as_str().to_string()).collect(),
+        ),
+        f("due", "Due", FieldType::Date, Vec::new()),
+        f("assignees", "Assignees", FieldType::Text, Vec::new()),
+        f("body", "Notes", FieldType::Text, Vec::new()),
+    ]
+}
+
+/// The current task field values as the synthesized-spec map `save` reads back.
+fn task_field_values(t: &Task) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    m.insert("title".into(), Value::String(t.title.clone()));
+    m.insert(
+        "status".into(),
+        Value::String(t.status.as_str().to_string()),
+    );
+    m.insert(
+        "priority".into(),
+        Value::String(t.priority.as_str().to_string()),
+    );
+    if let Some(d) = &t.due {
+        m.insert("due".into(), Value::String(d.clone()));
+    }
+    m.insert("assignees".into(), Value::String(t.assignees.join(", ")));
+    m.insert("body".into(), Value::String(t.body.clone()));
+    m
+}
+
+/// The reusable detail view: a header, a typed editor per field, a Notes
+/// section, an add-a-field affordance (contacts only), and the emergent
+/// "Related in your journal" backlinks — used by BOTH contacts and tasks.
+/// Fields stage into a working-copy signal; Save persists them the right way
+/// for the target (custom_entities_update for a contact, tasks_update for a
+/// task). `refresh` bumps so the pane behind re-pulls after a save.
+#[component]
+fn EntityDetail(
+    store: ReadOnlySignal<Store>,
+    selected: Signal<Option<Selected>>,
+    refresh: Signal<u32>,
+    target: Selected,
+) -> Element {
+    // Working copy of the field values (staged edits). Reloaded from the store
+    // whenever the target changes or a save/reload bumps `reload`.
+    let mut edits = use_signal(serde_json::Map::<String, Value>::new);
+    let mut reload = use_signal(|| 0u32);
+    let mut status_msg = use_signal(|| Option::<String>::None);
+    // Add-a-field form state (contacts only).
+    let mut new_field_label = use_signal(String::new);
+    let mut new_field_type = use_signal(|| FieldType::Text.as_str().to_string());
+
+    let target_load = target.clone();
+    let data = use_resource(move || {
+        let store = store();
+        let target = target_load.clone();
+        async move {
+            let _ = reload();
+            let loaded = load_detail(&store, &target).await?;
+            // Seed the working copy from the freshly loaded values.
+            edits.set(loaded.values.clone());
+            Ok::<DetailData, String>(loaded)
+        }
+    });
+
+    // The backlinks resolve independently (they don't change on field edits).
+    let target_links = target.clone();
+    let backlinks = use_resource(move || {
+        let store = store();
+        let target = target_links.clone();
+        async move {
+            let _ = reload();
+            let ref_id = detail_ref_id(&target);
+            related_journal_entries(&store, &ref_id).await
+        }
+    });
+
+    let target_save = target.clone();
+    let save = move || {
+        let store = store();
+        let target = target_save.clone();
+        let values = edits.peek().clone();
+        let mut refresh = refresh;
+        spawn(async move {
+            match save_detail(&store, &target, &values).await {
+                Ok(()) => {
+                    status_msg.set(Some("Saved.".to_string()));
+                    reload += 1; // re-pull the canonical row
+                    refresh += 1; // re-pull the pane behind
+                }
+                Err(e) => status_msg.set(Some(e)),
+            }
+        });
+    };
+
+    let target_addfield = target.clone();
+    let add_field = move || {
+        let label = new_field_label().trim().to_string();
+        if label.is_empty() {
+            return;
+        }
+        let Selected::Contact(_) = &target_addfield else {
+            return; // tasks have a fixed schema
+        };
+        let ft = new_field_type();
+        let store = store();
+        spawn(async move {
+            // Editing the TYPE (shared across every contact): append an
+            // EntityField to the contact type. It then renders for every card.
+            let patch = EntityTypePatch {
+                add_fields: vec![NewEntityField {
+                    slug: None, // derived from the label
+                    label,
+                    field_type: ft,
+                    required: false,
+                    position: None,
+                    options: Vec::new(),
+                    ref_kind: None,
+                }],
+                ..Default::default()
+            };
+            match store
+                .entity_types_update(CONTACT_TYPE_SLUG, patch, "system")
+                .await
+            {
+                Ok(_) => {
+                    new_field_label.set(String::new());
+                    reload += 1; // the new field shows on this card immediately
+                }
+                Err(e) => {
+                    let msg = match e {
+                        hive_core::store::entity_types::TypeWriteError::Issues(issues) => issues
+                            .iter()
+                            .map(|i| i.message.clone())
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                        hive_core::store::entity_types::TypeWriteError::Other(err) => {
+                            format!("{err:#}")
+                        }
+                    };
+                    status_msg.set(Some(msg));
+                }
+            }
+        });
+    };
+
+    let is_contact = matches!(target, Selected::Contact(_));
+
+    rsx! {
+        div {
+            id: "entity-detail",
+            style: "max-width: 760px; margin: 0 auto; padding: 1.4rem 1.2rem 3rem;",
+
+            // back to the list
+            button {
+                id: "detail-back",
+                style: "background: none; border: none; color: {GOLD}; font: inherit; \
+                        font-size: 0.85rem; cursor: pointer; padding: 0; margin-bottom: 0.9rem;",
+                onclick: move |_| selected.set(None),
+                "← Back"
+            }
+
+            match data() {
+                None => muted("loading…"),
+                Some(Err(e)) => muted(&format!("couldn't open this: {e}")),
+                Some(Ok(d)) => rsx! {
+                    // header: display name + kind chip
+                    div {
+                        style: "display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.3rem;",
+                        div { id: "detail-name", style: "font-size: 1.5rem; font-weight: 700;", "{d.name}" }
+                        span {
+                            style: "font-size: 0.66rem; font-weight: 700; letter-spacing: 0.06em; \
+                                    text-transform: uppercase; color: {BG}; background: {GOLD}; \
+                                    border-radius: 5px; padding: 0.12rem 0.4rem;",
+                            "{d.kind_label}"
+                        }
+                    }
+
+                    // fields
+                    div {
+                        style: "background: {PANEL}; border: 1px solid {EDGE}; border-radius: 12px; \
+                                padding: 1rem 1.1rem; margin: 1rem 0;",
+                        for spec in d.specs.iter().filter(|f| !f.archived) {
+                            {field_editor(spec, edits)}
+                        }
+
+                        // Save
+                        div {
+                            style: "display: flex; align-items: center; gap: 0.7rem; margin-top: 1.1rem;",
+                            button {
+                                id: "detail-save",
+                                style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                                        padding: 0.5rem 1.2rem; font-weight: 700; font-size: 0.9rem; cursor: pointer;",
+                                onclick: move |_| save(),
+                                "Save"
+                            }
+                            if let Some(m) = status_msg() {
+                                span { style: "font-size: 0.82rem; color: {DIM};", "{m}" }
+                            }
+                        }
+                    }
+
+                    // add a custom field (contacts only — edits the shared type)
+                    if is_contact {
+                        div {
+                            style: "background: {PANEL}; border: 1px dashed {EDGE}; border-radius: 12px; \
+                                    padding: 0.9rem 1.1rem; margin-bottom: 1rem;",
+                            div {
+                                style: "font-size: 0.74rem; font-weight: 700; letter-spacing: 0.06em; \
+                                        text-transform: uppercase; color: {FAINT};",
+                                "Add a field"
+                            }
+                            div {
+                                style: "color: {FAINT}; font-size: 0.78rem; margin-top: 0.25rem; line-height: 1.5;",
+                                "Adds to the contact type — it appears on every contact card."
+                            }
+                            div {
+                                style: "display: flex; gap: 0.5rem; margin-top: 0.7rem; flex-wrap: wrap;",
+                                input {
+                                    id: "field-add-label",
+                                    style: "flex: 1; min-width: 9rem; box-sizing: border-box; background: {BG}; \
+                                            color: {INK}; border: 1px solid {EDGE}; border-radius: 8px; \
+                                            padding: 0.5rem 0.7rem; font: inherit; font-size: 0.88rem; outline: none;",
+                                    placeholder: "Field name, e.g. Spouse",
+                                    value: "{new_field_label}",
+                                    oninput: move |e| new_field_label.set(e.value()),
+                                }
+                                select {
+                                    id: "field-add-type",
+                                    style: "background: {BG}; color: {INK}; border: 1px solid {EDGE}; \
+                                            border-radius: 8px; padding: 0.5rem 0.6rem; font: inherit; \
+                                            font-size: 0.88rem; cursor: pointer;",
+                                    value: "{new_field_type}",
+                                    onchange: move |e| new_field_type.set(e.value()),
+                                    option { value: "text", "Text" }
+                                    option { value: "number", "Number" }
+                                    option { value: "bool", "Yes / No" }
+                                    option { value: "date", "Date" }
+                                }
+                                button {
+                                    id: "field-add-submit",
+                                    style: "background: {EDGE}; color: {INK}; border: none; border-radius: 8px; \
+                                            padding: 0.5rem 1rem; font: inherit; font-weight: 700; \
+                                            font-size: 0.85rem; cursor: pointer;",
+                                    onclick: move |_| add_field(),
+                                    "Add"
+                                }
+                            }
+                        }
+                    }
+
+                    // related journal entries (emergent backlinks)
+                    {related_journal(backlinks())}
+                }
+            }
+        }
+    }
+}
+
+/// The "Related in your journal" section: the entries linked to this entity,
+/// newest first, each rendered as a compact card (sanitized markdown, reusing
+/// render_markdown). This is where "related journal entries emerge" — the
+/// links_for_entity edges resolve to their journal entries.
+fn related_journal(backlinks: Option<Result<Vec<JournalEntryView>, String>>) -> Element {
+    rsx! {
+        div {
+            style: "margin-top: 0.4rem;",
+            div {
+                style: "font-size: 0.9rem; font-weight: 700; margin-bottom: 0.6rem;",
+                "Related in your journal"
+            }
+            div {
+                id: "detail-backlinks",
+                match backlinks {
+                    None => muted("looking for mentions…"),
+                    Some(Err(e)) => muted(&format!("couldn't load mentions: {e}")),
+                    Some(Ok(entries)) if entries.is_empty() => muted(
+                        "Mention this in a journal entry — like [contact: a name] or [task: …] — \
+                         and it shows up here.",
+                    ),
+                    Some(Ok(entries)) => rsx! {
+                        for view in entries {
+                            {entry_card(&view)}
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// One typed field editor keyed by FieldType, staging into the shared `edits`
+/// map. Text → input (multiline textarea for `notes`/`body`), Number → number
+/// input, Bool → checkbox, Date → date input, Choice → select over options,
+/// Ref → an id text input (slice-2 identity refs will upgrade this to a picker
+/// over the ref_kind's entities). For a `birthday` Date field, a read-only
+/// calculated age renders beside it. Plain fn: EntityField lacks PartialEq.
+fn field_editor(spec: &EntityField, edits: Signal<serde_json::Map<String, Value>>) -> Element {
+    let slug = spec.slug.clone();
+    let current = value_str(edits.read().get(&slug));
+    let input_id = format!("field-{slug}");
+    let multiline = matches!(spec.slug.as_str(), "notes" | "body");
+
+    // Each arm's event closure owns its own clone of the slug (a `move` closure
+    // would otherwise move the shared binding, and the borrow checker sees all
+    // arms even though one runs) — this mirrors the file's per-closure-clone
+    // idiom.
+    let editor = match spec.field_type {
+        FieldType::Text if multiline => {
+            let slug = slug.clone();
+            rsx! {
+                textarea {
+                    id: "{input_id}",
+                    style: "{text_input_style()} min-height: 5rem; resize: vertical; line-height: 1.5;",
+                    value: "{current}",
+                    oninput: move |e| stage_str(edits, &slug, e.value()),
+                }
+            }
+        }
+        FieldType::Text => {
+            let slug = slug.clone();
+            rsx! {
+                input {
+                    id: "{input_id}",
+                    style: "{text_input_style()}",
+                    value: "{current}",
+                    oninput: move |e| stage_str(edits, &slug, e.value()),
+                }
+            }
+        }
+        FieldType::Number => {
+            let slug = slug.clone();
+            rsx! {
+                input {
+                    id: "{input_id}",
+                    r#type: "number",
+                    style: "{text_input_style()}",
+                    value: "{current}",
+                    oninput: move |e| {
+                        let v = e.value();
+                        let mut edits = edits;
+                        let mut m = edits.write();
+                        match v.trim().parse::<f64>() {
+                            Ok(n) => {
+                                m.insert(slug.clone(), serde_json::json!(n));
+                            }
+                            Err(_) => {
+                                m.remove(&slug);
+                            }
+                        }
+                    },
+                }
+            }
+        }
+        FieldType::Bool => {
+            let on = matches!(edits.read().get(&slug), Some(Value::Bool(true)));
+            let slug = slug.clone();
+            rsx! {
+                label {
+                    style: "display: inline-flex; align-items: center; gap: 0.45rem; margin-top: 0.35rem; \
+                            font-size: 0.9rem; color: {INK}; cursor: pointer;",
+                    input {
+                        id: "{input_id}",
+                        r#type: "checkbox",
+                        checked: on,
+                        onchange: move |e| {
+                            let mut edits = edits;
+                            let mut m = edits.write();
+                            m.insert(slug.clone(), Value::Bool(e.checked()));
+                        },
+                    }
+                    span { {if on { "Yes" } else { "No" }} }
+                }
+            }
+        }
+        FieldType::Date => {
+            let is_birthday = spec.slug == "birthday";
+            let age = age_years(&current, &today_ymd());
+            let slug = slug.clone();
+            rsx! {
+                div {
+                    style: "display: flex; align-items: center; gap: 0.7rem;",
+                    input {
+                        id: "{input_id}",
+                        r#type: "date",
+                        style: "{text_input_style()} max-width: 12rem;",
+                        value: "{current}",
+                        oninput: move |e| stage_str(edits, &slug, e.value()),
+                    }
+                    // calculated age beside a birthday (read-only, computed)
+                    if is_birthday {
+                        if let Some(age) = age {
+                            span {
+                                id: "field-birthday-age",
+                                style: "font-size: 0.82rem; color: {DIM};",
+                                "age {age}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        FieldType::Choice => {
+            let options = spec.options.clone();
+            let slug = slug.clone();
+            rsx! {
+                select {
+                    id: "{input_id}",
+                    style: "{text_input_style()} cursor: pointer; max-width: 16rem;",
+                    value: "{current}",
+                    onchange: move |e| stage_str(edits, &slug, e.value()),
+                    option { value: "", "—" }
+                    for opt in options.iter() {
+                        option { value: "{opt}", "{opt}" }
+                    }
+                }
+            }
+        }
+        FieldType::Ref => {
+            let ref_kind = spec.ref_kind.clone().unwrap_or_default();
+            let slug = slug.clone();
+            rsx! {
+                // slice 2: identities link here via a Ref field — a picker over
+                // the ref_kind's entities will replace this raw id input.
+                input {
+                    id: "{input_id}",
+                    style: "{text_input_style()}",
+                    placeholder: "id of the linked {ref_kind}",
+                    value: "{current}",
+                    oninput: move |e| stage_str(edits, &slug, e.value()),
+                }
+            }
+        }
+    };
+
+    rsx! {
+        div {
+            style: "margin-bottom: 0.2rem;",
+            {field_label(&spec.label)}
+            {editor}
+        }
+    }
+}
+
+/// Stage a string value into the working-copy map: empty clears the key
+/// (so a blanked field removes it), anything else sets it as a JSON string.
+fn stage_str(mut edits: Signal<serde_json::Map<String, Value>>, slug: &str, v: String) {
+    let mut m = edits.write();
+    if v.is_empty() {
+        m.remove(slug);
+    } else {
+        m.insert(slug.to_string(), Value::String(v));
+    }
+}
+
+/// The ref id `links_for_entity` resolves backlinks against, for either target.
+fn detail_ref_id(target: &Selected) -> String {
+    match target {
+        Selected::Contact(id) | Selected::Task(id) => id.clone(),
+    }
+}
+
+/// Load the detail data for a target: a contact card (custom entity + its type
+/// specs) or a task (synthesized specs + values).
+async fn load_detail(store: &Store, target: &Selected) -> Result<DetailData, String> {
+    match target {
+        Selected::Contact(id) => {
+            let entity = store
+                .custom_entities_get(id)
+                .await
+                .map_err(|e| format!("{e:#}"))?
+                .ok_or_else(|| "this contact no longer exists".to_string())?;
+            let ty = store
+                .entity_types_get(&entity.type_slug)
+                .await
+                .map_err(|e| format!("{e:#}"))?
+                .ok_or_else(|| "the contact type is missing".to_string())?;
+            Ok(DetailData {
+                name: contact_display(&entity),
+                kind_label: "contact".to_string(),
+                specs: ty.fields,
+                values: entity.fields,
+            })
+        }
+        Selected::Task(id) => {
+            let task = store
+                .tasks_get(id)
+                .await
+                .map_err(|e| format!("{e:#}"))?
+                .ok_or_else(|| "this task no longer exists".to_string())?;
+            Ok(DetailData {
+                name: task.title.clone(),
+                kind_label: "task".to_string(),
+                specs: task_field_specs(),
+                values: task_field_values(&task),
+            })
+        }
+    }
+}
+
+/// Persist staged field edits for a target the right way: a contact merges its
+/// values via custom_entities_update (title tracks the `title`/name); a task
+/// maps the synthesized fields back into a TaskPatch.
+async fn save_detail(
+    store: &Store,
+    target: &Selected,
+    values: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    match target {
+        Selected::Contact(id) => {
+            // The card's display name is its entity title. If the type has a
+            // `name` field we'd use it, but the model puts the primary name in
+            // the title, so a contact has no `name` field — title is edited via
+            // its own field row only if present. Persist all field values as a
+            // full replacement patch (merge semantics: present keys set, absent
+            // keys are left as-is by the fold, so we send the whole working map).
+            let patch = CustomEntityPatch {
+                title: None,
+                fields: Some(values.clone()),
+                scope: None,
+            };
+            store
+                .custom_entities_update(id, patch, "system", None)
+                .await
+                .map_err(entity_err)?;
+            Ok(())
+        }
+        Selected::Task(id) => {
+            let get = |k: &str| {
+                values
+                    .get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let assignees: Vec<String> = get("assignees")
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let patch = TaskPatch {
+                title: Some(get("title")),
+                body: Some(get("body")),
+                status: TaskStatus::parse(&get("status")),
+                priority: Some(Priority::from_str_lossy(&get("priority"))),
+                assignees: Some(assignees),
+                tags: None,
+            };
+            store
+                .tasks_update(id, patch, "system")
+                .await
+                .map_err(|e| format!("{e:#}"))?;
+            Ok(())
+        }
+    }
+}
+
+/// Resolve the journal entries linked to `ref_id` (the emergent backlinks):
+/// every links edge touching the id, keep the ones whose OTHER end is a
+/// journal entry, fetch each entry, newest first, de-duplicated. This is the
+/// cheapest correct source — the link rows already exist (emergence writes
+/// them); no extra scan of journal bodies is needed.
+async fn related_journal_entries(
+    store: &Store,
+    ref_id: &str,
+) -> Result<Vec<JournalEntryView>, String> {
+    let links: Vec<Link> = store
+        .links_for_entity(ref_id)
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    // Collect the journal-entry ids on the far side of each edge.
+    let mut entry_ids: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for l in &links {
+        let entry_id = if l.source_kind == "journal" && l.source_id != ref_id {
+            Some(l.source_id.clone())
+        } else if l.target_kind == "journal" && l.target_id != ref_id {
+            Some(l.target_id.clone())
+        } else {
+            None
+        };
+        if let Some(eid) = entry_id {
+            if seen.insert(eid.clone()) {
+                entry_ids.push(eid);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for eid in entry_ids {
+        if let Ok(Some(view)) = store.journal_get(&eid).await {
+            out.push(view);
+        }
+    }
+    // Newest first by entry timestamp.
+    out.sort_by(|a, b| b.entry.created_at.cmp(&a.entry.created_at));
+    Ok(out)
+}
+
 // ── settings pane ────────────────────────────────────────────────────────────
 
 /// Progress of a "Re-embed everything" run. Streamed to the UI off-thread.
@@ -2228,5 +3371,71 @@ mod tests {
             !html.contains("<a "),
             "a token was turned into a link: {html}"
         );
+    }
+
+    /// The calculated age: whole years, with the not-yet-this-year case
+    /// subtracting one, and non-plain-date inputs yielding None.
+    #[test]
+    fn age_years_is_whole_calendar_years() {
+        use super::age_years;
+        // Birthday already passed this year.
+        assert_eq!(age_years("1990-01-15", "2026-07-11"), Some(36));
+        // Birthday still ahead this year → one less.
+        assert_eq!(age_years("1990-12-31", "2026-07-11"), Some(35));
+        // Birthday is exactly today.
+        assert_eq!(age_years("2000-07-11", "2026-07-11"), Some(26));
+        // Day before the birthday.
+        assert_eq!(age_years("2000-07-12", "2026-07-11"), Some(25));
+        // A future birthday has no age.
+        assert_eq!(age_years("2030-01-01", "2026-07-11"), None);
+        // Non-plain-date inputs (ISO timestamp, empty, garbage) → None.
+        assert_eq!(age_years("1990-01-15T00:00:00Z", "2026-07-11"), None);
+        assert_eq!(age_years("", "2026-07-11"), None);
+        assert_eq!(age_years("not-a-date", "2026-07-11"), None);
+    }
+
+    /// Task grouping buckets every status column in board order and preserves
+    /// the incoming (priority-then-recency) order within each bucket.
+    #[test]
+    fn group_by_status_buckets_all_four_columns() {
+        use super::group_by_status;
+        use hive_shared::{Priority, Task, TaskStatus};
+
+        let task = |id: &str, status: TaskStatus| Task {
+            id: id.to_string(),
+            title: id.to_string(),
+            body: String::new(),
+            status,
+            priority: Priority::Normal,
+            tags: Vec::new(),
+            assignees: Vec::new(),
+            project: None,
+            phase: None,
+            due: None,
+            origin_entry_id: None,
+            anchor_text: None,
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        let grouped = group_by_status(vec![
+            task("a", TaskStatus::Doing),
+            task("b", TaskStatus::Todo),
+            task("c", TaskStatus::Doing),
+            task("d", TaskStatus::Done),
+        ]);
+        // Four columns, in board order, even the empty one (blocked).
+        let cols: Vec<TaskStatus> = grouped.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            cols,
+            vec![
+                TaskStatus::Todo,
+                TaskStatus::Doing,
+                TaskStatus::Blocked,
+                TaskStatus::Done
+            ]
+        );
+        let doing: Vec<&str> = grouped[1].1.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(doing, vec!["a", "c"], "input order preserved in-bucket");
+        assert_eq!(grouped[2].1.len(), 0, "blocked column present but empty");
     }
 }
