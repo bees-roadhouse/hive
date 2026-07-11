@@ -414,13 +414,24 @@ fn norm_ts(raw: &str, what: &str) -> Result<String> {
     if hive_core::oplog::ts_shape_ok(raw) {
         return Ok(raw.to_string());
     }
-    let parsed = chrono::DateTime::parse_from_rfc3339(raw).with_context(|| {
-        format!("{what}: timestamp {raw:?} is neither the frozen ISO shape nor RFC 3339")
-    })?;
-    Ok(parsed
-        .with_timezone(&chrono::Utc)
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string())
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(raw) {
+        return Ok(parsed
+            .with_timezone(&chrono::Utc)
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string());
+    }
+    // Pre-Postgres rows: the app's SQLite era wrote datetime('now') literals
+    // ("2026-05-11 13:47:34", naive, UTC by SQLite semantics) that the
+    // original Postgres migration carried over verbatim. Read them as UTC.
+    for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"] {
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, fmt) {
+            return Ok(naive.and_utc().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string());
+        }
+    }
+    anyhow::bail!(
+        "{what}: timestamp {raw:?} is neither the frozen ISO shape, RFC 3339, \
+         nor a naive SQLite-era datetime"
+    )
 }
 
 /// TEXT column holding a JSON string array → real array for the
@@ -1399,6 +1410,25 @@ async fn store_attachment_blobs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every timestamp shape the legacy instance ever wrote must normalize
+    /// to the frozen envelope form: JS toISOString (already frozen), RFC
+    /// 3339 with an offset, and the SQLite-era naive datetime('now')
+    /// literals the original Postgres migration carried over (read as UTC).
+    #[test]
+    fn norm_ts_accepts_every_legacy_shape() {
+        for (raw, want) in [
+            ("2026-05-11T13:47:34.123Z", "2026-05-11T13:47:34.123Z"),
+            ("2026-05-11T13:47:34+02:00", "2026-05-11T11:47:34.000Z"),
+            ("2026-05-11 13:47:34", "2026-05-11T13:47:34.000Z"),
+            ("2026-05-11 13:47:34.5", "2026-05-11T13:47:34.500Z"),
+            ("2026-05-11T13:47:34", "2026-05-11T13:47:34.000Z"),
+        ] {
+            assert_eq!(norm_ts(raw, "t").unwrap(), want, "raw {raw:?}");
+        }
+        assert!(norm_ts("2026-05-11", "t").is_err());
+        assert!(norm_ts("yesterday", "t").is_err());
+    }
 
     /// grouped() must partition PLAN_TABLES: every table in exactly one
     /// group. Distinct per-table counts make any omission or double-count
