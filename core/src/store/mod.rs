@@ -66,6 +66,21 @@ pub fn now_iso() -> String {
 /// One queued unit of work for the writer thread.
 type Job = Box<dyn FnOnce(&mut Core) + Send>;
 
+/// A snapshot of the embedder actually running (see `Store::embedder_state`).
+/// Every field is the truth about the live engine — the Settings pane renders
+/// exactly these, never the persisted-but-pending choice.
+#[derive(Debug, Clone)]
+pub struct EmbedderState {
+    /// "native" | "ollama" | "hash".
+    pub backend: String,
+    /// "CPU" | "CUDA" | "ROCm" | "Ollama" | "hash".
+    pub device: String,
+    /// The model name stamped on stored vectors.
+    pub model: String,
+    /// Degraded to the hash fallback (a real model failed to load).
+    pub latched: bool,
+}
+
 /// How many recent wire events the in-memory ring retains.
 const WIRE_RING_CAP: usize = 1024;
 
@@ -145,6 +160,21 @@ impl Store {
     /// The injected embedding engine.
     pub(crate) fn embedder(&self) -> &Arc<dyn Embedder> {
         &self.embedder
+    }
+
+    /// The TRUTHFUL running-engine state for the Settings readout: the actual
+    /// backend family, the actual accelerator, the model stamped on vectors,
+    /// and whether it has degraded to the hash fallback. Callers must show THIS,
+    /// never the user's saved-but-not-yet-running choice. `latched` means a real
+    /// model was configured but failed to load, so search is keyword-only until
+    /// the next launch.
+    pub fn embedder_state(&self) -> EmbedderState {
+        EmbedderState {
+            backend: self.embedder.backend(),
+            device: self.embedder.device(),
+            model: self.embedder.model(),
+            latched: self.embedder.latched(),
+        }
     }
 
     /// Run one closure on the writer thread and await its result — the

@@ -10,6 +10,12 @@ license.workspace = true
 default = ["onnx"]
 # The real BGE engine (ort + tokenizers + hf-hub). Off → hash-only (CI-light).
 onnx = ["dep:ort", "dep:tokenizers", "dep:hf-hub"]
+# GPU execution providers, OFF by default: they need the CUDA/ROCm SDK at build
+# time and the matching compute runtime at execution — neither is present in CI
+# or the flatpak sandbox, where the native engine runs on CPU (and says so).
+# The host-side GPU sidecar (a follow-on) is where these get switched on.
+cuda = ["onnx", "ort/cuda"]
+rocm = ["onnx", "ort/rocm"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -17,6 +23,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
+# Optional-manual Ollama backend (crate::ollama) + the RuntimeEmbedder that can
+# route to it: a small blocking HTTP client, always compiled so the runtime
+# router is available even in the hash-only (onnx-off) build.
+ureq = { workspace = true }
 
 ort = { workspace = true, optional = true }
 # Feature trims live on the workspace pins (CRT link clash / HF redirect notes there).

@@ -21,6 +21,11 @@ use std::sync::OnceLock;
 #[cfg(feature = "onnx")]
 pub mod onnx;
 
+pub mod ollama;
+mod runtime;
+
+pub use runtime::{Backend, EmbedConfig, RuntimeEmbedder};
+
 pub const HASH_DIM: usize = 256;
 pub const HASH_MODEL: &str = "hash-ngram-v1";
 pub const BGE_QUERY_INSTRUCTION: &str = "Represent this sentence for searching relevant passages: ";
@@ -219,6 +224,19 @@ pub trait Embedder: Send + Sync {
     /// Whether the engine is configured for a real model but has latched to
     /// the hash fallback (persisting callers must pause, not mislabel rows).
     fn latched(&self) -> bool;
+    /// The backend family actually in effect: "native" | "ollama" | "hash".
+    /// The Settings state readout shows this — it must be the TRUTH, never the
+    /// user's saved-but-not-running choice.
+    fn backend(&self) -> String {
+        "hash".to_string()
+    }
+    /// The accelerator actually in use for a human-readable readout: "CPU",
+    /// "CUDA", "ROCm", "Ollama", or "hash". Auto-detected at model load for the
+    /// native path (degrades to CPU when a GPU runtime is unreachable — e.g.
+    /// inside the flatpak sandbox — and reports CPU honestly, never fakes GPU).
+    fn device(&self) -> String {
+        "CPU".to_string()
+    }
 }
 
 /// The env-driven engine: delegates to this crate's free functions, i.e. the
@@ -248,6 +266,34 @@ impl Embedder for DefaultEmbedder {
     fn latched(&self) -> bool {
         transformers_latched()
     }
+    fn backend(&self) -> String {
+        // The hash provider ($HIVE_EMBED=hash, or a latched model) reports
+        // "hash" so the readout never claims a model that isn't running.
+        if provider_is_transformers() && !TRANSFORMERS_FAILED.load(Ordering::Relaxed) {
+            "native".to_string()
+        } else {
+            "hash".to_string()
+        }
+    }
+    fn device(&self) -> String {
+        if !provider_is_transformers() || TRANSFORMERS_FAILED.load(Ordering::Relaxed) {
+            return "hash".to_string();
+        }
+        onnx_device()
+    }
+}
+
+/// The accelerator the native ONNX engine actually loaded on, resolved lazily.
+/// "CPU" until a model loads (or when the `onnx` feature is off), then the
+/// truthful device. Never claims a GPU that didn't initialize.
+#[cfg(feature = "onnx")]
+fn onnx_device() -> String {
+    ensure_default_engine();
+    onnx::resolved_device()
+}
+#[cfg(not(feature = "onnx"))]
+fn onnx_device() -> String {
+    "CPU".to_string()
 }
 
 /// The deterministic hash engine, environment-free: what tests inject. Never
@@ -276,6 +322,12 @@ impl Embedder for HashEmbedder {
     }
     fn latched(&self) -> bool {
         false
+    }
+    fn backend(&self) -> String {
+        "hash".to_string()
+    }
+    fn device(&self) -> String {
+        "hash".to_string()
     }
 }
 
