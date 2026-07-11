@@ -27,8 +27,14 @@ finish-args:
   # keyring crate speaks the Secret Service API on the session bus directly,
   # not through the portal, so it needs the bus name.
   - --talk-name=org.freedesktop.secrets
-  # Phase 3+ will add scoped filesystem/network holes as modules land; note
-  # there is deliberately NO --share=network in this build (DIRECTION.md D27).
+  # Network: enables the in-app legacy import (first-launch onboarding dials
+  # the old instance's Postgres directly — the only network use today) and
+  # the future sync/module holes ride the same grant. hive still sends no
+  # telemetry: zero-collection is enforced in code, not by the sandbox (D27)
+  # — the sandbox can't tell a user-initiated import from a phone-home, so
+  # the honest posture is this hole plus the greppable absence of any other
+  # network caller (docs/THREAT-MODEL.md § Telemetry and network).
+  - --share=network
 modules:
   # dioxus-desktop links libxdo (input simulation via the xdo crate); the GNOME
   # runtime doesn't ship it, so build it from the pinned xdotool release. All

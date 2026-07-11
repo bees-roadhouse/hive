@@ -2668,7 +2668,9 @@ dependencies = [
  "dioxus",
  "hive-core",
  "hive-embed",
+ "hive-import",
  "hive-shared",
+ "tokio",
 ]
 
 [[package]]
@@ -2742,10 +2744,12 @@ dependencies = [
  "hive-core",
  "hive-embed",
  "nanoid",
+ "serde",
  "serde_json",
  "sqlx",
  "tempfile",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 

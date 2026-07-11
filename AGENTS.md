@@ -17,8 +17,11 @@ it on 2026-07-05). This repo is mid-pivot to a personal P2P desktop app
 - The datastore is the append-only op log + SQLCipher SQLite index under a
   local data dir (the PR 1.6 cutover; D18). Postgres left the workspace —
   the PR 1.7 importer is the one remaining Postgres reader and declares its
-  own sqlx (never in `[workspace.dependencies]`; the grep gate in
-  `importer/tests/no_postgres_gate.rs` enforces it).
+  own sqlx (never in `[workspace.dependencies]`). The app may depend on the
+  hive-import LIBRARY (it ships the first-launch GUI import) but its sources
+  stay sqlx-token-free, and no other crate may depend on hive-import at all
+  — the grep gate in `importer/tests/no_postgres_gate.rs` states and
+  enforces the whole rule.
 
 When docs disagree with code, workflows, or compose files, trust code and CI,
 then update the stale doc in the same change. `README.md` and parts of
@@ -49,6 +52,11 @@ then update the stale doc in the same change. `README.md` and parts of
   `Core::commit`. Honors `HIVE_DATA_DIR`; its keychain escape hatch is
   `HIVE_IMPORT_KEY_HEX` (importer-only, mirroring the bridge's — each binary
   names its own). Embeds nothing: the app backfills embeddings later.
+  Also a LIBRARY: `run(&Opts)` returns `RunOutcome::{Plan, Imported}` as
+  data (the CLI formats it; the app's onboarding renders it), and after a
+  real import the store is fully shut down so the same process can
+  immediately `Store::new` the dir — the app's first-launch GUI import
+  depends on both facts.
 - `shared/`: Rust shared domain types.
 - `embed/`: embedding seam, ONNX/BGE implementation, and hash fallback.
 - `jmap-sync/`: JMAP mailbox sync library (kept through the pause; its offline
@@ -131,7 +139,9 @@ DATABASE_URL=postgres://hive:hive@localhost:5432/hive cargo test -p hive-import
 
 Everything else stays Postgres-free by construction — the grep gate
 (`importer/tests/no_postgres_gate.rs`) fails on any `sqlx`/`pgvector` token
-outside `importer/`.
+outside `importer/`, and on any crate other than `app/` depending on
+hive-import (the app rides the importer library for GUI import; the engine
+crates and the bridge stay Postgres-free even transitively).
 
 There is no compose path or shippable image anymore. The local binaries are
 the app (`cargo run -p hive-app`) and the bridge

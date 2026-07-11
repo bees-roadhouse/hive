@@ -3,6 +3,11 @@
 // v0.7 journal + search: the append-only engine (PR 1.6) wired into the
 // window. One process — RSX handlers call hive-core in-process; the store's
 // writer thread owns the op log + SQLCipher index under the data dir.
+//
+// First launch (no store under the data dir yet) opens onto onboarding:
+// name yourself, then start fresh or import a hosted-era instance in-GUI —
+// the hive-import LIBRARY runs in-process (dry-run plan, then the one-shot
+// migration) and the window flips to the journal in place, no relaunch.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,17 +19,31 @@ use dioxus::prelude::*;
 use hive_core::keys::{KeySource, KeychainKeySource, MemoryKeySource};
 use hive_core::store::Store;
 use hive_embed::HashEmbedder;
+use hive_import::{Plan, RunOutcome, Summary};
 use hive_shared::{JournalEntryView, NewJournalEntry, SearchHit};
 
-/// What main() hands the UI: a live store, or the reason there isn't one.
+/// Config key naming the journal's author (the onboarding identity step
+/// writes it; the Shell reads it at mount). Dotted, matching the config
+/// table's conventions (instance.name, search.kind_weights).
+const IDENTITY_OWNER_KEY: &str = "identity.owner";
+
+/// What main() hands the UI: a live store, a fresh data dir awaiting
+/// onboarding, or the reason there is neither.
 #[derive(Clone)]
 enum Boot {
     Ready(Store),
+    /// The data dir holds no store yet (first launch). Deliberately NOT an
+    /// opened store: onboarding may import into this dir, and hive-import
+    /// is one-shot — it refuses a dir a store has touched.
+    Fresh {
+        master: [u8; 32],
+        dir: PathBuf,
+    },
     Failed(String),
 }
 
 fn main() {
-    let boot = open_store();
+    let boot = boot();
     dioxus::LaunchBuilder::desktop()
         .with_cfg(
             Config::new().with_menu(None).with_window(
@@ -54,22 +73,31 @@ fn data_dir() -> PathBuf {
     base.join("hive")
 }
 
-fn open_store() -> Boot {
+fn boot() -> Boot {
     // Master key: resolved from the OS keychain exactly once, here, before
     // the UI exists (created on first boot); the store then works from the
     // in-memory copy so no later wrap/unwrap blocks on D-Bus mid-frame.
     // Inside the flatpak this is the org.freedesktop.secrets hole in the
-    // manifest.
+    // manifest. Onboarding never touches the keychain again — it carries
+    // these bytes.
     let master = match KeychainKeySource::new().master_key() {
         Ok(key) => key,
         Err(e) => return Boot::Failed(format!("OS keychain unavailable: {e:#}")),
     };
+    // First-launch probe: the importer's own fresh-dir rule (device file or
+    // op-log segments), shared so the app and hive-import can never disagree
+    // about what "fresh" means.
+    let dir = data_dir();
+    if !hive_import::data_dir_holds_store(&dir) {
+        return Boot::Fresh { master, dir };
+    }
     // Hash embedder: offline and deterministic. The ONNX model becomes a
-    // settings choice in Phase 2 — it wants a network hole plus a model
-    // download this build deliberately doesn't have (D27), and keyword FTS
-    // is the primary retrieval path meanwhile.
+    // settings choice in Phase 2 — it wants a model download this build
+    // doesn't do, and keyword FTS is the primary retrieval path meanwhile
+    // (the network hole exists now, but solely for user-initiated import;
+    // see docs/THREAT-MODEL.md).
     match Store::new(
-        &data_dir(),
+        &dir,
         Arc::new(MemoryKeySource(master)),
         Arc::new(HashEmbedder),
     ) {
@@ -78,8 +106,9 @@ fn open_store() -> Boot {
     }
 }
 
-/// Journal authorship until identity setup lands (Phase 2 settings; the
-/// importer maps the old instance's actor): the OS login name.
+/// Fallback journal authorship — the OS login name. Prefills the onboarding
+/// identity step; covers stores that predate the identity.owner config (and
+/// any read failure of it).
 fn author_name() -> String {
     std::env::var("USER")
         .ok()
@@ -94,6 +123,16 @@ const INK: &str = "#e8e2d4";
 const DIM: &str = "#9a927e";
 const FAINT: &str = "#6f684f";
 const GOLD: &str = "#e2a921";
+
+/// What the window is currently for. Boot picks the initial mode; the
+/// onboarding flow moves it to Journal IN PLACE (one process, no relaunch)
+/// the moment a store exists.
+#[derive(Clone)]
+enum Mode {
+    Onboarding { master: [u8; 32], dir: PathBuf },
+    Journal(Store),
+    Failed(String),
+}
 
 fn app() -> Element {
     // The titlebar close button must actually quit (dioxus 0.6's default
@@ -112,11 +151,21 @@ fn app() -> Element {
         }
     });
 
-    match use_context::<Boot>() {
-        Boot::Ready(store) => rsx! {
+    let boot = use_context::<Boot>();
+    let mode = use_signal(move || match boot {
+        Boot::Ready(store) => Mode::Journal(store),
+        Boot::Fresh { master, dir } => Mode::Onboarding { master, dir },
+        Boot::Failed(reason) => Mode::Failed(reason),
+    });
+
+    match mode() {
+        Mode::Journal(store) => rsx! {
             Shell { store }
         },
-        Boot::Failed(reason) => rsx! {
+        Mode::Onboarding { master, dir } => rsx! {
+            Onboarding { mode, master, dir }
+        },
+        Mode::Failed(reason) => rsx! {
             div {
                 style: "position: fixed; inset: 0; display: flex; flex-direction: column; \
                         align-items: center; justify-content: center; gap: 0.8rem; \
@@ -133,12 +182,563 @@ fn app() -> Element {
     }
 }
 
+// ── onboarding ───────────────────────────────────────────────────────────────
+
+/// Which onboarding panel is showing.
+#[derive(Clone, Copy, PartialEq)]
+enum OnbStep {
+    /// "Who writes here?" — the identity name.
+    Identity,
+    /// Start fresh vs import.
+    Choice,
+    /// The import panel (URL, dry run, import).
+    Import,
+}
+
+/// Import-flow state machine. Every state renders a distinct block under
+/// the import panel; the panel's inputs/buttons keep fixed ids and a fixed
+/// tab order (URL field first) so the flow is scriptable end to end.
+#[derive(Clone)]
+enum ImportState {
+    /// Inputs live. `err` carries a dry-run/connection failure — those need
+    /// no cleanup, because a dry run writes nothing.
+    Idle { err: Option<String> },
+    /// Dry run in flight.
+    Checking,
+    /// Dry-run result: the plan card.
+    Planned(Plan),
+    /// Real import in flight.
+    Importing,
+    /// Real import failed. The data dir may hold partial state, so the only
+    /// way forward is [Clean up and retry].
+    ImportFailed(String),
+    /// Wiping the partial data dir.
+    CleaningUp,
+    /// Import complete: summary + [Open my journal].
+    Done(Summary),
+}
+
+/// Rotation for the working indicator (rsx format strings would eat the
+/// braces, so the CSS rides in as an interpolated value).
+const SPIN_CSS: &str = "@keyframes onb-spin { to { transform: rotate(360deg); } } \
+     .onb-spin { display: inline-block; animation: onb-spin 1.4s linear infinite; }";
+
+/// A store now exists (created fresh, or just imported): open it, record
+/// the chosen identity, and flip the window to the journal — in place.
+/// Store::new is sync but fast here (empty or freshly folded dir), and the
+/// keychain is NOT involved (the master bytes rode in from boot).
+async fn enter_journal(
+    mut mode: Signal<Mode>,
+    master: [u8; 32],
+    dir: PathBuf,
+    name: String,
+) -> Result<(), String> {
+    let store = Store::new(
+        &dir,
+        Arc::new(MemoryKeySource(master)),
+        Arc::new(HashEmbedder),
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    let name = name.trim();
+    let owner = if name.is_empty() {
+        author_name()
+    } else {
+        name.to_string()
+    };
+    // On failure the store drops here (writer thread stops, flock releases),
+    // so the button that got us here can simply be clicked again.
+    store
+        .config_set(IDENTITY_OWNER_KEY, &owner)
+        .await
+        .map_err(|e| format!("recording your name: {e:#}"))?;
+    mode.set(Mode::Journal(store));
+    Ok(())
+}
+
+/// Drive hive_import::run on its own OS thread with a dedicated
+/// current-thread tokio runtime — the CLI's exact execution shape. A big
+/// mailbox means minutes of blocking Postgres/blockstore work; the UI task
+/// only awaits the (runtime-agnostic) oneshot, so the window stays live.
+async fn run_import(opts: hive_import::Opts) -> Result<RunOutcome, String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("hive-import".to_string())
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| format!("building the import runtime: {e:#}"))
+                .and_then(|rt| {
+                    rt.block_on(hive_import::run(&opts))
+                        .map_err(|e| format!("{e:#}"))
+                });
+            let _ = tx.send(result);
+        });
+    if spawned.is_err() {
+        return Err("could not start the import thread".to_string());
+    }
+    rx.await
+        .unwrap_or_else(|_| Err("the import thread exited without reporting".to_string()))
+}
+
+#[component]
+fn Onboarding(mode: Signal<Mode>, master: [u8; 32], dir: PathBuf) -> Element {
+    let mut name = use_signal(author_name);
+    let mut step = use_signal(|| OnbStep::Identity);
+    let mut url = use_signal(String::new);
+    let mut import_state = use_signal(|| ImportState::Idle { err: None });
+    let mut fresh_err = use_signal(|| Option::<String>::None);
+
+    // Handlers each own a clone of the target dir (dioxus event closures
+    // are 'static, so they can't borrow the prop).
+    let dir_fresh = dir.clone();
+    let start_fresh = move |_| {
+        let dir = dir_fresh.clone();
+        let name = name();
+        spawn(async move {
+            if let Err(e) = enter_journal(mode, master, dir, name).await {
+                fresh_err.set(Some(e));
+            }
+        });
+    };
+
+    let dir_dry = dir.clone();
+    let dry_run = move |_| {
+        let from = url().trim().to_string();
+        if from.is_empty() {
+            return;
+        }
+        let data_dir = dir_dry.clone();
+        import_state.set(ImportState::Checking);
+        spawn(async move {
+            let next = match run_import(hive_import::Opts {
+                from,
+                data_dir,
+                dry_run: true,
+                master_key: None, // dry runs read only; no key involved
+            })
+            .await
+            {
+                Ok(RunOutcome::Plan(plan)) => ImportState::Planned(plan),
+                Ok(RunOutcome::Imported(_)) => ImportState::Idle {
+                    err: Some("importer bug: a dry run reported an import".to_string()),
+                },
+                Err(e) => ImportState::Idle { err: Some(e) },
+            };
+            import_state.set(next);
+        });
+    };
+
+    let dir_import = dir.clone();
+    let import = move |_| {
+        let from = url().trim().to_string();
+        if from.is_empty() {
+            return;
+        }
+        let data_dir = dir_import.clone();
+        import_state.set(ImportState::Importing);
+        spawn(async move {
+            let next = match run_import(hive_import::Opts {
+                from,
+                data_dir,
+                dry_run: false,
+                master_key: Some(master), // resolved once at boot, before the UI
+            })
+            .await
+            {
+                Ok(RunOutcome::Imported(summary)) => ImportState::Done(summary),
+                Ok(RunOutcome::Plan(_)) => ImportState::ImportFailed(
+                    "importer bug: an import reported a dry-run plan".to_string(),
+                ),
+                Err(e) => ImportState::ImportFailed(e),
+            };
+            import_state.set(next);
+        });
+    };
+
+    let dir_clean = dir.clone();
+    let cleanup = move |_| {
+        let dir = dir_clean.clone();
+        import_state.set(ImportState::CleaningUp);
+        spawn(async move {
+            // Deleting under the user's data dir is permitted HERE AND ONLY
+            // HERE, because all three of these hold:
+            //   1. this process verified at boot that the dir held NO store
+            //      (Boot::Fresh, via hive_import::data_dir_holds_store);
+            //   2. this window has opened no store on it since — every byte
+            //      under it was written by the import attempt that just
+            //      failed;
+            //   3. hive_import::run shut its store down before returning,
+            //      so the flock is free and no thread holds the files.
+            let result = match std::fs::remove_dir_all(&dir) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            }
+            .and_then(|()| std::fs::create_dir_all(&dir));
+            import_state.set(match result {
+                Ok(()) => ImportState::Idle { err: None },
+                Err(e) => ImportState::ImportFailed(format!(
+                    "clean-up failed: {e} — remove {} by hand and relaunch",
+                    dir.display()
+                )),
+            });
+        });
+    };
+
+    let dir_open = dir.clone();
+    let open_journal = move |_| {
+        let dir = dir_open.clone();
+        let name = name();
+        spawn(async move {
+            if let Err(e) = enter_journal(mode, master, dir, name).await {
+                import_state.set(ImportState::ImportFailed(format!(
+                    "opening the imported store: {e}"
+                )));
+            }
+        });
+    };
+
+    let state = import_state();
+    let busy = matches!(
+        state,
+        ImportState::Checking | ImportState::Importing | ImportState::CleaningUp
+    );
+    let settled = matches!(state, ImportState::ImportFailed(_) | ImportState::Done(_));
+    let inputs_off = busy || settled;
+    let run_off = inputs_off || url().trim().is_empty();
+
+    rsx! {
+        div {
+            style: "position: fixed; inset: 0; overflow-y: auto; background: {BG}; \
+                    color: {INK}; font-family: system-ui, sans-serif;",
+            style { "{SPIN_CSS}" }
+            div {
+                style: "max-width: 34rem; margin: 0 auto; padding: 3.4rem 1.2rem 3rem;",
+
+                // header
+                div {
+                    style: "display: flex; align-items: baseline; gap: 0.55rem; margin-bottom: 1.6rem;",
+                    span { style: "font-size: 1.5rem; color: {GOLD};", "⬡" }
+                    span { style: "font-size: 1.25rem; font-weight: 700; letter-spacing: 0.04em;", "hive" }
+                    span { style: "flex: 1;" }
+                    span { style: "font-size: 0.78rem; color: {FAINT};", "first launch" }
+                }
+
+                match step() {
+                    OnbStep::Identity => rsx! {
+                        div {
+                            style: "background: {PANEL}; border: 1px solid {EDGE}; border-radius: 12px; \
+                                    padding: 1.3rem 1.2rem;",
+                            div { style: "font-size: 1.15rem; font-weight: 700;", "Who writes here?" }
+                            div {
+                                style: "color: {DIM}; font-size: 0.9rem; line-height: 1.6; margin-top: 0.45rem;",
+                                "hive signs each journal entry with its author — this is the name \
+                                 your writing belongs to."
+                            }
+                            input {
+                                id: "onb-name",
+                                style: "width: 100%; box-sizing: border-box; background: {BG}; color: {INK}; \
+                                        border: 1px solid {EDGE}; border-radius: 8px; padding: 0.7rem 0.8rem; \
+                                        font: inherit; font-size: 0.95rem; outline: none; margin-top: 0.9rem;",
+                                value: "{name}",
+                                autofocus: true,
+                                oninput: move |e| name.set(e.value()),
+                                onkeydown: move |e| {
+                                    if e.key() == Key::Enter {
+                                        step.set(OnbStep::Choice);
+                                    }
+                                },
+                            }
+                            div {
+                                style: "display: flex; align-items: center; margin-top: 0.9rem;",
+                                span { style: "flex: 1;" }
+                                button {
+                                    id: "onb-continue",
+                                    style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                                            padding: 0.6rem 1.5rem; font-weight: 700; font-size: 0.95rem; \
+                                            cursor: pointer;",
+                                    onclick: move |_| step.set(OnbStep::Choice),
+                                    "Continue"
+                                }
+                            }
+                        }
+                    },
+
+                    OnbStep::Choice => rsx! {
+                        div {
+                            style: "display: flex; align-items: baseline; gap: 0.5rem; margin-bottom: 0.9rem;",
+                            span { style: "font-size: 1.15rem; font-weight: 700;", "How should this hive begin?" }
+                            span { style: "flex: 1;" }
+                            span { style: "font-size: 0.8rem; color: {FAINT};", "writing as {name}" }
+                            button {
+                                tabindex: "-1",
+                                style: "background: none; border: none; color: {GOLD}; font-size: 0.8rem; \
+                                        cursor: pointer; padding: 0;",
+                                onclick: move |_| step.set(OnbStep::Identity),
+                                "change"
+                            }
+                        }
+                        button {
+                            id: "onb-start-fresh",
+                            style: "display: block; width: 100%; text-align: left; background: {PANEL}; \
+                                    color: {INK}; border: 1px solid {EDGE}; border-radius: 12px; \
+                                    padding: 1.1rem 1.2rem; cursor: pointer; font: inherit; \
+                                    margin-bottom: 0.8rem;",
+                            onclick: start_fresh,
+                            div { style: "font-weight: 700; font-size: 1.02rem;", "Start fresh" }
+                            div {
+                                style: "color: {DIM}; font-size: 0.88rem; line-height: 1.55; margin-top: 0.3rem;",
+                                "An empty journal, ready for its first entry."
+                            }
+                        }
+                        button {
+                            id: "onb-import-choice",
+                            style: "display: block; width: 100%; text-align: left; background: {PANEL}; \
+                                    color: {INK}; border: 1px solid {EDGE}; border-radius: 12px; \
+                                    padding: 1.1rem 1.2rem; cursor: pointer; font: inherit;",
+                            onclick: move |_| step.set(OnbStep::Import),
+                            div { style: "font-weight: 700; font-size: 1.02rem;", "Import from my old hive" }
+                            div {
+                                style: "color: {DIM}; font-size: 0.88rem; line-height: 1.55; margin-top: 0.3rem;",
+                                "Copy a hosted-era instance's history — ids and timestamps intact — \
+                                 straight from its Postgres database."
+                            }
+                        }
+                        if let Some(err) = fresh_err() {
+                            div {
+                                style: "color: #e07a5f; font-size: 0.88rem; line-height: 1.55; margin-top: 0.9rem; \
+                                        white-space: pre-wrap; overflow-wrap: anywhere;",
+                                "{err}"
+                            }
+                        }
+                    },
+
+                    OnbStep::Import => rsx! {
+                        div {
+                            style: "background: {PANEL}; border: 1px solid {EDGE}; border-radius: 12px; \
+                                    padding: 1.3rem 1.2rem;",
+                            div { style: "font-size: 1.15rem; font-weight: 700;", "Import from your old hive" }
+                            div {
+                                style: "color: {DIM}; font-size: 0.9rem; line-height: 1.6; margin-top: 0.45rem;",
+                                "Postgres URL of the legacy instance:"
+                            }
+                            input {
+                                id: "onb-url",
+                                style: "width: 100%; box-sizing: border-box; background: {BG}; color: {INK}; \
+                                        border: 1px solid {EDGE}; border-radius: 8px; padding: 0.7rem 0.8rem; \
+                                        font: inherit; font-size: 0.92rem; outline: none; margin-top: 0.7rem;",
+                                placeholder: "postgres://user:pass@host:5432/hive",
+                                value: "{url}",
+                                autofocus: true,
+                                disabled: inputs_off,
+                                oninput: move |e| url.set(e.value()),
+                            }
+                            div {
+                                style: "color: {FAINT}; font-size: 0.8rem; line-height: 1.55; margin-top: 0.5rem;",
+                                "This is the old server's DATABASE, not the app's web address or an \
+                                 API key — reading Postgres directly is what preserves your original \
+                                 ids and timestamps."
+                            }
+                            div {
+                                style: "display: flex; gap: 0.7rem; margin-top: 0.9rem;",
+                                button {
+                                    id: "onb-dry-run",
+                                    style: "background: {BG}; color: {INK}; border: 1px solid {EDGE}; \
+                                            border-radius: 8px; padding: 0.6rem 1.3rem; font-weight: 600; \
+                                            font-size: 0.95rem; cursor: pointer;",
+                                    disabled: run_off,
+                                    onclick: dry_run,
+                                    "Check first (dry run)"
+                                }
+                                button {
+                                    id: "onb-import",
+                                    style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                                            padding: 0.6rem 1.5rem; font-weight: 700; font-size: 0.95rem; \
+                                            cursor: pointer;",
+                                    disabled: run_off,
+                                    onclick: import,
+                                    "Import"
+                                }
+                                span { style: "flex: 1;" }
+                                if matches!(state, ImportState::Idle { .. } | ImportState::Planned(_)) {
+                                    button {
+                                        tabindex: "-1",
+                                        style: "background: none; border: none; color: {FAINT}; \
+                                                font-size: 0.85rem; cursor: pointer;",
+                                        onclick: move |_| step.set(OnbStep::Choice),
+                                        "back"
+                                    }
+                                }
+                            }
+
+                            match state {
+                                ImportState::Idle { err: None } => rsx! {},
+                                ImportState::Idle { err: Some(err) } => rsx! {
+                                    {import_error(&err)}
+                                },
+                                ImportState::Checking => working("connecting and counting — nothing is written by a dry run…"),
+                                ImportState::Planned(plan) => plan_card(&plan),
+                                ImportState::Importing => working("importing — this can take a while on big mailboxes…"),
+                                ImportState::CleaningUp => working("cleaning up…"),
+                                ImportState::ImportFailed(err) => rsx! {
+                                    {import_error(&err)}
+                                    button {
+                                        id: "onb-retry",
+                                        style: "background: {BG}; color: {INK}; border: 1px solid {EDGE}; \
+                                                border-radius: 8px; padding: 0.6rem 1.3rem; font-weight: 600; \
+                                                font-size: 0.95rem; cursor: pointer; margin-top: 0.8rem;",
+                                        onclick: cleanup,
+                                        "Clean up and retry"
+                                    }
+                                },
+                                ImportState::Done(summary) => rsx! {
+                                    {summary_card(&summary)}
+                                    button {
+                                        id: "onb-open-journal",
+                                        style: "background: {GOLD}; color: #14120e; border: none; \
+                                                border-radius: 8px; padding: 0.7rem 1.6rem; font-weight: 700; \
+                                                font-size: 1rem; cursor: pointer; margin-top: 0.9rem;",
+                                        onclick: open_journal,
+                                        "Open my journal"
+                                    }
+                                },
+                            }
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
+// Plain render helpers (same rule as the journal ones below: shared structs
+// carry no PartialEq, so these stay out of #[component]).
+
+fn import_error(err: &str) -> Element {
+    rsx! {
+        div {
+            id: "onb-import-error",
+            style: "color: #e07a5f; font-size: 0.88rem; line-height: 1.55; margin-top: 0.9rem; \
+                    white-space: pre-wrap; overflow-wrap: anywhere;",
+            "{err}"
+        }
+    }
+}
+
+fn working(text: &str) -> Element {
+    rsx! {
+        div {
+            id: "onb-working",
+            style: "display: flex; align-items: center; gap: 0.6rem; margin-top: 0.9rem; \
+                    color: {DIM}; font-size: 0.9rem;",
+            span { class: "onb-spin", style: "color: {GOLD}; font-size: 1.1rem;", "⬡" }
+            "{text}"
+        }
+    }
+}
+
+/// The dry-run result: hive_import::Plan::grouped(), one row per group.
+fn plan_card(plan: &Plan) -> Element {
+    let total = plan.total_rows();
+    rsx! {
+        div {
+            id: "onb-plan",
+            style: "background: {BG}; border: 1px solid {EDGE}; border-radius: 10px; \
+                    padding: 0.85rem 1rem; margin-top: 0.9rem;",
+            div {
+                style: "font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; \
+                        text-transform: uppercase; color: {GOLD}; margin-bottom: 0.45rem;",
+                "found in your old hive"
+            }
+            for (label, n) in plan.grouped() {
+                div {
+                    key: "{label}",
+                    style: "display: flex; font-size: 0.9rem; line-height: 1.75;",
+                    span { style: "color: {DIM};", "{label}" }
+                    span { style: "flex: 1;" }
+                    span { "{n}" }
+                }
+            }
+            div {
+                style: "display: flex; font-size: 0.9rem; line-height: 1.75; font-weight: 600; \
+                        border-top: 1px solid {EDGE}; margin-top: 0.35rem; padding-top: 0.35rem;",
+                span { style: "color: {DIM};", "total source rows" }
+                span { style: "flex: 1;" }
+                span { "{total}" }
+            }
+            div {
+                style: "color: {FAINT}; font-size: 0.8rem; margin-top: 0.5rem;",
+                "Checked only — nothing is written until you import."
+            }
+        }
+    }
+}
+
+/// The import result: what landed in the new store.
+fn summary_card(summary: &Summary) -> Element {
+    rsx! {
+        div {
+            id: "onb-summary",
+            style: "background: {BG}; border: 1px solid {EDGE}; border-radius: 10px; \
+                    padding: 0.85rem 1rem; margin-top: 0.9rem;",
+            div {
+                style: "font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; \
+                        text-transform: uppercase; color: {GOLD}; margin-bottom: 0.45rem;",
+                "import complete"
+            }
+            div {
+                style: "display: flex; font-size: 0.9rem; line-height: 1.75;",
+                span { style: "color: {DIM};", "records written" }
+                span { style: "flex: 1;" }
+                span { "{summary.records}" }
+            }
+            div {
+                style: "display: flex; font-size: 0.9rem; line-height: 1.75;",
+                span { style: "color: {DIM};", "attachment blobs stored" }
+                span { style: "flex: 1;" }
+                span { "{summary.blobs_stored}" }
+            }
+            div {
+                style: "display: flex; font-size: 0.9rem; line-height: 1.75;",
+                span { style: "color: {DIM};", "search (FTS) rows" }
+                span { style: "flex: 1;" }
+                span { "{summary.mail_fts_rows}" }
+            }
+            if summary.mail_deleted_skipped > 0 || summary.inbox_read_skipped > 0 {
+                div {
+                    style: "color: {FAINT}; font-size: 0.8rem; margin-top: 0.5rem; line-height: 1.5;",
+                    "Left behind on purpose: {summary.mail_deleted_skipped} deleted mail message(s), \
+                     {summary.inbox_read_skipped} already-read inbox row(s)."
+                }
+            }
+            div {
+                style: "color: {FAINT}; font-size: 0.8rem; margin-top: 0.5rem;",
+                "Embeddings backfill in the background once the journal opens."
+            }
+        }
+    }
+}
+
 #[component]
 fn Shell(store: ReadOnlySignal<Store>) -> Element {
     let mut draft = use_signal(String::new);
     let mut query = use_signal(String::new);
     let mut status = use_signal(|| Option::<String>::None);
     let mut committed = use_signal(|| 0u32);
+
+    // Journal authorship: the identity chosen at onboarding (identity.owner
+    // config), read once at mount; author_name() covers stores that predate
+    // the record and any read failure.
+    let author = use_resource(move || {
+        let store = store();
+        async move {
+            match store.config_get(IDENTITY_OWNER_KEY).await {
+                Ok(Some(owner)) if !owner.trim().is_empty() => owner,
+                _ => author_name(),
+            }
+        }
+    });
 
     let entries = use_resource(move || {
         let store = store();
@@ -169,9 +769,10 @@ fn Shell(store: ReadOnlySignal<Store>) -> Element {
             return;
         }
         let store = store();
+        let byline = author().unwrap_or_else(author_name);
         spawn(async move {
             let input = NewJournalEntry {
-                author: Some(author_name()),
+                author: Some(byline),
                 body,
                 tags: None,
                 anchors: None,

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use hive_core::keys::{KeySource, KeychainKeySource};
-use hive_import::{run, Opts};
+use hive_import::{redact_url, run, Opts, RunOutcome};
 
 const USAGE: &str = "\
 hive-import — one-shot migration of a hosted hive Postgres into a local data dir
@@ -77,8 +77,37 @@ fn try_main() -> Result<()> {
         .enable_all()
         .build()
         .context("building the tokio runtime")?;
-    rt.block_on(async { run(&opts).await })?;
+    let outcome = rt.block_on(async { run(&opts).await })?;
+    report(&opts, &outcome);
     Ok(())
+}
+
+/// Human-readable results on stdout. The lib returns data (RunOutcome) so
+/// the app's onboarding can render the same structs as cards; formatting
+/// them is this CLI's job.
+fn report(opts: &Opts, outcome: &RunOutcome) {
+    println!("source     {}", redact_url(&opts.from));
+    println!("data dir   {}", opts.data_dir.display());
+    println!("plan (source rows):");
+    for (table, n) in &outcome.plan().tables {
+        println!("  {table:<22} {n}");
+    }
+    match outcome {
+        RunOutcome::Plan(_) => println!("[dry run] nothing written."),
+        RunOutcome::Imported(summary) => {
+            println!(
+                "imported {} records into {} ({} attachment blobs stored, {} mail FTS rows)",
+                summary.records,
+                opts.data_dir.display(),
+                summary.blobs_stored,
+                summary.mail_fts_rows
+            );
+            println!(
+                "no embeddings were computed — the hive app backfills them in the background \
+                 after its first open of this store"
+            );
+        }
+    }
 }
 
 fn parse_args(args: Vec<String>) -> Result<Cli> {

@@ -1,9 +1,21 @@
-// Architecture-guarding grep (PLAN.md PR 1.7): "no Postgres in hive" stays
-// auditable because sqlx lives ONLY in importer/Cargo.toml. Every other
-// workspace crate must be free of sqlx/pgvector — no dependency declaration
-// in its Cargo.toml, no token anywhere in its sources (code or comments,
-// same total-grep posture as core/tests/determinism.rs). Runs everywhere
-// (no database needed), so the main CI job enforces it too.
+// Architecture-guarding grep (PLAN.md PR 1.7; evolved for the Phase 2 GUI
+// import). The REAL invariant, stated precisely:
+//
+//   1. sqlx/pgvector are DECLARED by importer/Cargo.toml and nowhere else
+//      (never in [workspace.dependencies]);
+//   2. every other crate's sources are token-free — no sqlx/pgvector
+//      anywhere, code or comments (same total-grep posture as
+//      core/tests/determinism.rs);
+//   3. hive-import itself may be depended on ONLY by the app: the product
+//      ships GUI import (first-launch onboarding drives the importer
+//      LIBRARY in-process), so the app linking a Postgres driver is a
+//      conscious product fact — while core, shared, embed, jmap-sync, and
+//      bridge stay Postgres-free even transitively, so the engine and the
+//      MCP doorway never carry one. The app still writes no Postgres of its
+//      own: rule 2 keeps its sources token-free, so everything it can do
+//      with the database is hive-import's published surface.
+//
+// Runs everywhere (no database needed), so the main CI job enforces it too.
 
 use std::path::{Path, PathBuf};
 
@@ -92,13 +104,13 @@ fn only_the_importer_speaks_postgres() {
 
         // Manifests: no dependency DECLARATION (prose in comments may name
         // sqlx — e.g. the workspace manifest documents this very rule).
-        for (lineno, line) in manifest_lines(&crate_dir.join("Cargo.toml")) {
+        for (lineno, line) in manifest_lines(&crate_dir.join("Cargo.toml"), FORBIDDEN) {
             violations.push(format!(
                 "{krate}/Cargo.toml:{lineno}: Postgres dependency declared outside importer/: {line}"
             ));
         }
     }
-    for (lineno, line) in manifest_lines(&root.join("Cargo.toml")) {
+    for (lineno, line) in manifest_lines(&root.join("Cargo.toml"), FORBIDDEN) {
         violations.push(format!(
             "Cargo.toml:{lineno}: Postgres dependency declared in the workspace manifest: {line}"
         ));
@@ -111,9 +123,44 @@ fn only_the_importer_speaks_postgres() {
     );
 }
 
-/// Dependency-declaration lines mentioning a forbidden crate: `sqlx =`,
+/// Rule 3: the importer library is a controlled surface. Only the app may
+/// depend on hive-import (it ships the first-launch GUI import); the engine
+/// crates and the bridge must stay Postgres-free even transitively. Not in
+/// [workspace.dependencies] either — the one sanctioned dependency stays
+/// declared, visibly, in app/Cargo.toml.
+#[test]
+fn only_the_app_rides_the_importer() {
+    let root = workspace_root();
+    let mut violations = Vec::new();
+    for krate in fenced_crates(&root) {
+        if krate == "app" {
+            continue; // the one sanctioned rider (GUI import is the product)
+        }
+        for (lineno, line) in
+            manifest_lines(&root.join(&krate).join("Cargo.toml"), &["hive-import"])
+        {
+            violations.push(format!(
+                "{krate}/Cargo.toml:{lineno}: only app/ may depend on hive-import: {line}"
+            ));
+        }
+    }
+    for (lineno, line) in manifest_lines(&root.join("Cargo.toml"), &["hive-import"]) {
+        violations.push(format!(
+            "Cargo.toml:{lineno}: hive-import must not become a workspace dependency: {line}"
+        ));
+    }
+
+    assert!(
+        violations.is_empty(),
+        "hive-import is app-only (core/shared/embed/jmap-sync/bridge stay \
+         Postgres-free even transitively):\n{}",
+        violations.join("\n")
+    );
+}
+
+/// Dependency-declaration lines mentioning a fenced crate name: `sqlx =`,
 /// `pgvector =`, or a `[dependencies.sqlx]`-style table header.
-fn manifest_lines(path: &Path) -> Vec<(usize, String)> {
+fn manifest_lines(path: &Path, tokens: &[&str]) -> Vec<(usize, String)> {
     let text =
         std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     let mut hits = Vec::new();
@@ -122,7 +169,7 @@ fn manifest_lines(path: &Path) -> Vec<(usize, String)> {
         if line.starts_with('#') {
             continue;
         }
-        let declares = FORBIDDEN.iter().any(|t| {
+        let declares = tokens.iter().any(|t| {
             line.strip_prefix(t)
                 .is_some_and(|rest| rest.trim_start().starts_with('='))
                 || (line.starts_with('[') && line.contains(&format!("dependencies.{t}")))

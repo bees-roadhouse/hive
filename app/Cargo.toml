@@ -15,6 +15,14 @@ repository.workspace = true
 # revisit the pin when upstream fixes it.
 dioxus = { version = "0.6", features = ["desktop"] }
 hive-core = { path = "../core" }
+# GUI import: first-launch onboarding drives the importer LIBRARY in-process
+# (dry-run plan, then the one-shot migration). The Postgres fence still
+# holds — app sources stay token-free and only app/ may take this dependency
+# (importer/tests/no_postgres_gate.rs states and enforces the full rule).
+hive-import = { path = "../importer" }
 hive-shared = { workspace = true }
 hive-embed = { workspace = true }
 anyhow = { workspace = true }
+# The import runs on its own OS thread under a dedicated current-thread
+# runtime (the CLI's exact shape); the UI awaits a oneshot for the result.
+tokio = { workspace = true }
