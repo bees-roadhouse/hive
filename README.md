@@ -31,13 +31,17 @@ Phase 1 (the engine) is complete; Phase 2 (the app) is underway:
   served over stdio by the `hive-bridge` binary.
 - **App shell** — Dioxus desktop window with journal + search riding the
   engine, plus a flatpak manifest (`packaging/flatpak/`).
+- **Importer** — `hive-import` (PR 1.7), the one-shot bridge out of the
+  hosted era: replays an old instance's Postgres into a fresh data dir as
+  op-log records, original ids and timestamps intact, attachment bytes
+  crypto-sharded into the blockstore. The one Postgres client left anywhere
+  in the workspace.
 
 Honest gaps, per plan: **mail sync is paused** (the archive is readable;
 the sync daemon returns as a WASM module in Phase 3), **device sync is
-Phase 4** (single machine until then), **the importer** for hosted-era data
-is pending (PR 1.7), and in the interim bridge mode **the app and
-hive-bridge can't run at the same time** (single-writer lock; the Phase 2.4
-proxy lifts this).
+Phase 4** (single machine until then), and in the interim bridge mode
+**the app and hive-bridge can't run at the same time** (single-writer lock;
+the Phase 2.4 proxy lifts this).
 
 ## Workspace
 
@@ -46,6 +50,7 @@ proxy lifts this).
 | `core/` | hive-core — op log, blockstore, key custody, SQLCipher index + fold projector, the store (one writer thread), and the MCP tool layer |
 | `app/` | Dioxus desktop shell (journal + search) |
 | `bridge/` | `hive-bridge` — stdio MCP server over the local store; also `hive-bridge call` one-shot mode for hooks/scripts |
+| `importer/` | `hive-import` — one-shot hosted-Postgres → data-dir migration (the only sqlx in the workspace) |
 | `shared/` | domain types |
 | `embed/` | embedding seam: ONNX/BGE local models + deterministic hash fallback |
 | `jmap-sync/` | JMAP mail sync library (kept through the pause; returns in-module in Phase 3) |
@@ -61,6 +66,9 @@ cargo run -p hive-app
 # The MCP bridge (installs `hive-bridge` on PATH)
 cargo install --path bridge
 
+# Migrate a hosted-era instance (one-shot; --dry-run to preview the plan)
+cargo run -p hive-import -- --from postgres://user:pass@host/hive --dry-run
+
 # Flatpak (Bazzite/Fedora daily-driver path)
 flatpak-builder --user --install build-dir packaging/flatpak/com.beesroadhouse.Hive.yml
 
@@ -71,7 +79,9 @@ HIVE_EMBED=hash cargo test --workspace
 ```
 
 Tests are hermetic: tempdir data dirs, in-memory keys, hash embedder — no
-database service, no network.
+database service, no network. The one exception: the importer's fixture
+tests run only when `DATABASE_URL` points at a pgvector Postgres (they skip
+loudly otherwise), mirroring the CI split.
 
 ## How Claude connects
 

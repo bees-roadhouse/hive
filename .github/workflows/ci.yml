@@ -13,9 +13,11 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     # No database service: the store is op-log + SQLite since the PR 1.6
-    # cutover — every test runs against tempdir data dirs. PR 1.7 re-adds a
-    # Postgres service scoped to the importer's own tests (the importer is
-    # the one remaining Postgres reader).
+    # cutover — every test runs against tempdir data dirs. This job runs the
+    # WHOLE workspace with no DATABASE_URL (the invariant): hive-import's
+    # DB-backed tests skip themselves loudly, its grep gate and preflight
+    # tests still run. The `importer` job below is the one place Postgres
+    # exists, scoped to the importer's own tests.
     steps:
       - uses: actions/checkout@v4
 
@@ -53,3 +55,50 @@ jobs:
         env:
           HIVE_EMBED: hash
         run: cargo test --workspace
+
+  # The PR 1.7 exception, and the ONLY database in CI: hive-import reads a
+  # hosted-era Postgres, so its fixture tests get a pgvector service (the
+  # legacy schema's embeddings.vec_v column needs the extension) and
+  # DATABASE_URL. Everything else about "no Postgres in hive" is enforced by
+  # the grep gate (importer/tests/no_postgres_gate.rs), which runs in BOTH
+  # jobs.
+  importer:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: hive
+          POSTGRES_PASSWORD: hive
+          POSTGRES_DB: hive
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hive"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # hive-import pulls in hive-core (bundled SQLCipher + vendored
+      # OpenSSL) and hive-embed, but not the app — no webkit/gtk here.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: hive-rust-importer
+
+      - name: Importer tests (fixture Postgres)
+        env:
+          HIVE_EMBED: hash
+          DATABASE_URL: postgres://hive:hive@localhost:5432/hive
+        run: cargo test -p hive-import

@@ -901,7 +901,9 @@ pub fn fts_clip(body: &str, max_bytes: usize) -> &str {
     &body[..end]
 }
 
-const FTS_CLIP_BYTES: usize = 200_000;
+/// The one clip size for mail FTS bodies — shared with the 1.7 importer so
+/// imported and synced messages index identically.
+pub const FTS_CLIP_BYTES: usize = 200_000;
 
 /// THE mail embed-eligibility predicate — the single contract between the
 /// embed drain (which embeds rows matching it) and the reaper (which deletes

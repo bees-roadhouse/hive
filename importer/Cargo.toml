@@ -1,0 +1,33 @@
+[package]
+name = "hive-import"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+hive-core = { path = "../core" }
+hive-embed = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+# Envelope-ts normalization for legacy timestamps that miss the frozen shape.
+chrono = { workspace = true }
+# Re-keying attachment bytes to their blockstore-convention content hash.
+blake3 = { workspace = true }
+# HIVE_IMPORT_KEY_HEX decoding (the keychain-free test escape hatch).
+data-encoding = { workspace = true }
+
+# The ONE Postgres dependency in the workspace — declared here, deliberately
+# NOT in [workspace.dependencies], so "no Postgres in hive" stays
+# grep-auditable (the gate: importer/tests/no_postgres_gate.rs). Version line
+# matches what core carried before the PR 1.6 cutover; TLS included because
+# the real hosted instance may sit behind sslmode=require.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+nanoid = { workspace = true }
