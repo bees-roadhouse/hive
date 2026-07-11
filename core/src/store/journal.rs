@@ -102,6 +102,33 @@ impl Store {
         .await
     }
 
+    /// Like `journal_list`, but only entries authored by `author` (the
+    /// people.slug). Newest-first, paginated the same way — the app's
+    /// Identities filter uses it to show one identity's journal without
+    /// dropping entries: filtering a client-side page would silently hide
+    /// rows past the limit, so the WHERE runs in SQL on the derived index.
+    pub async fn journal_list_by_author(
+        &self,
+        author: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<JournalEntryView>> {
+        let author = author.to_string();
+        self.run(move |core| {
+            let entries: Vec<JournalEntry> = {
+                let mut stmt = core.conn().prepare(
+                    "SELECT * FROM journal WHERE author = ?1 \
+                     ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
+                )?;
+                let rows =
+                    stmt.query_map(rusqlite::params![author, limit, offset], row_to_entry)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            entries.into_iter().map(|e| entry_view(core, e)).collect()
+        })
+        .await
+    }
+
     pub async fn journal_get(&self, entry_id: &str) -> Result<Option<JournalEntryView>> {
         let entry_id = entry_id.to_string();
         self.run(move |core| {

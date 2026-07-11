@@ -85,6 +85,22 @@ impl Store {
         Ok(p)
     }
 
+    /// Create (or find, if the slug already exists) an authorable identity — a
+    /// human or an AI who can sign journal entries. The app's Identities pane
+    /// calls this to mint a new `ActorKind::Ai` author; it records through the
+    /// same `person_ensure_plan` fold as `people_ensure` (no reach into
+    /// internals) and emits `person.created` under the "system" actor, the
+    /// authorless origin the GUI uses when there's no acting user to name.
+    ///
+    /// Distinct from `people_create` only in that seam: same fold, but named
+    /// for the product surface (identity management) and self-actored so the
+    /// GUI needn't thread an actor through.
+    // Phase 3: a per-identity mail credential record will hang off this actor
+    // (each identity gets a credentialed mailbox); create it alongside here.
+    pub async fn identity_create(&self, name: &str, kind: ActorKind) -> Result<Person> {
+        self.people_create(name, kind, "system").await
+    }
+
     pub async fn people_update(
         &self,
         id_or_slug: &str,
