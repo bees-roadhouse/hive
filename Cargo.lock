@@ -2730,6 +2730,7 @@ dependencies = [
  "hive-embed",
  "hive-import",
  "hive-shared",
+ "serde_json",
  "tokio",
 ]
 
