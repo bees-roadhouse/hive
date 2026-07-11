@@ -18,14 +18,16 @@ use dioxus::desktop::{use_wry_event_handler, Config, WindowBuilder};
 use dioxus::prelude::*;
 use hive_core::keys::{KeySource, KeychainKeySource, MemoryKeySource};
 use hive_core::store::custom_entities::EntityFilter;
+use hive_core::store::events::EventCreate;
 use hive_core::store::tasks::TaskFilter;
 use hive_core::store::Store;
 use hive_embed::{Backend, EmbedConfig, Embedder, RuntimeEmbedder};
 use hive_import::{Plan, RunOutcome, Summary};
 use hive_shared::{
-    ActorKind, CustomEntity, CustomEntityPatch, EntityField, EntityTypePatch, FieldType,
-    JournalEntryView, Link, NewCustomEntity, NewEntityField, NewJournalEntry, Person, Priority,
-    SearchHit, Task, TaskPatch, TaskStatus, PRIORITIES, TASK_STATUSES,
+    ActorKind, CustomEntity, CustomEntityPatch, EntityField, EntityTypePatch, EventItem,
+    EventPatch, FieldType, JournalEntryView, Link, NewCustomEntity, NewEntityField,
+    NewJournalEntry, Person, Priority, SearchHit, Task, TaskPatch, TaskStatus, PRIORITIES,
+    TASK_STATUSES,
 };
 use serde_json::Value;
 
@@ -148,6 +150,8 @@ enum Selected {
     Contact(String),
     /// A task row.
     Task(String),
+    /// A calendar event (a built-in `event` row).
+    Event(String),
 }
 
 /// What main() hands the UI: a live store, a fresh data dir awaiting
@@ -960,12 +964,7 @@ fn Shell(store: ReadOnlySignal<Store>) -> Element {
                              send and receive as any of your identities, with every message \
                              woven into the same searchable memory as your journal.",
                         ),
-                        Section::Calendar => placeholder_pane(
-                            Section::Calendar,
-                            "A CalDAV client: your calendars synced from the servers you already \
-                             use, events sitting alongside the journal so your week and your \
-                             writing share one timeline.",
-                        ),
+                        Section::Calendar => rsx! { CalendarPane { store, selected, refresh } },
                     }
                 }
             }
@@ -1343,6 +1342,425 @@ fn placeholder_pane(s: Section, blurb: &str) -> Element {
             }
         }
     }
+}
+
+// ── calendar pane (fold-safe: a month grid over the existing events) ──────────
+//
+// The calendar renders the SAME built-in events the journal emits (title/body/
+// at/tags/assignees) — it invents no new type. Each event is placed by parsing
+// its free-form `at` with `event_day`; anything undated or unparseable falls
+// into the "Undated / unscheduled" list so nothing is hidden. Create/edit/
+// delete go through the reusable EntityDetail (Selected::Event). Recurrence,
+// reminders, and CalDAV are a deferred, batched fold-migration slice.
+
+/// The Calendar section: a navigable month grid of events, an undated list, and
+/// a minimal create form. Selecting an event (or creating one) opens the shared
+/// EntityDetail. `refresh` re-pulls the events after a create/edit/delete.
+#[component]
+fn CalendarPane(
+    store: ReadOnlySignal<Store>,
+    selected: Signal<Option<Selected>>,
+    refresh: Signal<u32>,
+) -> Element {
+    // Visible month, initialized to today (falls back to a fixed epoch only if
+    // the clock string is somehow unparseable — it never is).
+    let (ty0, tm0, _td0) = parse_ymd(&today_ymd()).unwrap_or((2026, 7, 11));
+    let mut year = use_signal(|| ty0);
+    let mut month = use_signal(|| tm0);
+    // Create-form state; a day-cell click prefills the date and the form sits
+    // at the top of the pane.
+    let mut new_title = use_signal(String::new);
+    let mut new_date = use_signal(today_ymd);
+    let mut err = use_signal(|| Option::<String>::None);
+
+    let events = use_resource(move || {
+        let store = store();
+        async move {
+            let _ = refresh();
+            store.events_list().await.map_err(|e| format!("{e:#}"))
+        }
+    });
+
+    // Create a minimal event on the chosen date, then open its detail.
+    let mut create = move || {
+        let title = new_title().trim().to_string();
+        if title.is_empty() {
+            err.set(Some("Give the event a title first.".to_string()));
+            return;
+        }
+        let date = new_date().trim().to_string();
+        let at = if date.is_empty() { None } else { Some(date) };
+        let store = store();
+        let mut refresh = refresh;
+        spawn(async move {
+            match store
+                .events_create(
+                    EventCreate {
+                        title,
+                        at,
+                        ..Default::default()
+                    },
+                    "system",
+                )
+                .await
+            {
+                Ok(e) => {
+                    new_title.set(String::new());
+                    err.set(None);
+                    refresh += 1;
+                    selected.set(Some(Selected::Event(e.id)));
+                }
+                Err(e) => err.set(Some(format!("{e:#}"))),
+            }
+        });
+    };
+
+    let y = year();
+    let m = month();
+    let today = today_ymd();
+
+    rsx! {
+        div {
+            id: "calendar-pane",
+            style: "max-width: 960px; margin: 0 auto; padding: 1.6rem 1.2rem 3rem;",
+            {pane_header("Calendar", "Your events on a month grid — the same happenings that \
+                                     emerge from your journal, plus any you add here. Click a day \
+                                     to plan something; click an event to open it.")}
+
+            // create form (a day-cell click prefills the date)
+            div {
+                style: "background: {PANEL}; border: 1px solid {EDGE}; border-radius: 12px; \
+                        padding: 1rem 1.1rem; margin: 1rem 0 1.3rem;",
+                div { style: "font-weight: 700; font-size: 1rem;", "New event" }
+                div {
+                    style: "display: flex; gap: 0.6rem; margin-top: 0.8rem; flex-wrap: wrap;",
+                    input {
+                        id: "cal-new-title",
+                        style: "flex: 1; min-width: 12rem; box-sizing: border-box; background: {BG}; color: {INK}; \
+                                border: 1px solid {EDGE}; border-radius: 8px; padding: 0.6rem 0.75rem; \
+                                font: inherit; font-size: 0.92rem; outline: none;",
+                        placeholder: "What's happening? e.g. Dentist",
+                        value: "{new_title}",
+                        oninput: move |e| new_title.set(e.value()),
+                        onkeydown: move |e| {
+                            if e.key() == Key::Enter {
+                                create();
+                            }
+                        },
+                    }
+                    input {
+                        id: "cal-new-date",
+                        r#type: "date",
+                        style: "box-sizing: border-box; background: {BG}; color: {INK}; \
+                                border: 1px solid {EDGE}; border-radius: 8px; padding: 0.6rem 0.75rem; \
+                                font: inherit; font-size: 0.92rem; outline: none;",
+                        value: "{new_date}",
+                        oninput: move |e| new_date.set(e.value()),
+                    }
+                    button {
+                        id: "cal-new",
+                        style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                                padding: 0.6rem 1.3rem; font-weight: 700; font-size: 0.9rem; cursor: pointer;",
+                        onclick: move |_| create(),
+                        "+ New event"
+                    }
+                }
+                if let Some(e) = err() {
+                    div {
+                        style: "color: #e07a5f; font-size: 0.85rem; margin-top: 0.6rem;",
+                        "{e}"
+                    }
+                }
+            }
+
+            // month nav
+            div {
+                style: "display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.8rem;",
+                button {
+                    id: "cal-prev",
+                    style: "{cal_nav_btn_style()}",
+                    onclick: move |_| {
+                        let (ny, nm) = step_month(year(), month(), false);
+                        year.set(ny);
+                        month.set(nm);
+                    },
+                    "‹"
+                }
+                button {
+                    id: "cal-today",
+                    style: "{cal_nav_btn_style()} padding-left: 0.9rem; padding-right: 0.9rem;",
+                    onclick: move |_| {
+                        if let Some((ty, tm, _)) = parse_ymd(&today_ymd()) {
+                            year.set(ty);
+                            month.set(tm);
+                        }
+                    },
+                    "Today"
+                }
+                button {
+                    id: "cal-next",
+                    style: "{cal_nav_btn_style()}",
+                    onclick: move |_| {
+                        let (ny, nm) = step_month(year(), month(), true);
+                        year.set(ny);
+                        month.set(nm);
+                    },
+                    "›"
+                }
+                div {
+                    id: "cal-label",
+                    style: "font-size: 1.15rem; font-weight: 700; margin-left: 0.4rem;",
+                    "{month_label(y, m)}"
+                }
+            }
+
+            match events() {
+                None => muted("loading events…"),
+                Some(Err(e)) => muted(&format!("events unavailable: {e}")),
+                Some(Ok(list)) => {
+                    let placed = placed_events(&list);
+                    let undated = undated_events(&list);
+                    rsx! {
+                        {month_grid_view(y, m, &today, &placed, selected, new_date)}
+                        {undated_view(&undated, selected)}
+                    }
+                }
+            }
+
+            // honest deferral — one quiet line, no non-functional controls.
+            div {
+                id: "cal-deferred",
+                style: "color: {FAINT}; font-size: 0.82rem; line-height: 1.6; margin-top: 1.6rem; \
+                        text-align: center;",
+                "Recurring events, reminders, and calendar-server (CalDAV) sync arrive in a later update."
+            }
+        }
+    }
+}
+
+/// Group events by the (year, month, day) their `at` parses to. Pure, so the
+/// placement is testable without a store or a component.
+fn placed_events(list: &[EventItem]) -> std::collections::HashMap<(i32, u32, u32), Vec<EventItem>> {
+    let mut map: std::collections::HashMap<(i32, u32, u32), Vec<EventItem>> =
+        std::collections::HashMap::new();
+    for e in list {
+        if let Some(day) = e.at.as_deref().and_then(event_day) {
+            map.entry(day).or_default().push(e.clone());
+        }
+    }
+    // Stable in-cell order: timed first (by time), then untimed, then title.
+    // `None` (untimed) must sort AFTER any time, so key it to a sentinel that
+    // orders last rather than relying on Option's None-sorts-first ordering.
+    for evs in map.values_mut() {
+        let key = |e: &EventItem| {
+            e.at.as_deref()
+                .and_then(event_time)
+                .unwrap_or_else(|| "99:99".to_string())
+        };
+        evs.sort_by(|a, b| key(a).cmp(&key(b)).then(a.title.cmp(&b.title)));
+    }
+    map
+}
+
+/// The events with no parseable date — null or vague `at` — surfaced so nothing
+/// is hidden. Pure and testable.
+fn undated_events(list: &[EventItem]) -> Vec<EventItem> {
+    list.iter()
+        .filter(|e| e.at.as_deref().and_then(event_day).is_none())
+        .cloned()
+        .collect()
+}
+
+/// The weekday header + the 6×7 day grid for the visible month. Plain fn:
+/// EventItem/HashMap lack the PartialEq component props want.
+fn month_grid_view(
+    year: i32,
+    month: u32,
+    today: &str,
+    placed: &std::collections::HashMap<(i32, u32, u32), Vec<EventItem>>,
+    selected: Signal<Option<Selected>>,
+    new_date: Signal<String>,
+) -> Element {
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    let cells = month_grid(year, month);
+    let today_day = parse_ymd(today).filter(|(ty, tm, _)| *ty == year && *tm == month);
+    rsx! {
+        // weekday header
+        div {
+            style: "display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; \
+                    margin-bottom: 4px;",
+            for wd in WEEKDAYS.iter() {
+                div {
+                    style: "font-size: 0.72rem; font-weight: 700; letter-spacing: 0.05em; \
+                            text-transform: uppercase; color: {DIM}; text-align: center; \
+                            padding: 0.3rem 0;",
+                    "{wd}"
+                }
+            }
+        }
+        // day cells
+        div {
+            id: "cal-grid",
+            style: "display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px;",
+            for (i, cell) in cells.iter().enumerate() {
+                {day_cell(*cell, i, year, month, today_day, placed, selected, new_date)}
+            }
+        }
+    }
+}
+
+/// One grid cell: an out-of-month blank, or a day with its (up to 3) event
+/// chips + "+N more". Clicking empty cell space prefills the create date.
+#[allow(clippy::too_many_arguments)]
+fn day_cell(
+    cell: Option<u32>,
+    idx: usize,
+    year: i32,
+    month: u32,
+    today_day: Option<(i32, u32, u32)>,
+    placed: &std::collections::HashMap<(i32, u32, u32), Vec<EventItem>>,
+    selected: Signal<Option<Selected>>,
+    mut new_date: Signal<String>,
+) -> Element {
+    let Some(day) = cell else {
+        // Padding cell before/after the month — inert, keyed by position.
+        return rsx! {
+            div {
+                key: "pad-{idx}",
+                style: "min-height: 6.2rem; background: transparent; border-radius: 8px;",
+            }
+        };
+    };
+    let key = ymd_key(year, month, day);
+    let is_today = today_day == Some((year, month, day));
+    let evs = placed.get(&(year, month, day)).cloned().unwrap_or_default();
+    let shown = evs.iter().take(3).cloned().collect::<Vec<_>>();
+    let extra = evs.len().saturating_sub(shown.len());
+    let border = if is_today {
+        format!("2px solid {GOLD}")
+    } else {
+        format!("1px solid {EDGE}")
+    };
+    let num_color = if is_today { GOLD } else { DIM };
+    let date_for_click = key.clone();
+    rsx! {
+        div {
+            id: "cal-cell-{key}",
+            style: "min-height: 6.2rem; background: {PANEL}; border: {border}; border-radius: 8px; \
+                    padding: 0.3rem 0.35rem; display: flex; flex-direction: column; gap: 2px; \
+                    cursor: pointer; overflow: hidden;",
+            // A click on empty cell space prefills the create form's date. Event
+            // chips stopPropagation so opening one doesn't also re-arm the date.
+            onclick: move |_| new_date.set(date_for_click.clone()),
+            div {
+                style: "font-size: 0.72rem; font-weight: 700; color: {num_color}; text-align: right; \
+                        padding: 0 0.15rem;",
+                "{day}"
+            }
+            for e in shown.iter() {
+                {event_chip(e, selected)}
+            }
+            if extra > 0 {
+                div {
+                    style: "font-size: 0.68rem; color: {DIM}; padding: 0 0.15rem;",
+                    "+{extra} more"
+                }
+            }
+        }
+    }
+}
+
+/// One event chip inside a day cell: the title (prefixed with its time when the
+/// `at` carried one), truncated, opening the event's detail on click.
+fn event_chip(e: &EventItem, mut selected: Signal<Option<Selected>>) -> Element {
+    let id = e.id.clone();
+    let time = e.at.as_deref().and_then(event_time);
+    let title = if e.title.trim().is_empty() {
+        "(untitled)".to_string()
+    } else {
+        e.title.clone()
+    };
+    let label = match &time {
+        Some(t) => format!("{t} {title}"),
+        None => title,
+    };
+    rsx! {
+        button {
+            id: "cal-event-{e.id}",
+            style: "display: block; width: 100%; text-align: left; background: {BG}; \
+                    border: 1px solid {EDGE}; border-radius: 6px; color: {INK}; font: inherit; \
+                    font-size: 0.72rem; padding: 0.15rem 0.35rem; cursor: pointer; \
+                    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;",
+            onclick: move |ev| {
+                ev.stop_propagation();
+                selected.set(Some(Selected::Event(id.clone())));
+            },
+            "{label}"
+        }
+    }
+}
+
+/// The "Undated / unscheduled" list below the grid — events whose `at` is null
+/// or unparseable, so journal-emerged vague events are never hidden.
+fn undated_view(undated: &[EventItem], selected: Signal<Option<Selected>>) -> Element {
+    if undated.is_empty() {
+        return rsx! {
+            div { id: "cal-undated", style: "display: none;" }
+        };
+    }
+    rsx! {
+        div {
+            id: "cal-undated",
+            style: "margin-top: 1.4rem;",
+            div {
+                style: "font-size: 0.78rem; font-weight: 700; letter-spacing: 0.05em; \
+                        text-transform: uppercase; color: {FAINT}; margin-bottom: 0.6rem;",
+                "Undated / unscheduled"
+            }
+            for e in undated.iter() {
+                {undated_row(e, selected)}
+            }
+        }
+    }
+}
+
+/// One undated event row: title + its raw `at` text (if any), opening the
+/// detail so a real date can be set.
+fn undated_row(e: &EventItem, mut selected: Signal<Option<Selected>>) -> Element {
+    let id = e.id.clone();
+    let raw = e.at.clone().filter(|s| !s.trim().is_empty());
+    let title = if e.title.trim().is_empty() {
+        "(untitled event)".to_string()
+    } else {
+        e.title.clone()
+    };
+    rsx! {
+        button {
+            id: "cal-undated-{e.id}",
+            style: "display: flex; align-items: center; gap: 0.7rem; width: 100%; text-align: left; \
+                    background: {PANEL}; border: 1px solid {EDGE}; border-radius: 10px; \
+                    padding: 0.6rem 0.9rem; margin-bottom: 0.5rem; color: {INK}; font: inherit; cursor: pointer;",
+            onclick: move |_| selected.set(Some(Selected::Event(id.clone()))),
+            div {
+                style: "flex: 1; min-width: 0;",
+                div { style: "font-weight: 600; font-size: 0.92rem;", "{title}" }
+                if let Some(r) = raw {
+                    div {
+                        style: "font-size: 0.76rem; color: {FAINT}; margin-top: 0.1rem;",
+                        "when: {r}"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Shared style for the small month-nav buttons.
+fn cal_nav_btn_style() -> String {
+    format!(
+        "background: {PANEL}; color: {INK}; border: 1px solid {EDGE}; border-radius: 8px; \
+         padding: 0.4rem 0.7rem; font: inherit; font-size: 0.95rem; font-weight: 700; cursor: pointer;"
+    )
 }
 
 // ── identities pane ──────────────────────────────────────────────────────────
@@ -1773,6 +2191,188 @@ fn today_ymd() -> String {
         .get(0..10)
         .unwrap_or_default()
         .to_string()
+}
+
+// ── a small, chrono-free calendar library (integer math, unit-tested) ─────────
+//
+// The month grid and event placement need only: which (y,m,d) an event falls
+// on, whether a year is a leap year, how many days a month has, and the weekday
+// of a date. All pure integer math (like age_years/today_ymd) so it tests
+// without a clock and never pulls chrono into the UI crate.
+
+/// Is `year` a leap year (proleptic Gregorian)?
+fn is_leap(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+/// Days in `month` (1-12) of `year`; 0 for an out-of-range month.
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Weekday of a date, 0 = Sunday … 6 = Saturday (Sakamoto's algorithm). Valid
+/// for the proleptic Gregorian calendar; month must be 1-12.
+fn weekday(year: i32, month: u32, day: u32) -> u32 {
+    const T: [i32; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let mut y = year;
+    if month < 3 {
+        y -= 1;
+    }
+    let m = month as i32;
+    let d = day as i32;
+    (((y + y / 4 - y / 100 + y / 400 + T[(m - 1) as usize] + d) % 7) + 7) as u32 % 7
+}
+
+/// Step one month, wrapping the year: (2026, 12) → (2027, 1), (2026, 1) prev →
+/// (2025, 12). `forward` picks the direction.
+fn step_month(year: i32, month: u32, forward: bool) -> (i32, u32) {
+    if forward {
+        if month == 12 {
+            (year + 1, 1)
+        } else {
+            (year, month + 1)
+        }
+    } else if month == 1 {
+        (year - 1, 12)
+    } else {
+        (year, month - 1)
+    }
+}
+
+/// The 42 cells (6 weeks × 7 days, Sunday-first) of the month view: `None`
+/// before the 1st and after the last day, `Some(day)` for the month's days.
+/// Six rows is the fixed maximum any Gregorian month needs, so the grid never
+/// reflows height between months.
+fn month_grid(year: i32, month: u32) -> Vec<Option<u32>> {
+    let lead = weekday(year, month, 1) as usize; // blanks before the 1st
+    let days = days_in_month(year, month) as usize;
+    let mut cells: Vec<Option<u32>> = Vec::with_capacity(42);
+    for _ in 0..lead {
+        cells.push(None);
+    }
+    for d in 1..=days {
+        cells.push(Some(d as u32));
+    }
+    while cells.len() < 42 {
+        cells.push(None);
+    }
+    cells
+}
+
+/// Parse a free-form event `at` string leniently into (year, month, day),
+/// accepting the shapes journal emergence and the editor actually write:
+///
+///   - the frozen 24-char ISO `YYYY-MM-DDTHH:MM:SS.sssZ`
+///   - an ISO date `YYYY-MM-DD`
+///   - an ISO datetime `YYYY-MM-DDTHH:MM[:SS]` (any timezone suffix ignored)
+///   - `YYYY-MM-DD HH:MM[:SS]` (space separator)
+///
+/// Anything else (vague prose like "next Tuesday", empty, malformed) → None, so
+/// it lands in the "Undated / unscheduled" list rather than a wrong cell. The
+/// date is validated (real month, real day-of-month) so 2026-02-30 is rejected.
+fn event_day(at: &str) -> Option<(i32, u32, u32)> {
+    let s = at.trim();
+    let b = s.as_bytes();
+    // Require at least `YYYY-MM-DD` with the two dashes in place; the char after
+    // the date (if any) must be a separator we recognize (T, t, or space).
+    if b.len() < 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    if b.len() > 10 && !matches!(b[10], b'T' | b't' | b' ') {
+        return None;
+    }
+    let num = |a: usize, z: usize| s.get(a..z)?.parse::<i32>().ok();
+    let year = num(0, 4)?;
+    let month = num(5, 7)?;
+    let day = num(8, 10)?;
+    // Reject stray signs/plus that parse::<i32> would tolerate on the sub-slice.
+    if !s.as_bytes()[0..10]
+        .iter()
+        .all(|c| c.is_ascii_digit() || *c == b'-')
+    {
+        return None;
+    }
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    let m = month as u32;
+    let d = day as u32;
+    if day < 1 || d > days_in_month(year, m) {
+        return None;
+    }
+    Some((year, m, d))
+}
+
+/// The `HH:MM` of an event `at` if it carried a time (datetime or dotted ISO),
+/// else None — used to show a time beside a day-cell chip. Requires a valid
+/// date prefix first (so a bare time-less date shows no time).
+fn event_time(at: &str) -> Option<String> {
+    event_day(at)?; // only meaningful for a real date
+    let s = at.trim();
+    let b = s.as_bytes();
+    if b.len() < 16 || !matches!(b[10], b'T' | b't' | b' ') {
+        return None;
+    }
+    // HH:MM at positions 11..16, both numeric, with the colon in place.
+    let hh = s.get(11..13)?;
+    let mm = s.get(14..16)?;
+    if b[13] != b':'
+        || !hh.bytes().all(|c| c.is_ascii_digit())
+        || !mm.bytes().all(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let (h, mi) = (hh.parse::<u32>().ok()?, mm.parse::<u32>().ok()?);
+    if h > 23 || mi > 59 {
+        return None;
+    }
+    Some(format!("{hh}:{mm}"))
+}
+
+/// Format a (year, month, day) as the `YYYY-MM-DD` key used for cell ids and
+/// as the clean value written into `at` from the date picker.
+fn ymd_key(year: i32, month: u32, day: u32) -> String {
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Parse `today_ymd()`-shaped `YYYY-MM-DD` back into (year, month, day) for the
+/// initial calendar position and the today highlight.
+fn parse_ymd(s: &str) -> Option<(i32, u32, u32)> {
+    event_day(s)
+}
+
+/// The month label a header shows, e.g. "July 2026".
+fn month_label(year: i32, month: u32) -> String {
+    const NAMES: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    let name = NAMES
+        .get((month.saturating_sub(1)) as usize)
+        .copied()
+        .unwrap_or("");
+    format!("{name} {year}")
 }
 
 /// A JSON field value as the string an `<input>`/`<textarea>` shows: strings
@@ -2256,6 +2856,108 @@ fn task_field_values(t: &Task) -> serde_json::Map<String, Value> {
     m
 }
 
+/// Synthesize the editable field specs for an event, so the SAME field editors
+/// render an event as they do a task/contact. `date` + `time` compose into a
+/// clean ISO `at`; `at_raw` only appears when the stored `at` couldn't be
+/// parsed (vague journal text) so its original value is never silently lost.
+/// Slugs match the EventPatch mapping in `save_detail`.
+fn event_field_specs(has_raw_at: bool) -> Vec<EntityField> {
+    let f = |slug: &str, label: &str, ft: FieldType| EntityField {
+        id: format!("eventfield_{slug}"),
+        slug: slug.to_string(),
+        label: label.to_string(),
+        field_type: ft,
+        required: false,
+        position: 0,
+        options: Vec::new(),
+        ref_kind: None,
+        archived: false,
+    };
+    let mut specs = vec![
+        f("title", "Title", FieldType::Text),
+        f("date", "Date", FieldType::Date),
+        f("time", "Time (optional, HH:MM)", FieldType::Text),
+    ];
+    // Only shown when the original `at` wasn't a clean date/datetime — editing
+    // it (or filling Date above) replaces it; leaving it keeps the prose.
+    if has_raw_at {
+        specs.push(f("at_raw", "When (as written)", FieldType::Text));
+    }
+    specs.push(f("assignees", "Assignees", FieldType::Text));
+    specs.push(f("body", "Notes", FieldType::Text));
+    specs
+}
+
+/// The current event field values as the synthesized-spec map `save_detail`
+/// reads back. A parseable `at` splits into `date` (+ `time` if it had one); an
+/// unparseable `at` is surfaced verbatim as `at_raw`.
+fn event_field_values(e: &EventItem) -> serde_json::Map<String, Value> {
+    let mut m = serde_json::Map::new();
+    m.insert("title".into(), Value::String(e.title.clone()));
+    match e.at.as_deref() {
+        Some(at) if !at.trim().is_empty() => match event_day(at) {
+            Some((y, mo, d)) => {
+                m.insert("date".into(), Value::String(ymd_key(y, mo, d)));
+                if let Some(hm) = event_time(at) {
+                    m.insert("time".into(), Value::String(hm));
+                }
+            }
+            None => {
+                m.insert("at_raw".into(), Value::String(at.to_string()));
+            }
+        },
+        _ => {}
+    }
+    m.insert("assignees".into(), Value::String(e.assignees.join(", ")));
+    m.insert("body".into(), Value::String(e.body.clone()));
+    m
+}
+
+/// Compose the `at` string an event edit should write from the staged fields:
+/// a `date` plus optional `time` become a clean ISO (`YYYY-MM-DD` or the frozen
+/// 24-char `…T HH:MM:00.000Z`); a `date` alone writes the bare date; no date
+/// but an `at_raw` keeps the original prose; nothing → None (unscheduled).
+fn compose_event_at(values: &serde_json::Map<String, Value>) -> Option<String> {
+    let get = |k: &str| {
+        values
+            .get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let date = get("date");
+    if !date.is_empty() {
+        let time = get("time");
+        // Accept HH:MM (or HH:MM:SS) → normalize to the frozen 24-char ISO so
+        // it round-trips through event_day/event_time; a bad time is dropped
+        // rather than corrupting the date.
+        if !time.is_empty() {
+            let tb = time.as_bytes();
+            let ok = tb.len() >= 5
+                && tb[2] == b':'
+                && time
+                    .get(0..2)
+                    .is_some_and(|h| h.bytes().all(|c| c.is_ascii_digit()))
+                && time
+                    .get(3..5)
+                    .is_some_and(|mm| mm.bytes().all(|c| c.is_ascii_digit()));
+            if ok {
+                let hh = &time[0..2];
+                let mm = &time[3..5];
+                return Some(format!("{date}T{hh}:{mm}:00.000Z"));
+            }
+        }
+        return Some(date);
+    }
+    let raw = get("at_raw");
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw)
+    }
+}
+
 /// The reusable detail view: a header, a typed editor per field, a Notes
 /// section, an add-a-field affordance (contacts only), and the emergent
 /// "Related in your journal" backlinks — used by BOTH contacts and tasks.
@@ -2277,6 +2979,8 @@ fn EntityDetail(
     // Add-a-field form state (contacts only).
     let mut new_field_label = use_signal(String::new);
     let mut new_field_type = use_signal(|| FieldType::Text.as_str().to_string());
+    // Two-step delete confirm (events): first click arms it, second commits.
+    let mut confirm_delete = use_signal(|| false);
 
     let target_load = target.clone();
     let data = use_resource(move || {
@@ -2317,6 +3021,28 @@ fn EntityDetail(
                     refresh += 1; // re-pull the pane behind
                 }
                 Err(e) => status_msg.set(Some(e)),
+            }
+        });
+    };
+
+    // Delete (events only for now): tombstones the row, then returns to the
+    // pane behind. Two-step — the first click arms `confirm_delete`, the
+    // second (the "Really delete?" button) actually deletes.
+    let target_delete = target.clone();
+    let delete = move || {
+        let Selected::Event(id) = target_delete.clone() else {
+            return;
+        };
+        let store = store();
+        let mut selected = selected;
+        let mut refresh = refresh;
+        spawn(async move {
+            match store.events_delete(&id, "system").await {
+                Ok(_) => {
+                    refresh += 1; // the calendar re-pulls without the event
+                    selected.set(None); // back to the pane
+                }
+                Err(e) => status_msg.set(Some(format!("{e:#}"))),
             }
         });
     };
@@ -2412,7 +3138,7 @@ fn EntityDetail(
                             {field_editor(spec, edits)}
                         }
 
-                        // Save
+                        // Save (+ Delete for events)
                         div {
                             style: "display: flex; align-items: center; gap: 0.7rem; margin-top: 1.1rem;",
                             button {
@@ -2424,6 +3150,40 @@ fn EntityDetail(
                             }
                             if let Some(m) = status_msg() {
                                 span { style: "font-size: 0.82rem; color: {DIM};", "{m}" }
+                            }
+                            // Delete lives at the right edge; events only.
+                            if matches!(target, Selected::Event(_)) {
+                                span { style: "flex: 1;" }
+                                if confirm_delete() {
+                                    span {
+                                        style: "font-size: 0.82rem; color: #e07a5f;",
+                                        "Delete this event?"
+                                    }
+                                    button {
+                                        id: "detail-delete",
+                                        style: "background: #e07a5f; color: #14120e; border: none; border-radius: 8px; \
+                                                padding: 0.5rem 1rem; font-weight: 700; font-size: 0.85rem; cursor: pointer;",
+                                        onclick: move |_| delete(),
+                                        "Really delete"
+                                    }
+                                    button {
+                                        id: "detail-delete-cancel",
+                                        style: "background: none; border: 1px solid {EDGE}; color: {DIM}; \
+                                                border-radius: 8px; padding: 0.5rem 0.9rem; font: inherit; \
+                                                font-size: 0.85rem; cursor: pointer;",
+                                        onclick: move |_| confirm_delete.set(false),
+                                        "Cancel"
+                                    }
+                                } else {
+                                    button {
+                                        id: "detail-delete-arm",
+                                        style: "background: none; border: 1px solid #e07a5f; color: #e07a5f; \
+                                                border-radius: 8px; padding: 0.5rem 1rem; font: inherit; font-weight: 700; \
+                                                font-size: 0.85rem; cursor: pointer;",
+                                        onclick: move |_| confirm_delete.set(true),
+                                        "Delete"
+                                    }
+                                }
                             }
                         }
                     }
@@ -2681,10 +3441,10 @@ fn stage_str(mut edits: Signal<serde_json::Map<String, Value>>, slug: &str, v: S
     }
 }
 
-/// The ref id `links_for_entity` resolves backlinks against, for either target.
+/// The ref id `links_for_entity` resolves backlinks against, for any target.
 fn detail_ref_id(target: &Selected) -> String {
     match target {
-        Selected::Contact(id) | Selected::Task(id) => id.clone(),
+        Selected::Contact(id) | Selected::Task(id) | Selected::Event(id) => id.clone(),
     }
 }
 
@@ -2721,6 +3481,27 @@ async fn load_detail(store: &Store, target: &Selected) -> Result<DetailData, Str
                 kind_label: "task".to_string(),
                 specs: task_field_specs(),
                 values: task_field_values(&task),
+            })
+        }
+        Selected::Event(id) => {
+            let event = store
+                .events_get(id)
+                .await
+                .map_err(|e| format!("{e:#}"))?
+                .ok_or_else(|| "this event no longer exists".to_string())?;
+            let has_raw_at = event
+                .at
+                .as_deref()
+                .is_some_and(|at| !at.trim().is_empty() && event_day(at).is_none());
+            Ok(DetailData {
+                name: if event.title.trim().is_empty() {
+                    "(untitled event)".to_string()
+                } else {
+                    event.title.clone()
+                },
+                kind_label: "event".to_string(),
+                specs: event_field_specs(has_raw_at),
+                values: event_field_values(&event),
             })
         }
     }
@@ -2776,6 +3557,35 @@ async fn save_detail(
             };
             store
                 .tasks_update(id, patch, "system")
+                .await
+                .map_err(|e| format!("{e:#}"))?;
+            Ok(())
+        }
+        Selected::Event(id) => {
+            let get = |k: &str| {
+                values
+                    .get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let assignees: Vec<String> = get("assignees")
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            // `at` is a double Option in the patch: Some(Some) sets it,
+            // Some(None) clears it. We always send the composed value, so a
+            // blanked date+raw clears `at` to unscheduled.
+            let patch = EventPatch {
+                title: Some(get("title")),
+                body: Some(get("body")),
+                at: Some(compose_event_at(values)),
+                assignees: Some(assignees),
+                tags: None,
+            };
+            store
+                .events_update(id, patch, "system")
                 .await
                 .map_err(|e| format!("{e:#}"))?;
             Ok(())
@@ -3437,5 +4247,212 @@ mod tests {
         let doing: Vec<&str> = grouped[1].1.iter().map(|t| t.id.as_str()).collect();
         assert_eq!(doing, vec!["a", "c"], "input order preserved in-bucket");
         assert_eq!(grouped[2].1.len(), 0, "blocked column present but empty");
+    }
+
+    // ── calendar library ──
+
+    /// event_day accepts every shape the store/editor actually writes and
+    /// rejects garbage (which then lands in the undated list, not a wrong cell).
+    #[test]
+    fn event_day_parses_accepted_shapes_and_rejects_garbage() {
+        use super::event_day;
+        // ISO date.
+        assert_eq!(event_day("2026-07-15"), Some((2026, 7, 15)));
+        // Frozen 24-char ISO (the op-log/now_iso shape).
+        assert_eq!(event_day("2026-08-01T09:30:00.000Z"), Some((2026, 8, 1)));
+        // ISO datetime without millis / Z.
+        assert_eq!(event_day("2026-12-31T23:59"), Some((2026, 12, 31)));
+        assert_eq!(event_day("2026-12-31t23:59:00"), Some((2026, 12, 31)));
+        // Space-separated datetime (2024 is a leap year, so Feb 29 is valid).
+        assert_eq!(event_day("2024-02-29 14:00"), Some((2024, 2, 29)));
+        // Leading/trailing whitespace tolerated.
+        assert_eq!(event_day("  2026-07-15  "), Some((2026, 7, 15)));
+
+        // Garbage / vague / malformed → None.
+        assert_eq!(event_day(""), None);
+        assert_eq!(event_day("next Tuesday"), None);
+        assert_eq!(event_day("2026/07/15"), None); // wrong separators
+        assert_eq!(event_day("2026-13-01"), None); // month out of range
+        assert_eq!(event_day("2026-00-10"), None); // month 0
+        assert_eq!(event_day("2026-04-31"), None); // April has 30 days
+        assert_eq!(event_day("2026-02-30"), None); // never
+        assert_eq!(event_day("2026-07-15X10:00"), None); // bad separator after date
+        assert_eq!(event_day("2026-7-15"), None); // unpadded month
+    }
+
+    /// 2026 is NOT a leap year, so Feb 29 2026 must be rejected; 2024/2000 are.
+    #[test]
+    fn event_day_honors_leap_years() {
+        use super::event_day;
+        assert_eq!(event_day("2026-02-29"), None, "2026 is not a leap year");
+        assert_eq!(
+            event_day("2024-02-29"),
+            Some((2024, 2, 29)),
+            "2024 is a leap year"
+        );
+        assert_eq!(
+            event_day("2000-02-29"),
+            Some((2000, 2, 29)),
+            "2000 is a leap year"
+        );
+        assert_eq!(
+            event_day("1900-02-29"),
+            None,
+            "1900 is NOT a leap year (century)"
+        );
+    }
+
+    /// event_time pulls HH:MM only from a real datetime; a bare date has none.
+    #[test]
+    fn event_time_extracts_only_when_timed() {
+        use super::event_time;
+        assert_eq!(event_time("2026-07-15"), None);
+        assert_eq!(
+            event_time("2026-08-01T09:30:00.000Z").as_deref(),
+            Some("09:30")
+        );
+        assert_eq!(event_time("2026-12-31 23:59").as_deref(), Some("23:59"));
+        assert_eq!(event_time("2026-12-31T24:00"), None, "hour out of range");
+        assert_eq!(event_time("next week"), None);
+    }
+
+    #[test]
+    fn leap_and_month_lengths() {
+        use super::{days_in_month, is_leap};
+        assert!(is_leap(2024) && is_leap(2000) && !is_leap(2026) && !is_leap(1900));
+        assert_eq!(days_in_month(2026, 1), 31);
+        assert_eq!(days_in_month(2026, 2), 28);
+        assert_eq!(days_in_month(2024, 2), 29);
+        assert_eq!(days_in_month(2026, 4), 30);
+        assert_eq!(days_in_month(2026, 12), 31);
+        assert_eq!(days_in_month(2026, 13), 0);
+    }
+
+    /// Weekday of known dates (0 = Sunday). Jul 1 2026 is a Wednesday;
+    /// Jul 11 2026 (today in this codebase) is a Saturday; the US epoch
+    /// Jan 1 1970 is a Thursday.
+    #[test]
+    fn weekday_of_known_dates() {
+        use super::weekday;
+        assert_eq!(weekday(2026, 7, 1), 3, "2026-07-01 is Wednesday");
+        assert_eq!(weekday(2026, 7, 11), 6, "2026-07-11 is Saturday");
+        assert_eq!(weekday(1970, 1, 1), 4, "1970-01-01 is Thursday");
+        assert_eq!(weekday(2000, 1, 1), 6, "2000-01-01 is Saturday");
+        assert_eq!(weekday(2024, 2, 29), 4, "leap day 2024-02-29 is Thursday");
+    }
+
+    /// The month grid is always 42 cells; day 1 sits at its weekday offset and
+    /// the last day is the month's length, with blanks filling the rest.
+    #[test]
+    fn month_grid_layout_and_leap_february() {
+        use super::{month_grid, weekday};
+        // July 2026: starts Wednesday (offset 3), 31 days.
+        let grid = month_grid(2026, 7);
+        assert_eq!(grid.len(), 42, "grid is a fixed 6x7");
+        assert_eq!(grid[0], None);
+        assert_eq!(grid[2], None);
+        assert_eq!(grid[3], Some(1), "day 1 lands on its weekday (Wed)");
+        assert_eq!(grid[3 + 30], Some(31), "last day present");
+        assert_eq!(grid[3 + 31], None, "cell after the last day is blank");
+        assert_eq!(grid.iter().flatten().count(), 31, "exactly 31 real days");
+
+        // February 2024 (leap): 29 days, starts Thursday (offset 4).
+        let feb = month_grid(2024, 2);
+        assert_eq!(feb[weekday(2024, 2, 1) as usize], Some(1));
+        assert_eq!(feb.iter().flatten().count(), 29, "leap Feb has 29 days");
+        assert_eq!(*feb.iter().flatten().max().unwrap(), 29);
+
+        // February 2026 (non-leap): 28 days.
+        let feb26 = month_grid(2026, 2);
+        assert_eq!(feb26.iter().flatten().count(), 28);
+    }
+
+    #[test]
+    fn step_month_wraps_the_year() {
+        use super::step_month;
+        assert_eq!(step_month(2026, 12, true), (2027, 1));
+        assert_eq!(step_month(2026, 1, false), (2025, 12));
+        assert_eq!(step_month(2026, 7, true), (2026, 8));
+        assert_eq!(step_month(2026, 7, false), (2026, 6));
+    }
+
+    /// compose_event_at recombines the split date/time editor fields into a
+    /// clean ISO string that round-trips through event_day/event_time, keeps
+    /// raw prose when there's no date, and clears to None when empty.
+    #[test]
+    fn compose_event_at_round_trips() {
+        use super::{compose_event_at, event_day, event_time};
+        use serde_json::json;
+
+        let m = |v: serde_json::Value| v.as_object().unwrap().clone();
+
+        // date + time → frozen ISO.
+        let at = compose_event_at(&m(json!({"date": "2026-07-15", "time": "09:30"}))).unwrap();
+        assert_eq!(event_day(&at), Some((2026, 7, 15)));
+        assert_eq!(event_time(&at).as_deref(), Some("09:30"));
+
+        // date alone → bare date.
+        assert_eq!(
+            compose_event_at(&m(json!({"date": "2026-07-15"}))).as_deref(),
+            Some("2026-07-15")
+        );
+
+        // bad time is dropped, date kept.
+        assert_eq!(
+            compose_event_at(&m(json!({"date": "2026-07-15", "time": "nope"}))).as_deref(),
+            Some("2026-07-15")
+        );
+
+        // no date but raw prose kept verbatim.
+        assert_eq!(
+            compose_event_at(&m(json!({"at_raw": "sometime next spring"}))).as_deref(),
+            Some("sometime next spring")
+        );
+
+        // nothing → unscheduled.
+        assert_eq!(compose_event_at(&m(json!({}))), None);
+        assert_eq!(
+            compose_event_at(&m(json!({"date": "", "at_raw": ""}))),
+            None
+        );
+    }
+
+    /// Placement buckets events by parsed day and routes the undated/vague ones
+    /// to the undated list; a timed event sorts before an untimed same-day one.
+    #[test]
+    fn placed_and_undated_split_events() {
+        use super::{placed_events, undated_events};
+        use hive_shared::EventItem;
+
+        let ev = |id: &str, title: &str, at: Option<&str>| EventItem {
+            id: id.into(),
+            title: title.into(),
+            body: String::new(),
+            at: at.map(str::to_string),
+            tags: Vec::new(),
+            assignees: Vec::new(),
+            origin_entry_id: None,
+            anchor_text: None,
+            created_at: String::new(),
+        };
+        let list = vec![
+            ev("e1", "Morning", Some("2026-07-15T08:00:00.000Z")),
+            ev("e2", "All-day-ish", Some("2026-07-15")),
+            ev("e3", "Other month", Some("2026-08-02")),
+            ev("e4", "Vague", Some("next spring")),
+            ev("e5", "Null", None),
+        ];
+
+        let placed = placed_events(&list);
+        let day = placed.get(&(2026, 7, 15)).unwrap();
+        assert_eq!(day.len(), 2, "both July 15 events placed together");
+        assert_eq!(day[0].id, "e1", "timed event sorts first");
+        assert_eq!(day[1].id, "e2");
+        assert!(placed.contains_key(&(2026, 8, 2)));
+        assert!(!placed.contains_key(&(2026, 7, 16)));
+
+        let undated = undated_events(&list);
+        let ids: Vec<&str> = undated.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["e4", "e5"], "vague + null are undated, in order");
     }
 }

@@ -1348,6 +1348,26 @@ pub struct DecisionPatch {
     pub assignees: Option<Vec<String>>,
 }
 
+/// Partial edit for an event over its EXISTING columns only (title, body, at,
+/// tags, assignees) — the fold-safe calendar slice. `at` is a double Option so
+/// the calendar can CLEAR it (null → unscheduled) distinctly from leaving it
+/// untouched (absent). No start/end/rrule/timezone here: rich recurrence is a
+/// deferred, batched fold migration (see store/events.rs).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct EventPatch {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    /// absent = keep, null = clear (unscheduled), value = set.
+    #[serde(default, deserialize_with = "double_option")]
+    pub at: Option<Option<String>>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub assignees: Option<Vec<String>>,
+}
+
 // ---- identities (cross-platform identity mapping; Rust-branch addition) ----
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
