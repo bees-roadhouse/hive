@@ -30,12 +30,14 @@ Phase 1 (the engine) is complete; Phase 2 (the app) is underway:
   semantic search, recall, entities, mail archive) in `core/src/mcp.rs`,
   served over stdio by the `hive-bridge` binary.
 - **App shell** — Dioxus desktop window with journal + search riding the
-  engine, plus a flatpak manifest (`packaging/flatpak/`).
+  engine, first-launch onboarding (identity + in-GUI legacy import), plus a
+  flatpak manifest (`packaging/flatpak/`).
 - **Importer** — `hive-import` (PR 1.7), the one-shot bridge out of the
   hosted era: replays an old instance's Postgres into a fresh data dir as
   op-log records, original ids and timestamps intact, attachment bytes
   crypto-sharded into the blockstore. The one Postgres client left anywhere
-  in the workspace.
+  in the workspace; the app's onboarding drives the same library for GUI
+  import, the CLI stays as the headless path.
 
 Honest gaps, per plan: **mail sync is paused** (the archive is readable;
 the sync daemon returns as a WASM module in Phase 3), **device sync is
@@ -82,6 +84,35 @@ Tests are hermetic: tempdir data dirs, in-memory keys, hash embedder — no
 database service, no network. The one exception: the importer's fixture
 tests run only when `DATABASE_URL` points at a pgvector Postgres (they skip
 loudly otherwise), mirroring the CI split.
+
+## First launch
+
+When the data dir holds no store yet, the app opens onto onboarding instead
+of the journal:
+
+1. **Who writes here?** — the name that signs your journal entries
+   (prefilled from `$USER`; stored as the `identity.owner` config record,
+   which the composer reads from then on).
+2. **Start fresh** — creates the empty encrypted store and drops you into
+   the journal; or
+3. **Import from my old hive** — paste the legacy instance's Postgres URL
+   (its *database*, not the old app URL or an API key — the direct read is
+   what preserves original ids and timestamps). *Check first (dry run)*
+   shows the per-group counts without writing anything; *Import* runs the
+   one-shot migration and lands you in the journal with your history. If an
+   import fails part-way, *Clean up and retry* wipes the partial data dir —
+   safe precisely because this launch verified the dir was fresh and opened
+   no store on it.
+
+The GUI import is why the flatpak carries `--share=network`; what the app
+does with that hole (exhaustively: the Postgres connection you initiate) is
+pinned in [docs/THREAT-MODEL.md](./docs/THREAT-MODEL.md#telemetry-and-network).
+`hive-import` remains the headless equivalent — same library, same one-shot
+rules — for scripted migrations:
+
+```bash
+cargo run -p hive-import -- --from postgres://user:pass@host/hive --dry-run
+```
 
 ## How Claude connects
 

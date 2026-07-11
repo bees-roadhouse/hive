@@ -20,7 +20,7 @@ use std::sync::Arc;
 use hive_core::keys::MemoryKeySource;
 use hive_core::store::Store;
 use hive_embed::HashEmbedder;
-use hive_import::{preflight_data_dir, run, Opts, IMPORT_DEVICE};
+use hive_import::{preflight_data_dir, run, Opts, RunOutcome, Summary, IMPORT_DEVICE};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 /// Fixed test master key (both import runs and every verification reopen).
@@ -41,6 +41,11 @@ macro_rules! require_pg {
     };
 }
 
+const ALPHA: [char; 36] = [
+    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's',
+    't', 'u', 'v', 'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+];
+
 /// Create a fresh schema on DATABASE_URL, apply the legacy schema + seed,
 /// and return a URL pinned to that schema. None (with a loud skip note)
 /// when DATABASE_URL is unset.
@@ -56,10 +61,6 @@ async fn fixture_url() -> Option<String> {
     static SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _guard = SETUP.lock().await;
 
-    const ALPHA: [char; 36] = [
-        'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r',
-        's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
-    ];
     let schema = format!("imp_{}", nanoid::nanoid!(12, &ALPHA));
 
     let admin = PgPoolOptions::new()
@@ -128,6 +129,14 @@ fn open_store(dir: &Path) -> Store {
     Store::new(dir, Arc::new(MemoryKeySource(KEY)), Arc::new(HashEmbedder)).expect("reopen store")
 }
 
+/// Run a real import and unwrap the Imported arm.
+async fn import(opts: &Opts) -> Summary {
+    match run(opts).await.expect("import") {
+        RunOutcome::Imported(summary) => summary,
+        RunOutcome::Plan(_) => panic!("a real run must return RunOutcome::Imported"),
+    }
+}
+
 async fn one_cell(store: &Store, sql: &str) -> serde_json::Value {
     let rows = store.raw_sql(sql, vec![]).await.expect("raw_sql");
     rows[0][0].clone()
@@ -180,7 +189,7 @@ async fn dry_run_counts_and_writes_nothing() {
     let url = require_pg!();
     let target = tmp();
     let data_dir: PathBuf = target.path().join("hive");
-    let summary = run(&Opts {
+    let outcome = run(&Opts {
         from: url,
         data_dir: data_dir.clone(),
         dry_run: true,
@@ -189,31 +198,35 @@ async fn dry_run_counts_and_writes_nothing() {
     .await
     .expect("dry run");
 
-    assert!(summary.dry_run);
-    assert_eq!(summary.records, 0);
-    assert!(!data_dir.exists(), "dry run must not create the data dir");
-    let count = |table: &str| {
-        summary
-            .plan
-            .iter()
-            .find(|(t, _)| *t == table)
-            .unwrap_or_else(|| panic!("plan covers {table}"))
-            .1
+    let RunOutcome::Plan(plan) = outcome else {
+        panic!("a dry run must return RunOutcome::Plan");
     };
-    assert_eq!(count("people"), 2);
-    assert_eq!(count("journal"), 5);
-    assert_eq!(count("anchors"), 3);
-    assert_eq!(count("entity_types"), 3);
-    assert_eq!(count("links"), 6);
-    assert_eq!(count("mail_messages"), 2);
-    assert_eq!(count("mail_attachments"), 1);
+    assert!(!data_dir.exists(), "dry run must not create the data dir");
+    assert_eq!(plan.rows("people"), 2);
+    assert_eq!(plan.rows("journal"), 5);
+    assert_eq!(plan.rows("anchors"), 3);
+    assert_eq!(plan.rows("entity_types"), 3);
+    assert_eq!(plan.rows("links"), 6);
+    assert_eq!(plan.rows("mail_messages"), 2);
+    assert_eq!(plan.rows("mail_attachments"), 1);
+
+    // The rollup the onboarding plan card renders: grouped() partitions the
+    // tables (sum == total) and surfaces the fixture's headline numbers.
+    let grouped: std::collections::HashMap<&str, i64> = plan.grouped().into_iter().collect();
+    assert_eq!(grouped["journal entries"], 5);
+    assert_eq!(grouped["links"], 6);
+    assert_eq!(grouped["mail messages"], 2);
+    assert_eq!(grouped["attachments"], 1);
+    assert!(grouped["entities"] >= 2 + 3 + 3, "entity tables roll up");
+    let grouped_sum: i64 = plan.grouped().iter().map(|(_, n)| n).sum();
+    assert_eq!(grouped_sum, plan.total_rows());
 }
 
 #[tokio::test]
 async fn import_maps_the_hosted_instance_onto_the_store() {
     let url = require_pg!();
     let target = tmp();
-    let summary = run(&opts(&url, target.path())).await.expect("import");
+    let summary = import(&opts(&url, target.path())).await;
 
     // Record accounting, exactly: 2 people + 1 profile + 1 identity +
     // 1 artifact + 1 source + 2 config (app.version excluded) + 3 types +
@@ -422,12 +435,78 @@ async fn import_maps_the_hosted_instance_onto_the_store() {
     store.shutdown().await.expect("orderly close");
 }
 
+/// The onboarding contract, pinned exactly: run() returns with its store
+/// fully shut down (flock released), so the SAME process can immediately
+/// Store::new the imported dir and read it — no relaunch between the
+/// [Import] click and the journal.
+#[tokio::test]
+async fn the_same_process_reopens_the_store_right_after_import() {
+    let url = require_pg!();
+    let target = tmp();
+    let summary = import(&opts(&url, target.path())).await;
+    assert!(summary.records > 0);
+
+    // Would fail with "another hive process has this data dir open" if
+    // run() had leaked its flock.
+    let store = open_store(target.path());
+    assert_eq!(store.device(), IMPORT_DEVICE);
+    let entries = store.journal_list(100, 0).await.expect("journal_list");
+    assert_eq!(entries.len(), 5, "the imported journal reads back");
+    store.shutdown().await.expect("orderly close");
+}
+
+/// A reachable Postgres that is NOT a hosted hive fails the source
+/// preflight with a plain answer (the onboarding shows it verbatim), not a
+/// bare SQL error from the first count.
+#[tokio::test]
+async fn refuses_a_database_that_is_not_a_hive() {
+    let Ok(base) = std::env::var("DATABASE_URL") else {
+        eprintln!(
+            "skipping: DATABASE_URL not set (the importer's DB tests need the fixture Postgres)"
+        );
+        return;
+    };
+    // A fresh empty schema, pinned via search_path: guaranteed hive-free.
+    let schema = format!("imp_{}", nanoid::nanoid!(12, &ALPHA));
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&base)
+        .await
+        .expect("connect DATABASE_URL");
+    sqlx::raw_sql(&format!("CREATE SCHEMA \"{schema}\""))
+        .execute(&admin)
+        .await
+        .expect("create empty schema");
+    admin.close().await;
+    let sep = if base.contains('?') { '&' } else { '?' };
+    let url = format!("{base}{sep}options=-csearch_path%3D{schema}");
+
+    let target = tmp();
+    let err = run(&Opts {
+        from: url,
+        data_dir: target.path().join("hive"),
+        dry_run: true,
+        master_key: None,
+    })
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(
+        err.contains("doesn't look like a hosted hive database"),
+        "plain-answer preflight: {err}"
+    );
+    assert!(
+        err.contains("missing table"),
+        "names a missing table: {err}"
+    );
+}
+
 #[tokio::test]
 async fn importing_twice_folds_to_identical_state() {
     let url = require_pg!();
     let (a, b) = (tmp(), tmp());
-    run(&opts(&url, a.path())).await.expect("first import");
-    run(&opts(&url, b.path())).await.expect("second import");
+    import(&opts(&url, a.path())).await;
+    import(&opts(&url, b.path())).await;
 
     let store_a = open_store(a.path());
     let dump_a = store_a.canonical_dump().await.expect("dump a");

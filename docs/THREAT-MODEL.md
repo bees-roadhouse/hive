@@ -92,13 +92,25 @@ It does NOT reach:
   overwritten lazily; remnants matter only to an attacker who also holds
   the master key, but state it: physical erasure is not guaranteed.
 
-## Telemetry
+## Telemetry and network
 
-Zero. No analytics, no crash reporting, no update pings, no network calls at
-all from the engine, the app, or the bridge (the grep gate keeps HTTP
-clients out of the bridge). Embeddings are computed locally. When update
-checks arrive (Phase 2.5) they are identifier-free against a static
-manifest.
+Telemetry: zero. No analytics, no crash reporting, no update pings.
+Embeddings are computed locally. When update checks arrive (Phase 2.5) they
+are identifier-free against a static manifest.
+
+Network: the flatpak sandbox HAS network access (`--share=network`, added
+with first-launch onboarding — an earlier build shipped without it). What
+the app does with it today, exhaustively: one outbound Postgres connection
+to the legacy hosted instance whose URL you type into the in-GUI import —
+user-initiated, to your own server, read-only against that server, and over
+whatever transport its URL demands (`sslmode=require` is supported; a
+plaintext URL to a remote host exposes that legacy data and its password in
+transit, exactly as it would from psql). Nothing else dials out: the engine
+and the bridge make no network calls at all (the grep gate keeps HTTP
+clients out of the bridge, and only the importer crate may speak Postgres —
+`importer/tests/no_postgres_gate.rs`). Zero collection is enforced in code
+and held by those gates, not by the sandbox, which cannot tell a
+user-initiated import from a phone-home (D27).
 
 ## Current gaps, stated plainly
 

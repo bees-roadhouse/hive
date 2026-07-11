@@ -4,8 +4,9 @@
 // tests/no_postgres_gate.rs keeps it that way).
 //
 // Shape of the run:
-//   1. preflight — refuse a data dir that already holds a store (one-shot);
-//   2. connect + count every source table, print the plan (--dry-run stops
+//   1. preflight — refuse a data dir that already holds a store (one-shot),
+//      then refuse a database that doesn't look like a hosted hive;
+//   2. connect + count every source table into the Plan (--dry-run stops
 //      here, having written nothing);
 //   3. open the store on a pinned synthetic device id, then replay the old
 //      instance as op-log records IN DEPENDENCY ORDER: actors, entity types,
@@ -34,6 +35,7 @@ use hive_core::store::import::ImportRecord;
 use hive_core::store::mail::{fts_clip, FTS_CLIP_BYTES};
 use hive_core::store::Store;
 use hive_embed::HashEmbedder;
+use serde::Serialize;
 use serde_json::{json, Value as Json};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
@@ -69,11 +71,76 @@ pub struct Opts {
     pub master_key: Option<[u8; 32]>,
 }
 
-/// What one run did (or, for --dry-run, would do). Counts of SOURCE rows are
-/// in `plan`; the rest count what was written.
-#[derive(Debug, Default)]
+/// The dry-run product: per-table SOURCE row counts, in import dependency
+/// order. Serializable so non-CLI callers (the app's onboarding today) can
+/// carry and render it; `grouped()` is the coarse human rollup they show.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Plan {
+    pub tables: Vec<(&'static str, i64)>,
+}
+
+impl Plan {
+    /// Rows counted for one source table (0 when the plan doesn't cover it).
+    pub fn rows(&self, table: &str) -> i64 {
+        self.tables
+            .iter()
+            .find(|(t, _)| *t == table)
+            .map(|(_, n)| *n)
+            .unwrap_or(0)
+    }
+
+    /// Every source row the import would read.
+    pub fn total_rows(&self) -> i64 {
+        self.tables.iter().map(|(_, n)| n).sum()
+    }
+
+    /// The coarse rollup a plan card renders: human labels over table
+    /// groups. Covers every PLAN_TABLES member exactly once, so the group
+    /// sum equals total_rows() — the grouped_covers_every_plan_table unit
+    /// test holds this mapping honest when tables are added.
+    pub fn grouped(&self) -> Vec<(&'static str, i64)> {
+        const GROUPS: &[(&str, &[&str])] = &[
+            ("journal entries", &["journal"]),
+            ("anchors", &["anchors"]),
+            (
+                "entities",
+                &[
+                    "people",
+                    "entity_types",
+                    "entity_fields",
+                    "projects",
+                    "topics",
+                    "phases",
+                    "tasks",
+                    "decisions",
+                    "events",
+                    "entities",
+                    "profile",
+                    "identity_artifacts",
+                    "identities",
+                    "sources",
+                ],
+            ),
+            ("links", &["links"]),
+            ("inbox items", &["inbox"]),
+            ("config entries", &["config"]),
+            ("mail accounts", &["mail_accounts"]),
+            ("mail folders", &["mail_mailboxes"]),
+            ("mail messages", &["mail_messages"]),
+            ("attachments", &["mail_attachments"]),
+        ];
+        GROUPS
+            .iter()
+            .map(|(label, tables)| (*label, tables.iter().map(|t| self.rows(t)).sum()))
+            .collect()
+    }
+}
+
+/// What one completed import wrote. `plan` carries the SOURCE row counts
+/// (the same counts a dry run reports); the rest count what landed.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Summary {
-    pub plan: Vec<(&'static str, i64)>,
+    pub plan: Plan,
     /// Op-log records committed.
     pub records: u64,
     /// Attachment blobs stored in the blockstore (round-trip verified).
@@ -88,13 +155,36 @@ pub struct Summary {
     pub inbox_read_skipped: u64,
     /// Mail messages given an FTS row (ingest-mailbox ∩ not-junk parity).
     pub mail_fts_rows: u64,
-    pub dry_run: bool,
+}
+
+/// What `run` produced — data only; the CLI formats it for stdout and the
+/// app's onboarding renders it as cards.
+#[derive(Debug, Clone, Serialize)]
+pub enum RunOutcome {
+    /// Dry run: the counted plan. Nothing was written; no key was needed.
+    Plan(Plan),
+    /// A real import ran to completion, and its store is fully shut down
+    /// (data-dir flock released) — the same process may Store::new the data
+    /// dir immediately, which is exactly what the app's onboarding does.
+    Imported(Summary),
+}
+
+impl RunOutcome {
+    /// The source counts, whichever arm this is.
+    pub fn plan(&self) -> &Plan {
+        match self {
+            RunOutcome::Plan(plan) => plan,
+            RunOutcome::Imported(summary) => &summary.plan,
+        }
+    }
 }
 
 /// Run the import per `opts`. On a partial failure after the store opened,
 /// the error tells the user to remove the data dir and re-run — one-shot
-/// means no resume.
-pub async fn run(opts: &Opts) -> Result<Summary> {
+/// means no resume. Errors are anyhow chains meant for eyes: connection
+/// refusals, the not-a-hive-database preflight, and stage failures all
+/// surface verbatim in the CLI and the onboarding UI.
+pub async fn run(opts: &Opts) -> Result<RunOutcome> {
     preflight_data_dir(&opts.data_dir)?;
 
     let pool = PgPoolOptions::new()
@@ -102,21 +192,18 @@ pub async fn run(opts: &Opts) -> Result<Summary> {
         .connect(&opts.from)
         .await
         .with_context(|| format!("connecting to {}", redact_url(&opts.from)))?;
+    preflight_source(&pool).await?;
 
-    let mut summary = Summary {
-        dry_run: opts.dry_run,
-        ..Summary::default()
+    let plan = Plan {
+        tables: count_plan(&pool).await?,
     };
-    summary.plan = count_plan(&pool).await?;
-    println!("source     {}", redact_url(&opts.from));
-    println!("data dir   {}", opts.data_dir.display());
-    println!("plan (source rows):");
-    for (label, n) in &summary.plan {
-        println!("  {label:<22} {n}");
-    }
+    tracing::info!(
+        source = %redact_url(&opts.from),
+        rows = plan.total_rows(),
+        "counted the source plan"
+    );
     if opts.dry_run {
-        println!("[dry run] nothing written.");
-        return Ok(summary);
+        return Ok(RunOutcome::Plan(plan));
     }
 
     let master = opts
@@ -139,8 +226,14 @@ pub async fn run(opts: &Opts) -> Result<Summary> {
     )
     .with_context(|| format!("opening hive store at {}", opts.data_dir.display()))?;
 
-    // Shut the writer thread down (releasing the data-dir lock) whether the
-    // stages succeeded or not, THEN surface the stage error.
+    let mut summary = Summary {
+        plan,
+        ..Summary::default()
+    };
+    // Shut the writer thread down — releasing the data-dir flock — whether
+    // the stages succeeded or not, THEN surface the stage error. The caller
+    // stays in-process either way: on success it reopens this dir at once,
+    // on failure it may clean the dir up and retry.
     let outcome = import_all(&pool, &store, &mut summary).await;
     store.shutdown().await?;
     outcome.with_context(|| {
@@ -150,34 +243,33 @@ pub async fn run(opts: &Opts) -> Result<Summary> {
         )
     })?;
 
-    println!(
-        "imported {} records into {}",
-        summary.records,
-        opts.data_dir.display()
-    );
-    println!(
-        "no embeddings were computed — the hive app backfills them in the background \
-         after its first open of this store"
-    );
-    Ok(summary)
+    tracing::info!(records = summary.records, "import complete");
+    Ok(RunOutcome::Imported(summary))
+}
+
+/// True when `dir` already holds a hive store: a `device` file, or op-log
+/// segments under `log/`. This is THE fresh-dir rule — the importer's
+/// one-shot refusal and the app's first-launch probe (fresh dir → onboarding,
+/// no store opened) must agree, so they share it.
+pub fn data_dir_holds_store(dir: &Path) -> bool {
+    let log = dir.join("log");
+    dir.join("device").exists()
+        || (log.is_dir()
+            && std::fs::read_dir(&log)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false))
 }
 
 /// One-shot target check: a `device` file or op-log segments mean a store
 /// already lives here. Runs for --dry-run too — it is the truthful preflight
 /// for the real run.
 pub fn preflight_data_dir(dir: &Path) -> Result<()> {
-    let device = dir.join("device");
-    let log = dir.join("log");
-    let log_used = log.is_dir()
-        && std::fs::read_dir(&log)
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-    if device.exists() || log_used {
+    if data_dir_holds_store(dir) {
         bail!(
             "data dir {} already holds a hive store ({}). hive-import is one-shot: \
              move or remove the existing store, or pass --data-dir to import elsewhere",
             dir.display(),
-            if device.exists() {
+            if dir.join("device").exists() {
                 "found a device file"
             } else {
                 "found op-log segments under log/"
@@ -187,8 +279,34 @@ pub fn preflight_data_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// "Is this actually a hosted hive database?" — probe for every source table
+/// before the first count, so a mistyped URL that reaches SOME Postgres
+/// fails with a plain answer instead of a bare SQL error. to_regclass
+/// resolves through search_path, matching how every later read finds tables.
+async fn preflight_source(pool: &PgPool) -> Result<()> {
+    let tables: Vec<String> = PLAN_TABLES.iter().map(|t| t.to_string()).collect();
+    let missing: Vec<String> = sqlx::query_scalar(
+        "SELECT t FROM unnest($1::text[]) AS t WHERE to_regclass(t) IS NULL ORDER BY t",
+    )
+    .bind(&tables)
+    .fetch_all(pool)
+    .await
+    .context("probing for the hosted hive tables")?;
+    if let Some(first) = missing.first() {
+        bail!(
+            "this doesn't look like a hosted hive database (missing table {first}{}) — \
+             the URL must point at the legacy instance's own Postgres",
+            match missing.len() {
+                1 => String::new(),
+                n => format!(" and {} more", n - 1),
+            }
+        );
+    }
+    Ok(())
+}
+
 /// Postgres URLs carry credentials; log/print only scheme + host + db.
-fn redact_url(url: &str) -> String {
+pub fn redact_url(url: &str) -> String {
     match url.split_once('@') {
         Some((head, tail)) => {
             let scheme = head.split("://").next().unwrap_or("postgres");
@@ -746,7 +864,7 @@ async fn stage_journal(pool: &PgPool, b: &mut Batcher<'_>) -> Result<()> {
     }
     if !anchors.is_empty() {
         let orphans: usize = anchors.values().map(Vec::len).sum();
-        eprintln!("warning: {orphans} anchor row(s) reference missing journal entries — skipped");
+        tracing::warn!("{orphans} anchor row(s) reference missing journal entries — skipped");
     }
     Ok(())
 }
@@ -1276,4 +1394,31 @@ async fn store_attachment_blobs(
         }
     }
     Ok(aliases)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// grouped() must partition PLAN_TABLES: every table in exactly one
+    /// group. Distinct per-table counts make any omission or double-count
+    /// break the sum, so adding a source table without placing it in a
+    /// group fails here (no database needed).
+    #[test]
+    fn grouped_covers_every_plan_table_exactly_once() {
+        let plan = Plan {
+            tables: PLAN_TABLES
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (*t, 1 + (i as i64)))
+                .collect(),
+        };
+        let grouped_sum: i64 = plan.grouped().iter().map(|(_, n)| n).sum();
+        assert_eq!(
+            grouped_sum,
+            plan.total_rows(),
+            "grouped() must partition PLAN_TABLES"
+        );
+        assert!(plan.total_rows() > 0);
+    }
 }
