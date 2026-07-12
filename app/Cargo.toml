@@ -40,3 +40,8 @@ ammonia = "4"
 # serde_json::Map<String, Value> the custom-entity store speaks). Already in
 # the lock transitively (hive-core/hive-shared); this pins it as a direct dep.
 serde_json = { workspace = true }
+# Mail attachments serve from the local blockstore as base64 data: URLs that a
+# tiny in-webview anchor click downloads (no external `open` dependency, no
+# network). base64 is already in the lock (hive-core uses it); this pins it as a
+# direct dep for the reader's attachment path.
+base64 = { workspace = true }

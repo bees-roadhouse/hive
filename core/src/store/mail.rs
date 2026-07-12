@@ -58,6 +58,10 @@ pub struct MailMailboxView {
     pub role: Option<String>,
     pub sort_order: i64,
     pub ingest: bool,
+    /// Live messages whose `mailbox_ids_json` contains this mailbox's jmap id.
+    pub total: i64,
+    /// Of those, the ones without the `$seen` keyword (the unread badge).
+    pub unread: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -592,9 +596,23 @@ impl Store {
     pub async fn mail_mailboxes_list(&self, account_id: &str) -> Result<Vec<MailMailboxView>> {
         let account_id = account_id.to_string();
         self.run(move |core| {
+            // Per-mailbox counts ride correlated subqueries: a message belongs
+            // to a mailbox when its `mailbox_ids_json` array holds the exact
+            // quoted jmap id (server-issued, never a substring of another —
+            // same containment match `mail_mailbox_set_ingest` uses), and it is
+            // unread when its `keywords_json` object lacks `$seen`. Live rows
+            // only (`deleted_at IS NULL`).
             let mut stmt = core.conn().prepare(
-                "SELECT id, jmap_id, name, role, sort_order, ingest FROM mail_mailboxes \
-                 WHERE account_id = ?1 ORDER BY sort_order ASC, name ASC",
+                "SELECT b.id, b.jmap_id, b.name, b.role, b.sort_order, b.ingest, \
+                 (SELECT COUNT(*) FROM mail_messages m \
+                    WHERE m.account_id = b.account_id AND m.deleted_at IS NULL \
+                    AND m.mailbox_ids_json LIKE '%\"' || b.jmap_id || '\"%') AS total, \
+                 (SELECT COUNT(*) FROM mail_messages m \
+                    WHERE m.account_id = b.account_id AND m.deleted_at IS NULL \
+                    AND m.mailbox_ids_json LIKE '%\"' || b.jmap_id || '\"%' \
+                    AND m.keywords_json NOT LIKE '%\"$seen\"%') AS unread \
+                 FROM mail_mailboxes b \
+                 WHERE b.account_id = ?1 ORDER BY b.sort_order ASC, b.name ASC",
             )?;
             let rows = stmt.query_map(rusqlite::params![account_id], |r| {
                 Ok(MailMailboxView {
@@ -604,9 +622,55 @@ impl Store {
                     role: r.get(3)?,
                     sort_order: r.get(4)?,
                     ingest: r.get(5)?,
+                    total: r.get(6)?,
+                    unread: r.get(7)?,
                 })
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+    }
+
+    /// Newest-first messages that belong to one mailbox: the reader's per-folder
+    /// list. Membership is the exact-quoted-jmap-id containment against
+    /// `mailbox_ids_json` (the same match the ingest toggle + count queries use);
+    /// the mailbox's account scopes the search so the LIKE can't collide across
+    /// accounts. Additive to `mail_messages_list` (which filters by account, not
+    /// mailbox) so existing callers are untouched.
+    pub async fn mail_messages_by_mailbox(
+        &self,
+        mailbox_id: &str,
+        limit: i64,
+    ) -> Result<Vec<MailMessageSummary>> {
+        let mailbox_id = mailbox_id.to_string();
+        self.run(move |core| {
+            let row: Option<(String, String)> = core
+                .conn()
+                .query_row(
+                    "SELECT account_id, jmap_id FROM mail_mailboxes WHERE id = ?1",
+                    rusqlite::params![mailbox_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((account_id, jmap_id)) = row else {
+                return Ok(Vec::new());
+            };
+            let needle = format!("%\"{jmap_id}\"%");
+            let sql = mail_message_select(
+                "WHERE m.account_id = ?1 AND m.deleted_at IS NULL \
+                 AND m.mailbox_ids_json LIKE ?2 ORDER BY m.received_at DESC LIMIT ?3",
+            );
+            let mut stmt = core.conn().prepare(&sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params![account_id, needle, limit.clamp(1, 200)],
+                row_to_message,
+            )?;
+            Ok(rows
+                .collect::<rusqlite::Result<Vec<MailMessageRow>>>()?
+                .into_iter()
+                .map(MailThreadMessage::from)
+                .map(|m| m.summary)
+                .collect())
         })
         .await
     }

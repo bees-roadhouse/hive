@@ -2724,6 +2724,7 @@ version = "0.7.0"
 dependencies = [
  "ammonia",
  "anyhow",
+ "base64 0.22.1",
  "comrak",
  "dioxus",
  "hive-core",
