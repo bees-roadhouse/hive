@@ -140,6 +140,45 @@ async fn journal_emergence_search_recall_dashboard() {
     assert!(pia.is_some(), "dryRun must not delete the actor");
 }
 
+/// A merge (and its preview) must REFUSE `from == into`: without the guard,
+/// merge_plan would reauthor everything onto the same slug and then tombstone
+/// it — the identity would delete itself. A genuine two-actor merge still runs.
+#[tokio::test]
+async fn actors_merge_rejects_self_merge() {
+    let store = test_store().await;
+    store.people_ensure("nate", ActorKind::Human).await.unwrap();
+    store.people_ensure("apis", ActorKind::Ai).await.unwrap();
+
+    // Self-merge is refused before any record is drafted — both the live run
+    // and the preview bail with the exact message.
+    let live = store.actors_merge("nate", "nate").await;
+    let msg = format!("{:#}", live.expect_err("self-merge must error"));
+    assert!(
+        msg.contains("cannot merge an identity into itself"),
+        "unexpected error: {msg}"
+    );
+    let prev = store.actors_merge_preview("nate", "nate").await;
+    let msg = format!("{:#}", prev.expect_err("self-merge preview must error"));
+    assert!(
+        msg.contains("cannot merge an identity into itself"),
+        "unexpected error: {msg}"
+    );
+    // Nothing was destroyed: the actor still resolves.
+    assert!(store.people_get("nate").await.unwrap().is_some());
+
+    // A real merge of two DISTINCT actors still works: apis folds into nate and
+    // the apis people row is gone afterward.
+    let res = store.actors_merge("apis", "nate").await.unwrap();
+    assert_eq!(res.from, "apis");
+    assert_eq!(res.into, "nate");
+    assert!(!res.dry_run, "a live merge is not a dry run");
+    assert!(
+        store.people_get("apis").await.unwrap().is_none(),
+        "the folded-away actor's people row must be removed"
+    );
+    assert!(store.people_get("nate").await.unwrap().is_some());
+}
+
 /// The Identities pane "Claim as mine" flow for a `writer:` row: an author that
 /// authored entries but has NO people row is materialised into a real AI Person
 /// owned by the owner, via `people_upsert` (owner set in the insert). Re-claiming

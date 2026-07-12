@@ -102,6 +102,9 @@ impl Store {
 
     /// Preview a merge WITHOUT mutating.
     pub async fn actors_merge_preview(&self, from: &str, into: &str) -> Result<ActorMergeResult> {
+        if from == into {
+            anyhow::bail!("cannot merge an identity into itself");
+        }
         let (from_s, into_s) = (from.to_string(), into.to_string());
         let wire = self.wire_ring_count(from);
         let mut acc = self
@@ -115,6 +118,9 @@ impl Store {
     /// Fold `from` into `into`: reassign all authorship/ownership/refs, then
     /// remove the `from` people/profile rows — one record batch.
     pub async fn actors_merge(&self, from: &str, into: &str) -> Result<ActorMergeResult> {
+        if from == into {
+            anyhow::bail!("cannot merge an identity into itself");
+        }
         let (from_s, into_s) = (from.to_string(), into.to_string());
         let mut acc = self
             .run(move |core| {
@@ -597,8 +603,13 @@ impl MergeCtx {
 
 /// The planning body of actors.merge (see the module-header recipe).
 fn merge_plan(core: &Core, from: &str, to: &str) -> Result<(ActorMergeResult, Vec<Draft>)> {
+    // Defense-in-depth: the public entry points reject from == into before ever
+    // spawning this plan, but merge_plan keys every record by the raw slug
+    // verbatim (author = ?1, owner = ?1, …), so a self-merge here would reauthor
+    // everything onto the same slug then tombstone it — self-destruction. Keep
+    // the raw-equality guard consistent with that keying.
     if from == to {
-        anyhow::bail!("cannot merge an actor into itself");
+        anyhow::bail!("cannot merge an identity into itself");
     }
     let mut acc = ActorMergeResult {
         from: from.to_string(),

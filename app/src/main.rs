@@ -1119,23 +1119,46 @@ async fn owner_name(store: &Store) -> String {
     }
 }
 
-/// The owner *slug* — who "you" are as an identity, for ownership/merge ops.
+/// The owner as a FIRMLY-BOUND identity — who "you" are, for ownership/merge
+/// ops. `identity.owner` stores an EXACT slug (set by "Set as owner" on a real
+/// row); this returns the matching identity ONLY on an exact match, so no fuzzy
+/// display-name guess can ever masquerade as an owner that owns no real row.
 ///
-/// `identity.owner` historically stored a display name (defaulting to $USER).
-/// This resolves that string to a real person slug so claim/take-over target a
-/// concrete identity: an exact slug match wins; else a person whose slug equals
-/// the slugified string (name → slug); else the slugified string itself (so a
-/// brand-new store with only "$USER" still yields a usable, stable slug key).
-async fn owner_slug(store: &Store) -> String {
-    let raw = owner_name(store).await;
-    if let Ok(Some(p)) = store.people_by_slug(&raw).await {
-        return p.slug;
+/// The match is drawn from the SAME roster the pane lists: first a real people
+/// row by exact slug, else a `journal_writers` author whose slug equals the
+/// stored value exactly (the synthesized `writer:` authors from the import).
+/// Returns None when the stored value is empty/unset or names no real identity —
+/// the pane then asks the user to pick which identity is them before offering
+/// any claim/take-over. Note this deliberately does NOT fall back to
+/// `owner_name()`/$USER: that stays a JOURNAL-AUTHOR default only (see the
+/// composer), never an implicit owner identity.
+async fn owner_binding(store: &Store) -> Option<Person> {
+    let stored = store.config_get(IDENTITY_OWNER_KEY).await.ok().flatten()?;
+    let stored = stored.trim();
+    if stored.is_empty() {
+        return None;
     }
-    let slug = hive_shared::slugify(&raw);
-    if let Ok(Some(p)) = store.people_by_slug(&slug).await {
-        return p.slug;
+    // A real people row wins on an exact slug match.
+    if let Ok(Some(p)) = store.people_by_slug(stored).await {
+        return Some(p);
     }
-    slug
+    // Else a bare author with journal history but no people row yet (an
+    // imported/legacy writer the roster synthesizes) — matched by exact slug.
+    if let Ok(writers) = store.journal_writers().await {
+        if let Some(w) = writers.into_iter().find(|w| w.slug == stored) {
+            return Some(Person {
+                id: format!("writer:{}", w.slug),
+                slug: w.slug,
+                name: w.name,
+                kind: w.kind,
+                owner: w.owner,
+                bio: None,
+                role: None,
+                created_at: String::new(),
+            });
+        }
+    }
+    None
 }
 
 // ── journal pane (the existing composer + feed + search, moved verbatim) ─────
@@ -1796,10 +1819,15 @@ fn IdentitiesPane(
 ) -> Element {
     let mut new_name = use_signal(String::new);
     let mut err = use_signal(|| Option::<String>::None);
-    // Who "you" are, as a slug — the target of set-owner/claim/take-over. Resolved
-    // once at mount (and on refresh) from identity.owner via owner_slug(). Empty
-    // until resolved; rows fall back to "no owner designated yet" copy.
+    // Who "you" are, as an EXACT slug — the target of set-owner/claim/take-over.
+    // Resolved once at mount (and on refresh) from identity.owner via
+    // owner_binding(): the stored slug ONLY when it names a real identity, else
+    // empty. Empty = no owner bound yet → the pane prompts "pick which identity
+    // is you" and gates every claim/take-over control until one is set.
     let owner = use_signal(String::new);
+    // Whether the owner resolution has completed at least once. Distinguishes
+    // "still loading" (don't flash the prompt) from "resolved to no owner".
+    let owner_resolved = use_signal(|| false);
     // A merge/claim/set-owner in flight — disables every mutating control so a
     // second click can't race the first (the confirm especially is irreversible).
     let busy = use_signal(|| false);
@@ -1807,15 +1835,23 @@ fn IdentitiesPane(
     // one at a time (the spec) — opening another replaces it.
     let preview = use_signal(|| Option::<(String, ActorMergeResult)>::None);
 
-    // Resolve the owner slug once (re-runs when refresh bumps, e.g. after a
-    // set-owner). Writes into `owner` so rows can compare synchronously.
+    // Resolve the owner binding once (re-runs when refresh bumps, e.g. after a
+    // set-owner). Writes the EXACT bound slug (or empty) into `owner` so rows can
+    // compare synchronously, and marks resolution done so the prompt is honest.
     {
         let mut owner = owner;
+        let mut owner_resolved = owner_resolved;
         let _ = use_resource(move || {
             let store = store();
             async move {
                 let _ = refresh();
-                owner.set(owner_slug(&store).await);
+                owner.set(
+                    owner_binding(&store)
+                        .await
+                        .map(|p| p.slug)
+                        .unwrap_or_default(),
+                );
+                owner_resolved.set(true);
             }
         });
     }
@@ -1879,15 +1915,18 @@ fn IdentitiesPane(
                                        authors its own journal entries; the active one is who the \
                                        composer writes as.")}
 
-            // One-line explainer: what the owner is and how claim vs take-over differ.
+            // Explainer: designate which identity is you (the owner), then what
+            // claim vs take-over do for the OTHER identities.
             div {
                 id: "identity-explainer",
                 style: "color: {DIM}; font-size: 0.85rem; line-height: 1.55; margin-top: 0.7rem;",
-                "Identities are who authors entries. The owner is you — "
-                span { style: "color: {INK};", "claim" }
-                " an AI identity to mark it yours, or "
+                "Identities are who authors entries. First designate which identity is "
+                span { style: "color: {INK};", "you — the owner" }
+                ". Then, for other identities that are actually you, "
                 span { style: "color: {INK};", "take over" }
-                " a human identity that is actually you to merge its whole history into yours."
+                " a human one to merge its whole history into yours, or "
+                span { style: "color: {INK};", "claim" }
+                " an AI one to mark it yours."
             }
 
             // create a new AI identity
@@ -1939,6 +1978,22 @@ fn IdentitiesPane(
                 }
             }
 
+            // No owner bound yet (resolved, empty): the first step is to pick
+            // which real identity is you. Claim/take-over stay disabled on every
+            // row until then; only "Set as owner" is offered.
+            if owner_resolved() && owner().is_empty() {
+                div {
+                    id: "identity-pick-owner",
+                    style: "color: {INK}; font-size: 0.88rem; line-height: 1.55; background: {PANEL}; \
+                            border: 1px solid {GOLD}; border-radius: 10px; padding: 0.7rem 0.9rem; \
+                            margin: 0 0 1rem;",
+                    span { style: "font-weight: 700; color: {GOLD};", "Pick which identity is you." }
+                    " Choose your identity below with "
+                    span { style: "font-weight: 700;", "Set as owner" }
+                    ". Until then, claiming and taking over other identities is disabled."
+                }
+            }
+
             // the roster
             match roster() {
                 None => muted("loading identities…"),
@@ -1980,12 +2035,19 @@ fn identity_row(
     // from journal_writers); claiming one must materialise a real Person first.
     let is_writer = person.id.starts_with("writer:");
     let owner_slug = owner();
-    // The owner is "you". Only a resolved (non-empty) owner can match, so an
-    // unresolved owner leaves every row a plain non-owner (controls still show).
-    let is_owner = !owner_slug.is_empty() && owner_slug == person.slug;
+    // Whether an owner is firmly bound. When empty, no identity is the owner and
+    // the ONLY control offered on any row is "Set as owner" — claim/take-over are
+    // withheld entirely (not merely disabled) until the user picks who they are.
+    let has_owner = !owner_slug.is_empty();
+    // The owner is "you", by EXACT slug. Only a bound owner can match.
+    let is_owner = has_owner && owner_slug == person.slug;
     // An AI already linked to you (Person.owner == owner). Writer rows carry the
     // owner journal_writers reported, so a claimed-then-forgotten row still reads.
-    let is_owned_by_me = !owner_slug.is_empty() && person.owner.as_deref() == Some(&*owner_slug);
+    let is_owned_by_me = has_owner && person.owner.as_deref() == Some(&*owner_slug);
+    // Belt-and-suspenders: take-over/claim may only ever target a DIFFERENT
+    // identity than the owner. On a non-owner row with a bound owner this is
+    // always true, but compute it explicitly so self-targeting can never render.
+    let can_reconcile = has_owner && !is_owner;
     // The owner badge wins; else AI vs human.
     let (badge, badge_bg) = if is_owner {
         ("you · owner", GOLD)
@@ -2073,7 +2135,8 @@ fn identity_row(
                             }
                         }
                         // AI: claim (link to you) unless already owned by you.
-                        if is_ai && !is_owned_by_me {
+                        // Withheld entirely until an owner is bound (can_reconcile).
+                        if can_reconcile && is_ai && !is_owned_by_me {
                             {
                                 let claim_slug = person.slug.clone();
                                 let claim_name = person.name.clone();
@@ -2132,8 +2195,12 @@ fn identity_row(
                                 }
                             }
                         }
-                        // Human: take over (merge history into you) — opens the preview.
-                        if !is_ai {
+                        // Human: take over (merge history into you) — opens the
+                        // preview. can_reconcile already excludes the owner's own
+                        // row, so the merge target can never equal this row (no
+                        // self-merge can ever be initiated); withheld until an
+                        // owner is bound.
+                        if can_reconcile && !is_ai {
                             {
                                 let to_slug = person.slug.clone();
                                 rsx! {
