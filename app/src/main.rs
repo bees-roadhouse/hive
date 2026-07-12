@@ -1395,21 +1395,35 @@ fn placeholder_pane(s: Section, blurb: &str) -> Element {
 // delete go through the reusable EntityDetail (Selected::Event). Recurrence,
 // reminders, and CalDAV are a deferred, batched fold-migration slice.
 
-/// The Calendar section: a navigable month grid of events, an undated list, and
-/// a minimal create form. Selecting an event (or creating one) opens the shared
-/// EntityDetail. `refresh` re-pulls the events after a create/edit/delete.
+/// Which calendar layout is showing. A single cursor date drives all three;
+/// the ‹/› buttons step by this view's unit (day / week / month).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CalView {
+    Day,
+    Week,
+    Month,
+}
+
+/// The Calendar section: an Apple-Calendar-style Day / Week / Month switcher
+/// over the same fold-safe events, an undated list, and a minimal create form.
+/// A single cursor date (y, m, d) drives every view; selecting an event (or
+/// creating one) opens the shared EntityDetail. `refresh` re-pulls after a
+/// create/edit/delete.
 #[component]
 fn CalendarPane(
     store: ReadOnlySignal<Store>,
     selected: Signal<Option<Selected>>,
     refresh: Signal<u32>,
 ) -> Element {
-    // Visible month, initialized to today (falls back to a fixed epoch only if
-    // the clock string is somehow unparseable — it never is).
-    let (ty0, tm0, _td0) = parse_ymd(&today_ymd()).unwrap_or((2026, 7, 11));
-    let mut year = use_signal(|| ty0);
-    let mut month = use_signal(|| tm0);
-    // Create-form state; a day-cell click prefills the date and the form sits
+    // The cursor date, initialized to today (falls back to a fixed epoch only
+    // if the clock string is somehow unparseable — it never is). One signal
+    // per component, driving all three views; ‹/› step it by the view's unit.
+    let (ty0, tm0, td0) = parse_ymd(&today_ymd()).unwrap_or((2026, 7, 11));
+    let mut cur_y = use_signal(|| ty0);
+    let mut cur_m = use_signal(|| tm0);
+    let mut cur_d = use_signal(|| td0);
+    let view = use_signal(|| CalView::Month);
+    // Create-form state; a day/hour click prefills the date and the form sits
     // at the top of the pane.
     let mut new_title = use_signal(String::new);
     let mut new_date = use_signal(today_ymd);
@@ -1457,16 +1471,25 @@ fn CalendarPane(
         });
     };
 
-    let y = year();
-    let m = month();
+    let y = cur_y();
+    let m = cur_m();
+    let d = cur_d();
+    let cur_view = view();
     let today = today_ymd();
+
+    // The contextual header label depends on the active view's unit.
+    let label = match cur_view {
+        CalView::Day => day_label(y, m, d),
+        CalView::Week => week_range_label(y, m, d),
+        CalView::Month => month_label(y, m),
+    };
 
     rsx! {
         div {
             id: "calendar-pane",
             style: "max-width: 960px; margin: 0 auto; padding: 1.6rem 1.2rem 3rem;",
-            {pane_header("Calendar", "Your events on a month grid — the same happenings that \
-                                     emerge from your journal, plus any you add here. Click a day \
+            {pane_header("Calendar", "Your events by day, week, or month — the same happenings that \
+                                     emerge from your journal, plus any you add here. Click a slot \
                                      to plan something; click an event to open it.")}
 
             // create form (a day-cell click prefills the date)
@@ -1515,16 +1538,15 @@ fn CalendarPane(
                 }
             }
 
-            // month nav
+            // nav + contextual label + Day/Week/Month switcher
             div {
-                style: "display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.8rem;",
+                style: "display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.8rem; \
+                        flex-wrap: wrap;",
                 button {
                     id: "cal-prev",
                     style: "{cal_nav_btn_style()}",
                     onclick: move |_| {
-                        let (ny, nm) = step_month(year(), month(), false);
-                        year.set(ny);
-                        month.set(nm);
+                        step_cursor(cur_view, false, &mut cur_y, &mut cur_m, &mut cur_d);
                     },
                     "‹"
                 }
@@ -1532,9 +1554,10 @@ fn CalendarPane(
                     id: "cal-today",
                     style: "{cal_nav_btn_style()} padding-left: 0.9rem; padding-right: 0.9rem;",
                     onclick: move |_| {
-                        if let Some((ty, tm, _)) = parse_ymd(&today_ymd()) {
-                            year.set(ty);
-                            month.set(tm);
+                        if let Some((ty, tm, td)) = parse_ymd(&today_ymd()) {
+                            cur_y.set(ty);
+                            cur_m.set(tm);
+                            cur_d.set(td);
                         }
                     },
                     "Today"
@@ -1543,16 +1566,22 @@ fn CalendarPane(
                     id: "cal-next",
                     style: "{cal_nav_btn_style()}",
                     onclick: move |_| {
-                        let (ny, nm) = step_month(year(), month(), true);
-                        year.set(ny);
-                        month.set(nm);
+                        step_cursor(cur_view, true, &mut cur_y, &mut cur_m, &mut cur_d);
                     },
                     "›"
                 }
                 div {
                     id: "cal-label",
                     style: "font-size: 1.15rem; font-weight: 700; margin-left: 0.4rem;",
-                    "{month_label(y, m)}"
+                    "{label}"
+                }
+                // segmented control, pushed to the right
+                div {
+                    style: "margin-left: auto; display: inline-flex; background: {PANEL}; \
+                            border: 1px solid {EDGE}; border-radius: 8px; overflow: hidden;",
+                    {cal_view_seg("cal-view-day", "Day", CalView::Day, cur_view, view)}
+                    {cal_view_seg("cal-view-week", "Week", CalView::Week, cur_view, view)}
+                    {cal_view_seg("cal-view-month", "Month", CalView::Month, cur_view, view)}
                 }
             }
 
@@ -1562,9 +1591,19 @@ fn CalendarPane(
                 Some(Ok(list)) => {
                     let placed = placed_events(&list);
                     let undated = undated_events(&list);
-                    rsx! {
-                        {month_grid_view(y, m, &today, &placed, selected, new_date)}
-                        {undated_view(&undated, selected)}
+                    match cur_view {
+                        CalView::Month => rsx! {
+                            {month_grid_view(y, m, &today, &placed, selected, new_date)}
+                            {undated_view(&undated, selected)}
+                        },
+                        CalView::Week => rsx! {
+                            {week_view(y, m, d, &today, &placed, selected, new_date)}
+                            {undated_view(&undated, selected)}
+                        },
+                        CalView::Day => rsx! {
+                            {day_view(y, m, d, &today, &placed, selected, new_date)}
+                            {undated_view(&undated, selected)}
+                        },
                     }
                 }
             }
@@ -1716,6 +1755,7 @@ fn day_cell(
 /// `at` carried one), truncated, opening the event's detail on click.
 fn event_chip(e: &EventItem, mut selected: Signal<Option<Selected>>) -> Element {
     let id = e.id.clone();
+    let color = event_color(e);
     let time = e.at.as_deref().and_then(event_time);
     let title = if e.title.trim().is_empty() {
         "(untitled)".to_string()
@@ -1730,7 +1770,8 @@ fn event_chip(e: &EventItem, mut selected: Signal<Option<Selected>>) -> Element 
         button {
             id: "cal-event-{e.id}",
             style: "display: block; width: 100%; text-align: left; background: {BG}; \
-                    border: 1px solid {EDGE}; border-radius: 6px; color: {INK}; font: inherit; \
+                    border: 1px solid {EDGE}; border-left: 3px solid {color}; border-radius: 6px; \
+                    color: {INK}; font: inherit; \
                     font-size: 0.72rem; padding: 0.15rem 0.35rem; cursor: pointer; \
                     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;",
             onclick: move |ev| {
@@ -1803,6 +1844,351 @@ fn cal_nav_btn_style() -> String {
         "background: {PANEL}; color: {INK}; border: 1px solid {EDGE}; border-radius: 8px; \
          padding: 0.4rem 0.7rem; font: inherit; font-size: 0.95rem; font-weight: 700; cursor: pointer;"
     )
+}
+
+/// Step the cursor date by the active view's unit: Day → ±1 day (`step_day`,
+/// wrapping months/years), Week → ±7 days, Month → ±1 month (`step_month`,
+/// keeping the day-of-month but clamping to the target month's length so
+/// e.g. Jan 31 → Feb 28). Mutates the three cursor signals in place.
+fn step_cursor(
+    view: CalView,
+    forward: bool,
+    cur_y: &mut Signal<i32>,
+    cur_m: &mut Signal<u32>,
+    cur_d: &mut Signal<u32>,
+) {
+    let (y, m, d) = (
+        cur_y.peek().to_owned(),
+        cur_m.peek().to_owned(),
+        cur_d.peek().to_owned(),
+    );
+    let (ny, nm, nd) = match view {
+        CalView::Day => step_day(y, m, d, forward),
+        CalView::Week => {
+            let mut cur = (y, m, d);
+            for _ in 0..7 {
+                cur = step_day(cur.0, cur.1, cur.2, forward);
+            }
+            cur
+        }
+        CalView::Month => {
+            let (ny, nm) = step_month(y, m, forward);
+            (ny, nm, d.min(days_in_month(ny, nm)))
+        }
+    };
+    cur_y.set(ny);
+    cur_m.set(nm);
+    cur_d.set(nd);
+}
+
+/// One segment of the Day/Week/Month control: highlighted (gold) when it is the
+/// active view, and a click switches to it. `mine` is this segment's view,
+/// `current` the active one, `view` the signal to set.
+fn cal_view_seg(
+    id: &'static str,
+    label: &'static str,
+    mine: CalView,
+    current: CalView,
+    mut view: Signal<CalView>,
+) -> Element {
+    let active = mine == current;
+    let (bg, fg) = if active {
+        (GOLD.to_string(), "#14120e".to_string())
+    } else {
+        ("transparent".to_string(), INK.to_string())
+    };
+    rsx! {
+        button {
+            id: "{id}",
+            style: "background: {bg}; color: {fg}; border: none; padding: 0.4rem 0.85rem; \
+                    font: inherit; font-size: 0.85rem; font-weight: 700; cursor: pointer;",
+            onclick: move |_| view.set(mine),
+            "{label}"
+        }
+    }
+}
+
+/// A single day's events, ordered timed-first (by `event_time`), then untimed,
+/// then by title — the same in-cell order `placed_events` uses, reused by the
+/// Week columns and the Day view's all-day strip. Pulls the day out of the
+/// pre-grouped placement map so it stays a simple lookup.
+fn day_events(
+    placed: &std::collections::HashMap<(i32, u32, u32), Vec<EventItem>>,
+    year: i32,
+    month: u32,
+    day: u32,
+) -> Vec<EventItem> {
+    placed.get(&(year, month, day)).cloned().unwrap_or_default()
+}
+
+// ── week view (seven day-columns for the cursor's week) ───────────────────────
+
+/// The Week view: seven Sunday→Saturday day-columns for the cursor's week, each
+/// with a clickable header (weekday abbrev + day number, today highlighted) and
+/// that day's colored event chips beneath. Horizontally scrollable if it
+/// overflows; the body scrolls vertically. Plain fn (EventItem/HashMap lack the
+/// PartialEq component props want).
+fn week_view(
+    year: i32,
+    month: u32,
+    day: u32,
+    today: &str,
+    placed: &std::collections::HashMap<(i32, u32, u32), Vec<EventItem>>,
+    selected: Signal<Option<Selected>>,
+    new_date: Signal<String>,
+) -> Element {
+    let days = week_days(year, month, day);
+    let today_ymd = parse_ymd(today);
+    rsx! {
+        div {
+            id: "cal-week",
+            style: "overflow-x: auto;",
+            div {
+                style: "display: grid; grid-template-columns: repeat(7, minmax(7.5rem, 1fr)); \
+                        gap: 4px; min-width: 46rem;",
+                for (dy, dm, dd) in days.into_iter() {
+                    {week_column(dy, dm, dd, today_ymd, placed, selected, new_date)}
+                }
+            }
+        }
+    }
+}
+
+/// One week day-column: its header (clickable → prefill create on that day) and
+/// its colored event chips, sorted by time.
+fn week_column(
+    year: i32,
+    month: u32,
+    day: u32,
+    today_ymd: Option<(i32, u32, u32)>,
+    placed: &std::collections::HashMap<(i32, u32, u32), Vec<EventItem>>,
+    selected: Signal<Option<Selected>>,
+    mut new_date: Signal<String>,
+) -> Element {
+    let key = ymd_key(year, month, day);
+    let is_today = today_ymd == Some((year, month, day));
+    let wd = weekday_abbrev(weekday(year, month, day));
+    let evs = day_events(placed, year, month, day);
+    let border = if is_today {
+        format!("2px solid {GOLD}")
+    } else {
+        format!("1px solid {EDGE}")
+    };
+    let num_color = if is_today { GOLD } else { INK };
+    let date_for_click = key.clone();
+    rsx! {
+        div {
+            id: "cal-weekcol-{key}",
+            style: "background: {PANEL}; border: {border}; border-radius: 8px; \
+                    padding: 0.4rem 0.4rem 0.6rem; display: flex; flex-direction: column; \
+                    gap: 3px; min-height: 12rem; cursor: pointer;",
+            onclick: move |_| new_date.set(date_for_click.clone()),
+            div {
+                style: "text-align: center; padding: 0.15rem 0 0.4rem; border-bottom: 1px solid {EDGE}; \
+                        margin-bottom: 0.3rem;",
+                div {
+                    style: "font-size: 0.68rem; font-weight: 700; letter-spacing: 0.04em; \
+                            text-transform: uppercase; color: {DIM};",
+                    "{wd}"
+                }
+                div {
+                    style: "font-size: 1.05rem; font-weight: 700; color: {num_color};",
+                    "{day}"
+                }
+            }
+            if evs.is_empty() {
+                div {
+                    style: "font-size: 0.7rem; color: {FAINT}; text-align: center; padding: 0.3rem 0;",
+                    "—"
+                }
+            }
+            for e in evs.iter() {
+                {week_chip(e, selected)}
+            }
+        }
+    }
+}
+
+/// One event chip in a week column: colored, time-prefixed when timed, title
+/// truncated, opening the event's detail on click (stopping propagation so the
+/// column's prefill click doesn't also fire).
+fn week_chip(e: &EventItem, mut selected: Signal<Option<Selected>>) -> Element {
+    let id = e.id.clone();
+    let color = event_color(e);
+    let time = e.at.as_deref().and_then(event_time);
+    let title = if e.title.trim().is_empty() {
+        "(untitled)".to_string()
+    } else {
+        e.title.clone()
+    };
+    let label = match &time {
+        Some(t) => format!("{t} {title}"),
+        None => title,
+    };
+    rsx! {
+        button {
+            id: "cal-week-event-{e.id}",
+            style: "display: block; width: 100%; text-align: left; background: {BG}; \
+                    border: 1px solid {EDGE}; border-left: 3px solid {color}; border-radius: 6px; \
+                    color: {INK}; font: inherit; font-size: 0.72rem; padding: 0.2rem 0.35rem; \
+                    cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;",
+            onclick: move |ev| {
+                ev.stop_propagation();
+                selected.set(Some(Selected::Event(id.clone())));
+            },
+            "{label}"
+        }
+    }
+}
+
+// ── day view (all-day strip + hourly timeline for the cursor day) ─────────────
+
+/// The Day view: an all-day / untimed strip at top, then a 0–23h timeline with
+/// each timed event placed in its start-hour row (stacked when several share an
+/// hour). Colored blocks; clicking an empty hour prefills a create on that day
+/// at that hour. Plain fn (EventItem/HashMap lack the PartialEq props want).
+fn day_view(
+    year: i32,
+    month: u32,
+    day: u32,
+    today: &str,
+    placed: &std::collections::HashMap<(i32, u32, u32), Vec<EventItem>>,
+    selected: Signal<Option<Selected>>,
+    new_date: Signal<String>,
+) -> Element {
+    let evs = day_events(placed, year, month, day);
+    // Split into untimed (all-day strip) and timed (timeline), bucketing the
+    // timed ones by their start hour. Untimed = no parseable HH:MM in `at`.
+    let (timed, untimed): (Vec<EventItem>, Vec<EventItem>) = evs
+        .into_iter()
+        .partition(|e| e.at.as_deref().and_then(event_time).is_some());
+    let is_today = parse_ymd(today) == Some((year, month, day));
+    let key = ymd_key(year, month, day);
+    rsx! {
+        div {
+            id: "cal-day",
+            style: "border: 1px solid {EDGE}; border-radius: 10px; overflow: hidden;",
+            // all-day / untimed strip
+            div {
+                id: "cal-day-allday",
+                style: "display: flex; gap: 0.5rem; align-items: flex-start; padding: 0.5rem 0.6rem; \
+                        background: {PANEL}; border-bottom: 1px solid {EDGE};",
+                div {
+                    style: "width: 3.4rem; flex-shrink: 0; font-size: 0.68rem; font-weight: 700; \
+                            letter-spacing: 0.03em; text-transform: uppercase; color: {DIM}; \
+                            padding-top: 0.2rem;",
+                    "All-day"
+                }
+                div {
+                    style: "flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px;",
+                    if untimed.is_empty() {
+                        div {
+                            style: "font-size: 0.74rem; color: {FAINT}; padding: 0.15rem 0;",
+                            "Nothing all-day."
+                        }
+                    }
+                    for e in untimed.iter() {
+                        {day_block(e, selected)}
+                    }
+                }
+            }
+            // hourly timeline
+            for h in 0u32..24 {
+                {day_hour_row(h, is_today, &key, &timed, selected, new_date)}
+            }
+        }
+    }
+}
+
+/// One hour row of the Day timeline: the hour gutter label, and any timed events
+/// whose start-hour is `h` (stacked). Clicking empty row space prefills a create
+/// on this day at this hour.
+fn day_hour_row(
+    hour: u32,
+    is_today: bool,
+    key: &str,
+    timed: &[EventItem],
+    selected: Signal<Option<Selected>>,
+    mut new_date: Signal<String>,
+) -> Element {
+    let here: Vec<EventItem> = timed
+        .iter()
+        .filter(|e| e.at.as_deref().and_then(event_hour) == Some(hour))
+        .cloned()
+        .collect();
+    // Prefill the date with an ISO datetime at this hour so the editor lands on
+    // the right day and time; a bare `YYYY-MMTHH` wouldn't round-trip, so use
+    // the frozen 24-char shape event_day/event_time accept.
+    let prefill = format!("{key}T{hour:02}:00:00.000Z");
+    let label = format!("{hour:02}:00");
+    // A faint gold left edge marks the current hour on today (current_hour()
+    // already fails safe to no-marker if the clock is unreadable).
+    let cur_hour = is_today && current_hour() == Some(hour);
+    let row_border = if cur_hour {
+        format!("border-left: 2px solid {GOLD};")
+    } else {
+        "border-left: 2px solid transparent;".to_string()
+    };
+    rsx! {
+        div {
+            id: "cal-day-hour-{hour}",
+            style: "display: flex; gap: 0.5rem; align-items: stretch; min-height: 2.6rem; \
+                    border-top: 1px solid {EDGE}; {row_border} cursor: pointer;",
+            onclick: move |_| new_date.set(prefill.clone()),
+            div {
+                style: "width: 3.4rem; flex-shrink: 0; font-size: 0.7rem; color: {DIM}; \
+                        padding: 0.25rem 0 0 0.35rem; text-align: right; box-sizing: border-box;",
+                "{label}"
+            }
+            div {
+                style: "flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; \
+                        padding: 0.2rem 0.4rem;",
+                for e in here.iter() {
+                    {day_block(e, selected)}
+                }
+            }
+        }
+    }
+}
+
+/// One event block in the Day view (all-day strip or a timeline hour): a colored
+/// block with the title and its time, opening the detail on click.
+fn day_block(e: &EventItem, mut selected: Signal<Option<Selected>>) -> Element {
+    let id = e.id.clone();
+    let color = event_color(e);
+    let time = e.at.as_deref().and_then(event_time);
+    let title = if e.title.trim().is_empty() {
+        "(untitled)".to_string()
+    } else {
+        e.title.clone()
+    };
+    rsx! {
+        button {
+            id: "cal-day-event-{e.id}",
+            style: "display: flex; align-items: baseline; gap: 0.5rem; width: 100%; text-align: left; \
+                    background: {BG}; border: 1px solid {EDGE}; border-left: 4px solid {color}; \
+                    border-radius: 6px; color: {INK}; font: inherit; font-size: 0.82rem; \
+                    padding: 0.3rem 0.5rem; cursor: pointer; overflow: hidden;",
+            onclick: move |ev| {
+                ev.stop_propagation();
+                selected.set(Some(Selected::Event(id.clone())));
+            },
+            span {
+                style: "font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;",
+                "{title}"
+            }
+            if let Some(t) = time {
+                span { style: "color: {DIM}; font-size: 0.74rem; flex-shrink: 0;", "{t}" }
+            }
+        }
+    }
+}
+
+/// The current hour (0–23) from the store's clock, for the Day view's now-marker.
+/// None if the clock string is somehow unparseable.
+fn current_hour() -> Option<u32> {
+    let iso = hive_core::store::now_iso();
+    iso.get(11..13)?.parse::<u32>().ok().filter(|h| *h <= 23)
 }
 
 // ── identities pane ──────────────────────────────────────────────────────────
@@ -2661,6 +3047,121 @@ fn step_month(year: i32, month: u32, forward: bool) -> (i32, u32) {
     }
 }
 
+/// Step one calendar day, wrapping months and years: (2026, 7, 31) forward →
+/// (2026, 8, 1); (2026, 1, 1) prev → (2025, 12, 31). Pure integer math over
+/// `days_in_month` so the Day view's ‹/› never pulls chrono. `month` must be
+/// 1-12 and `day` a valid day-of-month.
+fn step_day(year: i32, month: u32, day: u32, forward: bool) -> (i32, u32, u32) {
+    if forward {
+        if day < days_in_month(year, month) {
+            (year, month, day + 1)
+        } else {
+            let (ny, nm) = step_month(year, month, true);
+            (ny, nm, 1)
+        }
+    } else if day > 1 {
+        (year, month, day - 1)
+    } else {
+        let (py, pm) = step_month(year, month, false);
+        (py, pm, days_in_month(py, pm))
+    }
+}
+
+/// The Sunday that starts the week containing `(year, month, day)` — i.e. step
+/// back by the date's weekday (0 = Sunday). Returned as its own (y, m, d),
+/// wrapping across a month/year boundary. Pure (uses `weekday` + `step_day`),
+/// so the Week view's column set is testable without a clock.
+fn week_start_sunday(year: i32, month: u32, day: u32) -> (i32, u32, u32) {
+    let mut cur = (year, month, day);
+    for _ in 0..weekday(year, month, day) {
+        cur = step_day(cur.0, cur.1, cur.2, false);
+    }
+    cur
+}
+
+/// The seven consecutive days (Sun→Sat) of the week containing `(y, m, d)`,
+/// each as its own (year, month, day). Built by stepping forward from the
+/// week's Sunday, so it wraps month/year ends correctly.
+fn week_days(year: i32, month: u32, day: u32) -> Vec<(i32, u32, u32)> {
+    let mut cur = week_start_sunday(year, month, day);
+    let mut days = Vec::with_capacity(7);
+    days.push(cur);
+    for _ in 0..6 {
+        cur = step_day(cur.0, cur.1, cur.2, true);
+        days.push(cur);
+    }
+    days
+}
+
+/// A short weekday name (0 = Sunday), e.g. "Mon" — used by the Day header and
+/// the week/day labels.
+fn weekday_abbrev(wd: u32) -> &'static str {
+    const WD: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    WD.get(wd as usize).copied().unwrap_or("")
+}
+
+/// A short month name (1 = January), e.g. "Jul" — used by the week-range and
+/// day labels (the month grid uses the full `month_label`).
+fn month_abbrev(month: u32) -> &'static str {
+    const MO: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    MO.get(month.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or("")
+}
+
+/// The contextual label for the Week view: the span of its seven days, e.g.
+/// "Jul 7–13, 2026", collapsing a shared month/year and spelling both out when
+/// the week straddles a boundary ("Nov 30 – Dec 6, 2026", "Dec 28, 2026 – Jan
+/// 3, 2027"). Pure over `week_days`.
+fn week_range_label(year: i32, month: u32, day: u32) -> String {
+    let days = week_days(year, month, day);
+    let (fy, fm, fd) = days[0];
+    let (ly, lm, ld) = days[6];
+    if fy == ly && fm == lm {
+        format!("{} {fd}–{ld}, {fy}", month_abbrev(fm))
+    } else if fy == ly {
+        format!(
+            "{} {fd} – {} {ld}, {fy}",
+            month_abbrev(fm),
+            month_abbrev(lm)
+        )
+    } else {
+        format!(
+            "{} {fd}, {fy} – {} {ld}, {ly}",
+            month_abbrev(fm),
+            month_abbrev(lm)
+        )
+    }
+}
+
+/// The contextual label for the Day view, e.g. "Monday, Jul 12, 2026".
+fn day_label(year: i32, month: u32, day: u32) -> String {
+    const FULL: [&str; 7] = [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ];
+    let wd = FULL
+        .get(weekday(year, month, day) as usize)
+        .copied()
+        .unwrap_or("");
+    format!("{wd}, {} {day}, {year}", month_abbrev(month))
+}
+
+/// The 0–23 start-hour of a timed event `at`, or None when it carries no time
+/// (all-day / untimed) — the Day timeline buckets timed events into hour rows
+/// by this. Derived from `event_time` so it accepts exactly the same shapes.
+fn event_hour(at: &str) -> Option<u32> {
+    let t = event_time(at)?;
+    t.get(0..2)?.parse::<u32>().ok().filter(|h| *h <= 23)
+}
+
 /// The 42 cells (6 weeks × 7 days, Sunday-first) of the month view: `None`
 /// before the 1st and after the last day, `Some(day)` for the month's days.
 /// Six rows is the fixed maximum any Gregorian month needs, so the grid never
@@ -2921,6 +3422,38 @@ fn avatar_color(name: &str) -> &'static str {
     ];
     let mut hash: u32 = 2166136261; // FNV-1a offset basis
     for b in name.trim().to_lowercase().bytes() {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    PALETTE[(hash as usize) % PALETTE.len()]
+}
+
+/// A deterministic accent color for an event, so the same happening keeps the
+/// same hue in every calendar view (month chip, week chip, day block). Chosen
+/// FOLD-SAFELY without any color column: hash the event's first tag if it has
+/// one (so a tag like "work" tints all its events alike), else its title, with
+/// the same FNV-1a the contact avatars use. Always returns a palette member.
+fn event_color(ev: &EventItem) -> &'static str {
+    // Six saturated-but-muted hues that read as event blocks on the {BG} dark
+    // theme (distinct from the warmer, dimmer avatar palette).
+    const PALETTE: &[&str] = &[
+        "#c56b4f", // terracotta
+        "#c99a3f", // amber
+        "#6f9a52", // leaf
+        "#3f9a8a", // teal
+        "#5a86c9", // azure
+        "#8a6bc9", // violet
+        "#c25f8a", // magenta-rose
+        "#9a8a52", // brass
+    ];
+    let seed = ev
+        .tags
+        .iter()
+        .map(|t| t.trim())
+        .find(|t| !t.is_empty())
+        .unwrap_or(ev.title.trim());
+    let mut hash: u32 = 2166136261; // FNV-1a offset basis
+    for b in seed.to_lowercase().bytes() {
         hash ^= b as u32;
         hash = hash.wrapping_mul(16777619);
     }
@@ -5620,6 +6153,124 @@ mod tests {
         let undated = undated_events(&list);
         let ids: Vec<&str> = undated.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, vec!["e4", "e5"], "vague + null are undated, in order");
+    }
+
+    // ── Apple-Calendar day/week/day-view helpers ──
+
+    /// step_day advances/retreats one calendar day, wrapping month and year
+    /// ends over the right month lengths (incl. leap February).
+    #[test]
+    fn step_day_wraps_months_and_years() {
+        use super::step_day;
+        // Ordinary mid-month steps.
+        assert_eq!(step_day(2026, 7, 12, true), (2026, 7, 13));
+        assert_eq!(step_day(2026, 7, 12, false), (2026, 7, 11));
+        // Month rollover forward (July has 31 days) and back.
+        assert_eq!(step_day(2026, 7, 31, true), (2026, 8, 1));
+        assert_eq!(step_day(2026, 8, 1, false), (2026, 7, 31));
+        // Year rollover both ways.
+        assert_eq!(step_day(2026, 12, 31, true), (2027, 1, 1));
+        assert_eq!(step_day(2026, 1, 1, false), (2025, 12, 31));
+        // February lengths: leap 2024 has 29, non-leap 2026 has 28.
+        assert_eq!(step_day(2024, 2, 28, true), (2024, 2, 29));
+        assert_eq!(step_day(2024, 2, 29, true), (2024, 3, 1));
+        assert_eq!(step_day(2026, 2, 28, true), (2026, 3, 1));
+        assert_eq!(step_day(2026, 3, 1, false), (2026, 2, 28));
+    }
+
+    /// The week's Sunday is the date stepped back by its weekday; a Sunday is
+    /// its own week start; the seven days run Sun→Sat and wrap month/year ends.
+    #[test]
+    fn week_sunday_and_days_span_the_week() {
+        use super::{week_days, week_start_sunday, weekday};
+        // 2026-07-12 is a Sunday (weekday 0), so it starts its own week.
+        assert_eq!(weekday(2026, 7, 12), 0);
+        assert_eq!(week_start_sunday(2026, 7, 12), (2026, 7, 12));
+        // 2026-07-15 is a Wednesday; its week's Sunday is the 12th.
+        assert_eq!(week_start_sunday(2026, 7, 15), (2026, 7, 12));
+        let days = week_days(2026, 7, 15);
+        assert_eq!(days.len(), 7);
+        assert_eq!(days[0], (2026, 7, 12), "first column is Sunday");
+        assert_eq!(days[6], (2026, 7, 18), "last column is Saturday");
+        // A week straddling a month boundary wraps correctly. 2026-08-01 is a
+        // Saturday, so its week's Sunday is 2026-07-26.
+        assert_eq!(weekday(2026, 8, 1), 6);
+        let cross = week_days(2026, 8, 1);
+        assert_eq!(cross[0], (2026, 7, 26));
+        assert_eq!(cross[6], (2026, 8, 1));
+    }
+
+    /// The contextual labels: week range collapses a shared month/year and
+    /// spells both out across a boundary; the day label names the weekday.
+    #[test]
+    fn week_and_day_labels_read_naturally() {
+        use super::{day_label, week_range_label};
+        // Same month/year: "Jul 12–18, 2026" (week of Sunday the 12th).
+        assert_eq!(week_range_label(2026, 7, 15), "Jul 12–18, 2026");
+        // Crossing a month within a year: week of Sunday 2026-07-26 → Aug 1.
+        assert_eq!(week_range_label(2026, 8, 1), "Jul 26 – Aug 1, 2026");
+        // Crossing a year end: week of Sunday 2025-12-28 → Jan 3 2026.
+        assert_eq!(week_range_label(2025, 12, 31), "Dec 28, 2025 – Jan 3, 2026");
+        // Day label spells the full weekday. 2026-07-12 is a Sunday.
+        assert_eq!(day_label(2026, 7, 12), "Sunday, Jul 12, 2026");
+    }
+
+    /// event_hour buckets a timed event by its start hour and yields None for an
+    /// untimed (all-day) event, matching the Day timeline's partition.
+    #[test]
+    fn event_hour_buckets_by_start_hour() {
+        use super::event_hour;
+        assert_eq!(event_hour("2026-07-12T09:30:00.000Z"), Some(9));
+        assert_eq!(event_hour("2026-07-12 00:15"), Some(0));
+        assert_eq!(event_hour("2026-07-12T23:59"), Some(23));
+        assert_eq!(event_hour("2026-07-12"), None, "bare date is untimed");
+        assert_eq!(event_hour("next week"), None);
+    }
+
+    /// event_color is deterministic (same event → same hue everywhere), keys off
+    /// the first tag when present else the title, and always returns a palette
+    /// member.
+    #[test]
+    fn event_color_is_deterministic_and_in_palette() {
+        use super::event_color;
+        use hive_shared::EventItem;
+
+        let ev = |title: &str, tags: &[&str]| EventItem {
+            id: "x".into(),
+            title: title.into(),
+            body: String::new(),
+            at: None,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            assignees: Vec::new(),
+            origin_entry_id: None,
+            anchor_text: None,
+            created_at: String::new(),
+        };
+
+        // Same inputs → same color.
+        assert_eq!(
+            event_color(&ev("Dentist", &[])),
+            event_color(&ev("Dentist", &[]))
+        );
+        // Always a 7-char hex palette entry.
+        let c = event_color(&ev("anything", &[]));
+        assert!(c.starts_with('#') && c.len() == 7);
+        // Tag drives the color when present: two differently-titled events that
+        // share their first tag get the SAME color (so a "work" tag tints alike),
+        // and it matches coloring by that tag's text as the title.
+        assert_eq!(
+            event_color(&ev("Standup", &["work"])),
+            event_color(&ev("Review", &["work"]))
+        );
+        assert_eq!(
+            event_color(&ev("Standup", &["work"])),
+            event_color(&ev("work", &[]))
+        );
+        // A blank first tag falls through to the title.
+        assert_eq!(
+            event_color(&ev("Solo", &["  "])),
+            event_color(&ev("Solo", &[]))
+        );
     }
 
     // ── Apple-Contacts helpers (favorites, groups, avatars, A–Z) ──
