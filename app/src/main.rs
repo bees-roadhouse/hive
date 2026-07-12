@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use dioxus::desktop::tao::dpi::LogicalSize;
 use dioxus::desktop::tao::event::{Event, WindowEvent};
@@ -19,6 +20,7 @@ use dioxus::prelude::*;
 use hive_core::keys::{KeySource, KeychainKeySource, MemoryKeySource};
 use hive_core::store::custom_entities::EntityFilter;
 use hive_core::store::events::EventCreate;
+use hive_core::store::mail::MailAccountAdminView;
 use hive_core::store::tasks::TaskFilter;
 use hive_core::store::Store;
 use hive_embed::{Backend, EmbedConfig, Embedder, RuntimeEmbedder};
@@ -259,6 +261,31 @@ fn author_name() -> String {
         .ok()
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| "owner".to_string())
+}
+
+/// Whether the Shell spawns the mail sync driver at store open. On by default
+/// (the flatpak ships `--share=network`); dev/CI opt OUT with
+/// `HIVE_MAIL_ENABLED=0` so no test or headless run reaches for a JMAP server.
+/// (Named to match the pre-pivot daemon's `HIVE_MAIL_ENABLED`, sense inverted
+/// to default-on since the driver now lives in the shipping app, not a separate
+/// binary you'd choose to launch.)
+fn mail_driver_enabled() -> bool {
+    !matches!(
+        std::env::var("HIVE_MAIL_ENABLED")
+            .unwrap_or_default()
+            .trim(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// Seconds between mail sync driver ticks: `HIVE_MAIL_TICK`, default 30. Read
+/// once when the driver spawns.
+fn mail_driver_tick_secs() -> u64 {
+    std::env::var("HIVE_MAIL_TICK")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(30)
 }
 
 const BG: &str = "#14120e";
@@ -932,6 +959,28 @@ fn Shell(store: ReadOnlySignal<Store>) -> Element {
         }
     });
 
+    // The mail sync DRIVER (Slice A). Spawned ONCE at store open (Shell mounts
+    // only in Journal mode), it drives jmap-sync's intact engine: every tick,
+    // one bounded sync pass per due account (`mail_sync_tick`). Fire-and-forget
+    // on the UI's tokio runtime — each await yields, and the heavy JMAP/network
+    // work happens off the store's single writer thread inside the tick. A
+    // freshly-added enabled account is picked up on the next tick with no
+    // relaunch. Off by default in dev/CI (HIVE_MAIL_ENABLED); the flatpak turns
+    // it on (it has --share=network).
+    use_hook(|| {
+        if !mail_driver_enabled() {
+            return;
+        }
+        let store = store.peek().clone();
+        let tick = Duration::from_secs(mail_driver_tick_secs());
+        spawn(async move {
+            loop {
+                store.mail_sync_tick().await;
+                tokio::time::sleep(tick).await;
+            }
+        });
+    });
+
     rsx! {
         div {
             style: "position: fixed; inset: 0; display: flex; background: {BG}; \
@@ -958,12 +1007,7 @@ fn Shell(store: ReadOnlySignal<Store>) -> Element {
                             IdentitiesPane { store, section, active, refresh }
                         },
                         Section::Settings => rsx! { SettingsPane { store, refresh } },
-                        Section::Mail => placeholder_pane(
-                            Section::Mail,
-                            "Connect your mail server and give each identity its own mailbox — \
-                             send and receive as any of your identities, with every message \
-                             woven into the same searchable memory as your journal.",
-                        ),
+                        Section::Mail => rsx! { MailPane { store } },
                         Section::Calendar => rsx! { CalendarPane { store, selected, refresh } },
                     }
                 }
@@ -1359,30 +1403,497 @@ fn segmented_style(on: bool) -> String {
     )
 }
 
-// ── placeholder panes (mail / contacts / calendar — honest "coming soon") ────
+// ── mail pane (Slice A: accounts screen — the reading UI is a later slice) ────
+//
+// The sync driver (store/mail_sync.rs, spawned in Shell) runs jmap-sync's
+// intact engine; this pane is where you connect a server and give each identity
+// its own credentialed mailbox. Reading (folders / threads / labels / compose)
+// arrives in the next update. Every add stores the password through the
+// cc_credentials vault (mail_account_create does the cc_cred_put itself — the
+// UI never persists or logs the raw secret); the driver's first pass discovers
+// the real jmap_account_id.
 
-/// An honest placeholder: the section icon, "Coming in a later update", and one
-/// true sentence of what the section will do. No fake UI.
-fn placeholder_pane(s: Section, blurb: &str) -> Element {
+/// A pending two-step delete: which account row is armed (the second click
+/// commits). None = nothing armed.
+type ArmedDelete = Option<String>;
+
+#[component]
+fn MailPane(store: ReadOnlySignal<Store>) -> Element {
+    // Re-pulls the account list after add / toggle / resync / delete.
+    let refresh = use_signal(|| 0u32);
+
+    // All connected accounts, with sync state, grouped by owner in render.
+    let accounts = use_resource(move || {
+        let store = store();
+        async move {
+            let _ = refresh();
+            store
+                .mail_accounts_admin_list()
+                .await
+                .map_err(|e| format!("{e:#}"))
+        }
+    });
+
     rsx! {
         div {
-            id: "placeholder-pane",
-            style: "max-width: 560px; margin: 0 auto; padding: 5rem 1.4rem; text-align: center;",
-            div { style: "font-size: 3rem; color: {GOLD};", "{s.icon()}" }
+            id: "mail-pane",
+            style: "max-width: 720px; margin: 0 auto; padding: 2.2rem 1.4rem 4rem;",
+
+            // header
             div {
-                style: "font-size: 1.5rem; font-weight: 700; margin-top: 0.6rem;",
-                "{s.label()}"
+                style: "display: flex; align-items: baseline; gap: 0.6rem;",
+                div { style: "font-size: 1.5rem; font-weight: 700;", "Mail accounts" }
+                div { style: "font-size: 1.6rem; color: {GOLD};", "✉" }
             }
             div {
-                style: "font-size: 0.82rem; font-weight: 700; letter-spacing: 0.08em; \
-                        text-transform: uppercase; color: {DIM}; margin-top: 0.5rem;",
-                "Coming in a later update"
+                style: "color: {DIM}; font-size: 0.9rem; line-height: 1.6; margin-top: 0.4rem;",
+                "Connect a JMAP mail server for each identity. Hive syncs every mailbox in the \
+                 background and weaves messages into the same searchable memory as your journal."
             }
+
+            // ── add-account form ─────────────────────────────────────────────
+            MailAddAccount { store, refresh }
+
+            // ── connected accounts, grouped by owner identity ────────────────
             div {
-                style: "color: {DIM}; font-size: 0.95rem; line-height: 1.65; margin-top: 1rem;",
-                "{blurb}"
+                style: "margin-top: 1.8rem;",
+                div {
+                    style: "font-size: 0.78rem; font-weight: 700; letter-spacing: 0.08em; \
+                            text-transform: uppercase; color: {DIM}; margin-bottom: 0.6rem;",
+                    "Connected"
+                }
+                div {
+                    id: "mail-account-list",
+                    match accounts() {
+                        None => muted("loading accounts…"),
+                        Some(Err(e)) => muted(&format!("accounts unavailable: {e}")),
+                        Some(Ok(list)) if list.is_empty() => rsx! {
+                            div {
+                                style: "color: {FAINT}; font-size: 0.9rem; padding: 1.2rem 0;",
+                                "No mailboxes yet. Add one above to start syncing."
+                            }
+                        },
+                        Some(Ok(list)) => rsx! {
+                            for acct in list.into_iter() {
+                                {mail_account_row(store, acct, refresh)}
+                            }
+                        },
+                    }
+                }
+            }
+
+            // quiet note about the reading UI + per-identity mailboxes
+            div {
+                style: "margin-top: 2rem; padding-top: 1rem; border-top: 1px solid {EDGE}; \
+                        color: {FAINT}; font-size: 0.82rem; line-height: 1.6;",
+                "Reading your mail — folders, threads, labels, and compose — arrives in the next \
+                 update. Each identity can have its own mailbox, so you send and receive as any \
+                 of them."
             }
         }
+    }
+}
+
+/// The add-account form. On submit, `mail_account_create` vaults the raw
+/// password itself (cc_cred_put) and creates the account with an empty
+/// jmap_account_id; the driver's first pass discovers the real one.
+#[component]
+fn MailAddAccount(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
+    let mut owner = use_signal(String::new);
+    let mut address = use_signal(String::new);
+    let mut url = use_signal(String::new);
+    let mut username = use_signal(String::new);
+    let mut secret = use_signal(String::new);
+    let mut error = use_signal(|| Option::<String>::None);
+    let mut ok = use_signal(|| false);
+    let mut busy = use_signal(|| false);
+
+    // Every identity that can own a mailbox (people_list — pia/maggie included).
+    let identities = use_resource(move || {
+        let store = store();
+        async move { store.people_list().await.map_err(|e| format!("{e:#}")) }
+    });
+    let people: Vec<Person> = match identities() {
+        Some(Ok(list)) => list,
+        _ => Vec::new(),
+    };
+    // Precomputed (rsx format strings can't hold an `if` expression).
+    let submit_opacity = if busy() { "0.6" } else { "1" };
+
+    let submit = move |_| {
+        if busy() {
+            return;
+        }
+        let owner_v = owner().trim().to_string();
+        let address_v = address().trim().to_string();
+        let url_v = url().trim().to_string();
+        let username_v = username().trim().to_string();
+        let secret_v = secret(); // NOT trimmed — a password may hold spaces
+                                 // Minimal client-side validation; the store re-checks and dedupes.
+        if owner_v.is_empty() {
+            error.set(Some("Pick which identity owns this mailbox.".into()));
+            return;
+        }
+        if address_v.is_empty() || url_v.is_empty() || secret_v.is_empty() {
+            error.set(Some(
+                "Address, server URL, and password are all required.".into(),
+            ));
+            return;
+        }
+        let store = store();
+        let mut refresh = refresh;
+        busy.set(true);
+        ok.set(false);
+        error.set(None);
+        spawn(async move {
+            // `secret` is the RAW password: mail_account_create encrypts it into
+            // the vault (cc_cred_put) and stores only the cred id on the account.
+            // jmap_account_id is left empty — the driver discovers it.
+            let uname = if username_v.is_empty() {
+                None
+            } else {
+                Some(username_v.as_str())
+            };
+            let result = store
+                .mail_account_create(&owner_v, &address_v, &url_v, uname, "", &secret_v)
+                .await;
+            busy.set(false);
+            match result {
+                Ok(_) => {
+                    // Clear the sensitive field first, then the rest.
+                    secret.set(String::new());
+                    address.set(String::new());
+                    url.set(String::new());
+                    username.set(String::new());
+                    ok.set(true);
+                    refresh += 1;
+                }
+                Err(e) => error.set(Some(format!("{e:#}"))),
+            }
+        });
+    };
+
+    rsx! {
+        div {
+            id: "mail-account-add",
+            style: "margin-top: 1.4rem; background: {PANEL}; border: 1px solid {EDGE}; \
+                    border-radius: 12px; padding: 1.1rem 1.2rem;",
+            div {
+                style: "font-size: 1rem; font-weight: 700; margin-bottom: 0.2rem;",
+                "Add a mailbox"
+            }
+            div {
+                style: "color: {FAINT}; font-size: 0.82rem; margin-bottom: 0.9rem;",
+                "Its password is encrypted in your local vault — never stored or logged in the clear."
+            }
+
+            // owner identity
+            label {
+                style: "display: block; color: {DIM}; font-size: 0.82rem; font-weight: 700;",
+                "Owner identity"
+            }
+            select {
+                id: "mail-add-owner",
+                style: "{text_input_style()} cursor: pointer;",
+                value: "{owner}",
+                onchange: move |e| owner.set(e.value()),
+                option { value: "", "Choose an identity…" }
+                for p in people.iter() {
+                    option {
+                        value: "{p.slug}",
+                        "{identity_option_label(p)}"
+                    }
+                }
+            }
+
+            // address
+            label {
+                style: "display: block; color: {DIM}; font-size: 0.82rem; font-weight: 700; margin-top: 0.7rem;",
+                "Email address"
+            }
+            input {
+                id: "mail-add-address",
+                style: "{text_input_style()}",
+                r#type: "email",
+                placeholder: "you@example.com",
+                value: "{address}",
+                oninput: move |e| address.set(e.value()),
+            }
+
+            // JMAP URL
+            label {
+                style: "display: block; color: {DIM}; font-size: 0.82rem; font-weight: 700; margin-top: 0.7rem;",
+                "JMAP server URL"
+            }
+            input {
+                id: "mail-add-url",
+                style: "{text_input_style()}",
+                r#type: "url",
+                placeholder: "https://mail.example.com",
+                value: "{url}",
+                oninput: move |e| url.set(e.value()),
+            }
+            div {
+                style: "color: {FAINT}; font-size: 0.76rem; margin-top: 0.3rem;",
+                "Your provider's JMAP session URL (often the base host, or its /.well-known/jmap)."
+            }
+
+            // username (optional)
+            label {
+                style: "display: block; color: {DIM}; font-size: 0.82rem; font-weight: 700; margin-top: 0.7rem;",
+                "Username "
+                span { style: "color: {FAINT}; font-weight: 400;", "(optional — defaults to the address)" }
+            }
+            input {
+                id: "mail-add-username",
+                style: "{text_input_style()}",
+                r#type: "text",
+                placeholder: "usually your email address",
+                value: "{username}",
+                oninput: move |e| username.set(e.value()),
+            }
+
+            // password (masked)
+            label {
+                style: "display: block; color: {DIM}; font-size: 0.82rem; font-weight: 700; margin-top: 0.7rem;",
+                "Password"
+            }
+            input {
+                id: "mail-add-secret",
+                style: "{text_input_style()}",
+                r#type: "password",
+                placeholder: "app password or account password",
+                value: "{secret}",
+                oninput: move |e| secret.set(e.value()),
+            }
+
+            // submit + status
+            div {
+                style: "display: flex; align-items: center; gap: 0.8rem; margin-top: 1rem;",
+                button {
+                    id: "mail-add-submit",
+                    disabled: busy(),
+                    style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                            padding: 0.55rem 1.1rem; font-weight: 700; font-size: 0.88rem; \
+                            cursor: pointer; opacity: {submit_opacity};",
+                    onclick: submit,
+                    if busy() { "Connecting…" } else { "Add mailbox" }
+                }
+                if ok() {
+                    span {
+                        style: "color: #7fb069; font-size: 0.84rem;",
+                        "Mailbox added — syncing will begin shortly."
+                    }
+                }
+            }
+            if let Some(e) = error() {
+                div {
+                    id: "mail-add-error",
+                    style: "color: #e07a5f; font-size: 0.84rem; margin-top: 0.6rem;",
+                    "{e}"
+                }
+            }
+        }
+    }
+}
+
+/// One connected account: address, owner, status/last-sync + any error, and the
+/// enabled toggle / force-resync / delete controls (delete is two-step). A
+/// plain fn, not a `#[component]`: `MailAccountAdminView` has no `PartialEq`, so
+/// it can't be a memoized prop.
+fn mail_account_row(
+    store: ReadOnlySignal<Store>,
+    acct: MailAccountAdminView,
+    refresh: Signal<u32>,
+) -> Element {
+    let mut armed = use_signal(|| None as ArmedDelete);
+    let mut row_err = use_signal(|| Option::<String>::None);
+    let id = acct.id.clone();
+
+    let toggle = {
+        let id = id.clone();
+        let enabled_now = acct.enabled;
+        move |_| {
+            let store = store();
+            let id = id.clone();
+            let mut refresh = refresh;
+            spawn(async move {
+                match store.mail_account_set_enabled(&id, !enabled_now).await {
+                    Ok(_) => refresh += 1,
+                    Err(e) => row_err.set(Some(format!("{e:#}"))),
+                }
+            });
+        }
+    };
+
+    let resync = {
+        let id = id.clone();
+        move |_| {
+            let store = store();
+            let id = id.clone();
+            let mut refresh = refresh;
+            spawn(async move {
+                match store.mail_account_force_resync(&id).await {
+                    Ok(_) => refresh += 1,
+                    Err(e) => row_err.set(Some(format!("{e:#}"))),
+                }
+            });
+        }
+    };
+
+    let delete = {
+        let id = id.clone();
+        move |_| {
+            let store = store();
+            let id = id.clone();
+            let mut refresh = refresh;
+            spawn(async move {
+                match store.mail_account_delete(&id).await {
+                    Ok(_) => refresh += 1,
+                    Err(e) => row_err.set(Some(format!("{e:#}"))),
+                }
+            });
+        }
+    };
+
+    rsx! {
+        div {
+            id: "mail-account-row-{acct.id}",
+            style: "background: {PANEL}; border: 1px solid {EDGE}; border-radius: 10px; \
+                    padding: 0.9rem 1rem; margin-bottom: 0.6rem;",
+            div {
+                style: "display: flex; align-items: center; gap: 0.8rem;",
+                // address + owner + status
+                div {
+                    style: "flex: 1; min-width: 0;",
+                    div {
+                        style: "font-weight: 700; font-size: 0.96rem; overflow: hidden; \
+                                text-overflow: ellipsis; white-space: nowrap;",
+                        "{acct.address}"
+                    }
+                    div {
+                        style: "color: {DIM}; font-size: 0.8rem; margin-top: 0.15rem;",
+                        "owned by "
+                        span { style: "color: {GOLD};", "{acct.owner}" }
+                        " · "
+                        span { "{account_status_line(&acct)}" }
+                    }
+                }
+                // enabled toggle
+                button {
+                    id: "mail-account-toggle-{acct.id}",
+                    style: mail_pill_style(acct.enabled),
+                    onclick: toggle,
+                    if acct.enabled { "Enabled" } else { "Disabled" }
+                }
+                // force-resync
+                button {
+                    id: "mail-account-resync-{acct.id}",
+                    style: "background: none; border: 1px solid {EDGE}; color: {DIM}; \
+                            border-radius: 999px; padding: 0.35rem 0.8rem; font: inherit; \
+                            font-size: 0.8rem; cursor: pointer;",
+                    title: "Re-check the whole mailbox against the server",
+                    onclick: resync,
+                    "Resync"
+                }
+                // delete (two-step)
+                if armed().as_deref() == Some(acct.id.as_str()) {
+                    button {
+                        id: "mail-account-delete-{acct.id}",
+                        style: "background: #e07a5f; color: #14120e; border: none; border-radius: 999px; \
+                                padding: 0.35rem 0.8rem; font-weight: 700; font-size: 0.8rem; cursor: pointer;",
+                        onclick: delete,
+                        "Really delete"
+                    }
+                    button {
+                        style: "background: none; border: 1px solid {EDGE}; color: {DIM}; \
+                                border-radius: 999px; padding: 0.35rem 0.7rem; font: inherit; \
+                                font-size: 0.8rem; cursor: pointer;",
+                        onclick: move |_| armed.set(None),
+                        "Cancel"
+                    }
+                } else {
+                    button {
+                        style: "background: none; border: 1px solid #e07a5f; color: #e07a5f; \
+                                border-radius: 999px; padding: 0.35rem 0.8rem; font: inherit; \
+                                font-size: 0.8rem; cursor: pointer;",
+                        title: "Disconnect this mailbox and delete its local copy",
+                        onclick: {
+                            let rid = acct.id.clone();
+                            move |_| armed.set(Some(rid.clone()))
+                        },
+                        "Delete"
+                    }
+                }
+            }
+            // last error, if the last sync failed
+            if let Some(err) = acct.last_error.as_ref().filter(|_| !acct.enabled || acct.attempts > 0) {
+                div {
+                    style: "color: #e07a5f; font-size: 0.78rem; margin-top: 0.5rem; overflow-wrap: anywhere;",
+                    "Last error: {err}"
+                }
+            }
+            if let Some(e) = row_err() {
+                div {
+                    style: "color: #e07a5f; font-size: 0.78rem; margin-top: 0.5rem;",
+                    "{e}"
+                }
+            }
+        }
+    }
+}
+
+/// Dropdown label for an identity option: name, plus a kind hint for AI
+/// identities so pia/maggie read distinctly from human owners.
+fn identity_option_label(p: &Person) -> String {
+    if matches!(p.kind, ActorKind::Ai) {
+        format!("{} (AI)", p.name)
+    } else {
+        p.name.clone()
+    }
+}
+
+/// The compact status line under an address: backfill phase + last outcome +
+/// last-synced time, or the disabled/never-synced state. No secrets.
+fn account_status_line(a: &MailAccountAdminView) -> String {
+    if !a.enabled {
+        return "disabled".to_string();
+    }
+    let phase = match a.backfill_status.as_str() {
+        "complete" => "up to date",
+        "in_progress" => "backfilling…",
+        _ => "waiting to sync",
+    };
+    match (a.last_status.as_deref(), a.last_synced_at.as_deref()) {
+        (Some("error"), _) => format!("{phase} · last attempt failed"),
+        (_, Some(ts)) => format!("{phase} · synced {}", short_time(ts)),
+        _ => phase.to_string(),
+    }
+}
+
+/// The enabled/disabled pill style (gold when enabled, muted when off).
+fn mail_pill_style(enabled: bool) -> String {
+    if enabled {
+        format!(
+            "background: {GOLD}; color: #14120e; border: none; border-radius: 999px; \
+             padding: 0.35rem 0.8rem; font-weight: 700; font-size: 0.8rem; cursor: pointer;"
+        )
+    } else {
+        format!(
+            "background: none; border: 1px solid {FAINT}; color: {DIM}; border-radius: 999px; \
+             padding: 0.35rem 0.8rem; font: inherit; font-size: 0.8rem; cursor: pointer;"
+        )
+    }
+}
+
+/// ISO-8601 → a short `YYYY-MM-DD HH:MM` for the status line (the timestamps
+/// are always the `now_iso` shape). Falls back to the raw string if it is
+/// shorter than expected.
+fn short_time(iso: &str) -> String {
+    if iso.len() >= 16 {
+        format!("{} {}", &iso[..10], &iso[11..16])
+    } else {
+        iso.to_string()
     }
 }
 

@@ -18,6 +18,14 @@ reqwest = { workspace = true }
 hive-shared = { workspace = true }
 hive-embed = { workspace = true }
 
+# Mail sync DRIVER (Slice A): the loop that runs jmap-sync's intact engine over
+# the store. jmap-sync has NO hive deps, so core → jmap-sync is acyclic. The
+# JMAP client itself stays contained in jmap-sync/src/client.rs (see the
+# workspace Cargo.toml mail section); core only speaks the CursorStore/MailSink
+# traits and the Syncer driver methods.
+jmap-sync = { path = "../jmap-sync" }
+async-trait = { workspace = true }
+
 # Crypto primitives for the credential vault (mail account credentials at rest)
 rand = { workspace = true }
 sha2 = { workspace = true }
