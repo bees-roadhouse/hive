@@ -21,9 +21,10 @@ use hive_core::keys::{KeySource, KeychainKeySource, MemoryKeySource};
 use hive_core::store::custom_entities::EntityFilter;
 use hive_core::store::events::EventCreate;
 use hive_core::store::mail::{
-    MailAccountAdminView, MailAttachmentChip, MailMailboxView, MailMessageSummary,
-    MailThreadMessage,
+    EmailAddr, MailAccountAdminView, MailAttachmentChip, MailMailboxView, MailMessageSummary,
+    MailReplyMeta, MailThreadMessage,
 };
+use hive_core::store::mail_sync::{MailAddress, OutgoingEmail};
 use hive_core::store::tasks::TaskFilter;
 use hive_core::store::Store;
 use hive_embed::{Backend, EmbedConfig, Embedder, RuntimeEmbedder};
@@ -1441,6 +1442,21 @@ enum MailListSource {
     Search { query: String },
 }
 
+/// The prefill for the compose window. `None` for a fresh "New Message"; a
+/// reply/reply-all builds one from the open message. `account_id` preselects the
+/// From account (empty = let the user pick). Carries the reply threading headers
+/// so the send keeps the conversation intact.
+#[derive(Clone, PartialEq, Default)]
+struct ComposeSeed {
+    account_id: String,
+    to: String,
+    cc: String,
+    subject: String,
+    body: String,
+    in_reply_to: Option<String>,
+    references: Vec<String>,
+}
+
 #[component]
 fn MailPane(store: ReadOnlySignal<Store>) -> Element {
     // Flip between the reader and the Slice-A account manager (the gear).
@@ -1451,6 +1467,8 @@ fn MailPane(store: ReadOnlySignal<Store>) -> Element {
     let source = use_signal(|| MailListSource::None);
     let selected_msg = use_signal(|| Option::<MailMessageSummary>::None);
     let search = use_signal(String::new);
+    // Some(seed) = the compose overlay is open (fresh or a reply prefill).
+    let compose = use_signal(|| Option::<ComposeSeed>::None);
 
     if managing() {
         return rsx! { MailAccountsManager { store, refresh, managing } };
@@ -1459,10 +1477,13 @@ fn MailPane(store: ReadOnlySignal<Store>) -> Element {
     rsx! {
         div {
             id: "mail-pane",
-            style: "display: flex; height: 100%; min-height: 0; background: {BG};",
-            MailSidebar { store, refresh, source, selected_msg, search, managing }
+            style: "display: flex; height: 100%; min-height: 0; background: {BG}; position: relative;",
+            MailSidebar { store, refresh, source, selected_msg, search, managing, compose }
             MailList { store, source, selected_msg }
-            MailReader { store, selected_msg }
+            MailReader { store, selected_msg, compose }
+            if compose().is_some() {
+                ComposeWindow { store, compose }
+            }
         }
     }
 }
@@ -1478,6 +1499,7 @@ fn MailSidebar(
     selected_msg: Signal<Option<MailMessageSummary>>,
     search: Signal<String>,
     managing: Signal<bool>,
+    compose: Signal<Option<ComposeSeed>>,
 ) -> Element {
     let accounts = use_resource(move || {
         let store = store();
@@ -1525,6 +1547,19 @@ fn MailSidebar(
                     onclick: move |_| managing.set(true),
                     "⚙"
                 }
+            }
+
+            // New Message — opens the compose overlay with a blank seed.
+            button {
+                id: "mail-compose-new",
+                style: "width: 100%; box-sizing: border-box; background: {GOLD}; color: #14120e; \
+                        border: none; border-radius: 8px; padding: 0.5rem 0.8rem; font: inherit; \
+                        font-weight: 700; font-size: 0.86rem; cursor: pointer; margin-bottom: 0.7rem;",
+                onclick: move |_| {
+                    let mut compose = compose;
+                    compose.set(Some(ComposeSeed::default()));
+                },
+                "✎ New Message"
             }
 
             // global search
@@ -1839,6 +1874,7 @@ fn mail_list_row(
 fn MailReader(
     store: ReadOnlySignal<Store>,
     selected_msg: Signal<Option<MailMessageSummary>>,
+    compose: Signal<Option<ComposeSeed>>,
 ) -> Element {
     let thread = use_resource(move || {
         let store = store();
@@ -1895,15 +1931,14 @@ fn MailReader(
                             div {
                                 style: "margin-top: 1.2rem;",
                                 for tmsg in thread.messages.into_iter() {
-                                    {mail_thread_message(store, tmsg, focused_id.as_deref())}
+                                    {mail_thread_message(store, tmsg, focused_id.as_deref(), compose)}
                                 }
                             }
-                            // read-only honesty
+                            // what's still to come (compose + reply are live now)
                             div {
                                 style: "margin-top: 2rem; padding-top: 1rem; border-top: 1px solid {EDGE}; \
                                         color: {FAINT}; font-size: 0.8rem; line-height: 1.6;",
-                                "Reading only for now — replying, composing, and marking read or \
-                                 labeling arrive in the next update."
+                                "Marking read, labeling, and moving messages arrive in the next update."
                             }
                         }
                     }
@@ -1921,9 +1956,13 @@ fn mail_thread_message(
     store: ReadOnlySignal<Store>,
     tmsg: MailThreadMessage,
     focused_id: Option<&str>,
+    compose: Signal<Option<ComposeSeed>>,
 ) -> Element {
     let is_focused = focused_id == Some(tmsg.summary.id.as_str());
     let mut expanded = use_signal(|| is_focused);
+    let msg_id = tmsg.summary.id.clone();
+    // The body we quote into a reply (the sanitized plaintext already stored).
+    let original_body = tmsg.body_text.clone();
     let sender = tmsg.summary.from.clone();
     let date = short_time(&tmsg.summary.received_at);
     let to_line = if tmsg.summary.to.is_empty() {
@@ -1967,6 +2006,45 @@ fn mail_thread_message(
         };
     }
 
+    // Open the compose overlay prefilled as a reply (all = reply-all) to this
+    // message: pull the parent's threading headers + participants, then seed.
+    let open_reply = move |all: bool| {
+        let store = store();
+        let id = msg_id.clone();
+        // Clone the quoted body per call so this closure stays `Fn` (the async
+        // block must not move a capture out of the closure's environment).
+        let original_body = original_body.clone();
+        let mut compose = compose;
+        spawn(async move {
+            let Ok(Some(meta)) = store.mail_message_reply_meta(&id).await else {
+                return;
+            };
+            let (to, cc) = if all {
+                reply_all_recipients(&meta)
+            } else {
+                (reply_to_recipients(&meta), Vec::new())
+            };
+            let sender = meta
+                .from
+                .first()
+                .map(addr_label)
+                .unwrap_or_else(|| meta.account_address.clone());
+            let seed = ComposeSeed {
+                account_id: meta.account_id.clone(),
+                to: addrs_to_field(&to),
+                cc: addrs_to_field(&cc),
+                subject: reply_subject(&meta.subject),
+                body: format!(
+                    "\n\n{}",
+                    quote_reply_body(&meta.received_at, &sender, &original_body)
+                ),
+                in_reply_to: meta.message_id_hdr.clone(),
+                references: reply_references(&meta),
+            };
+            compose.set(Some(seed));
+        });
+    };
+
     rsx! {
         div {
             style: "border: 1px solid {EDGE}; border-radius: 10px; padding: 0.9rem 1.1rem; \
@@ -1994,6 +2072,25 @@ fn mail_thread_message(
                     for chip in chips.into_iter() {
                         {label_chip(&chip)}
                     }
+                }
+            }
+            // reply / reply-all
+            div {
+                style: "display: flex; gap: 0.5rem; margin-top: 0.7rem;",
+                button {
+                    id: "mail-reply-{tmsg.summary.id}",
+                    style: reply_button_style(),
+                    onclick: {
+                        let open_reply = open_reply.clone();
+                        move |_| open_reply(false)
+                    },
+                    "↩ Reply"
+                }
+                button {
+                    id: "mail-replyall-{tmsg.summary.id}",
+                    style: reply_button_style(),
+                    onclick: move |_| open_reply(true),
+                    "↩↩ Reply all"
                 }
             }
             // the SANITIZED body + its remote-image opt-in
@@ -2141,6 +2238,321 @@ fn mail_attachment_chip(store: ReadOnlySignal<Store>, att: MailAttachmentChip) -
     }
 }
 
+/// How far a queued send has gotten, for the compose status line.
+#[derive(Clone, PartialEq)]
+enum SendState {
+    Idle,
+    /// Enqueued; the job id we're tracking through the outbox.
+    Queued(String),
+    Sent,
+    Failed(String),
+}
+
+/// The compose overlay: From (a picker over the enabled mail accounts), To, Cc,
+/// Subject, Body, and Send / Cancel. Sending enqueues an `OutgoingEmail` on the
+/// durable outbox (`mail_send_enqueue`) and then polls that job to turn "Queued"
+/// into "Sent"/"Failed" as the driver flushes it. Plaintext body this slice.
+#[component]
+fn ComposeWindow(store: ReadOnlySignal<Store>, compose: Signal<Option<ComposeSeed>>) -> Element {
+    // Snapshot the seed once (the overlay owns its own field state from here).
+    let seed = compose().unwrap_or_default();
+
+    let mut from_id = use_signal(|| seed.account_id.clone());
+    let mut to = use_signal(|| seed.to.clone());
+    let mut cc = use_signal(|| seed.cc.clone());
+    let mut subject = use_signal(|| seed.subject.clone());
+    let mut body = use_signal(|| seed.body.clone());
+    let mut error = use_signal(|| Option::<String>::None);
+    let mut state = use_signal(|| SendState::Idle);
+    // The reply threading headers ride alongside; they never show in the UI.
+    let in_reply_to = seed.in_reply_to.clone();
+    let references = seed.references.clone();
+
+    // Enabled accounts are the From choices (address + id).
+    let accounts = use_resource(move || {
+        let store = store();
+        async move {
+            store
+                .mail_accounts_admin_list()
+                .await
+                .map(|list| list.into_iter().filter(|a| a.enabled).collect::<Vec<_>>())
+                .map_err(|e| format!("{e:#}"))
+        }
+    });
+    let account_list: Vec<MailAccountAdminView> = match accounts() {
+        Some(Ok(list)) => list,
+        _ => Vec::new(),
+    };
+    // Default the From to the first enabled account when the seed didn't set one
+    // (or set one that isn't enabled/present).
+    let from_valid = account_list.iter().any(|a| a.id == from_id());
+    if !from_valid {
+        if let Some(first) = account_list.first() {
+            from_id.set(first.id.clone());
+        }
+    }
+    let sending = matches!(state(), SendState::Queued(_));
+    // Precomputed (rsx format strings can't hold an `if` expression).
+    let send_opacity = if sending { "0.6" } else { "1" };
+
+    let submit = move |_| {
+        if sending {
+            return;
+        }
+        error.set(None);
+        let account_id = from_id();
+        if account_id.is_empty() {
+            error.set(Some("Pick which account to send from.".into()));
+            return;
+        }
+        // Resolve the From address from the chosen account.
+        let from_address = accounts()
+            .and_then(|r| r.ok())
+            .and_then(|list| list.into_iter().find(|a| a.id == account_id))
+            .map(|a| a.address);
+        let Some(from_address) = from_address else {
+            error.set(Some("That account is no longer available.".into()));
+            return;
+        };
+        let to_list = parse_recipients(&to());
+        let cc_list = parse_recipients(&cc());
+        if to_list.is_empty() && cc_list.is_empty() {
+            error.set(Some("Add at least one recipient.".into()));
+            return;
+        }
+        if body().trim().is_empty() {
+            error.set(Some("The message body is empty.".into()));
+            return;
+        }
+        let msg = OutgoingEmail {
+            from_address,
+            from_name: None,
+            to: to_list,
+            cc: cc_list,
+            bcc: Vec::new(),
+            subject: subject(),
+            body_text: body(),
+            in_reply_to: in_reply_to.clone(),
+            references: references.clone(),
+            drafts_mailbox_id: None,
+            identity_id: None,
+        };
+        let store = store();
+        state.set(SendState::Queued(String::new()));
+        spawn(async move {
+            match store.mail_send_enqueue(&account_id, msg).await {
+                Ok(job_id) => {
+                    state.set(SendState::Queued(job_id.clone()));
+                    // Poll the job: the driver flushes on its next tick (≤ ~30s
+                    // by default). Bounded so a wedged send doesn't spin forever
+                    // — after the window it stays "Sending…" (still queued).
+                    for _ in 0..40 {
+                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        match store.outbox_get(&job_id).await {
+                            Ok(Some(job)) => match job.status {
+                                hive_shared::OutboxStatus::Done => {
+                                    state.set(SendState::Sent);
+                                    return;
+                                }
+                                hive_shared::OutboxStatus::Failed => {
+                                    state.set(SendState::Failed(
+                                        job.last_error.unwrap_or_else(|| "send failed".into()),
+                                    ));
+                                    return;
+                                }
+                                hive_shared::OutboxStatus::Pending => {}
+                            },
+                            // Row gone (pruned) — treat as sent.
+                            Ok(None) => {
+                                state.set(SendState::Sent);
+                                return;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                Err(e) => state.set(SendState::Failed(format!("{e:#}"))),
+            }
+        });
+    };
+
+    let close = move |_| {
+        let mut compose = compose;
+        compose.set(None);
+    };
+
+    rsx! {
+        // full-pane dimmed backdrop; clicking it closes (unless mid-send)
+        div {
+            id: "mail-compose-backdrop",
+            style: "position: absolute; inset: 0; background: rgba(0,0,0,0.5); \
+                    display: flex; align-items: center; justify-content: center; z-index: 20;",
+            onclick: move |_| {
+                if !sending {
+                    let mut compose = compose;
+                    compose.set(None);
+                }
+            },
+            // the compose card — stop click-through so clicks inside don't close
+            div {
+                id: "mail-compose",
+                style: "width: min(640px, 92%); max-height: 88%; overflow-y: auto; \
+                        background: {PANEL}; border: 1px solid {EDGE}; border-radius: 14px; \
+                        padding: 1.3rem 1.4rem 1.5rem; box-shadow: 0 18px 50px rgba(0,0,0,0.55);",
+                onclick: move |e| e.stop_propagation(),
+
+                // header
+                div {
+                    style: "display: flex; align-items: baseline; justify-content: space-between; \
+                            margin-bottom: 0.9rem;",
+                    div {
+                        style: "display: flex; align-items: baseline; gap: 0.5rem;",
+                        div { style: "font-size: 1.2rem; font-weight: 700;", "New message" }
+                        div { style: "color: {GOLD};", "✉" }
+                    }
+                    button {
+                        id: "mail-compose-close",
+                        style: "background: none; border: none; color: {DIM}; font-size: 1.2rem; \
+                                cursor: pointer; line-height: 1;",
+                        title: "Close",
+                        onclick: close,
+                        "✕"
+                    }
+                }
+
+                // From
+                label {
+                    style: "display: block; color: {DIM}; font-size: 0.82rem; font-weight: 700;",
+                    "From"
+                }
+                if account_list.is_empty() {
+                    div {
+                        style: "color: {FAINT}; font-size: 0.84rem; margin-top: 0.35rem;",
+                        "No enabled mail account to send from. Connect one from the ⚙ menu."
+                    }
+                } else {
+                    select {
+                        id: "compose-from",
+                        style: "{text_input_style()} cursor: pointer;",
+                        value: "{from_id}",
+                        onchange: move |e| from_id.set(e.value()),
+                        for a in account_list.iter() {
+                            option { value: "{a.id}", "{a.address}" }
+                        }
+                    }
+                }
+
+                // To
+                label {
+                    style: "display: block; color: {DIM}; font-size: 0.82rem; font-weight: 700; margin-top: 0.7rem;",
+                    "To"
+                }
+                input {
+                    id: "compose-to",
+                    style: "{text_input_style()}",
+                    r#type: "text",
+                    placeholder: "name@example.com, another@example.com",
+                    value: "{to}",
+                    oninput: move |e| to.set(e.value()),
+                }
+
+                // Cc
+                label {
+                    style: "display: block; color: {DIM}; font-size: 0.82rem; font-weight: 700; margin-top: 0.7rem;",
+                    "Cc "
+                    span { style: "color: {FAINT}; font-weight: 400;", "(optional)" }
+                }
+                input {
+                    id: "compose-cc",
+                    style: "{text_input_style()}",
+                    r#type: "text",
+                    placeholder: "optional",
+                    value: "{cc}",
+                    oninput: move |e| cc.set(e.value()),
+                }
+
+                // Subject
+                label {
+                    style: "display: block; color: {DIM}; font-size: 0.82rem; font-weight: 700; margin-top: 0.7rem;",
+                    "Subject"
+                }
+                input {
+                    id: "compose-subject",
+                    style: "{text_input_style()}",
+                    r#type: "text",
+                    placeholder: "Subject",
+                    value: "{subject}",
+                    oninput: move |e| subject.set(e.value()),
+                }
+
+                // Body
+                label {
+                    style: "display: block; color: {DIM}; font-size: 0.82rem; font-weight: 700; margin-top: 0.7rem;",
+                    "Message"
+                }
+                textarea {
+                    id: "compose-body",
+                    style: "{text_input_style()} min-height: 220px; resize: vertical; \
+                            line-height: 1.5; font-family: inherit;",
+                    placeholder: "Write your message…",
+                    value: "{body}",
+                    oninput: move |e| body.set(e.value()),
+                }
+
+                // actions + status
+                div {
+                    style: "display: flex; align-items: center; gap: 0.9rem; margin-top: 1rem;",
+                    button {
+                        id: "compose-send",
+                        disabled: sending || account_list.is_empty(),
+                        style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                                padding: 0.55rem 1.3rem; font-weight: 700; font-size: 0.9rem; \
+                                cursor: pointer; opacity: {send_opacity};",
+                        onclick: submit,
+                        if sending { "Sending…" } else { "Send" }
+                    }
+                    button {
+                        id: "compose-cancel",
+                        style: "background: none; border: 1px solid {EDGE}; color: {DIM}; \
+                                border-radius: 8px; padding: 0.55rem 1rem; font: inherit; \
+                                font-size: 0.88rem; cursor: pointer;",
+                        onclick: close,
+                        "Cancel"
+                    }
+                    {compose_status(state())}
+                }
+                if let Some(e) = error() {
+                    div {
+                        id: "compose-error",
+                        style: "color: #e07a5f; font-size: 0.84rem; margin-top: 0.6rem;",
+                        "{e}"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The compose status line beside the Send button, keyed off the outbox job.
+fn compose_status(state: SendState) -> Element {
+    match state {
+        SendState::Idle => rsx! {},
+        SendState::Queued(_) => rsx! {
+            span { style: "color: {DIM}; font-size: 0.84rem;", "Queued — sending…" }
+        },
+        SendState::Sent => rsx! {
+            span { style: "color: #7fb069; font-size: 0.84rem;", "Sent ✓" }
+        },
+        SendState::Failed(reason) => rsx! {
+            span {
+                id: "compose-failed",
+                style: "color: #e07a5f; font-size: 0.84rem;",
+                "Failed: {reason}"
+            }
+        },
+    }
+}
+
 /// A small label/flag chip in the message list + reader. Flagged reads gold; the
 /// rest read as muted pills.
 fn label_chip(label: &str) -> Element {
@@ -2209,6 +2621,143 @@ fn sender_display(from: &str) -> String {
         return addr.to_string();
     }
     from.to_string()
+}
+
+// ── compose pure helpers (unit-tested; no signals, no store) ─────────────────
+
+/// Parse a comma/semicolon-separated recipient string into addresses. Accepts
+/// `Name <email>` and bare `email`; trims, unquotes display names, and drops
+/// empty/address-less entries. A duplicate address (case-insensitive) collapses
+/// to its first occurrence.
+fn parse_recipients(raw: &str) -> Vec<MailAddress> {
+    let mut out: Vec<MailAddress> = Vec::new();
+    for token in raw.split([',', ';']) {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let (name, email) = if let Some(open) = token.find('<') {
+            let name = token[..open].trim().trim_matches('"').trim();
+            let email = token[open + 1..].trim_end_matches('>').trim();
+            let name = if name.is_empty() {
+                None
+            } else {
+                Some(name.to_string())
+            };
+            (name, email.to_string())
+        } else {
+            (None, token.to_string())
+        };
+        if email.is_empty() {
+            continue;
+        }
+        if out.iter().any(|a| a.email.eq_ignore_ascii_case(&email)) {
+            continue;
+        }
+        out.push(MailAddress { email, name });
+    }
+    out
+}
+
+/// The `Re:` subject for a reply — prefixed once, never doubled. An existing
+/// `Re:`/`RE:`/`re:` (with any surrounding space) is left as-is.
+fn reply_subject(subject: &str) -> String {
+    let trimmed = subject.trim();
+    if trimmed.len() >= 3 && trimmed[..3].eq_ignore_ascii_case("re:") {
+        return trimmed.to_string();
+    }
+    if trimmed.is_empty() {
+        "Re:".to_string()
+    } else {
+        format!("Re: {trimmed}")
+    }
+}
+
+/// A display label for an address in an attribution line / recipient field:
+/// `Name <email>` when a name exists, else the bare email.
+fn addr_label(a: &EmailAddr) -> String {
+    match a.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => format!("{n} <{}>", a.email),
+        None => a.email.clone(),
+    }
+}
+
+/// Render an address list back to a comma-separated string for a recipient
+/// input field.
+fn addrs_to_field(addrs: &[EmailAddr]) -> String {
+    addrs.iter().map(addr_label).collect::<Vec<_>>().join(", ")
+}
+
+/// The quoted body for a reply: an attribution line + the original body with
+/// each line `> `-prefixed. Empty original → empty quote (no dangling header).
+fn quote_reply_body(received_at: &str, sender: &str, body: &str) -> String {
+    if body.trim().is_empty() {
+        return String::new();
+    }
+    let quoted: String = body
+        .lines()
+        .map(|l| {
+            if l.is_empty() {
+                ">".to_string()
+            } else {
+                format!("> {l}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("On {}, {} wrote:\n{}", received_at, sender, quoted)
+}
+
+/// The References chain for a reply: the parent's References plus its
+/// Message-ID (RFC 5322 §3.6.4), de-duplicated, order preserved.
+fn reply_references(meta: &MailReplyMeta) -> Vec<String> {
+    let mut refs = meta.references.clone();
+    if let Some(mid) = meta.message_id_hdr.as_ref().filter(|s| !s.is_empty()) {
+        if !refs.iter().any(|r| r == mid) {
+            refs.push(mid.clone());
+        }
+    }
+    refs
+}
+
+/// Reply recipients: the original Reply-To if the sender set one, else the
+/// original From. (Reply, not reply-all — just the one party.)
+fn reply_to_recipients(meta: &MailReplyMeta) -> Vec<EmailAddr> {
+    if !meta.reply_to.is_empty() {
+        meta.reply_to.clone()
+    } else {
+        meta.from.clone()
+    }
+}
+
+/// Reply-all recipients: (To = original sender + original To) and
+/// (Cc = original Cc), both with the replying account's own address removed so
+/// we don't reply to ourselves. Returns `(to, cc)`.
+fn reply_all_recipients(meta: &MailReplyMeta) -> (Vec<EmailAddr>, Vec<EmailAddr>) {
+    let self_addr = meta.account_address.to_ascii_lowercase();
+    let is_self = |a: &EmailAddr| a.email.eq_ignore_ascii_case(&self_addr);
+
+    let mut to: Vec<EmailAddr> = Vec::new();
+    let push_unique = |list: &mut Vec<EmailAddr>, a: &EmailAddr| {
+        if a.email.is_empty() || is_self(a) {
+            return;
+        }
+        if !list.iter().any(|x| x.email.eq_ignore_ascii_case(&a.email)) {
+            list.push(a.clone());
+        }
+    };
+    for a in reply_to_recipients(meta).iter().chain(meta.to.iter()) {
+        push_unique(&mut to, a);
+    }
+    let mut cc: Vec<EmailAddr> = Vec::new();
+    for a in &meta.cc {
+        // Don't duplicate a To recipient down into Cc.
+        if to.iter().any(|x| x.email.eq_ignore_ascii_case(&a.email)) {
+            continue;
+        }
+        push_unique(&mut cc, a);
+    }
+    (to, cc)
 }
 
 /// A short, human date for the message list. If it is today, show HH:MM; if this
@@ -7333,6 +7882,15 @@ fn text_input_style() -> String {
     )
 }
 
+/// The small outlined pill the reader's Reply / Reply-all buttons share.
+fn reply_button_style() -> String {
+    format!(
+        "background: none; border: 1px solid {EDGE}; color: {INK}; border-radius: 8px; \
+         padding: 0.35rem 0.8rem; font: inherit; font-size: 0.82rem; font-weight: 600; \
+         cursor: pointer;"
+    )
+}
+
 fn field_label(text: &str) -> Element {
     rsx! {
         div {
@@ -8078,5 +8636,94 @@ mod tests {
         assert!(contact_matches_search(&hit, "jane"));
         assert!(contact_matches_search(&hit, "acme"));
         assert!(!contact_matches_search(&hit, "zzz"));
+    }
+
+    // ── compose helpers ─────────────────────────────────────────────────────
+
+    /// Comma/semicolon splitting, `Name <email>` parsing, unquoting, and
+    /// case-insensitive de-duplication.
+    #[test]
+    fn parse_recipients_splits_and_dedups() {
+        use super::parse_recipients;
+        let got = parse_recipients(
+            "  Alice <alice@ex.test> , bob@ex.test; \"Carol B\" <carol@ex.test>, ALICE@ex.test ,  ",
+        );
+        assert_eq!(got.len(), 3, "Alice de-duplicated, empties dropped");
+        assert_eq!(got[0].email, "alice@ex.test");
+        assert_eq!(got[0].name.as_deref(), Some("Alice"));
+        assert_eq!(got[1].email, "bob@ex.test");
+        assert_eq!(got[1].name, None);
+        assert_eq!(got[2].name.as_deref(), Some("Carol B"));
+        assert!(parse_recipients("   ").is_empty());
+    }
+
+    /// `Re:` is prefixed once and never doubled.
+    #[test]
+    fn reply_subject_no_double_re() {
+        use super::reply_subject;
+        assert_eq!(reply_subject("Hello"), "Re: Hello");
+        assert_eq!(reply_subject("Re: Hello"), "Re: Hello");
+        assert_eq!(reply_subject("RE: Hello"), "RE: Hello");
+        assert_eq!(reply_subject("re: hello"), "re: hello");
+        assert_eq!(reply_subject("  spaced  "), "Re: spaced");
+        assert_eq!(reply_subject(""), "Re:");
+    }
+
+    /// The quoted body carries an attribution line and `> `-prefixes each line;
+    /// an empty original quotes to nothing (no dangling header).
+    #[test]
+    fn quote_reply_body_attributes_and_prefixes() {
+        use super::quote_reply_body;
+        let q = quote_reply_body("2026-07-10", "Maggie <m@ex.test>", "hi there\n\nsee you");
+        assert_eq!(
+            q,
+            "On 2026-07-10, Maggie <m@ex.test> wrote:\n> hi there\n>\n> see you"
+        );
+        assert_eq!(quote_reply_body("2026-07-10", "x", "   "), "");
+    }
+
+    /// Reply picks Reply-To over From; reply-all unions sender + To into To and
+    /// keeps Cc, always dropping the replying account's own address. References
+    /// append the parent Message-ID once.
+    #[test]
+    fn reply_recipients_and_references() {
+        use super::{
+            reply_all_recipients, reply_references, reply_to_recipients, EmailAddr, MailReplyMeta,
+        };
+        let addr = |e: &str| EmailAddr {
+            email: e.into(),
+            name: None,
+        };
+        let meta = MailReplyMeta {
+            account_id: "acct".into(),
+            account_address: "me@ex.test".into(),
+            message_id_hdr: Some("<parent@ex.test>".into()),
+            references: vec!["<root@ex.test>".into()],
+            from: vec![addr("sender@ex.test")],
+            reply_to: vec![addr("list@ex.test")],
+            to: vec![addr("me@ex.test"), addr("other@ex.test")],
+            cc: vec![addr("cc1@ex.test"), addr("me@ex.test")],
+            subject: "Bees".into(),
+            received_at: "2026-07-10".into(),
+        };
+
+        // Reply → the Reply-To party only.
+        let reply = reply_to_recipients(&meta);
+        assert_eq!(reply.len(), 1);
+        assert_eq!(reply[0].email, "list@ex.test");
+
+        // Reply-all → To = reply-to + original To minus self; Cc = original Cc
+        // minus self and minus anyone already in To.
+        let (to, cc) = reply_all_recipients(&meta);
+        let to_emails: Vec<_> = to.iter().map(|a| a.email.as_str()).collect();
+        assert_eq!(to_emails, vec!["list@ex.test", "other@ex.test"]);
+        let cc_emails: Vec<_> = cc.iter().map(|a| a.email.as_str()).collect();
+        assert_eq!(cc_emails, vec!["cc1@ex.test"]);
+
+        // References = existing chain + the parent id, appended once.
+        assert_eq!(
+            reply_references(&meta),
+            vec!["<root@ex.test>".to_string(), "<parent@ex.test>".to_string()]
+        );
     }
 }
