@@ -948,12 +948,12 @@ fn Shell(store: ReadOnlySignal<Store>) -> Element {
                 id: "main-pane",
                 style: "flex: 1; min-width: 0; height: 100%; overflow-y: auto;",
                 if let Some(sel) = selected() {
-                    EntityDetail { store, selected, refresh, target: sel }
+                    EntityDetail { store, selected, refresh, target: sel, embedded: false }
                 } else {
                     match section() {
                         Section::Journal => rsx! { JournalPane { store, active } },
                         Section::Tasks => rsx! { TasksPane { store, selected } },
-                        Section::Contacts => rsx! { ContactsPane { store, selected, refresh } },
+                        Section::Contacts => rsx! { ContactsPane { store, refresh } },
                         Section::Identities => rsx! {
                             IdentitiesPane { store, section, active, refresh }
                         },
@@ -2818,26 +2818,227 @@ fn contact_hint(e: &CustomEntity) -> Option<String> {
     None
 }
 
-/// The Contacts section: the card list + a create field. Selecting a row (or
-/// creating a card) opens the reusable detail view. The `contact` type is
-/// seeded idempotently on mount (ensure_contact_type), so the very first use
-/// works with no setup.
+// ── Apple-Contacts pure helpers (favorites, groups, avatars, A–Z) ─────────────
+//
+// All total and clock-free so they unit-test without a store (like age_years /
+// the calendar library). Favorites/groups live in the contact's own
+// EntityFields — `favorite` (Bool) and `groups` (Text, comma-separated) — so
+// these read/format those JSON values with no fold or schema involvement.
+
+/// Whether a contact is favorited: its `favorite` Bool field is exactly `true`.
+/// Absent/null/false all read as not-favorite (existing contacts are null).
+fn contact_is_favorite(e: &CustomEntity) -> bool {
+    matches!(e.fields.get("favorite"), Some(Value::Bool(true)))
+}
+
+/// Parse a comma-separated `groups` string into distinct, trimmed group names,
+/// in first-seen order, dropping blanks and case-insensitive duplicates. The
+/// storage format is a single Text field ("Family, Work") so there is no schema
+/// change; this is the one place that format is interpreted.
+fn parse_groups(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for part in raw.split(',') {
+        let name = part.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if seen.insert(name.to_lowercase()) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// A contact's groups (its `groups` Text field, parsed).
+fn contact_groups(e: &CustomEntity) -> Vec<String> {
+    parse_groups(&value_str(e.fields.get("groups")))
+}
+
+/// Join group names back into the stored comma-separated form ("Family, Work").
+/// Round-trips with `parse_groups` (which re-trims/dedupes on the way in).
+fn join_groups(groups: &[String]) -> String {
+    groups.join(", ")
+}
+
+/// A stable slug for a group name, for the left-rail row id `#contacts-group-{slug}`.
+/// Lowercased, non-alphanumerics collapsed to single hyphens, trimmed — enough
+/// to be a unique, valid id per distinct name at household scale.
+fn group_slug(name: &str) -> String {
+    let mut s = String::new();
+    let mut prev_dash = false;
+    for c in name.trim().chars() {
+        if c.is_ascii_alphanumeric() {
+            s.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            s.push('-');
+            prev_dash = true;
+        }
+    }
+    s.trim_matches('-').to_string()
+}
+
+/// The initials shown in a contact's avatar: first letter of the first word and
+/// first letter of the last word, uppercased (a single word yields one letter).
+/// A name with no letters (blank / symbols only) yields "#", matching the "#"
+/// alphabetical bucket.
+fn avatar_initials(name: &str) -> String {
+    let words: Vec<&str> = name.split_whitespace().filter(|w| !w.is_empty()).collect();
+    let first_letter = |w: &str| w.chars().find(|c| c.is_alphanumeric());
+    let mut initials = String::new();
+    if let Some(f) = words.first().and_then(|w| first_letter(w)) {
+        initials.extend(f.to_uppercase());
+    }
+    if words.len() > 1 {
+        if let Some(l) = words.last().and_then(|w| first_letter(w)) {
+            initials.extend(l.to_uppercase());
+        }
+    }
+    if initials.is_empty() {
+        "#".to_string()
+    } else {
+        initials
+    }
+}
+
+/// A deterministic avatar background color for a name, so the same contact keeps
+/// the same hue across launches. FNV-1a over the lowercased name indexes a fixed
+/// palette tuned for the dark theme (muted, readable against light initials).
+fn avatar_color(name: &str) -> &'static str {
+    // Warm, muted palette that sits on the {BG} dark theme without a light mode.
+    const PALETTE: &[&str] = &[
+        "#b5793a", // amber
+        "#7a6f3a", // olive gold
+        "#8a5a4a", // clay
+        "#5f6b4a", // moss
+        "#4a6b6b", // teal-slate
+        "#6b5a7a", // muted plum
+        "#7a5a5a", // dusty rose
+        "#5a6b7a", // steel blue
+        "#7a6b4a", // bronze
+        "#4a5f6b", // deep slate
+    ];
+    let mut hash: u32 = 2166136261; // FNV-1a offset basis
+    for b in name.trim().to_lowercase().bytes() {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    PALETTE[(hash as usize) % PALETTE.len()]
+}
+
+/// The A–Z section bucket a display name sorts under: its first ASCII letter
+/// (uppercased), or "#" for names that start with a digit/symbol or are blank.
+/// Non-ASCII-alphabetic leading chars also bucket under "#".
+fn section_letter(name: &str) -> String {
+    match name.trim().chars().next() {
+        Some(c) if c.is_ascii_alphabetic() => c.to_ascii_uppercase().to_string(),
+        _ => "#".to_string(),
+    }
+}
+
+/// The case-insensitive sort key for the alphabetical list: a name that has no
+/// leading ASCII letter (blank, or starting with a digit/symbol) sinks into the
+/// trailing "#" bucket (leading `1`), everything else sorts by lowercased name
+/// (leading `0`). Ties break on the raw name for stability.
+fn contact_sort_key(name: &str) -> (u8, String) {
+    let trimmed = name.trim();
+    let bucket = match trimmed.chars().next() {
+        Some(c) if c.is_ascii_alphabetic() => 0,
+        _ => 1,
+    };
+    (bucket, trimmed.to_lowercase())
+}
+
+/// Collect the distinct group names across all contacts, sorted case-insensitively
+/// for the left rail. Each name maps to a stable `group_slug` for its row id.
+fn all_group_names(contacts: &[CustomEntity]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for c in contacts {
+        for g in contact_groups(c) {
+            if seen.insert(g.to_lowercase()) {
+                names.push(g);
+            }
+        }
+    }
+    names.sort_by_key(|a| a.to_lowercase());
+    names
+}
+
+/// Does a contact match the free-text search? Case-insensitive substring over
+/// the display name plus email/phone/organization/title/nickname — the fields a
+/// person would type to find someone. Empty query matches everything.
+fn contact_matches_search(e: &CustomEntity, query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    let mut hay = contact_display(e).to_lowercase();
+    for key in ["email", "phone", "organization", "title", "nickname"] {
+        let v = value_str(e.fields.get(key));
+        if !v.is_empty() {
+            hay.push(' ');
+            hay.push_str(&v.to_lowercase());
+        }
+    }
+    hay.contains(&q)
+}
+
+/// The active left-rail filter: All contacts, just Favorites, or one named group.
+#[derive(Clone, PartialEq)]
+enum ContactFilter {
+    All,
+    Favorites,
+    Group(String),
+}
+
+impl ContactFilter {
+    /// Does this contact pass the source-list filter (before the search box)?
+    fn accepts(&self, e: &CustomEntity) -> bool {
+        match self {
+            ContactFilter::All => true,
+            ContactFilter::Favorites => contact_is_favorite(e),
+            ContactFilter::Group(name) => {
+                let lc = name.to_lowercase();
+                contact_groups(e).iter().any(|g| g.to_lowercase() == lc)
+            }
+        }
+    }
+}
+
+/// The Contacts section, styled as an Apple-Contacts app: a left source list
+/// (All / Favorites / group rail + a search box, then the alphabetical contact
+/// list with initials avatars and A–Z section headers) beside a right card (the
+/// selected contact via the reusable `EntityDetail`, restyled). Selection is a
+/// LOCAL signal so the list ↔ card switch happens IN PLACE inside this pane —
+/// the outer Section sidebar is untouched, and the global `selected` (which
+/// swaps the whole main pane for tasks/events) is deliberately not used here.
+/// The `contact` type is seeded idempotently on mount (ensure_contact_type),
+/// backfilling `favorite`/`groups`, so the very first use works with no setup.
 #[component]
-fn ContactsPane(
-    store: ReadOnlySignal<Store>,
-    selected: Signal<Option<Selected>>,
-    refresh: Signal<u32>,
-) -> Element {
+fn ContactsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
     let mut new_name = use_signal(String::new);
     let mut err = use_signal(|| Option::<String>::None);
+    let mut search = use_signal(String::new);
+    let filter = use_signal(|| ContactFilter::All);
+    // The card column's selection, local to this pane (the outer `selected`
+    // signal would take over the ENTIRE main pane; here the list must stay). It
+    // carries a `Selected::Contact` so the reused EntityDetail can clear it on
+    // its "← Back" (which returns the card column to the empty state).
+    let card_sel = use_signal(|| Option::<Selected>::None);
+    // Bumped by favorite/group edits in the card so the left list re-pulls.
+    let local_refresh = use_signal(|| 0u32);
+    let mut show_new = use_signal(|| false);
 
-    // Seed the type, then list its instances. `refresh` re-pulls after a
-    // create (here or via journal [contact:] emergence). ensure_contact_type
-    // is idempotent, so running it every load is cheap and self-healing.
+    // Seed the type (idempotent; backfills favorite/groups), then list its
+    // instances. Re-pulls on the outer `refresh` (journal [contact:] emergence)
+    // and the pane-local one (favorite/group edits from the card).
     let contacts = use_resource(move || {
         let store = store();
         async move {
             let _ = refresh();
+            let _ = local_refresh();
             store
                 .ensure_contact_type()
                 .await
@@ -2863,9 +3064,10 @@ fn ContactsPane(
         }
         let store = store();
         let mut refresh = refresh;
+        let mut card_sel = card_sel;
         spawn(async move {
             // Ensure the type first (a fresh store may not have it yet), then
-            // create the card and open it.
+            // create the card and open it in the right column.
             if let Err(e) = store.ensure_contact_type().await {
                 err.set(Some(format!("{e:#}")));
                 return;
@@ -2886,8 +3088,9 @@ fn ContactsPane(
                 Ok(e) => {
                     new_name.set(String::new());
                     err.set(None);
+                    show_new.set(false);
                     refresh += 1;
-                    selected.set(Some(Selected::Contact(e.id)));
+                    card_sel.set(Some(Selected::Contact(e.id)));
                 }
                 Err(e) => err.set(Some(entity_err(e))),
             }
@@ -2897,101 +3100,617 @@ fn ContactsPane(
     rsx! {
         div {
             id: "contacts-pane",
-            style: "max-width: 760px; margin: 0 auto; padding: 1.6rem 1.2rem 3rem;",
-            {pane_header("Contacts", "The people you know. Each contact is a card — standard \
-                                     details plus any fields you add — and the journal entries \
-                                     that mention them gather on the card automatically.")}
+            style: "display: flex; height: 100%; min-height: 0;",
 
-            // create a contact
+            // ── left source list ─────────────────────────────────────────────
             div {
-                style: "background: {PANEL}; border: 1px solid {EDGE}; border-radius: 12px; \
-                        padding: 1rem 1.1rem; margin: 1rem 0 1.3rem;",
-                div { style: "font-weight: 700; font-size: 1rem;", "New contact" }
+                style: "width: 21rem; flex-shrink: 0; height: 100%; box-sizing: border-box; \
+                        border-right: 1px solid {EDGE}; background: {PANEL}; display: flex; \
+                        flex-direction: column; min-height: 0;",
+
+                // header row: title + new-contact "+"
                 div {
-                    style: "display: flex; gap: 0.6rem; margin-top: 0.8rem;",
-                    input {
-                        id: "contact-new-name",
-                        style: "flex: 1; box-sizing: border-box; background: {BG}; color: {INK}; \
-                                border: 1px solid {EDGE}; border-radius: 8px; padding: 0.6rem 0.75rem; \
-                                font: inherit; font-size: 0.92rem; outline: none;",
-                        placeholder: "Full name, e.g. Jane Doe",
-                        value: "{new_name}",
-                        oninput: move |e| new_name.set(e.value()),
-                        onkeydown: move |e| {
-                            if e.key() == Key::Enter {
-                                create();
-                            }
-                        },
-                    }
+                    style: "display: flex; align-items: center; gap: 0.5rem; padding: 1rem 1rem 0.6rem;",
+                    div { style: "font-size: 1.25rem; font-weight: 700; flex: 1;", "Contacts" }
                     button {
-                        id: "contact-create",
-                        style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
-                                padding: 0.6rem 1.3rem; font-weight: 700; font-size: 0.9rem; cursor: pointer;",
-                        onclick: move |_| create(),
-                        "Create"
+                        id: "contact-new",
+                        style: "background: {EDGE}; color: {GOLD}; border: none; border-radius: 50%; \
+                                width: 1.9rem; height: 1.9rem; font-size: 1.15rem; line-height: 1; \
+                                cursor: pointer; flex-shrink: 0;",
+                        title: "New contact",
+                        onclick: move |_| {
+                            let now = !show_new();
+                            show_new.set(now);
+                        },
+                        "+"
                     }
                 }
-                if let Some(e) = err() {
+
+                // new-contact inline form (toggled by the +)
+                if show_new() {
                     div {
-                        style: "color: #e07a5f; font-size: 0.85rem; margin-top: 0.6rem;",
-                        "{e}"
+                        style: "padding: 0 1rem 0.7rem;",
+                        div {
+                            style: "display: flex; gap: 0.4rem;",
+                            input {
+                                id: "contact-new-name",
+                                style: "flex: 1; min-width: 0; box-sizing: border-box; background: {BG}; \
+                                        color: {INK}; border: 1px solid {EDGE}; border-radius: 8px; \
+                                        padding: 0.5rem 0.6rem; font: inherit; font-size: 0.88rem; outline: none;",
+                                placeholder: "Full name, e.g. Jane Doe",
+                                value: "{new_name}",
+                                oninput: move |e| new_name.set(e.value()),
+                                onkeydown: move |e| {
+                                    if e.key() == Key::Enter {
+                                        create();
+                                    }
+                                },
+                            }
+                            button {
+                                id: "contact-create",
+                                style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                                        padding: 0.5rem 0.9rem; font-weight: 700; font-size: 0.85rem; cursor: pointer;",
+                                onclick: move |_| create(),
+                                "Add"
+                            }
+                        }
+                        if let Some(e) = err() {
+                            div {
+                                style: "color: #e07a5f; font-size: 0.8rem; margin-top: 0.4rem;",
+                                "{e}"
+                            }
+                        }
+                    }
+                }
+
+                // search box
+                div {
+                    style: "padding: 0 1rem 0.6rem;",
+                    input {
+                        id: "contacts-search",
+                        style: "width: 100%; box-sizing: border-box; background: {BG}; color: {INK}; \
+                                border: 1px solid {EDGE}; border-radius: 8px; padding: 0.5rem 0.7rem; \
+                                font: inherit; font-size: 0.88rem; outline: none;",
+                        r#type: "search",
+                        placeholder: "Search",
+                        value: "{search}",
+                        oninput: move |e| search.set(e.value()),
+                    }
+                }
+
+                // filter rail + the alphabetical list share the scroll area
+                div {
+                    style: "flex: 1; min-height: 0; overflow-y: auto; padding: 0 0.5rem 1rem;",
+                    match contacts() {
+                        None => muted("loading contacts…"),
+                        Some(Err(e)) => muted(&format!("contacts unavailable: {e}")),
+                        Some(Ok(list)) => {
+                            let groups = all_group_names(&list);
+                            rsx! {
+                                {contact_filter_rail(filter, &groups, &list)}
+                                {contact_source_list(&list, filter(), &search(), card_sel)}
+                            }
+                        }
                     }
                 }
             }
 
-            // the card list
-            match contacts() {
-                None => muted("loading contacts…"),
-                Some(Err(e)) => muted(&format!("contacts unavailable: {e}")),
-                Some(Ok(list)) if list.is_empty() => muted(
-                    "No contacts yet. Add the first one above — or write [contact: a name] in \
-                     a journal entry and a card appears here, already holding that entry.",
-                ),
-                Some(Ok(list)) => rsx! {
-                    div {
-                        id: "contact-list",
-                        for c in list.iter() {
-                            {contact_row(c, selected)}
-                        }
-                    }
-                },
+            // ── right card column ────────────────────────────────────────────
+            div {
+                id: "contact-card-col",
+                style: "flex: 1; min-width: 0; height: 100%; overflow-y: auto;",
+                if let Some(Selected::Contact(id)) = card_sel() {
+                    // Key on the id so switching contacts makes a fresh card
+                    // instance (fresh resource + cleared group-input state).
+                    ContactCard { key: "{id}", store, card_sel, refresh, local_refresh, id }
+                } else {
+                    {contact_empty_state()}
+                }
             }
         }
     }
 }
 
-/// One contact row: name + optional hint, opening the detail view. Plain fn:
-/// CustomEntity lacks the PartialEq component props need.
-fn contact_row(c: &CustomEntity, mut selected: Signal<Option<Selected>>) -> Element {
-    let id = c.id.clone();
-    let hint = contact_hint(c);
+/// The left rail's filter chips: All Contacts, Favorites, then one row per
+/// distinct group name (sorted). The active one is highlighted. Selecting a row
+/// sets the `filter` signal; the list below re-filters. Plain fn: it takes a
+/// slice and signal, no PartialEq props.
+fn contact_filter_rail(
+    mut filter: Signal<ContactFilter>,
+    groups: &[String],
+    contacts: &[CustomEntity],
+) -> Element {
+    let active = filter();
+    let fav_count = contacts.iter().filter(|c| contact_is_favorite(c)).count();
+    let all_count = contacts.len();
+    let row_style = |on: bool| {
+        let (bg, fg) = if on {
+            (GOLD.to_string(), "#14120e".to_string())
+        } else {
+            ("transparent".to_string(), INK.to_string())
+        };
+        format!(
+            "display: flex; align-items: center; gap: 0.55rem; width: 100%; text-align: left; \
+             background: {bg}; color: {fg}; border: none; border-radius: 8px; \
+             padding: 0.45rem 0.6rem; font: inherit; font-size: 0.9rem; cursor: pointer; \
+             margin-bottom: 0.15rem;"
+        )
+    };
+    rsx! {
+        div {
+            style: "margin-bottom: 0.5rem;",
+            button {
+                id: "contacts-filter-all",
+                style: "{row_style(matches!(active, ContactFilter::All))} font-weight: 600;",
+                onclick: move |_| filter.set(ContactFilter::All),
+                span { style: "width: 1.2rem; text-align: center;", "◎" }
+                span { style: "flex: 1;", "All Contacts" }
+                span { style: "font-size: 0.78rem; opacity: 0.8;", "{all_count}" }
+            }
+            button {
+                id: "contacts-filter-favorites",
+                style: "{row_style(matches!(active, ContactFilter::Favorites))} font-weight: 600;",
+                onclick: move |_| filter.set(ContactFilter::Favorites),
+                span { style: "width: 1.2rem; text-align: center;", "⭐" }
+                span { style: "flex: 1;", "Favorites" }
+                span { style: "font-size: 0.78rem; opacity: 0.8;", "{fav_count}" }
+            }
+            if !groups.is_empty() {
+                div {
+                    style: "font-size: 0.68rem; font-weight: 700; letter-spacing: 0.06em; \
+                            text-transform: uppercase; color: {FAINT}; padding: 0.5rem 0.6rem 0.25rem;",
+                    "Groups"
+                }
+                for name in groups.iter() {
+                    {group_rail_row(filter, name, contacts)}
+                }
+            }
+        }
+    }
+}
+
+/// One group row in the filter rail. Split out so each closure owns its own
+/// clone of the group name (the file's per-closure-clone idiom).
+fn group_rail_row(
+    mut filter: Signal<ContactFilter>,
+    name: &str,
+    contacts: &[CustomEntity],
+) -> Element {
+    let slug = group_slug(name);
+    let name_owned = name.to_string();
+    let on = matches!(filter(), ContactFilter::Group(ref g) if g.eq_ignore_ascii_case(name));
+    let count = contacts
+        .iter()
+        .filter(|c| {
+            contact_groups(c)
+                .iter()
+                .any(|g| g.eq_ignore_ascii_case(name))
+        })
+        .count();
+    let (bg, fg) = if on {
+        (GOLD.to_string(), "#14120e".to_string())
+    } else {
+        ("transparent".to_string(), INK.to_string())
+    };
     rsx! {
         button {
-            id: "contact-row-{c.id}",
-            style: "display: flex; align-items: center; gap: 0.7rem; width: 100%; text-align: left; \
-                    background: {PANEL}; border: 1px solid {EDGE}; border-radius: 10px; \
-                    padding: 0.7rem 0.9rem; margin-bottom: 0.6rem; color: {INK}; font: inherit; \
-                    cursor: pointer;",
-            onclick: move |_| selected.set(Some(Selected::Contact(id.clone()))),
-            span {
-                style: "display: inline-flex; align-items: center; justify-content: center; \
-                        width: 2.1rem; height: 2.1rem; border-radius: 50%; background: {EDGE}; \
-                        color: {GOLD}; font-size: 1rem; flex-shrink: 0;",
-                "☺"
+            id: "contacts-group-{slug}",
+            style: "display: flex; align-items: center; gap: 0.55rem; width: 100%; text-align: left; \
+                    background: {bg}; color: {fg}; border: none; border-radius: 8px; \
+                    padding: 0.45rem 0.6rem; font: inherit; font-size: 0.9rem; cursor: pointer; \
+                    margin-bottom: 0.15rem;",
+            onclick: move |_| filter.set(ContactFilter::Group(name_owned.clone())),
+            span { style: "width: 1.2rem; text-align: center;", "◈" }
+            span { style: "flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;", "{name}" }
+            span { style: "font-size: 0.78rem; opacity: 0.8;", "{count}" }
+        }
+    }
+}
+
+/// The alphabetical contact list: apply the source filter AND the search, sort
+/// case-insensitively by display name (no-letter names sink under "#"), then
+/// render A–Z section headers with a row (avatar + name + ⭐) per contact.
+fn contact_source_list(
+    contacts: &[CustomEntity],
+    filter: ContactFilter,
+    search: &str,
+    card_sel: Signal<Option<Selected>>,
+) -> Element {
+    let mut shown: Vec<&CustomEntity> = contacts
+        .iter()
+        .filter(|c| filter.accepts(c) && contact_matches_search(c, search))
+        .collect();
+    shown.sort_by(|a, b| {
+        contact_sort_key(&contact_display(a)).cmp(&contact_sort_key(&contact_display(b)))
+    });
+
+    if shown.is_empty() {
+        let msg = match (&filter, search.trim().is_empty()) {
+            (_, false) => "No contacts match your search.",
+            (ContactFilter::Favorites, true) => {
+                "No favorites yet. Open a contact and tap the star to add one."
             }
-            div {
-                style: "flex: 1; min-width: 0;",
-                div { style: "font-weight: 700; font-size: 0.98rem;", "{contact_display(c)}" }
-                if let Some(h) = hint {
-                    div {
-                        style: "font-size: 0.78rem; color: {FAINT}; margin-top: 0.15rem; \
-                                overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                        "{h}"
+            (ContactFilter::Group(_), true) => "No contacts in this group yet.",
+            (ContactFilter::All, true) => {
+                "No contacts yet. Tap + to add one — or write [contact: a name] in a journal entry."
+            }
+        };
+        return muted(msg);
+    }
+
+    let mut last_letter = String::new();
+    rsx! {
+        div {
+            id: "contact-list",
+            for c in shown.into_iter() {
+                {
+                    let letter = section_letter(&contact_display(c));
+                    let header = if letter != last_letter {
+                        last_letter = letter.clone();
+                        Some(letter)
+                    } else {
+                        None
+                    };
+                    rsx! {
+                        if let Some(h) = header {
+                            div {
+                                class: "contact-section-header",
+                                style: "font-size: 0.72rem; font-weight: 700; color: {GOLD}; \
+                                        letter-spacing: 0.08em; padding: 0.6rem 0.6rem 0.25rem;",
+                                "{h}"
+                            }
+                        }
+                        {contact_row(c, card_sel)}
                     }
                 }
             }
         }
     }
+}
+
+/// One contact row: circular initials avatar (deterministic color) + name + a
+/// small ⭐ if favorited. Clicking selects it into the card column. Plain fn:
+/// CustomEntity lacks the PartialEq component props need.
+fn contact_row(c: &CustomEntity, mut card_sel: Signal<Option<Selected>>) -> Element {
+    let id = c.id.clone();
+    let name = contact_display(c);
+    let initials = avatar_initials(&name);
+    let color = avatar_color(&name);
+    let favorite = contact_is_favorite(c);
+    let selected_now = matches!(card_sel(), Some(Selected::Contact(ref s)) if s == &c.id);
+    let bg = if selected_now { EDGE } else { "transparent" };
+    rsx! {
+        button {
+            id: "contact-row-{c.id}",
+            class: "contact-row",
+            style: "display: flex; align-items: center; gap: 0.65rem; width: 100%; text-align: left; \
+                    background: {bg}; border: none; border-radius: 8px; padding: 0.4rem 0.6rem; \
+                    margin-bottom: 0.1rem; color: {INK}; font: inherit; cursor: pointer;",
+            onclick: move |_| card_sel.set(Some(Selected::Contact(id.clone()))),
+            span {
+                style: "display: inline-flex; align-items: center; justify-content: center; \
+                        width: 2rem; height: 2rem; border-radius: 50%; background: {color}; \
+                        color: #f4eeda; font-size: 0.8rem; font-weight: 700; flex-shrink: 0;",
+                "{initials}"
+            }
+            span {
+                style: "flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; \
+                        white-space: nowrap; font-size: 0.95rem;",
+                "{name}"
+            }
+            if favorite {
+                span { style: "color: {GOLD}; font-size: 0.8rem; flex-shrink: 0;", "⭐" }
+            }
+        }
+    }
+}
+
+/// The right column when no contact is selected: a tasteful, centered empty
+/// state that reads like Apple Contacts' "No Contact Selected".
+fn contact_empty_state() -> Element {
+    rsx! {
+        div {
+            id: "contact-empty",
+            style: "height: 100%; display: flex; flex-direction: column; align-items: center; \
+                    justify-content: center; text-align: center; color: {FAINT}; padding: 2rem;",
+            div {
+                style: "display: inline-flex; align-items: center; justify-content: center; \
+                        width: 4.5rem; height: 4.5rem; border-radius: 50%; background: {PANEL}; \
+                        border: 1px solid {EDGE}; color: {FAINT}; font-size: 2rem; margin-bottom: 1rem;",
+                "☺"
+            }
+            div { style: "font-size: 1.05rem; font-weight: 700; color: {DIM};", "No contact selected" }
+            div {
+                style: "font-size: 0.88rem; margin-top: 0.4rem; max-width: 22rem; line-height: 1.55;",
+                "Pick a contact from the list, or tap + to add one. Each contact is a card — \
+                 standard details plus any fields you add — and the journal entries that mention \
+                 them gather on the card automatically."
+            }
+        }
+    }
+}
+
+/// The right-column contact card: the reusable `EntityDetail` (fields, add-field
+/// affordance, journal backlinks) preceded by an Apple-style header — a large
+/// avatar, the name, a favorite star toggle, and the groups editor (chips +
+/// add). Favorite/group edits persist a single field immediately and bump both
+/// the card (`local_refresh`, so header + chips re-read) and the left list.
+/// A `#[component]` (its props are all Copy/PartialEq) so the header re-pulls
+/// the entity independently of EntityDetail's internal working copy.
+#[component]
+fn ContactCard(
+    store: ReadOnlySignal<Store>,
+    card_sel: Signal<Option<Selected>>,
+    refresh: Signal<u32>,
+    local_refresh: Signal<u32>,
+    id: String,
+) -> Element {
+    let err = use_signal(|| Option::<String>::None);
+    let mut new_group = use_signal(String::new);
+
+    // The card header reads the contact directly (name + favorite + groups),
+    // re-pulling whenever a header edit bumps local_refresh or a field Save
+    // bumps refresh. EntityDetail below owns the field editors separately.
+    let id_for_load = id.clone();
+    let entity = use_resource(move || {
+        let store = store();
+        let id = id_for_load.clone();
+        async move {
+            let _ = refresh();
+            let _ = local_refresh();
+            store
+                .custom_entities_get(&id)
+                .await
+                .map_err(|e| format!("{e:#}"))
+        }
+    });
+
+    // Single-field writes (favorite toggle, group add/remove) go through the
+    // free `persist_contact_field` helper below: each event closure captures the
+    // Copy signals + clones the (cheap) `id`, so no shared non-Copy closure is
+    // threaded through the chips. `err`/`refresh`/`local_refresh` are Copy.
+
+    rsx! {
+        div {
+            id: "contact-card",
+            style: "max-width: 640px; margin: 0 auto; padding: 1.6rem 1.4rem 0;",
+            match entity() {
+                None => muted("loading…"),
+                Some(Err(e)) => muted(&format!("couldn't open this contact: {e}")),
+                Some(Ok(None)) => muted("this contact no longer exists"),
+                Some(Ok(Some(c))) => {
+                    let name = contact_display(&c);
+                    let initials = avatar_initials(&name);
+                    let color = avatar_color(&name);
+                    let favorite = contact_is_favorite(&c);
+                    let groups = contact_groups(&c);
+                    let star = if favorite { "⭐" } else { "☆" };
+                    let star_color = if favorite { GOLD } else { FAINT };
+                    // Add the typed group name to this contact's `groups`, deduped.
+                    let add_group = {
+                        let groups = groups.clone();
+                        let id = id.clone();
+                        move || {
+                            let g = new_group().trim().to_string();
+                            if g.is_empty() {
+                                return;
+                            }
+                            let mut next = groups.clone();
+                            next.push(g);
+                            // parse_groups on the joined value dedupes case-insensitively.
+                            let joined = join_groups(&parse_groups(&join_groups(&next)));
+                            new_group.set(String::new());
+                            persist_contact_field(
+                                store, id.clone(), "groups", Value::String(joined),
+                                refresh, local_refresh, err,
+                            );
+                        }
+                    };
+                    rsx! {
+                        // deselect back to the empty state (the embedded
+                        // EntityDetail hides its own back button)
+                        button {
+                            id: "contact-card-back",
+                            style: "background: none; border: none; color: {GOLD}; font: inherit; \
+                                    font-size: 0.85rem; cursor: pointer; padding: 0; margin-bottom: 0.8rem;",
+                            onclick: move |_| {
+                                let mut card_sel = card_sel;
+                                card_sel.set(None);
+                            },
+                            "← Back"
+                        }
+
+                        // avatar + name + favorite star header
+                        div {
+                            style: "display: flex; flex-direction: column; align-items: center; \
+                                    text-align: center; margin-bottom: 1.2rem;",
+                            span {
+                                style: "display: inline-flex; align-items: center; justify-content: center; \
+                                        width: 5rem; height: 5rem; border-radius: 50%; background: {color}; \
+                                        color: #f4eeda; font-size: 1.8rem; font-weight: 700; margin-bottom: 0.7rem;",
+                                "{initials}"
+                            }
+                            div {
+                                style: "display: flex; align-items: center; gap: 0.5rem;",
+                                div { id: "contact-card-name", style: "font-size: 1.5rem; font-weight: 700;", "{name}" }
+                                button {
+                                    id: "contact-favorite",
+                                    style: "background: none; border: none; color: {star_color}; \
+                                            font-size: 1.35rem; line-height: 1; cursor: pointer; padding: 0;",
+                                    title: if favorite { "Remove from Favorites" } else { "Add to Favorites" },
+                                    onclick: {
+                                        let id = id.clone();
+                                        move |_| persist_contact_field(
+                                            store, id.clone(), "favorite", Value::Bool(!favorite),
+                                            refresh, local_refresh, err,
+                                        )
+                                    },
+                                    "{star}"
+                                }
+                            }
+                            if let Some(h) = contact_hint(&c) {
+                                div { style: "font-size: 0.9rem; color: {DIM}; margin-top: 0.2rem;", "{h}" }
+                            }
+                        }
+
+                        // groups editor: current groups as removable chips + an add input
+                        div {
+                            id: "contact-groups",
+                            style: "background: {PANEL}; border: 1px solid {EDGE}; border-radius: 12px; \
+                                    padding: 0.8rem 1rem; margin-bottom: 1rem;",
+                            div {
+                                style: "font-size: 0.72rem; font-weight: 700; letter-spacing: 0.06em; \
+                                        text-transform: uppercase; color: {FAINT}; margin-bottom: 0.5rem;",
+                                "Groups"
+                            }
+                            div {
+                                style: "display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center;",
+                                for g in groups.iter() {
+                                    {group_chip(store, &id, g, &groups, refresh, local_refresh, err)}
+                                }
+                                if groups.is_empty() {
+                                    span { style: "color: {FAINT}; font-size: 0.82rem;", "No groups yet." }
+                                }
+                            }
+                            div {
+                                style: "display: flex; gap: 0.4rem; margin-top: 0.6rem;",
+                                input {
+                                    id: "contact-group-add",
+                                    style: "flex: 1; min-width: 0; box-sizing: border-box; background: {BG}; \
+                                            color: {INK}; border: 1px solid {EDGE}; border-radius: 8px; \
+                                            padding: 0.45rem 0.6rem; font: inherit; font-size: 0.85rem; outline: none;",
+                                    placeholder: "Add to a group, e.g. Family",
+                                    value: "{new_group}",
+                                    oninput: move |e| new_group.set(e.value()),
+                                    onkeydown: {
+                                        let mut add_group = add_group.clone();
+                                        move |e: KeyboardEvent| {
+                                            if e.key() == Key::Enter {
+                                                add_group();
+                                            }
+                                        }
+                                    },
+                                }
+                                button {
+                                    id: "contact-group-add-submit",
+                                    style: "background: {EDGE}; color: {INK}; border: none; border-radius: 8px; \
+                                            padding: 0.45rem 0.9rem; font: inherit; font-weight: 700; \
+                                            font-size: 0.82rem; cursor: pointer;",
+                                    onclick: move |_| {
+                                        let mut add_group = add_group.clone();
+                                        add_group();
+                                    },
+                                    "Add"
+                                }
+                            }
+                        }
+
+                        if let Some(e) = err() {
+                            div { style: "color: #e07a5f; font-size: 0.82rem; margin-bottom: 0.6rem;", "{e}" }
+                        }
+
+                        // the reusable typed-field editor + journal backlinks
+                        EntityDetail {
+                            store,
+                            selected: card_sel,
+                            refresh,
+                            target: Selected::Contact(c.id.clone()),
+                            embedded: true,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One removable group chip. Removing rewrites the `groups` field without this
+/// name (via the shared free helper). Plain fn: it takes a slice + Copy signals,
+/// no PartialEq props, and each chip owns its own clones (per-closure-clone).
+#[allow(clippy::too_many_arguments)]
+fn group_chip(
+    store: ReadOnlySignal<Store>,
+    id: &str,
+    name: &str,
+    groups: &[String],
+    refresh: Signal<u32>,
+    local_refresh: Signal<u32>,
+    err: Signal<Option<String>>,
+) -> Element {
+    let name_owned = name.to_string();
+    let id_owned = id.to_string();
+    let remaining: Vec<String> = groups
+        .iter()
+        .filter(|g| !g.eq_ignore_ascii_case(name))
+        .cloned()
+        .collect();
+    rsx! {
+        span {
+            class: "contact-group-chip",
+            style: "display: inline-flex; align-items: center; gap: 0.35rem; background: {EDGE}; \
+                    color: {INK}; border-radius: 999px; padding: 0.22rem 0.35rem 0.22rem 0.6rem; \
+                    font-size: 0.82rem;",
+            "{name}"
+            button {
+                style: "background: none; border: none; color: {DIM}; font-size: 0.9rem; line-height: 1; \
+                        cursor: pointer; padding: 0 0.15rem;",
+                title: "Remove from {name_owned}",
+                onclick: move |_| {
+                    persist_contact_field(
+                        store,
+                        id_owned.clone(),
+                        "groups",
+                        Value::String(join_groups(&remaining)),
+                        refresh,
+                        local_refresh,
+                        err,
+                    )
+                },
+                "×"
+            }
+        }
+    }
+}
+
+/// Persist a single field on a contact, then refresh the card header and the
+/// left list. The shared write path for the favorite toggle and group
+/// add/remove — instant, independent of EntityDetail's Save button. All signals
+/// are Copy and `id` is owned, so callers just clone the (cheap) id per closure.
+#[allow(clippy::too_many_arguments)]
+fn persist_contact_field(
+    store: ReadOnlySignal<Store>,
+    id: String,
+    slug: &'static str,
+    value: Value,
+    mut refresh: Signal<u32>,
+    mut local_refresh: Signal<u32>,
+    mut err: Signal<Option<String>>,
+) {
+    let store = store();
+    spawn(async move {
+        let mut fields = serde_json::Map::new();
+        fields.insert(slug.to_string(), value);
+        match store
+            .custom_entities_update(
+                &id,
+                CustomEntityPatch {
+                    title: None,
+                    fields: Some(fields),
+                    scope: None,
+                },
+                "system",
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                err.set(None);
+                local_refresh += 1; // card header + group chips re-read
+                refresh += 1; // the left list (⭐, group rail) re-pulls
+            }
+            Err(e) => err.set(Some(entity_err(e))),
+        }
+    });
 }
 
 /// A friendly one-liner for an entity write error (the detail/create paths
@@ -3375,12 +4094,19 @@ fn compose_event_at(values: &serde_json::Map<String, Value>) -> Option<String> {
 /// Fields stage into a working-copy signal; Save persists them the right way
 /// for the target (custom_entities_update for a contact, tasks_update for a
 /// task). `refresh` bumps so the pane behind re-pulls after a save.
+///
+/// `embedded` = true when this renders INSIDE the Apple-Contacts card (which
+/// supplies its own avatar/name header + Back), so the view drops its own back
+/// button and name/kind chip to avoid a doubled header; the field editor,
+/// add-field affordance, and backlinks are unchanged. The full-pane task/event
+/// takeover passes false.
 #[component]
 fn EntityDetail(
     store: ReadOnlySignal<Store>,
     selected: Signal<Option<Selected>>,
     refresh: Signal<u32>,
     target: Selected,
+    embedded: bool,
 ) -> Element {
     // Working copy of the field values (staged edits). Reloaded from the store
     // whenever the target changes or a save/reload bumps `reload`.
@@ -3511,41 +4237,60 @@ fn EntityDetail(
 
     let is_contact = matches!(target, Selected::Contact(_));
 
+    // Embedded in the contact card: no outer max-width/padding (the card owns
+    // the frame) and no own back/name header. Standalone: the full detail frame.
+    let outer_style = if embedded {
+        "margin: 0;".to_string()
+    } else {
+        "max-width: 760px; margin: 0 auto; padding: 1.4rem 1.2rem 3rem;".to_string()
+    };
+
     rsx! {
         div {
             id: "entity-detail",
-            style: "max-width: 760px; margin: 0 auto; padding: 1.4rem 1.2rem 3rem;",
+            style: "{outer_style}",
 
-            // back to the list
-            button {
-                id: "detail-back",
-                style: "background: none; border: none; color: {GOLD}; font: inherit; \
-                        font-size: 0.85rem; cursor: pointer; padding: 0; margin-bottom: 0.9rem;",
-                onclick: move |_| selected.set(None),
-                "← Back"
+            // back to the list (standalone takeover only; the card supplies its own)
+            if !embedded {
+                button {
+                    id: "detail-back",
+                    style: "background: none; border: none; color: {GOLD}; font: inherit; \
+                            font-size: 0.85rem; cursor: pointer; padding: 0; margin-bottom: 0.9rem;",
+                    onclick: move |_| selected.set(None),
+                    "← Back"
+                }
             }
 
             match data() {
                 None => muted("loading…"),
                 Some(Err(e)) => muted(&format!("couldn't open this: {e}")),
                 Some(Ok(d)) => rsx! {
-                    // header: display name + kind chip
-                    div {
-                        style: "display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.3rem;",
-                        div { id: "detail-name", style: "font-size: 1.5rem; font-weight: 700;", "{d.name}" }
-                        span {
-                            style: "font-size: 0.66rem; font-weight: 700; letter-spacing: 0.06em; \
-                                    text-transform: uppercase; color: {BG}; background: {GOLD}; \
-                                    border-radius: 5px; padding: 0.12rem 0.4rem;",
-                            "{d.kind_label}"
+                    // header: display name + kind chip (standalone only — the
+                    // contact card renders its own avatar + name header).
+                    if !embedded {
+                        div {
+                            style: "display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.3rem;",
+                            div { id: "detail-name", style: "font-size: 1.5rem; font-weight: 700;", "{d.name}" }
+                            span {
+                                style: "font-size: 0.66rem; font-weight: 700; letter-spacing: 0.06em; \
+                                        text-transform: uppercase; color: {BG}; background: {GOLD}; \
+                                        border-radius: 5px; padding: 0.12rem 0.4rem;",
+                                "{d.kind_label}"
+                            }
                         }
                     }
 
-                    // fields
+                    // fields. For a contact, `favorite`/`groups` are surfaced
+                    // as the star toggle + group chips in the card header
+                    // (ContactCard), so they are hidden from the raw editor here.
                     div {
                         style: "background: {PANEL}; border: 1px solid {EDGE}; border-radius: 12px; \
                                 padding: 1rem 1.1rem; margin: 1rem 0;",
-                        for spec in d.specs.iter().filter(|f| !f.archived) {
+                        for spec in d.specs.iter().filter(|f| {
+                            !(f.archived
+                                || is_contact
+                                    && matches!(f.slug.as_str(), "favorite" | "groups"))
+                        }) {
                             {field_editor(spec, edits)}
                         }
 
@@ -3931,12 +4676,18 @@ async fn save_detail(
             // The card's display name is its entity title. If the type has a
             // `name` field we'd use it, but the model puts the primary name in
             // the title, so a contact has no `name` field — title is edited via
-            // its own field row only if present. Persist all field values as a
-            // full replacement patch (merge semantics: present keys set, absent
-            // keys are left as-is by the fold, so we send the whole working map).
+            // its own field row only if present. Persist the working field
+            // values as a merge patch (present keys set, absent keys left as-is
+            // by the fold). `favorite`/`groups` are OWNED by the card header's
+            // star + chips (which write them instantly via their own path), so
+            // they are stripped here — Save must never clobber them with a
+            // possibly-stale working-copy value.
+            let mut fields = values.clone();
+            fields.remove("favorite");
+            fields.remove("groups");
             let patch = CustomEntityPatch {
                 title: None,
-                fields: Some(values.clone()),
+                fields: Some(fields),
                 scope: None,
             };
             store
@@ -4865,5 +5616,147 @@ mod tests {
         let undated = undated_events(&list);
         let ids: Vec<&str> = undated.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(ids, vec!["e4", "e5"], "vague + null are undated, in order");
+    }
+
+    // ── Apple-Contacts helpers (favorites, groups, avatars, A–Z) ──
+
+    /// Group parsing splits on commas, trims, drops blanks, and dedupes
+    /// case-insensitively in first-seen order; join round-trips the result.
+    #[test]
+    fn parse_and_join_groups_normalize() {
+        use super::{join_groups, parse_groups};
+        assert_eq!(
+            parse_groups("Family, Work"),
+            vec!["Family".to_string(), "Work".to_string()]
+        );
+        // Blanks, extra whitespace, and trailing commas are cleaned.
+        assert_eq!(
+            parse_groups("  Family ,, ,Work,  "),
+            vec!["Family".to_string(), "Work".to_string()]
+        );
+        // Case-insensitive dedupe keeps the first spelling.
+        assert_eq!(
+            parse_groups("Family, family, FAMILY"),
+            vec!["Family".to_string()]
+        );
+        assert!(parse_groups("").is_empty());
+        assert!(parse_groups("   ,  , ").is_empty());
+        // Round-trip through the stored form.
+        let g = vec!["Family".to_string(), "Work".to_string()];
+        assert_eq!(join_groups(&g), "Family, Work");
+        assert_eq!(parse_groups(&join_groups(&g)), g);
+    }
+
+    /// Group slugs (left-rail row ids) are lowercased, hyphen-collapsed, trimmed.
+    #[test]
+    fn group_slug_is_stable_id() {
+        use super::group_slug;
+        assert_eq!(group_slug("Family"), "family");
+        assert_eq!(group_slug("Close Friends"), "close-friends");
+        assert_eq!(group_slug("  Work / Team!!  "), "work-team");
+        assert_eq!(group_slug("A&B  C"), "a-b-c");
+    }
+
+    /// Avatar initials: first + last word letters, uppercased; single word →
+    /// one letter; a letterless name → "#" (matching the "#" bucket).
+    #[test]
+    fn avatar_initials_first_and_last() {
+        use super::avatar_initials;
+        assert_eq!(avatar_initials("Jane Doe"), "JD");
+        assert_eq!(avatar_initials("jane van doe"), "JD"); // first + last only
+        assert_eq!(avatar_initials("Cher"), "C");
+        assert_eq!(avatar_initials("  ada   lovelace "), "AL");
+        assert_eq!(avatar_initials(""), "#");
+        assert_eq!(avatar_initials("(unnamed contact)"), "UC"); // '(' skipped
+        assert_eq!(avatar_initials("!!!"), "#");
+    }
+
+    /// Avatar color is deterministic (same name → same hue) and always a
+    /// palette member.
+    #[test]
+    fn avatar_color_is_deterministic() {
+        use super::avatar_color;
+        assert_eq!(avatar_color("Jane Doe"), avatar_color("Jane Doe"));
+        // Case-insensitive: the same person keeps their color if titled differently.
+        assert_eq!(avatar_color("Jane Doe"), avatar_color("jane doe"));
+        // Always starts with a hex marker (a real palette entry).
+        assert!(avatar_color("anyone").starts_with('#'));
+        assert_eq!(avatar_color("anyone").len(), 7);
+    }
+
+    /// A–Z bucketing: leading ASCII letter uppercased, else "#"; and the sort
+    /// key sinks letterless names below alphabetical ones.
+    #[test]
+    fn section_and_sort_bucket_correctly() {
+        use super::{contact_sort_key, section_letter};
+        assert_eq!(section_letter("Ada"), "A");
+        assert_eq!(section_letter("zeb"), "Z");
+        assert_eq!(section_letter("42 Jump St"), "#");
+        assert_eq!(section_letter("  "), "#");
+        assert_eq!(section_letter("(unnamed contact)"), "#");
+
+        // Sort: case-insensitive; letterless (bucket 1) sorts after letters.
+        let mut names = vec!["zoe", "Ada", "9lives", "bob", "(x)"];
+        names.sort_by_key(|a| contact_sort_key(a));
+        assert_eq!(names, vec!["Ada", "bob", "zoe", "(x)", "9lives"]);
+    }
+
+    /// The favorite predicate reads the Bool field strictly; the group filter
+    /// and search compose over a contact's fields.
+    #[test]
+    fn favorite_filter_and_search_read_fields() {
+        use super::{contact_matches_search, ContactFilter};
+        use hive_shared::CustomEntity;
+        use serde_json::{Map, Value};
+
+        let make = |title: &str, fields: Vec<(&str, Value)>| {
+            let mut m = Map::new();
+            for (k, v) in fields {
+                m.insert(k.to_string(), v);
+            }
+            CustomEntity {
+                id: "c1".into(),
+                type_id: "t".into(),
+                type_slug: "contact".into(),
+                title: title.into(),
+                fields: m,
+                user_scope: None,
+                origin_entry_id: None,
+                created_by: "system".into(),
+                created_at: String::new(),
+                updated_at: String::new(),
+            }
+        };
+
+        let fav = make("Jane Doe", vec![("favorite", Value::Bool(true))]);
+        let not_fav = make("Bob", vec![("favorite", Value::Bool(false))]);
+        let null_fav = make("Carol", vec![]);
+        assert!(ContactFilter::Favorites.accepts(&fav));
+        assert!(!ContactFilter::Favorites.accepts(&not_fav));
+        assert!(
+            !ContactFilter::Favorites.accepts(&null_fav),
+            "null is not favorite"
+        );
+        assert!(ContactFilter::All.accepts(&null_fav));
+
+        let grouped = make(
+            "Jane Doe",
+            vec![("groups", Value::String("Family, Work".into()))],
+        );
+        assert!(
+            ContactFilter::Group("family".into()).accepts(&grouped),
+            "case-insensitive group"
+        );
+        assert!(!ContactFilter::Group("School".into()).accepts(&grouped));
+
+        // Search hits name and org, case-insensitively; empty query matches all.
+        let hit = make(
+            "Jane Doe",
+            vec![("organization", Value::String("Acme".into()))],
+        );
+        assert!(contact_matches_search(&hit, ""));
+        assert!(contact_matches_search(&hit, "jane"));
+        assert!(contact_matches_search(&hit, "acme"));
+        assert!(!contact_matches_search(&hit, "zzz"));
     }
 }

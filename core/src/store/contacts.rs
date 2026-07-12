@@ -33,6 +33,14 @@ pub const CONTACT_TYPE_SLUG: &str = "contact";
 /// their OWN fields via `entity_types_update` (see the detail view). `birthday`
 /// is a Date the UI reads to show a calculated age; `notes` is the manual
 /// notes section (multiline in the UI).
+///
+/// `favorite` (Bool) and `groups` (Text; comma-separated group names) power the
+/// Apple-Contacts pane's Favorites list and group rail. They are ordinary
+/// EntityFields on the custom `contact` type — NO fold/schema change, so no
+/// re-embed. Existing contacts read null → not-favorite / no groups. They come
+/// LAST in the seed so a pre-existing store (created before these were added)
+/// gets them appended at the end by `ensure_contact_fields` without disturbing
+/// the standard-field order or positions.
 const CONTACT_FIELDS: &[(&str, &str, &str)] = &[
     ("birthday", "Birthday", "date"),
     ("birth_name", "Birth name", "text"),
@@ -44,6 +52,8 @@ const CONTACT_FIELDS: &[(&str, &str, &str)] = &[
     ("organization", "Organization", "text"),
     ("title", "Title", "text"),
     ("notes", "Notes", "text"),
+    ("favorite", "Favorite", "bool"),
+    ("groups", "Groups", "text"),
 ];
 
 impl Store {
@@ -54,24 +64,68 @@ impl Store {
     /// pane mount.
     pub async fn ensure_contact_type(&self) -> Result<EntityTypeView> {
         self.run(|core| {
-            if let Some(view) = super::entity_types::entity_type_get(core, CONTACT_TYPE_SLUG)? {
-                return Ok(view);
+            // First-boot seed of the whole type (with every standard field). If
+            // the type already exists this is a no-op and we fall through to the
+            // field top-up below.
+            if super::entity_types::entity_type_get(core, CONTACT_TYPE_SLUG)?.is_none() {
+                let (_type_id, payloads) = contact_type_ensure_payloads(core)?;
+                let ts = now_iso();
+                let batch: Vec<Draft> = payloads
+                    .iter()
+                    .map(|p| {
+                        Draft::new(crate::oplog::kind::ENTITY_CREATE, "system", &ts, p.clone())
+                    })
+                    .collect();
+                core.commit(batch)?;
             }
-            let (type_id, payloads) = contact_type_ensure_payloads(core)?;
-            // payloads is non-empty here (the type was absent); commit each as
-            // its own entity.create record, exactly like entity_types_create.
-            let ts = now_iso();
-            let batch: Vec<Draft> = payloads
-                .iter()
-                .map(|p| Draft::new(crate::oplog::kind::ENTITY_CREATE, "system", &ts, p.clone()))
-                .collect();
-            core.commit(batch)?;
-            let view = super::entity_types::entity_type_get(core, &type_id)?
-                .expect("contact type just seeded");
+            // Top up any standard fields the existing type is missing. This is
+            // what backfills `favorite`/`groups` onto a `contact` type that a
+            // prior release (or the importer / journal emergence) created before
+            // those fields existed. Idempotent: only absent slugs are appended,
+            // so a fully-seeded type commits nothing.
+            ensure_contact_fields(core)?;
+            let view = super::entity_types::entity_type_get(core, CONTACT_TYPE_SLUG)?
+                .expect("contact type present after seed");
             Ok(view)
         })
         .await
     }
+}
+
+/// Append any `CONTACT_FIELDS` the live `contact` type is missing, at the end
+/// (after its current fields), as entity_field.create records. Check-then-add
+/// against the current field slugs so a field is NEVER duplicated — running
+/// this on every `ensure_contact_type` call is cheap and self-healing. Assumes
+/// the type already exists (its caller seeds it first).
+fn ensure_contact_fields(core: &mut Core) -> Result<()> {
+    let view = super::entity_types::entity_type_get(core, CONTACT_TYPE_SLUG)?
+        .expect("contact type present before field top-up");
+    let have: std::collections::HashSet<&str> =
+        view.fields.iter().map(|f| f.slug.as_str()).collect();
+    let ts = now_iso();
+    let mut next_pos = view.fields.iter().map(|f| f.position).max().unwrap_or(-1) + 1;
+    let mut batch = Vec::new();
+    for (slug, label, field_type) in CONTACT_FIELDS {
+        if have.contains(slug) {
+            continue;
+        }
+        batch.push(Draft::new(
+            crate::oplog::kind::ENTITY_CREATE,
+            "system",
+            &ts,
+            json!({"kind": "entity_field", "id": new_id("efield"), "fields": {
+                "type_id": view.id, "slug": slug, "label": label,
+                "field_type": field_type, "required": false, "position": next_pos,
+                "options": to_json(&Vec::<String>::new()), "ref_kind": null,
+                "archived": false, "created_at": ts, "updated_at": ts,
+            }}),
+        ));
+        next_pos += 1;
+    }
+    if !batch.is_empty() {
+        core.commit(batch)?;
+    }
+    Ok(())
 }
 
 /// Sync, Core-level planner shared by the seed and journal emergence: return
