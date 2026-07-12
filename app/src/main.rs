@@ -24,10 +24,10 @@ use hive_core::store::Store;
 use hive_embed::{Backend, EmbedConfig, Embedder, RuntimeEmbedder};
 use hive_import::{Plan, RunOutcome, Summary};
 use hive_shared::{
-    ActorKind, CustomEntity, CustomEntityPatch, EntityField, EntityTypePatch, EventItem,
-    EventPatch, FieldType, JournalEntryView, Link, NewCustomEntity, NewEntityField,
-    NewJournalEntry, Person, Priority, SearchHit, Task, TaskPatch, TaskStatus, PRIORITIES,
-    TASK_STATUSES,
+    ActorKind, ActorMergeResult, CustomEntity, CustomEntityPatch, EntityField, EntityTypePatch,
+    EventItem, EventPatch, FieldType, JournalEntryView, Link, NewCustomEntity, NewEntityField,
+    NewJournalEntry, Person, PersonPatch, Priority, SearchHit, Task, TaskPatch, TaskStatus,
+    PRIORITIES, TASK_STATUSES,
 };
 use serde_json::Value;
 
@@ -1119,6 +1119,25 @@ async fn owner_name(store: &Store) -> String {
     }
 }
 
+/// The owner *slug* — who "you" are as an identity, for ownership/merge ops.
+///
+/// `identity.owner` historically stored a display name (defaulting to $USER).
+/// This resolves that string to a real person slug so claim/take-over target a
+/// concrete identity: an exact slug match wins; else a person whose slug equals
+/// the slugified string (name → slug); else the slugified string itself (so a
+/// brand-new store with only "$USER" still yields a usable, stable slug key).
+async fn owner_slug(store: &Store) -> String {
+    let raw = owner_name(store).await;
+    if let Ok(Some(p)) = store.people_by_slug(&raw).await {
+        return p.slug;
+    }
+    let slug = hive_shared::slugify(&raw);
+    if let Ok(Some(p)) = store.people_by_slug(&slug).await {
+        return p.slug;
+    }
+    slug
+}
+
 // ── journal pane (the existing composer + feed + search, moved verbatim) ─────
 
 /// The Journal section: composer + feed + search, exactly as it worked before
@@ -1777,6 +1796,29 @@ fn IdentitiesPane(
 ) -> Element {
     let mut new_name = use_signal(String::new);
     let mut err = use_signal(|| Option::<String>::None);
+    // Who "you" are, as a slug — the target of set-owner/claim/take-over. Resolved
+    // once at mount (and on refresh) from identity.owner via owner_slug(). Empty
+    // until resolved; rows fall back to "no owner designated yet" copy.
+    let owner = use_signal(String::new);
+    // A merge/claim/set-owner in flight — disables every mutating control so a
+    // second click can't race the first (the confirm especially is irreversible).
+    let busy = use_signal(|| false);
+    // The single open take-over preview: (from_slug, counts). None = closed. Only
+    // one at a time (the spec) — opening another replaces it.
+    let preview = use_signal(|| Option::<(String, ActorMergeResult)>::None);
+
+    // Resolve the owner slug once (re-runs when refresh bumps, e.g. after a
+    // set-owner). Writes into `owner` so rows can compare synchronously.
+    {
+        let mut owner = owner;
+        let _ = use_resource(move || {
+            let store = store();
+            async move {
+                let _ = refresh();
+                owner.set(owner_slug(&store).await);
+            }
+        });
+    }
 
     // The roster: every author. people_list is the identity table (the actors,
     // human + AI). journal_writers is unioned in so an imported author who has
@@ -1837,6 +1879,17 @@ fn IdentitiesPane(
                                        authors its own journal entries; the active one is who the \
                                        composer writes as.")}
 
+            // One-line explainer: what the owner is and how claim vs take-over differ.
+            div {
+                id: "identity-explainer",
+                style: "color: {DIM}; font-size: 0.85rem; line-height: 1.55; margin-top: 0.7rem;",
+                "Identities are who authors entries. The owner is you — "
+                span { style: "color: {INK};", "claim" }
+                " an AI identity to mark it yours, or "
+                span { style: "color: {INK};", "take over" }
+                " a human identity that is actually you to merge its whole history into yours."
+            }
+
             // create a new AI identity
             div {
                 style: "background: {PANEL}; border: 1px solid {EDGE}; border-radius: 12px; \
@@ -1872,11 +1925,17 @@ fn IdentitiesPane(
                         "Create"
                     }
                 }
-                if let Some(e) = err() {
-                    div {
-                        style: "color: #e07a5f; font-size: 0.85rem; margin-top: 0.6rem;",
-                        "{e}"
-                    }
+            }
+
+            // Errors from any action (create, set-owner, claim, take-over) surface
+            // here, in-pane, above the roster — never a panic.
+            if let Some(e) = err() {
+                div {
+                    id: "identity-error",
+                    style: "color: #e07a5f; font-size: 0.85rem; background: {PANEL}; \
+                            border: 1px solid #e07a5f; border-radius: 8px; padding: 0.6rem 0.8rem; \
+                            margin: 0 0 0.8rem;",
+                    "{e}"
                 }
             }
 
@@ -1888,7 +1947,7 @@ fn IdentitiesPane(
                     div {
                         id: "identity-list",
                         for person in people.iter() {
-                            {identity_row(store, person, active, section)}
+                            {identity_row(store, person, active, section, owner, busy, preview, refresh, err)}
                         }
                     }
                 },
@@ -1897,75 +1956,346 @@ fn IdentitiesPane(
     }
 }
 
-/// One identity row: badge + name + slug, with a Switch/Active control that
-/// persists identity.active (and hops to the Journal so the switch is felt).
-/// Plain fn: Person and the signals lack the PartialEq component props need.
+/// One identity row: badge + name + slug + a Switch/Active control (persists
+/// identity.active and hops to the Journal so the switch is felt), plus the
+/// ownership controls — set-as-owner, claim (AI), and take-over (human, opens an
+/// inline merge preview). Plain fn: Person and the signals lack the PartialEq
+/// component props need.
+#[allow(clippy::too_many_arguments)]
 fn identity_row(
     store: ReadOnlySignal<Store>,
     person: &Person,
     mut active: Signal<String>,
     mut section: Signal<Section>,
+    owner: Signal<String>,
+    mut busy: Signal<bool>,
+    mut preview: Signal<Option<(String, ActorMergeResult)>>,
+    mut refresh: Signal<u32>,
+    mut err: Signal<Option<String>>,
 ) -> Element {
     let is_ai = person.kind == ActorKind::Ai;
-    let (badge, badge_bg) = if is_ai { ("AI", GOLD) } else { ("you", FAINT) };
     let is_active = active() == person.slug;
     let slug = person.slug.clone();
+    // A `writer:`-prefixed id is a bare author with no people row (unioned in
+    // from journal_writers); claiming one must materialise a real Person first.
+    let is_writer = person.id.starts_with("writer:");
+    let owner_slug = owner();
+    // The owner is "you". Only a resolved (non-empty) owner can match, so an
+    // unresolved owner leaves every row a plain non-owner (controls still show).
+    let is_owner = !owner_slug.is_empty() && owner_slug == person.slug;
+    // An AI already linked to you (Person.owner == owner). Writer rows carry the
+    // owner journal_writers reported, so a claimed-then-forgotten row still reads.
+    let is_owned_by_me = !owner_slug.is_empty() && person.owner.as_deref() == Some(&*owner_slug);
+    // The owner badge wins; else AI vs human.
+    let (badge, badge_bg) = if is_owner {
+        ("you · owner", GOLD)
+    } else if is_ai {
+        ("AI", GOLD)
+    } else {
+        ("human", FAINT)
+    };
     // Phase 3: per-identity mail credentials hang off the identity here.
 
     rsx! {
+        // Column wrapper: the horizontal row line, then the inline take-over
+        // preview panel (when this row is the one being taken over).
         div {
-            // A stable, per-slug id so a script can target a specific identity row.
-            id: "identity-row-{person.slug}",
-            style: "display: flex; align-items: center; gap: 0.7rem; background: {PANEL}; \
-                    border: 1px solid {EDGE}; border-radius: 10px; padding: 0.7rem 0.9rem; \
-                    margin-bottom: 0.6rem;",
-            span {
-                style: "display: inline-flex; align-items: center; justify-content: center; \
-                        width: 2.1rem; height: 2.1rem; border-radius: 50%; background: {EDGE}; \
-                        color: {GOLD}; font-size: 1rem; flex-shrink: 0;",
-                "⬡"
-            }
+            style: "background: {PANEL}; border: 1px solid {EDGE}; border-radius: 10px; \
+                    padding: 0.7rem 0.9rem; margin-bottom: 0.6rem;",
             div {
-                style: "flex: 1; min-width: 0;",
+                // A stable, per-slug id so a script can target a specific identity row.
+                id: "identity-row-{person.slug}",
+                style: "display: flex; align-items: center; gap: 0.7rem;",
+                span {
+                    style: "display: inline-flex; align-items: center; justify-content: center; \
+                            width: 2.1rem; height: 2.1rem; border-radius: 50%; background: {EDGE}; \
+                            color: {GOLD}; font-size: 1rem; flex-shrink: 0;",
+                    "⬡"
+                }
                 div {
-                    style: "display: flex; align-items: baseline; gap: 0.5rem;",
-                    span { style: "font-weight: 700; font-size: 0.98rem;", "{person.name}" }
-                    span {
-                        style: "font-size: 0.62rem; font-weight: 700; letter-spacing: 0.05em; \
-                                text-transform: uppercase; color: {BG}; background: {badge_bg}; \
-                                border-radius: 5px; padding: 0.1rem 0.35rem;",
-                        "{badge}"
+                    style: "flex: 1; min-width: 0;",
+                    div {
+                        style: "display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap;",
+                        span { style: "font-weight: 700; font-size: 0.98rem;", "{person.name}" }
+                        span {
+                            style: "font-size: 0.62rem; font-weight: 700; letter-spacing: 0.05em; \
+                                    text-transform: uppercase; color: {BG}; background: {badge_bg}; \
+                                    border-radius: 5px; padding: 0.1rem 0.35rem;",
+                            "{badge}"
+                        }
+                        // Owned-by-you marker on claimed AI rows (not on the owner itself).
+                        if is_owned_by_me && !is_owner {
+                            span {
+                                id: "identity-owned-{person.slug}",
+                                style: "font-size: 0.62rem; font-weight: 700; letter-spacing: 0.04em; \
+                                        text-transform: uppercase; color: {GOLD}; border: 1px solid {GOLD}; \
+                                        border-radius: 5px; padding: 0.1rem 0.35rem;",
+                                "owned by you"
+                            }
+                        }
+                    }
+                    div {
+                        style: "font-size: 0.78rem; color: {FAINT}; margin-top: 0.15rem;",
+                        "{person.slug}"
                     }
                 }
-                div {
-                    style: "font-size: 0.78rem; color: {FAINT}; margin-top: 0.15rem;",
-                    "{person.slug}"
+                // Ownership controls — never on the owner's own row.
+                if !is_owner {
+                    div {
+                        style: "display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap; \
+                                justify-content: flex-end;",
+                        // Set-as-owner: repoint identity.owner at this slug (cheap, allowed).
+                        {
+                            let set_slug = person.slug.clone();
+                            rsx! {
+                                button {
+                                    id: "identity-setowner-{person.slug}",
+                                    disabled: busy(),
+                                    style: "background: {BG}; color: {DIM}; border: 1px solid {EDGE}; \
+                                            border-radius: 999px; padding: 0.25rem 0.7rem; font: inherit; \
+                                            font-size: 0.74rem; font-weight: 600; cursor: pointer;",
+                                    onclick: move |_| {
+                                        if busy() { return; }
+                                        let set_slug = set_slug.clone();
+                                        let store = store();
+                                        busy.set(true);
+                                        err.set(None);
+                                        spawn(async move {
+                                            match store.config_set(IDENTITY_OWNER_KEY, &set_slug).await {
+                                                Ok(()) => refresh += 1,
+                                                Err(e) => err.set(Some(format!("{e:#}"))),
+                                            }
+                                            busy.set(false);
+                                        });
+                                    },
+                                    "Set as owner"
+                                }
+                            }
+                        }
+                        // AI: claim (link to you) unless already owned by you.
+                        if is_ai && !is_owned_by_me {
+                            {
+                                let claim_slug = person.slug.clone();
+                                let claim_name = person.name.clone();
+                                rsx! {
+                                    button {
+                                        id: "identity-claim-{person.slug}",
+                                        disabled: busy() || owner_slug.is_empty(),
+                                        style: "background: {GOLD}; color: #14120e; border: none; \
+                                                border-radius: 999px; padding: 0.25rem 0.8rem; font: inherit; \
+                                                font-size: 0.74rem; font-weight: 700; cursor: pointer;",
+                                        onclick: move |_| {
+                                            if busy() { return; }
+                                            let owner_slug = owner();
+                                            if owner_slug.is_empty() { return; }
+                                            let (claim_slug, claim_name) =
+                                                (claim_slug.clone(), claim_name.clone());
+                                            let store = store();
+                                            busy.set(true);
+                                            err.set(None);
+                                            spawn(async move {
+                                                // A writer-only row has no Person yet — materialise
+                                                // one (owner set in the insert) via people_upsert;
+                                                // a real AI row just gets its owner patched.
+                                                let res = if is_writer {
+                                                    store
+                                                        .people_upsert(
+                                                            &claim_slug,
+                                                            &claim_name,
+                                                            ActorKind::Ai,
+                                                            Some(&owner_slug),
+                                                        )
+                                                        .await
+                                                        .map(|_| ())
+                                                } else {
+                                                    store
+                                                        .people_update(
+                                                            &claim_slug,
+                                                            PersonPatch {
+                                                                owner: Some(Some(owner_slug.clone())),
+                                                                ..Default::default()
+                                                            },
+                                                            &owner_slug,
+                                                        )
+                                                        .await
+                                                        .map(|_| ())
+                                                };
+                                                match res {
+                                                    Ok(()) => refresh += 1,
+                                                    Err(e) => err.set(Some(format!("{e:#}"))),
+                                                }
+                                                busy.set(false);
+                                            });
+                                        },
+                                        "Claim as mine"
+                                    }
+                                }
+                            }
+                        }
+                        // Human: take over (merge history into you) — opens the preview.
+                        if !is_ai {
+                            {
+                                let to_slug = person.slug.clone();
+                                rsx! {
+                                    button {
+                                        id: "identity-takeover-{person.slug}",
+                                        disabled: busy() || owner_slug.is_empty(),
+                                        style: "background: {BG}; color: {INK}; border: 1px solid {GOLD}; \
+                                                border-radius: 999px; padding: 0.25rem 0.8rem; font: inherit; \
+                                                font-size: 0.74rem; font-weight: 700; cursor: pointer;",
+                                        onclick: move |_| {
+                                            if busy() { return; }
+                                            let owner_slug = owner();
+                                            if owner_slug.is_empty() { return; }
+                                            let from = to_slug.clone();
+                                            let store = store();
+                                            busy.set(true);
+                                            err.set(None);
+                                            spawn(async move {
+                                                match store
+                                                    .actors_merge_preview(&from, &owner_slug)
+                                                    .await
+                                                {
+                                                    Ok(res) => preview.set(Some((from, res))),
+                                                    Err(e) => err.set(Some(format!("{e:#}"))),
+                                                }
+                                                busy.set(false);
+                                            });
+                                        },
+                                        "This is me — take over"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if is_active {
+                    span {
+                        style: "font-size: 0.75rem; font-weight: 700; color: {GOLD}; \
+                                border: 1px solid {GOLD}; border-radius: 999px; padding: 0.2rem 0.7rem;",
+                        "active"
+                    }
+                } else {
+                    button {
+                        id: "identity-switch-{person.slug}",
+                        style: "background: {BG}; color: {INK}; border: 1px solid {EDGE}; \
+                                border-radius: 999px; padding: 0.25rem 0.8rem; font: inherit; \
+                                font-size: 0.78rem; font-weight: 600; cursor: pointer;",
+                        onclick: move |_| {
+                            let slug = slug.clone();
+                            let store = store();
+                            // Persist identity.active, reflect it locally, and hop to
+                            // the Journal so the composer immediately writes as it.
+                            active.set(slug.clone());
+                            section.set(Section::Journal);
+                            spawn(async move {
+                                let _ = store.config_set(IDENTITY_ACTIVE_KEY, &slug).await;
+                            });
+                        },
+                        "Switch"
+                    }
                 }
             }
-            if is_active {
-                span {
-                    style: "font-size: 0.75rem; font-weight: 700; color: {GOLD}; \
-                            border: 1px solid {GOLD}; border-radius: 999px; padding: 0.2rem 0.7rem;",
-                    "active"
-                }
-            } else {
+            // Inline take-over preview — only for the row being taken over.
+            {takeover_preview(store, person, owner, busy, preview, refresh, err)}
+        }
+    }
+}
+
+/// The inline merge preview panel for a take-over: shows what `actors_merge`
+/// would rewrite (per the preview counts) and gates the irreversible merge
+/// behind an explicit confirm. Renders only when `preview` names this row.
+#[allow(clippy::too_many_arguments)]
+fn takeover_preview(
+    store: ReadOnlySignal<Store>,
+    person: &Person,
+    owner: Signal<String>,
+    mut busy: Signal<bool>,
+    mut preview: Signal<Option<(String, ActorMergeResult)>>,
+    mut refresh: Signal<u32>,
+    mut err: Signal<Option<String>>,
+) -> Element {
+    // Show only when this row is the one under preview.
+    let Some((from, res)) = preview() else {
+        return rsx! {};
+    };
+    if from != person.slug {
+        return rsx! {};
+    }
+    let owner_slug = owner();
+    // Counts worth surfacing: journal (authored) + mentions ride journal, plus
+    // the emerged entities and links the merge rewrites onto you.
+    let confirm_from = from.clone();
+    rsx! {
+        div {
+            id: "takeover-preview",
+            style: "margin-top: 0.7rem; border-top: 1px solid {EDGE}; padding-top: 0.7rem;",
+            div {
+                style: "color: {INK}; font-size: 0.86rem; line-height: 1.55;",
+                "This merges "
+                span { style: "font-weight: 700;", "{from}" }
+                " into "
+                span { style: "font-weight: 700; color: {GOLD};", "{owner_slug}" }
+                ". It rewrites "
+                span { style: "font-weight: 700;", "{res.journal}" }
+                " journal entries, "
+                span { style: "font-weight: 700;", "{res.tasks}" }
+                " tasks, "
+                span { style: "font-weight: 700;", "{res.decisions}" }
+                " decisions, "
+                span { style: "font-weight: 700;", "{res.events}" }
+                " events, "
+                span { style: "font-weight: 700;", "{res.inbox}" }
+                " inbox items, "
+                span { style: "font-weight: 700;", "{res.entities}" }
+                " entities and "
+                span { style: "font-weight: 700;", "{res.sources}" }
+                " sources to "
+                span { style: "font-weight: 700; color: {GOLD};", "{owner_slug}" }
+                ", then removes "
+                span { style: "font-weight: 700;", "{from}" }
+                ". This can't be undone."
+            }
+            div {
+                style: "display: flex; gap: 0.5rem; margin-top: 0.7rem;",
                 button {
-                    id: "identity-switch-{person.slug}",
-                    style: "background: {BG}; color: {INK}; border: 1px solid {EDGE}; \
-                            border-radius: 999px; padding: 0.25rem 0.8rem; font: inherit; \
-                            font-size: 0.78rem; font-weight: 600; cursor: pointer;",
+                    id: "takeover-confirm",
+                    disabled: busy() || owner_slug.is_empty(),
+                    style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                            padding: 0.4rem 1rem; font: inherit; font-size: 0.82rem; \
+                            font-weight: 700; cursor: pointer;",
                     onclick: move |_| {
-                        let slug = slug.clone();
+                        if busy() { return; }
+                        let owner_slug = owner();
+                        if owner_slug.is_empty() { return; }
+                        let from = confirm_from.clone();
                         let store = store();
-                        // Persist identity.active, reflect it locally, and hop to
-                        // the Journal so the composer immediately writes as it.
-                        active.set(slug.clone());
-                        section.set(Section::Journal);
+                        busy.set(true);
+                        err.set(None);
                         spawn(async move {
-                            let _ = store.config_set(IDENTITY_ACTIVE_KEY, &slug).await;
+                            match store.actors_merge(&from, &owner_slug).await {
+                                Ok(_) => {
+                                    preview.set(None);
+                                    refresh += 1;
+                                }
+                                Err(e) => err.set(Some(format!("{e:#}"))),
+                            }
+                            busy.set(false);
                         });
                     },
-                    "Switch"
+                    "Merge into {owner_slug}"
+                }
+                button {
+                    id: "takeover-cancel",
+                    disabled: busy(),
+                    style: "background: {BG}; color: {DIM}; border: 1px solid {EDGE}; \
+                            border-radius: 8px; padding: 0.4rem 1rem; font: inherit; \
+                            font-size: 0.82rem; font-weight: 600; cursor: pointer;",
+                    onclick: move |_| {
+                        if busy() { return; }
+                        preview.set(None);
+                    },
+                    "Cancel"
                 }
             }
         }

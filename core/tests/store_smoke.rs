@@ -140,6 +140,61 @@ async fn journal_emergence_search_recall_dashboard() {
     assert!(pia.is_some(), "dryRun must not delete the actor");
 }
 
+/// The Identities pane "Claim as mine" flow for a `writer:` row: an author that
+/// authored entries but has NO people row is materialised into a real AI Person
+/// owned by the owner, via `people_upsert` (owner set in the insert). Re-claiming
+/// is a no-op that keeps the existing row.
+#[tokio::test]
+async fn claim_materialises_writer_slug_owned_by_owner() {
+    let store = test_store().await;
+
+    // An author with journal history but no people row (an imported/legacy
+    // writer): it shows in journal_writers yet people_get returns nothing.
+    store
+        .journal_append(
+            journal_input("A note from a bare author."),
+            Some("ghostwriter"),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store.people_get("ghostwriter").await.unwrap().is_none(),
+        "precondition: the writer has no people row yet"
+    );
+
+    // Claim it: materialise a real AI Person owned by the owner slug.
+    let owner = "nate";
+    let claimed = store
+        .people_upsert("ghostwriter", "Ghostwriter", ActorKind::Ai, Some(owner))
+        .await
+        .unwrap();
+    assert_eq!(claimed.slug, "ghostwriter", "slug is preserved verbatim");
+    assert_eq!(claimed.kind, ActorKind::Ai);
+    assert_eq!(claimed.owner.as_deref(), Some(owner), "owned by the owner");
+
+    // It now resolves as a real person carrying the owner link.
+    let got = store.people_get("ghostwriter").await.unwrap().unwrap();
+    assert_eq!(got.owner.as_deref(), Some(owner));
+
+    // Re-claiming is idempotent — the existing row wins, no duplicate/clobber.
+    let again = store
+        .people_upsert(
+            "ghostwriter",
+            "Ghostwriter",
+            ActorKind::Ai,
+            Some("someone-else"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.id, claimed.id, "same row returned, not a new one");
+    assert_eq!(
+        again.owner.as_deref(),
+        Some(owner),
+        "owner unchanged on a no-op upsert"
+    );
+}
+
 #[tokio::test]
 async fn inbox_roundtrip_and_self_notification_skip() {
     let store = test_store().await;
