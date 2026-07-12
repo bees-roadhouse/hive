@@ -111,6 +111,37 @@ impl OutgoingEmail {
     }
 }
 
+/// An in-place change to an existing server message: what [`Syncer::patch_email`]
+/// turns into ONE JMAP `Email/set` (an `update` patch, or a `destroy`). This is
+/// the message-actions counterpart to [`OutgoingEmail`] — read/unread, flag,
+/// label edits, move, archive, and (permanent) delete all reduce to it. In JMAP,
+/// folders/labels are mailboxes and flags are keywords, so:
+///   - read = keyword `$seen` on/off; flag = keyword `$flagged` on/off;
+///   - label add/remove = a per-mailbox membership change, expressed here as a
+///     full replacement `mailbox_ids` set the store already recomputed;
+///   - move/archive/delete-to-trash = replace `mailbox_ids` with the single
+///     target mailbox; permanent delete = `destroy`.
+///
+/// Serializable so it round-trips through the durable outbox payload. Network
+/// work only — carries no secret; the driver decrypts and connects first.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EmailPatch {
+    /// Per-keyword patches: `(keyword, on)` → `keywords/<keyword>` set true/false.
+    /// Each maps to one `keyword(name, on)` call (a partial patch, not a full
+    /// keywords replacement), so untouched keywords are preserved server-side.
+    #[serde(default)]
+    pub keywords: Vec<(String, bool)>,
+    /// `Some(ids)` replaces the WHOLE mailbox-membership set (the store computes
+    /// the resulting set for label add/remove, or a single-element vec for
+    /// move/archive/trash). `None` leaves membership untouched.
+    #[serde(default)]
+    pub mailbox_ids: Option<Vec<String>>,
+    /// Destroy the message outright (permanent delete). When set, the keyword /
+    /// mailbox fields are ignored — one `destroy([id])` is issued instead.
+    #[serde(default)]
+    pub destroy: bool,
+}
+
 /// How `body_text` was produced. Raw HTML is never stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodySource {
@@ -375,6 +406,20 @@ impl Syncer {
             _ => self.raw.resolve_identity(&msg.from_address).await?,
         };
         self.raw.send_email(msg, &drafts, &identity).await
+    }
+
+    /// Apply one [`EmailPatch`] to an existing server message in ONE `Email/set`
+    /// request: either `destroy([jmap_id])` (permanent delete) or `update(jmap_id)`
+    /// carrying the keyword patches and, when `Some`, the replacement mailboxIds.
+    /// A JMAP `notUpdated`/`notDestroyed` entry surfaces as [`SyncError::Protocol`].
+    /// Network work only — no store, no secret (the driver decrypts and connects
+    /// before calling this).
+    pub async fn patch_email(
+        &mut self,
+        jmap_id: &str,
+        patch: &EmailPatch,
+    ) -> Result<(), SyncError> {
+        self.raw.patch_email(jmap_id, patch).await
     }
 
     /// Find the Drafts mailbox jmap id from the server's mailbox list.

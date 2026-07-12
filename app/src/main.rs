@@ -1469,6 +1469,10 @@ fn MailPane(store: ReadOnlySignal<Store>) -> Element {
     let search = use_signal(String::new);
     // Some(seed) = the compose overlay is open (fresh or a reply prefill).
     let compose = use_signal(|| Option::<ComposeSeed>::None);
+    // Bumped by every message action (read/flag/label/move/archive/delete) so the
+    // list, reader thread, and sidebar unread badges re-pull the optimistically
+    // patched rows immediately.
+    let mail_refresh = use_signal(|| 0u32);
 
     if managing() {
         return rsx! { MailAccountsManager { store, refresh, managing } };
@@ -1478,9 +1482,9 @@ fn MailPane(store: ReadOnlySignal<Store>) -> Element {
         div {
             id: "mail-pane",
             style: "display: flex; height: 100%; min-height: 0; background: {BG}; position: relative;",
-            MailSidebar { store, refresh, source, selected_msg, search, managing, compose }
-            MailList { store, source, selected_msg }
-            MailReader { store, selected_msg, compose }
+            MailSidebar { store, refresh, source, selected_msg, search, managing, compose, mail_refresh }
+            MailList { store, source, selected_msg, mail_refresh }
+            MailReader { store, selected_msg, compose, mail_refresh }
             if compose().is_some() {
                 ComposeWindow { store, compose }
             }
@@ -1500,6 +1504,7 @@ fn MailSidebar(
     search: Signal<String>,
     managing: Signal<bool>,
     compose: Signal<Option<ComposeSeed>>,
+    mail_refresh: Signal<u32>,
 ) -> Element {
     let accounts = use_resource(move || {
         let store = store();
@@ -1601,7 +1606,7 @@ fn MailSidebar(
                                         "{owner}"
                                     }
                                     for acct in accts.into_iter() {
-                                        {mail_account_group(store, acct, source, selected_msg)}
+                                        {mail_account_group(store, acct, source, selected_msg, mail_refresh)}
                                     }
                                 }
                             }
@@ -1621,12 +1626,15 @@ fn mail_account_group(
     acct: MailAccountAdminView,
     source: Signal<MailListSource>,
     selected_msg: Signal<Option<MailMessageSummary>>,
+    mail_refresh: Signal<u32>,
 ) -> Element {
     let account_id = acct.id.clone();
     let mailboxes = use_resource(move || {
         let store = store();
         let account_id = account_id.clone();
         async move {
+            // Re-pull unread badges after every message action.
+            let _ = mail_refresh();
             store
                 .mail_mailboxes_list(&account_id)
                 .await
@@ -1714,12 +1722,14 @@ fn MailList(
     store: ReadOnlySignal<Store>,
     source: Signal<MailListSource>,
     selected_msg: Signal<Option<MailMessageSummary>>,
+    mail_refresh: Signal<u32>,
 ) -> Element {
-    // Re-pulls whenever the source changes.
+    // Re-pulls whenever the source changes OR an action patched a row.
     let messages = use_resource(move || {
         let store = store();
         let src = source();
         async move {
+            let _ = mail_refresh();
             match src {
                 MailListSource::None => Ok(Vec::new()),
                 MailListSource::Mailbox { id, .. } => store
@@ -1875,11 +1885,13 @@ fn MailReader(
     store: ReadOnlySignal<Store>,
     selected_msg: Signal<Option<MailMessageSummary>>,
     compose: Signal<Option<ComposeSeed>>,
+    mail_refresh: Signal<u32>,
 ) -> Element {
     let thread = use_resource(move || {
         let store = store();
         let sel = selected_msg();
         async move {
+            let _ = mail_refresh();
             match sel {
                 None => Ok(None),
                 Some(msg) => store
@@ -1889,6 +1901,25 @@ fn MailReader(
                     .map_err(|e| format!("{e:#}")),
             }
         }
+    });
+
+    // Auto-mark-read on open (Apple behavior): opening an unread message marks
+    // it read. Keyed on the selected id so it fires once per open, off the UI
+    // thread; the optimistic patch + mail_refresh bump repaint the unread dots.
+    use_effect(move || {
+        let Some(msg) = selected_msg() else { return };
+        let unread = !msg.labels.iter().any(|l| l == "seen");
+        if !unread {
+            return;
+        }
+        let store = store();
+        let mut mail_refresh = mail_refresh;
+        let id = msg.id.clone();
+        spawn(async move {
+            if store.mail_mark_read(&id, true).await.is_ok() {
+                mail_refresh.set(mail_refresh() + 1);
+            }
+        });
     });
 
     let focused_id = selected_msg().map(|m| m.id);
@@ -1931,14 +1962,8 @@ fn MailReader(
                             div {
                                 style: "margin-top: 1.2rem;",
                                 for tmsg in thread.messages.into_iter() {
-                                    {mail_thread_message(store, tmsg, focused_id.as_deref(), compose)}
+                                    {mail_thread_message(store, tmsg, focused_id.as_deref(), compose, mail_refresh)}
                                 }
-                            }
-                            // what's still to come (compose + reply are live now)
-                            div {
-                                style: "margin-top: 2rem; padding-top: 1rem; border-top: 1px solid {EDGE}; \
-                                        color: {FAINT}; font-size: 0.8rem; line-height: 1.6;",
-                                "Marking read, labeling, and moving messages arrive in the next update."
                             }
                         }
                     }
@@ -1957,10 +1982,16 @@ fn mail_thread_message(
     tmsg: MailThreadMessage,
     focused_id: Option<&str>,
     compose: Signal<Option<ComposeSeed>>,
+    mail_refresh: Signal<u32>,
 ) -> Element {
     let is_focused = focused_id == Some(tmsg.summary.id.as_str());
     let mut expanded = use_signal(|| is_focused);
     let msg_id = tmsg.summary.id.clone();
+    // Read/flag state + membership drive the action bar's toggles.
+    let is_seen = tmsg.summary.labels.iter().any(|l| l == "seen");
+    let is_flagged = tmsg.summary.labels.iter().any(|l| l == "flagged");
+    let account_id = tmsg.summary.account_id.clone();
+    let mailbox_ids = tmsg.summary.mailbox_ids.clone();
     // The body we quote into a reply (the sanitized plaintext already stored).
     let original_body = tmsg.body_text.clone();
     let sender = tmsg.summary.from.clone();
@@ -2093,6 +2124,16 @@ fn mail_thread_message(
                     "↩↩ Reply all"
                 }
             }
+            // per-message actions: read/flag/move/labels/archive/delete
+            MailActionBar {
+                store,
+                message_id: tmsg.summary.id.clone(),
+                account_id,
+                is_seen,
+                is_flagged,
+                mailbox_ids,
+                mail_refresh,
+            }
             // the SANITIZED body + its remote-image opt-in
             MailBodyView { id: tmsg.summary.id.clone(), body: tmsg.body_text.clone() }
             // attachments
@@ -2107,6 +2148,293 @@ fn mail_thread_message(
             }
         }
     }
+}
+
+/// The per-message action row on the focused reader message: mark unread/read,
+/// flag, a Move-to menu over the account's mailboxes, membership toggles for the
+/// account's label mailboxes (role-less), Archive, and Delete (→ Trash, or a
+/// two-step permanent delete when the message is already in Trash). Every action
+/// calls the store (which optimistically patches the derived row + enqueues the
+/// server write), then bumps `mail_refresh` so the list, thread, and unread
+/// badges repaint. A `#[component]` because all its props derive PartialEq
+/// (String/bool/Vec/signals) — the reader structs don't, so this stays split out.
+#[component]
+fn MailActionBar(
+    store: ReadOnlySignal<Store>,
+    message_id: String,
+    account_id: String,
+    is_seen: bool,
+    is_flagged: bool,
+    mailbox_ids: Vec<String>,
+    mail_refresh: Signal<u32>,
+) -> Element {
+    // The account's mailboxes drive the Move menu + label toggles. Re-pulled on
+    // action so membership badges stay live.
+    let acct_for_boxes = account_id.clone();
+    let mailboxes = use_resource(move || {
+        let store = store();
+        let acct = acct_for_boxes.clone();
+        async move {
+            let _ = mail_refresh();
+            store.mail_mailboxes_list(&acct).await.unwrap_or_default()
+        }
+    });
+    let boxes = mailboxes().unwrap_or_default();
+
+    let mut menu_open = use_signal(|| false);
+    // Two-step permanent-delete confirm.
+    let mut confirm_perm = use_signal(|| false);
+    let mut err = use_signal(|| Option::<String>::None);
+    let mut busy = use_signal(|| false);
+
+    // Is the message currently in the Trash mailbox? (permanent-delete gate)
+    let trash_jmap = boxes
+        .iter()
+        .find(|b| b.role.as_deref() == Some("trash"))
+        .map(|b| b.jmap_id.clone());
+    let in_trash = trash_jmap
+        .as_ref()
+        .map(|t| mailbox_ids.iter().any(|m| m == t))
+        .unwrap_or(false);
+
+    // Run a store action off the UI thread, then repaint. `busy` guards against
+    // double-fire; errors surface in-pane (never a panic). Captures a cloned id
+    // (leaving `message_id` free for the element-id format strings) and only Copy
+    // signals besides, so it is itself `Clone` — cloned into each onclick below.
+    let run = {
+        let mid = message_id.clone();
+        move |fut_kind: MailActionKind| {
+            if busy() {
+                return;
+            }
+            busy.set(true);
+            err.set(None);
+            menu_open.set(false);
+            confirm_perm.set(false);
+            let store = store();
+            let id = mid.clone();
+            let mut mail_refresh = mail_refresh;
+            let mut busy = busy;
+            let mut err = err;
+            spawn(async move {
+                let res = match fut_kind {
+                    MailActionKind::MarkRead(read) => store.mail_mark_read(&id, read).await,
+                    MailActionKind::Flag(on) => store.mail_set_flagged(&id, on).await,
+                    MailActionKind::Move(target) => store.mail_move(&id, &target).await,
+                    MailActionKind::AddLabel(m) => store.mail_add_label(&id, &m).await,
+                    MailActionKind::RemoveLabel(m) => store.mail_remove_label(&id, &m).await,
+                    MailActionKind::Archive => store.mail_archive(&id).await,
+                    MailActionKind::Delete => store.mail_delete(&id).await,
+                    MailActionKind::DeletePermanently => store.mail_delete_permanently(&id).await,
+                };
+                match res {
+                    Ok(_) => mail_refresh.set(mail_refresh() + 1),
+                    Err(e) => err.set(Some(format!("{e:#}"))),
+                }
+                busy.set(false);
+            });
+        }
+    };
+
+    // Label mailboxes = role-less ones (folders carry a role). Membership is a
+    // toggle reflecting the current mailbox_ids.
+    let label_boxes: Vec<MailMailboxView> =
+        boxes.iter().filter(|b| b.role.is_none()).cloned().collect();
+
+    rsx! {
+        div {
+            style: "display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; \
+                    margin-top: 0.6rem; position: relative;",
+
+            // mark unread / read
+            button {
+                id: "mail-read-{message_id}",
+                style: reply_button_style(),
+                disabled: busy(),
+                title: if is_seen { "Mark as unread" } else { "Mark as read" },
+                onclick: {
+                    let mut run = run.clone();
+                    move |_| run(MailActionKind::MarkRead(!is_seen))
+                },
+                if is_seen { "✉ Mark unread" } else { "✓ Mark read" }
+            }
+
+            // flag / unflag
+            button {
+                id: "mail-flag-{message_id}",
+                style: reply_button_style(),
+                disabled: busy(),
+                title: if is_flagged { "Remove flag" } else { "Flag" },
+                onclick: {
+                    let mut run = run.clone();
+                    move |_| run(MailActionKind::Flag(!is_flagged))
+                },
+                if is_flagged { "⚑ Unflag" } else { "⚐ Flag" }
+            }
+
+            // move-to menu
+            div {
+                style: "position: relative;",
+                button {
+                    id: "mail-move-{message_id}",
+                    style: reply_button_style(),
+                    disabled: busy(),
+                    title: "Move to a folder",
+                    onclick: move |_| {
+                        let now = menu_open();
+                        menu_open.set(!now);
+                    },
+                    "🗂 Move ▾"
+                }
+                if menu_open() {
+                    div {
+                        id: "mail-move-menu-{message_id}",
+                        style: "position: absolute; top: 100%; left: 0; z-index: 30; margin-top: 0.2rem; \
+                                background: {PANEL}; border: 1px solid {EDGE}; border-radius: 10px; \
+                                box-shadow: 0 12px 30px rgba(0,0,0,0.5); padding: 0.3rem; min-width: 180px; \
+                                max-height: 260px; overflow-y: auto;",
+                        if boxes.is_empty() {
+                            div { style: "color: {FAINT}; font-size: 0.8rem; padding: 0.4rem 0.5rem;", "No folders" }
+                        }
+                        for mbox in boxes.iter().cloned() {
+                            {
+                                let target = mbox.jmap_id.clone();
+                                let here = mailbox_ids.iter().any(|m| m == &target);
+                                let icon = mailbox_icon(mbox.role.as_deref(), &mbox.name);
+                                rsx! {
+                                    button {
+                                        id: "mail-move-{message_id}-{mbox.id}",
+                                        style: "display: flex; width: 100%; align-items: center; gap: 0.45rem; \
+                                                background: none; border: none; color: {INK}; text-align: left; \
+                                                border-radius: 7px; padding: 0.4rem 0.5rem; font: inherit; \
+                                                font-size: 0.84rem; cursor: pointer;",
+                                        disabled: busy() || here,
+                                        onclick: {
+                                            let mut run = run.clone();
+                                            move |_| run(MailActionKind::Move(target.clone()))
+                                        },
+                                        span { style: "width: 1rem; text-align: center;", "{icon}" }
+                                        span { style: "flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;", "{mbox.name}" }
+                                        if here {
+                                            span { style: "color: {FAINT}; font-size: 0.72rem;", "here" }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // archive
+            button {
+                id: "mail-archive-{message_id}",
+                style: reply_button_style(),
+                disabled: busy(),
+                title: "Archive",
+                onclick: {
+                    let mut run = run.clone();
+                    move |_| run(MailActionKind::Archive)
+                },
+                "🗄 Archive"
+            }
+
+            // delete — soft (→ Trash) or permanent (already in Trash, two-step)
+            if in_trash {
+                if confirm_perm() {
+                    button {
+                        id: "mail-delete-perm-{message_id}",
+                        style: "background: #7a2e22; border: 1px solid #e07a5f; color: #ffe; \
+                                border-radius: 8px; padding: 0.35rem 0.8rem; font: inherit; \
+                                font-size: 0.82rem; font-weight: 700; cursor: pointer;",
+                        disabled: busy(),
+                        title: "Permanently delete — this cannot be undone",
+                        onclick: {
+                            let mut run = run.clone();
+                            move |_| run(MailActionKind::DeletePermanently)
+                        },
+                        "Delete forever?"
+                    }
+                } else {
+                    button {
+                        id: "mail-delete-{message_id}",
+                        style: reply_button_style(),
+                        disabled: busy(),
+                        title: "Delete permanently",
+                        onclick: move |_| confirm_perm.set(true),
+                        "🗑 Delete…"
+                    }
+                }
+            } else {
+                button {
+                    id: "mail-delete-{message_id}",
+                    style: reply_button_style(),
+                    disabled: busy(),
+                    title: "Move to Trash",
+                    onclick: {
+                        let mut run = run.clone();
+                        move |_| run(MailActionKind::Delete)
+                    },
+                    "🗑 Delete"
+                }
+            }
+
+            // label membership toggles (role-less mailboxes)
+            if !label_boxes.is_empty() {
+                div {
+                    style: "display: flex; flex-wrap: wrap; gap: 0.3rem; align-items: center; \
+                            width: 100%; margin-top: 0.35rem;",
+                    span { style: "color: {FAINT}; font-size: 0.72rem;", "Labels:" }
+                    for mbox in label_boxes.into_iter() {
+                        {
+                            let mjmap = mbox.jmap_id.clone();
+                            let on = mailbox_ids.iter().any(|m| m == &mjmap);
+                            let (bg, fg, border) = if on { (GOLD, "#14120e", GOLD) } else { ("transparent", DIM, EDGE) };
+                            rsx! {
+                                button {
+                                    id: "mail-label-{message_id}-{mbox.id}",
+                                    style: "font-size: 0.72rem; font-weight: 600; color: {fg}; background: {bg}; \
+                                            border: 1px solid {border}; border-radius: 999px; padding: 0.1rem 0.5rem; \
+                                            cursor: pointer;",
+                                    disabled: busy(),
+                                    title: if on { "Remove label" } else { "Add label" },
+                                    onclick: {
+                                        let mut run = run.clone();
+                                        move |_| {
+                                            if on {
+                                                run(MailActionKind::RemoveLabel(mjmap.clone()))
+                                            } else {
+                                                run(MailActionKind::AddLabel(mjmap.clone()))
+                                            }
+                                        }
+                                    },
+                                    if on { "✓ {mbox.name}" } else { "{mbox.name}" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(e) = err() {
+                div { style: "color: #e07a5f; font-size: 0.74rem; width: 100%;", "{e}" }
+            }
+        }
+    }
+}
+
+/// The message action a reader button dispatches. Carried into the async task so
+/// each `onclick` stays a plain `Fn` (no capture moved into the future).
+#[derive(Clone, PartialEq)]
+enum MailActionKind {
+    MarkRead(bool),
+    Flag(bool),
+    Move(String),
+    AddLabel(String),
+    RemoveLabel(String),
+    Archive,
+    Delete,
+    DeletePermanently,
 }
 
 /// The sanitized message body plus a per-message "Load remote images" toggle.

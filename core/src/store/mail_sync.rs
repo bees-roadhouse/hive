@@ -31,8 +31,8 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use hive_shared::InboxReason;
 use jmap_sync::{
-    BackfillOutcome, BackfillState, CursorStore, MailSink, MailboxInfo, NormalizedMessage,
-    SyncConfig, SyncCursor, SyncError, Syncer,
+    BackfillOutcome, BackfillState, CursorStore, EmailPatch, MailSink, MailboxInfo,
+    NormalizedMessage, SyncConfig, SyncCursor, SyncError, Syncer,
 };
 
 use super::mail::{MailAccountSync, MailIngestAttachment, MailIngestMessage};
@@ -63,6 +63,17 @@ const SEND_KIND: &str = "mail.send";
 /// Send jobs flushed per driver tick. Household volume is tiny; this just keeps
 /// one giant backlog from monopolizing a tick.
 const SEND_BATCH: i64 = 20;
+
+/// The outbox kind the mail ACTION path owns (read/flag/label/move/archive/
+/// delete write-back). Like `mail.send`, it is deliberately absent from the
+/// generic worker's `WORKER_OUTBOX_KINDS`, so actions wait for this driver
+/// instead of being swallowed as no-op successes. `pub(crate)` so the enqueue
+/// helpers in `mail.rs` name the same kind.
+pub(crate) const ACTION_KIND: &str = "mail.action";
+
+/// Action jobs flushed per driver tick; actions are cheap single `Email/set`
+/// calls, but this bounds a burst (e.g. flag-then-move-then-archive) per tick.
+const ACTION_BATCH: i64 = 50;
 
 fn mail_env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -520,6 +531,63 @@ struct SendJob {
     msg: OutgoingEmail,
 }
 
+// ── the message-action path (Slice C2): optimistic patch → flush via the outbox ─
+//
+// A reader action (mark read/unread, flag, edit labels, move, archive, delete)
+// calls `mail_enqueue_action`, which in ONE writer tx both patches the derived
+// `mail_messages` row (so the UI reflects it now) and serializes a durable
+// `mail.action` outbox job. The driver tick then flushes queued actions via the
+// SAME shape as sends: `connect_syncer` (decrypt the vault credential + connect),
+// `patch_email` (one `Email/set`), then `outbox_complete`/`outbox_fail` (backoff).
+// Network work stays a plain async task off the writer.
+
+/// The change one `mail.action` job applies, server-side. Each variant reduces
+/// to an [`EmailPatch`]; the store has already applied the matching optimistic
+/// patch to the derived row. Serde-tagged so the payload is self-describing and
+/// versioned by shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum MailAction {
+    /// Toggle one keyword (`$seen` = read, `$flagged` = flag).
+    SetKeyword { keyword: String, on: bool },
+    /// Replace the whole mailbox-membership set (move/archive/trash = one id;
+    /// label add/remove = the store-recomputed resulting set).
+    SetMailboxes { ids: Vec<String> },
+    /// Permanent delete (`Email/set destroy`).
+    Destroy,
+}
+
+impl MailAction {
+    /// The JMAP patch this action becomes. Mirrors the optimistic patch the
+    /// store already applied to the derived row.
+    fn to_patch(&self) -> EmailPatch {
+        match self {
+            MailAction::SetKeyword { keyword, on } => EmailPatch {
+                keywords: vec![(keyword.clone(), *on)],
+                ..Default::default()
+            },
+            MailAction::SetMailboxes { ids } => EmailPatch {
+                mailbox_ids: Some(ids.clone()),
+                ..Default::default()
+            },
+            MailAction::Destroy => EmailPatch {
+                destroy: true,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+/// The serialized `mail.action` job body: which account authenticates it, the
+/// server message id it targets, and the change. No secret (the credential is
+/// resolved at flush time from the account's vault entry).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ActionJob {
+    pub account_id: String,
+    pub jmap_id: String,
+    pub action: MailAction,
+}
+
 /// The send seam. The driver flush loop is generic over this so the
 /// claim→send→complete/fail transitions can be exercised offline (a mock
 /// transport); the real transport does the JMAP round-trip, which only a live
@@ -548,34 +616,42 @@ impl SendTransport for JmapSendTransport<'_> {
     }
 }
 
+/// Decrypt an account's vault credential and connect a [`Syncer`] for it — the
+/// preamble every outbound JMAP write shares (C1 send + C2 actions). Looks up
+/// the account's sync fields, decrypts the credential by id, builds the
+/// `SyncConfig` (username falls back to the address; the JMAP account id is
+/// pinned when known), and connects. The secret lives only inside the returned
+/// connection — it is never logged and never lands in an error string.
+async fn connect_syncer(store: &Store, account_id: &str) -> Result<Syncer> {
+    let acct = store
+        .mail_account_sync_get(account_id)
+        .await?
+        .ok_or_else(|| anyhow!("mail account {account_id} is gone"))?;
+    let cred_id = acct
+        .cred_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("account has no stored credential"))?;
+    let secret = store
+        .cc_cred_decrypt_by_id(cred_id)
+        .await
+        .context("credential vault")?
+        .ok_or_else(|| anyhow!("credential row {cred_id} is gone"))?;
+
+    let username = acct
+        .jmap_username
+        .clone()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| acct.address.clone());
+    let mut cfg = SyncConfig::new(&acct.jmap_url, username, secret);
+    if !acct.jmap_account_id.is_empty() {
+        cfg.account_id = Some(acct.jmap_account_id.clone());
+    }
+    Ok(Syncer::connect(cfg).await?)
+}
+
 impl JmapSendTransport<'_> {
     async fn send_inner(&self, account_id: &str, msg: &OutgoingEmail) -> Result<String> {
-        let acct = self
-            .store
-            .mail_account_sync_get(account_id)
-            .await?
-            .ok_or_else(|| anyhow!("mail account {account_id} is gone"))?;
-        let cred_id = acct
-            .cred_id
-            .as_deref()
-            .ok_or_else(|| anyhow!("account has no stored credential"))?;
-        let secret = self
-            .store
-            .cc_cred_decrypt_by_id(cred_id)
-            .await
-            .context("credential vault")?
-            .ok_or_else(|| anyhow!("credential row {cred_id} is gone"))?;
-
-        let username = acct
-            .jmap_username
-            .clone()
-            .filter(|u| !u.is_empty())
-            .unwrap_or_else(|| acct.address.clone());
-        let mut cfg = SyncConfig::new(&acct.jmap_url, username, secret);
-        if !acct.jmap_account_id.is_empty() {
-            cfg.account_id = Some(acct.jmap_account_id.clone());
-        }
-        let mut syncer = Syncer::connect(cfg).await?;
+        let mut syncer = connect_syncer(self.store, account_id).await?;
 
         // Fill the Drafts mailbox from local state when we already synced it;
         // otherwise send_email resolves it from the server's mailbox list.
@@ -588,6 +664,46 @@ impl JmapSendTransport<'_> {
         }
         let submission_id = syncer.send_email(&msg).await?;
         Ok(submission_id)
+    }
+}
+
+/// The action seam, mirroring [`SendTransport`]: the flush loop is generic over
+/// it so the claim→apply→complete/fail transitions run offline against a mock,
+/// while the real transport does the JMAP `Email/set`, which only a live server
+/// validates.
+#[async_trait]
+trait ActionTransport {
+    /// Apply one queued action's patch to the server message. The error string
+    /// is stored on the job (never a secret — it is the JMAP error text).
+    async fn apply(
+        &self,
+        account_id: &str,
+        jmap_id: &str,
+        patch: &EmailPatch,
+    ) -> Result<(), String>;
+}
+
+/// The production action transport: connect the account (via the shared
+/// [`connect_syncer`]) and `patch_email`.
+struct JmapActionTransport<'a> {
+    store: &'a Store,
+}
+
+#[async_trait]
+impl ActionTransport for JmapActionTransport<'_> {
+    async fn apply(
+        &self,
+        account_id: &str,
+        jmap_id: &str,
+        patch: &EmailPatch,
+    ) -> Result<(), String> {
+        async {
+            let mut syncer = connect_syncer(self.store, account_id).await?;
+            syncer.patch_email(jmap_id, patch).await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await
+        .map_err(|e| format!("{e:#}"))
     }
 }
 
@@ -665,6 +781,52 @@ impl Store {
         self.flush_send_jobs(&transport, SEND_BATCH).await
     }
 
+    /// Flush queued `mail.action` jobs through the given transport: claim due
+    /// jobs, rebuild each [`EmailPatch`] from its `MailAction` payload, apply,
+    /// complete on success / fail-with-backoff on error. Generic over the
+    /// transport so tests drive it without a network. Returns how many completed.
+    /// The derived row was already patched optimistically at enqueue time; this
+    /// only reconciles the server (a later sync delta is authoritative).
+    async fn flush_action_jobs<T: ActionTransport>(
+        &self,
+        transport: &T,
+        limit: i64,
+    ) -> Result<i64> {
+        let mut done = 0;
+        for job in self.outbox_claim(&[ACTION_KIND], limit).await? {
+            let parsed: Result<ActionJob, _> = serde_json::from_value(job.payload.clone());
+            let applied: Result<(), String> = match &parsed {
+                Ok(aj) => {
+                    transport
+                        .apply(&aj.account_id, &aj.jmap_id, &aj.action.to_patch())
+                        .await
+                }
+                // A malformed payload can never succeed; fail it (backoff then
+                // permanent) rather than looping on a parse error forever.
+                Err(e) => Err(format!("unreadable mail.action payload: {e}")),
+            };
+            match applied {
+                Ok(()) => {
+                    tracing::info!(job = %job.id, "mail action applied");
+                    self.outbox_complete(&job.id).await?;
+                    done += 1;
+                }
+                Err(reason) => {
+                    tracing::warn!(job = %job.id, attempt = job.attempts + 1, %reason, "mail action failed, will retry");
+                    self.outbox_fail(&job.id, &reason, job.attempts + 1).await?;
+                }
+            }
+        }
+        Ok(done)
+    }
+
+    /// The driver's action flush with the production JMAP transport. Called once
+    /// per tick beside the send flush.
+    async fn flush_actions(&self) -> Result<i64> {
+        let transport = JmapActionTransport { store: self };
+        self.flush_action_jobs(&transport, ACTION_BATCH).await
+    }
+
     /// ONE driver tick: every due account gets one bounded sync pass. The app
     /// spawns this on an interval (like the embed backfill). Sequential across
     /// accounts — household N is small, and the store's single writer serializes
@@ -675,13 +837,16 @@ impl Store {
     /// account's backoff (`run_account_pass`), so one broken server can't wedge
     /// the others. The scan itself failing is logged and skipped this tick.
     ///
-    /// Queued sends flush every tick regardless of whether any account was due
-    /// for a poll — a send must not wait on the account's poll cadence. Send
-    /// failures are captured by each job's own outbox backoff, so a flaky send
-    /// can't wedge the poll either.
+    /// Queued sends AND actions flush every tick regardless of whether any
+    /// account was due for a poll — neither must wait on the account's poll
+    /// cadence. Failures are captured by each job's own outbox backoff, so a
+    /// flaky send/action can't wedge the poll either.
     pub async fn mail_sync_tick(&self) -> usize {
         if let Err(e) = self.flush_sends().await {
             tracing::warn!(error = %format!("{e:#}"), "mail send flush failed");
+        }
+        if let Err(e) = self.flush_actions().await {
+            tracing::warn!(error = %format!("{e:#}"), "mail action flush failed");
         }
         let due = match self.mail_accounts_due().await {
             Ok(due) => due,
@@ -919,5 +1084,380 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("unreadable mail.send payload"));
+    }
+
+    // ── message actions (Slice C2) ──────────────────────────────────────────
+
+    /// Records the (account, jmap_id, patch) tuples it is asked to apply and
+    /// returns a scripted Ok/Err, so the action flush loop's transitions run
+    /// with no network.
+    struct MockActionTransport {
+        calls: Arc<Mutex<Vec<(String, String, EmailPatch)>>>,
+        fail: bool,
+    }
+
+    impl MockActionTransport {
+        fn ok() -> Self {
+            MockActionTransport {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                fail: false,
+            }
+        }
+        fn failing() -> Self {
+            MockActionTransport {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                fail: true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ActionTransport for MockActionTransport {
+        async fn apply(
+            &self,
+            account_id: &str,
+            jmap_id: &str,
+            patch: &EmailPatch,
+        ) -> Result<(), String> {
+            self.calls.lock().unwrap().push((
+                account_id.to_string(),
+                jmap_id.to_string(),
+                patch.clone(),
+            ));
+            if self.fail {
+                Err("server said no".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Seed one account, its inbox + archive + trash mailboxes, and one message
+    /// sitting in the inbox (unread, unflagged). Returns the mail row id.
+    async fn seed_message(store: &Store) -> String {
+        seed_account(store).await;
+        for (id, jmap, role) in [
+            ("mb-inbox", "jmbox-inbox", "inbox"),
+            ("mb-arch", "jmbox-arch", "archive"),
+            ("mb-trash", "jmbox-trash", "trash"),
+        ] {
+            store
+                .raw_sql(
+                    "INSERT INTO mail_mailboxes (id, account_id, jmap_id, name, role, ingest) \
+                     VALUES (?, 'acct-a', ?, ?, ?, TRUE)",
+                    vec![id.into(), jmap.into(), jmap.into(), role.into()],
+                )
+                .await
+                .expect("seed mailbox");
+        }
+        store
+            .raw_sql(
+                "INSERT INTO mail_messages \
+                 (id, account_id, user_scope, jmap_id, jmap_thread_id, mailbox_ids_json, \
+                  keywords_json, received_at, created_at, updated_at) \
+                 VALUES ('mail-1', 'acct-a', 'alice', 'jm-1', 'jt-1', '[\"jmbox-inbox\"]', \
+                  '{}', '2026-07-05T00:00:00.000Z', '2026-07-05T00:00:00.000Z', '2026-07-05T00:00:00.000Z')",
+                vec![],
+            )
+            .await
+            .expect("seed message");
+        "mail-1".to_string()
+    }
+
+    /// The derived row's (keywords_json, mailbox_ids_json, deleted?) as the UI
+    /// re-reads it.
+    async fn row_state(store: &Store, id: &str) -> (String, String, bool) {
+        let rows = store
+            .raw_sql(
+                "SELECT keywords_json, mailbox_ids_json, deleted_at FROM mail_messages WHERE id = ?",
+                vec![id.into()],
+            )
+            .await
+            .unwrap();
+        let r = &rows[0];
+        (
+            r[0].as_str().unwrap().to_string(),
+            r[1].as_str().unwrap().to_string(),
+            !r[2].is_null(),
+        )
+    }
+
+    fn action_of(payload: &serde_json::Value) -> MailAction {
+        let job: ActionJob = serde_json::from_value(payload.clone()).unwrap();
+        job.action
+    }
+
+    /// Marking read optimistically sets `$seen` on the derived row AND enqueues a
+    /// claimable, round-tripping `mail.action` the generic drainer ignores.
+    #[tokio::test]
+    async fn mark_read_patches_row_and_enqueues() {
+        let store = test_store();
+        let id = seed_message(&store).await;
+
+        let job_id = store.mail_mark_read(&id, true).await.unwrap();
+        assert!(job_id.starts_with("out"));
+
+        // Optimistic patch is visible immediately.
+        let (kw, mboxes, deleted) = row_state(&store, &id).await;
+        assert!(kw.contains("$seen"));
+        assert_eq!(mboxes, r#"["jmbox-inbox"]"#); // membership untouched
+        assert!(!deleted);
+
+        // A claimable mail.action with the right payload.
+        let claimed = store.outbox_claim(&[ACTION_KIND], 10).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, job_id);
+        let job: ActionJob = serde_json::from_value(claimed[0].payload.clone()).unwrap();
+        assert_eq!(job.account_id, "acct-a");
+        assert_eq!(job.jmap_id, "jm-1");
+        assert_eq!(
+            job.action,
+            MailAction::SetKeyword {
+                keyword: "$seen".into(),
+                on: true
+            }
+        );
+
+        // The generic worker drainer must NOT claim mail.action.
+        assert_eq!(store.drain_outbox().await.unwrap(), 0);
+        assert_eq!(
+            store.outbox_claim(&[ACTION_KIND], 10).await.unwrap().len(),
+            1
+        );
+    }
+
+    /// Flag toggles `$flagged`; unflag drops it (idempotent double-apply).
+    #[tokio::test]
+    async fn flag_and_unflag_patch_keyword() {
+        let store = test_store();
+        let id = seed_message(&store).await;
+
+        store.mail_set_flagged(&id, true).await.unwrap();
+        assert!(row_state(&store, &id).await.0.contains("$flagged"));
+
+        store.mail_set_flagged(&id, false).await.unwrap();
+        assert!(!row_state(&store, &id).await.0.contains("$flagged"));
+
+        // Two enqueued jobs, both SetKeyword $flagged.
+        let claimed = store.outbox_claim(&[ACTION_KIND], 10).await.unwrap();
+        assert_eq!(claimed.len(), 2);
+        for job in &claimed {
+            match action_of(&job.payload) {
+                MailAction::SetKeyword { keyword, .. } => assert_eq!(keyword, "$flagged"),
+                other => panic!("unexpected action {other:?}"),
+            }
+        }
+    }
+
+    /// Move replaces the whole membership set with the single target, and the
+    /// payload carries exactly that set.
+    #[tokio::test]
+    async fn move_replaces_mailboxes() {
+        let store = test_store();
+        let id = seed_message(&store).await;
+
+        store.mail_move(&id, "jmbox-arch").await.unwrap();
+        assert_eq!(row_state(&store, &id).await.1, r#"["jmbox-arch"]"#);
+
+        let claimed = store.outbox_claim(&[ACTION_KIND], 10).await.unwrap();
+        assert_eq!(
+            action_of(&claimed[0].payload),
+            MailAction::SetMailboxes {
+                ids: vec!["jmbox-arch".into()]
+            }
+        );
+    }
+
+    /// Label add/remove recompute the set and enqueue the FULL resulting set, so
+    /// the server patch matches the optimistic row.
+    #[tokio::test]
+    async fn label_add_then_remove_recompute_set() {
+        let store = test_store();
+        let id = seed_message(&store).await;
+
+        store.mail_add_label(&id, "jmbox-arch").await.unwrap();
+        let (_, mboxes, _) = row_state(&store, &id).await;
+        let ids: Vec<String> = serde_json::from_str(&mboxes).unwrap();
+        assert_eq!(ids, vec!["jmbox-inbox", "jmbox-arch"]);
+        let claimed = store.outbox_claim(&[ACTION_KIND], 10).await.unwrap();
+        assert_eq!(
+            action_of(&claimed[0].payload),
+            MailAction::SetMailboxes {
+                ids: vec!["jmbox-inbox".into(), "jmbox-arch".into()]
+            }
+        );
+        store.outbox_complete(&claimed[0].id).await.unwrap();
+
+        store.mail_remove_label(&id, "jmbox-arch").await.unwrap();
+        assert_eq!(row_state(&store, &id).await.1, r#"["jmbox-inbox"]"#);
+    }
+
+    /// Archive resolves the role=archive mailbox and moves there.
+    #[tokio::test]
+    async fn archive_moves_to_archive_role() {
+        let store = test_store();
+        let id = seed_message(&store).await;
+        store.mail_archive(&id).await.unwrap();
+        assert_eq!(row_state(&store, &id).await.1, r#"["jmbox-arch"]"#);
+    }
+
+    /// Delete (Apple soft delete) moves to role=trash.
+    #[tokio::test]
+    async fn delete_moves_to_trash_role() {
+        let store = test_store();
+        let id = seed_message(&store).await;
+        store.mail_delete(&id).await.unwrap();
+        assert_eq!(row_state(&store, &id).await.1, r#"["jmbox-trash"]"#);
+    }
+
+    /// A missing role mailbox surfaces a clean error (no panic), and nothing is
+    /// enqueued.
+    #[tokio::test]
+    async fn archive_without_archive_mailbox_errors_cleanly() {
+        let store = test_store();
+        seed_account(&store).await;
+        // A message but NO archive mailbox for the account.
+        store
+            .raw_sql(
+                "INSERT INTO mail_messages \
+                 (id, account_id, user_scope, jmap_id, jmap_thread_id, mailbox_ids_json, \
+                  keywords_json, received_at, created_at, updated_at) \
+                 VALUES ('mail-x', 'acct-a', 'alice', 'jm-x', 'jt-x', '[]', '{}', \
+                  '2026-07-05T00:00:00.000Z', '2026-07-05T00:00:00.000Z', '2026-07-05T00:00:00.000Z')",
+                vec![],
+            )
+            .await
+            .unwrap();
+        let err = store.mail_archive("mail-x").await.unwrap_err();
+        assert!(format!("{err:#}").contains("archive mailbox"));
+        assert_eq!(
+            store.outbox_claim(&[ACTION_KIND], 10).await.unwrap().len(),
+            0
+        );
+    }
+
+    /// Permanent delete tombstones the local row (drops it from the reader) AND
+    /// enqueues a Destroy.
+    #[tokio::test]
+    async fn permanent_delete_tombstones_and_enqueues_destroy() {
+        let store = test_store();
+        let id = seed_message(&store).await;
+
+        store.mail_delete_permanently(&id).await.unwrap();
+        // Row is soft-deleted (gone from the reader's live per-mailbox list,
+        // which filters deleted_at).
+        assert!(row_state(&store, &id).await.2);
+        assert!(store
+            .mail_messages_by_mailbox("mb-inbox", 50)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let claimed = store.outbox_claim(&[ACTION_KIND], 10).await.unwrap();
+        assert_eq!(action_of(&claimed[0].payload), MailAction::Destroy);
+    }
+
+    /// Acting on a gone message errors cleanly and enqueues nothing.
+    #[tokio::test]
+    async fn action_on_missing_message_errors() {
+        let store = test_store();
+        seed_account(&store).await;
+        assert!(store.mail_mark_read("nope", true).await.is_err());
+        assert_eq!(
+            store.outbox_claim(&[ACTION_KIND], 10).await.unwrap().len(),
+            0
+        );
+    }
+
+    /// A successful action flush completes the job and hands the transport the
+    /// rebuilt patch.
+    #[tokio::test]
+    async fn action_flush_completes_on_success() {
+        let store = test_store();
+        let id = seed_message(&store).await;
+        store.mail_mark_read(&id, true).await.unwrap();
+
+        let transport = MockActionTransport::ok();
+        let done = store
+            .flush_action_jobs(&transport, ACTION_BATCH)
+            .await
+            .unwrap();
+        assert_eq!(done, 1);
+
+        let calls = {
+            let g = transport.calls.lock().unwrap();
+            g.clone()
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "acct-a");
+        assert_eq!(calls[0].1, "jm-1");
+        assert_eq!(calls[0].2.keywords, vec![("$seen".to_string(), true)]);
+        assert!(calls[0].2.mailbox_ids.is_none());
+        assert!(!calls[0].2.destroy);
+
+        // Job done, no longer claimable.
+        assert_eq!(
+            store.outbox_claim(&[ACTION_KIND], 10).await.unwrap().len(),
+            0
+        );
+    }
+
+    /// A failed action flush stays queued with backoff (attempts++, run_after
+    /// pushed out, still pending).
+    #[tokio::test]
+    async fn action_flush_fails_with_backoff_and_stays_queued() {
+        let store = test_store();
+        let id = seed_message(&store).await;
+        store.mail_set_flagged(&id, true).await.unwrap();
+
+        let transport = MockActionTransport::failing();
+        let done = store
+            .flush_action_jobs(&transport, ACTION_BATCH)
+            .await
+            .unwrap();
+        assert_eq!(done, 0);
+        // Not immediately re-claimable (run_after in the future).
+        assert_eq!(
+            store.outbox_claim(&[ACTION_KIND], 10).await.unwrap().len(),
+            0
+        );
+        let listed = store.outbox_list(10).await.unwrap();
+        let job = listed.iter().find(|j| j.kind == ACTION_KIND).unwrap();
+        assert_eq!(job.attempts, 1);
+        assert_eq!(job.status, hive_shared::OutboxStatus::Pending);
+        assert_eq!(job.last_error.as_deref(), Some("server said no"));
+    }
+
+    /// An unreadable mail.action payload fails (with backoff), never touching the
+    /// transport.
+    #[tokio::test]
+    async fn action_flush_fails_unreadable_payload() {
+        let store = test_store();
+        store
+            .outbox_enqueue(
+                ACTION_KIND,
+                serde_json::json!({"nope": true}),
+                None,
+                "alice",
+            )
+            .await
+            .unwrap();
+
+        let transport = MockActionTransport::ok();
+        let done = store
+            .flush_action_jobs(&transport, ACTION_BATCH)
+            .await
+            .unwrap();
+        assert_eq!(done, 0);
+        assert!(transport.calls.lock().unwrap().is_empty());
+
+        let listed = store.outbox_list(10).await.unwrap();
+        let job = listed.iter().find(|j| j.kind == ACTION_KIND).unwrap();
+        assert_eq!(job.attempts, 1);
+        assert!(job
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("unreadable mail.action payload"));
     }
 }
