@@ -1158,3 +1158,239 @@ async fn actor_remove_cascades_mail_with_zero_orphans() {
         "vault credential survived the actor cascade"
     );
 }
+
+// ── mail sync DRIVER scheduling / cursor logic (Slice A) ─────────────────────
+//
+// These exercise the store-facing pieces the reconstructed driver
+// (store/mail_sync.rs) leans on WITHOUT a live JMAP server: which accounts come
+// due (enabled ∩ backoff), the cursor round-trip the CursorStore impl performs,
+// and force-resync's cursor reset. The connect→ingest network path is validated
+// on a real server (Slice A report), not here.
+
+/// mail_sync_tick's due-scan (`mail_accounts_due`) honors enabled + the
+/// per-account backoff window: a disabled account and one whose next_attempt_at
+/// is still in the future are both skipped; clearing the window brings it back.
+#[tokio::test]
+async fn driver_due_honors_enabled_and_backoff() {
+    std::env::set_var("HIVE_CRED_KEY", "mail-store-test-key");
+    let store = common::test_store().await;
+    let view = store
+        .mail_account_create(
+            "alice",
+            "due@example.test",
+            "https://mail.example.test",
+            None,
+            "acc-due",
+            "pw",
+        )
+        .await
+        .unwrap();
+
+    // Fresh + enabled → due immediately (next_attempt_at NULL).
+    assert!(
+        store
+            .mail_accounts_due()
+            .await
+            .unwrap()
+            .iter()
+            .any(|a| a.id == view.id),
+        "a fresh enabled account is due"
+    );
+
+    // Disabled → never due (even with the window clear).
+    assert!(store
+        .mail_account_set_enabled(&view.id, false)
+        .await
+        .unwrap());
+    assert!(
+        !store
+            .mail_accounts_due()
+            .await
+            .unwrap()
+            .iter()
+            .any(|a| a.id == view.id),
+        "a disabled account is skipped"
+    );
+
+    // Re-enable, then push the backoff window into the future → skipped until it
+    // elapses.
+    assert!(store
+        .mail_account_set_enabled(&view.id, true)
+        .await
+        .unwrap());
+    exec(
+        &store,
+        "UPDATE mail_accounts SET next_attempt_at = '2099-01-01T00:00:00.000Z' WHERE id = ?",
+        vec![view.id.clone().into()],
+    )
+    .await;
+    assert!(
+        !store
+            .mail_accounts_due()
+            .await
+            .unwrap()
+            .iter()
+            .any(|a| a.id == view.id),
+        "an account inside its backoff window is not due"
+    );
+
+    // An elapsed window (past timestamp) is due again.
+    exec(
+        &store,
+        "UPDATE mail_accounts SET next_attempt_at = '2000-01-01T00:00:00.000Z' WHERE id = ?",
+        vec![view.id.clone().into()],
+    )
+    .await;
+    assert!(
+        store
+            .mail_accounts_due()
+            .await
+            .unwrap()
+            .iter()
+            .any(|a| a.id == view.id),
+        "an elapsed backoff window makes the account due again"
+    );
+}
+
+/// The CursorStore round-trip: what mail_cursor_save persists, mail_cursor_load
+/// returns — including an in_progress backfill cursor (the resume anchor) and
+/// both JMAP state strings. This is exactly the load/save the driver's
+/// StoreCursor performs between backfill pages.
+#[tokio::test]
+async fn driver_cursor_roundtrips_through_the_store() {
+    std::env::set_var("HIVE_CRED_KEY", "mail-store-test-key");
+    let store = common::test_store().await;
+    let view = store
+        .mail_account_create(
+            "alice",
+            "cursor@example.test",
+            "https://mail.example.test",
+            None,
+            "acc-cur",
+            "pw",
+        )
+        .await
+        .unwrap();
+
+    // A fresh account: no email/mailbox state, backfill pending.
+    let (email, mailbox, status, cursor) = store.mail_cursor_load(&view.id).await.unwrap();
+    assert_eq!(email, None);
+    assert_eq!(mailbox, None);
+    assert_eq!(status, "pending");
+    assert!(cursor.is_none());
+
+    // Save an in-progress backfill cursor with both state strings (the shape
+    // StoreCursor writes mid-backfill).
+    let anchor = serde_json::json!({
+        "phase": "in_progress",
+        "received_at": "2026-07-04T00:00:00.000Z",
+        "jmap_id": "j-anchor"
+    });
+    store
+        .mail_cursor_save(
+            &view.id,
+            Some("email-state-1"),
+            Some("mailbox-state-1"),
+            "in_progress",
+            Some(&anchor),
+        )
+        .await
+        .unwrap();
+
+    let (email, mailbox, status, cursor) = store.mail_cursor_load(&view.id).await.unwrap();
+    assert_eq!(email.as_deref(), Some("email-state-1"));
+    assert_eq!(mailbox.as_deref(), Some("mailbox-state-1"));
+    assert_eq!(status, "in_progress");
+    assert_eq!(cursor, Some(anchor));
+
+    // Completing the backfill clears the anchor.
+    store
+        .mail_cursor_save(&view.id, Some("email-state-2"), None, "complete", None)
+        .await
+        .unwrap();
+    let (email, _mailbox, status, cursor) = store.mail_cursor_load(&view.id).await.unwrap();
+    assert_eq!(email.as_deref(), Some("email-state-2"));
+    assert_eq!(status, "complete");
+    assert!(cursor.is_none(), "a complete cursor carries no anchor");
+}
+
+/// Force-resync plants the sentinel state that routes the next delta into
+/// reconciliation AND clears the backoff, so a previously-failing account comes
+/// due again on the next tick. (Complements the lifecycle test, focused on the
+/// driver's re-arm contract.)
+#[tokio::test]
+async fn driver_force_resync_resets_cursor_and_rearms() {
+    std::env::set_var("HIVE_CRED_KEY", "mail-store-test-key");
+    let store = common::test_store().await;
+    let view = store
+        .mail_account_create(
+            "alice",
+            "resync@example.test",
+            "https://mail.example.test",
+            None,
+            "acc-rs",
+            "pw",
+        )
+        .await
+        .unwrap();
+
+    // Simulate two prior failures (attempts + a future backoff window) and a
+    // captured email state.
+    store
+        .mail_account_mark_failed(&view.id, "connect refused")
+        .await
+        .unwrap();
+    store
+        .mail_account_mark_failed(&view.id, "connect refused")
+        .await
+        .unwrap();
+    exec(
+        &store,
+        "UPDATE mail_accounts SET email_state = 'live-state' WHERE id = ?",
+        vec![view.id.clone().into()],
+    )
+    .await;
+    assert!(
+        !store
+            .mail_accounts_due()
+            .await
+            .unwrap()
+            .iter()
+            .any(|a| a.id == view.id),
+        "the backed-off account is not due before resync"
+    );
+
+    assert!(store.mail_account_force_resync(&view.id).await.unwrap());
+
+    // Sentinel state string (the ONLY deliberate route into reconcile),
+    // attempts cleared, window cleared → due again.
+    assert_eq!(
+        text_of(
+            &store,
+            "SELECT email_state FROM mail_accounts WHERE id = ?",
+            vec![view.id.clone().into()]
+        )
+        .await
+        .as_deref(),
+        Some("force-resync")
+    );
+    assert_eq!(
+        count(
+            &store,
+            "SELECT attempts FROM mail_accounts WHERE id = ?",
+            vec![view.id.clone().into()]
+        )
+        .await,
+        0,
+        "force-resync clears the attempt counter"
+    );
+    assert!(
+        store
+            .mail_accounts_due()
+            .await
+            .unwrap()
+            .iter()
+            .any(|a| a.id == view.id),
+        "force-resync re-arms the account so the next tick runs it"
+    );
+}

@@ -39,6 +39,7 @@ pub mod inbox;
 pub mod journal;
 pub mod links;
 pub mod mail;
+pub mod mail_sync;
 pub mod maintenance;
 pub mod outbox;
 pub mod people;
