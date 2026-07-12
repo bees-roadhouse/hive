@@ -3202,7 +3202,11 @@ fn ContactsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
                 if let Some(Selected::Contact(id)) = card_sel() {
                     // Key on the id so switching contacts makes a fresh card
                     // instance (fresh resource + cleared group-input state).
-                    ContactCard { key: "{id}", store, card_sel, refresh, local_refresh, id }
+                    // `id` is cloned for the prop so the `key: "{id}"` borrow
+                    // survives it — the move-then-borrow otherwise borrow-checks
+                    // clean in debug but FAILS in release (opt-level temporary
+                    // lifetime difference), which is why CI/debug missed it.
+                    ContactCard { key: "{id}", store, card_sel, refresh, local_refresh, id: id.clone() }
                 } else {
                     {contact_empty_state()}
                 }
