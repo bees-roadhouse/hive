@@ -9,7 +9,8 @@ use jmap_client::client::{Client, Credentials};
 use jmap_client::core::error::MethodErrorType;
 use jmap_client::core::query::{Filter as CoreFilter, QueryResponse};
 use jmap_client::core::response::{
-    EmailGetResponse, IdentityGetResponse, MailboxGetResponse, MethodResponse, TaggedMethodResponse,
+    EmailGetResponse, EmailSetResponse, IdentityGetResponse, MailboxGetResponse, MethodResponse,
+    TaggedMethodResponse,
 };
 use jmap_client::core::set::SetObject;
 use jmap_client::email::{self, Email, EmailBodyPart, Property};
@@ -17,7 +18,7 @@ use jmap_client::email_submission::Address as SubmissionAddress;
 use jmap_client::mailbox::{self, Role};
 use jmap_client::{DataType, Error as JmapError};
 
-use crate::{AttachmentMeta, MailboxInfo, OutgoingEmail, SyncConfig, SyncError};
+use crate::{AttachmentMeta, EmailPatch, MailboxInfo, OutgoingEmail, SyncConfig, SyncError};
 
 pub(crate) type DoorbellStream = Pin<Box<dyn Stream<Item = Result<(), SyncError>> + Send>>;
 
@@ -457,6 +458,47 @@ impl RawClient {
             .id()
             .map(|s| s.to_string())
             .ok_or_else(|| SyncError::Protocol("submission created without an id".into()))
+    }
+
+    /// One `Email/set` that either destroys the message or patches its keywords
+    /// and/or mailbox membership. Mirrors the vendored `email_set_keyword` /
+    /// `email_set_mailboxes` / `email_destroy` helpers: a per-keyword `keyword`
+    /// call is a partial patch (`keywords/<name>` → bool) that leaves other
+    /// keywords intact, while `mailbox_ids([...])` replaces the whole membership
+    /// set. `.updated(id)` / `.destroyed(id)` fold the server's `notUpdated` /
+    /// `notDestroyed` entry into an error.
+    pub(crate) async fn patch_email(
+        &self,
+        jmap_id: &str,
+        patch: &EmailPatch,
+    ) -> Result<(), SyncError> {
+        let mut request = self.inner.build();
+        if patch.destroy {
+            request.set_email().destroy([jmap_id]);
+            request
+                .send_single::<EmailSetResponse>()
+                .await
+                .map_err(map_err)?
+                .destroyed(jmap_id)
+                .map_err(map_err)
+        } else {
+            {
+                let email = request.set_email().update(jmap_id);
+                for (keyword, on) in &patch.keywords {
+                    email.keyword(keyword, *on);
+                }
+                if let Some(ids) = &patch.mailbox_ids {
+                    email.mailbox_ids(ids.iter().map(|s| s.as_str()));
+                }
+            }
+            request
+                .send_single::<EmailSetResponse>()
+                .await
+                .map_err(map_err)?
+                .updated(jmap_id)
+                .map(|_| ())
+                .map_err(map_err)
+        }
     }
 
     /// An SSE doorbell: yields `()` whenever the server reports an Email

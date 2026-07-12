@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::cc_credentials::NewCcCredential;
+use super::mail_sync::{ActionJob, MailAction, ACTION_KIND};
 use super::{new_id, now_iso, Core, Draft, Store};
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,6 +71,7 @@ struct MailMessageRow {
     pub account_id: String,
     pub thread_id: String,
     pub labels_json: String,
+    pub mailbox_ids_json: String,
     pub subject: String,
     pub from_name: Option<String>,
     pub from_email: String,
@@ -87,6 +89,11 @@ pub struct MailMessageSummary {
     pub thread_id: String,
     pub account_id: String,
     pub labels: Vec<String>,
+    /// Raw JMAP mailbox ids this message belongs to (folder/label membership) —
+    /// the reader uses it to render which label mailboxes are currently on. This
+    /// is the derived `mailbox_ids_json` array, deserialized; empty when the row
+    /// carries none. Derived-read-only (no fold surface).
+    pub mailbox_ids: Vec<String>,
     pub from: String,
     pub to: Vec<String>,
     pub cc: Vec<String>,
@@ -163,6 +170,7 @@ impl From<MailMessageRow> for MailThreadMessage {
             thread_id: row.thread_id,
             account_id: row.account_id,
             labels: mail_labels(&row.labels_json),
+            mailbox_ids: serde_json::from_str(&row.mailbox_ids_json).unwrap_or_default(),
             from,
             to: json_string_array(&row.to_json),
             cc: json_string_array(&row.cc_json),
@@ -267,12 +275,72 @@ fn json_string_array(raw: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+// ── optimistic-patch primitives (pure; unit-tested) ─────────────────────────
+//
+// These transform the two derived JSON columns a message action mutates, so the
+// UI reflects the change the instant the store call returns (the server
+// round-trip then reconciles). They are deliberately store-free and
+// deterministic (serde_json::Map is a BTreeMap → sorted keys), so the same
+// input always yields byte-identical output and repeated application is a no-op.
+
+/// Set or clear one keyword in a `keywords_json` object (`{"$seen": true}` shape).
+/// `on` inserts `keyword: true`; `!on` removes the key entirely (unread = the
+/// object simply lacks `$seen`, matching the reader's `NOT LIKE '%"$seen"%'`).
+/// A non-object / unparseable input is treated as an empty object. Idempotent:
+/// setting a present keyword or removing an absent one re-serializes unchanged.
+pub fn kw_set(keywords_json: &str, keyword: &str, on: bool) -> String {
+    let mut map = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(keywords_json)
+        .unwrap_or_default();
+    if on {
+        map.insert(keyword.to_string(), serde_json::Value::Bool(true));
+    } else {
+        map.remove(keyword);
+    }
+    serde_json::Value::Object(map).to_string()
+}
+
+/// Parse a `mailbox_ids_json` array into a de-duplicated, insertion-ordered
+/// list. A non-array / unparseable input becomes empty.
+fn mbox_parse(mailbox_ids_json: &str) -> Vec<String> {
+    let raw: Vec<String> = serde_json::from_str(mailbox_ids_json).unwrap_or_default();
+    let mut seen = HashSet::new();
+    raw.into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
+}
+
+/// Replace the whole membership set with exactly `[id]` (move / archive / trash).
+pub fn mbox_replace(_mailbox_ids_json: &str, id: &str) -> String {
+    serde_json::Value::Array(vec![serde_json::Value::String(id.to_string())]).to_string()
+}
+
+/// Add `id` to the membership set if absent (label add). Idempotent — adding a
+/// present id re-serializes unchanged; existing order is preserved.
+pub fn mbox_add(mailbox_ids_json: &str, id: &str) -> String {
+    let mut ids = mbox_parse(mailbox_ids_json);
+    if !ids.iter().any(|x| x == id) {
+        ids.push(id.to_string());
+    }
+    serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into())
+}
+
+/// Remove `id` from the membership set (label remove). Idempotent — removing an
+/// absent id is a no-op.
+pub fn mbox_remove(mailbox_ids_json: &str, id: &str) -> String {
+    let ids: Vec<String> = mbox_parse(mailbox_ids_json)
+        .into_iter()
+        .filter(|x| x != id)
+        .collect();
+    serde_json::to_string(&ids).unwrap_or_else(|_| "[]".into())
+}
+
 fn row_to_message(r: &rusqlite::Row) -> rusqlite::Result<MailMessageRow> {
     Ok(MailMessageRow {
         id: r.get("id")?,
         account_id: r.get("account_id")?,
         thread_id: r.get("thread_id")?,
         labels_json: r.get("labels_json")?,
+        mailbox_ids_json: r.get("mailbox_ids_json")?,
         subject: r.get("subject")?,
         from_name: r.get("from_name")?,
         from_email: r.get("from_email")?,
@@ -869,6 +937,283 @@ impl Store {
     }
 }
 
+// ── message actions (Slice C2): optimistic derived-row patch + durable enqueue ─
+//
+// Each action mutates the sync-derived `mail_messages` row optimistically (so
+// the reader reflects it instantly) AND enqueues a `mail.action` outbox job the
+// driver later pushes to the server via `Email/set` — the exact durable pattern
+// C1 (compose/send) established, one seam over. The optimistic patch is a
+// `module.doc` message update carrying ONLY the two mutable JSON columns
+// (`keywords_json` / `mailbox_ids_json`) — identical in shape to the update arm
+// the sync ingest already writes on a delta, so it is fold-safe (derived table,
+// existing fold route, no DDL). Both the patch and the outbox insert happen in
+// ONE writer closure so the UI never sees a patched row without its queued job.
+
+/// The reader's intent, resolved against the current row inside the enqueue
+/// transaction. Keyword/replace are pure functions of the action; label add/
+/// remove and permanent delete need the live row (its current membership /
+/// existence), so they resolve here to keep the read→compute→patch→enqueue
+/// atomic and race-free.
+enum ActionIntent {
+    /// `$seen` (read) / `$flagged` (flag) on or off.
+    Keyword { keyword: String, on: bool },
+    /// Replace the whole membership set with a single mailbox (move/archive/trash).
+    ReplaceMailboxes { jmap_id: String },
+    /// Add the message to a label mailbox (recompute-and-replace).
+    AddLabel { jmap_id: String },
+    /// Remove the message from a label mailbox (recompute-and-replace).
+    RemoveLabel { jmap_id: String },
+    /// Permanent delete: drop the local row (tombstone, like the JMAP-destroy
+    /// sink path) AND enqueue a server `destroy`.
+    Destroy,
+}
+
+impl Store {
+    /// Mark a message read (`on = true`) or unread. Optimistic `$seen` toggle +
+    /// a `mail.action` job. Returns the outbox job id.
+    pub async fn mail_mark_read(&self, message_id: &str, read: bool) -> Result<String> {
+        self.mail_enqueue_action(
+            message_id,
+            ActionIntent::Keyword {
+                keyword: "$seen".into(),
+                on: read,
+            },
+        )
+        .await
+    }
+
+    /// Flag (`on = true`) or unflag a message. Optimistic `$flagged` toggle + job.
+    pub async fn mail_set_flagged(&self, message_id: &str, on: bool) -> Result<String> {
+        self.mail_enqueue_action(
+            message_id,
+            ActionIntent::Keyword {
+                keyword: "$flagged".into(),
+                on,
+            },
+        )
+        .await
+    }
+
+    /// Move a message to a single target mailbox (by its JMAP id), replacing its
+    /// whole folder/label membership. Optimistic replace + job.
+    pub async fn mail_move(
+        &self,
+        message_id: &str,
+        target_mailbox_jmap_id: &str,
+    ) -> Result<String> {
+        self.mail_enqueue_action(
+            message_id,
+            ActionIntent::ReplaceMailboxes {
+                jmap_id: target_mailbox_jmap_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Add a message to a label mailbox (keeps its other memberships). Optimistic
+    /// add (recompute-and-replace) + job.
+    pub async fn mail_add_label(&self, message_id: &str, mailbox_jmap_id: &str) -> Result<String> {
+        self.mail_enqueue_action(
+            message_id,
+            ActionIntent::AddLabel {
+                jmap_id: mailbox_jmap_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Remove a message from a label mailbox. Optimistic remove + job.
+    pub async fn mail_remove_label(
+        &self,
+        message_id: &str,
+        mailbox_jmap_id: &str,
+    ) -> Result<String> {
+        self.mail_enqueue_action(
+            message_id,
+            ActionIntent::RemoveLabel {
+                jmap_id: mailbox_jmap_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// Archive a message: resolve the account's role=archive mailbox and move to
+    /// it. Errors cleanly (no panic) when the account has no Archive mailbox.
+    pub async fn mail_archive(&self, message_id: &str) -> Result<String> {
+        let target = self.mail_action_role_target(message_id, "archive").await?;
+        self.mail_move(message_id, &target).await
+    }
+
+    /// Delete a message the Apple way: move it to the account's role=trash
+    /// mailbox (soft delete). Errors cleanly when there is no Trash mailbox. A
+    /// message already in Trash is deleted for good via
+    /// [`Store::mail_delete_permanently`].
+    pub async fn mail_delete(&self, message_id: &str) -> Result<String> {
+        let target = self.mail_action_role_target(message_id, "trash").await?;
+        self.mail_move(message_id, &target).await
+    }
+
+    /// Permanently delete a message: tombstone the local row (drops it from the
+    /// reader + retrieval, exactly like the JMAP-destroy sink) AND enqueue a
+    /// server `Email/set destroy`. Used from the Trash folder only.
+    pub async fn mail_delete_permanently(&self, message_id: &str) -> Result<String> {
+        self.mail_enqueue_action(message_id, ActionIntent::Destroy)
+            .await
+    }
+
+    /// Resolve an account-role mailbox jmap id for the account that owns
+    /// `message_id`, mapping an absent role mailbox to a clean, surfaced error.
+    async fn mail_action_role_target(&self, message_id: &str, role: &str) -> Result<String> {
+        let message_id = message_id.to_string();
+        let account_id = self
+            .run(move |core| {
+                Ok(core
+                    .conn()
+                    .query_row(
+                        "SELECT account_id FROM mail_messages WHERE id = ?1 AND deleted_at IS NULL",
+                        rusqlite::params![message_id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?)
+            })
+            .await?
+            .ok_or_else(|| anyhow!("message not found"))?;
+        self.mail_mailbox_jmap_by_role(&account_id, role)
+            .await?
+            .ok_or_else(|| anyhow!("this account has no {role} mailbox"))
+    }
+
+    /// The one writer transaction behind every action: read the live row, apply
+    /// the optimistic patch to the derived `mail_messages` row (via the existing
+    /// `module.doc` update route, or a tombstone for a permanent delete), and
+    /// enqueue the matching `mail.action` outbox job — atomically. Returns the
+    /// outbox job id. NO fold change (derived table + runtime outbox only).
+    async fn mail_enqueue_action(&self, message_id: &str, intent: ActionIntent) -> Result<String> {
+        let message_id = message_id.to_string();
+        let (job_id, owner) = self
+            .run(move |core| {
+                // The live row: its server id, account, owner, and the two
+                // mutable JSON columns the patch derives from.
+                let row: Option<(String, String, String, String, String)> = core
+                    .conn()
+                    .query_row(
+                        "SELECT account_id, jmap_id, user_scope, keywords_json, mailbox_ids_json \
+                         FROM mail_messages WHERE id = ?1 AND deleted_at IS NULL",
+                        rusqlite::params![message_id],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, String>(3)?,
+                                r.get::<_, String>(4)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((account_id, jmap_id, owner, keywords_json, mailbox_ids_json)) = row else {
+                    return Err(anyhow!("message {message_id} not found"));
+                };
+
+                let ts = now_iso();
+                // Resolve the intent to (the optimistic field patch, the wire
+                // action). `patch_fields` carries only the changed JSON column(s).
+                let mut patch_fields = serde_json::Map::new();
+                let (action, tombstone) = match &intent {
+                    ActionIntent::Keyword { keyword, on } => {
+                        patch_fields.insert(
+                            "keywords_json".into(),
+                            json!(kw_set(&keywords_json, keyword, *on)),
+                        );
+                        (
+                            MailAction::SetKeyword {
+                                keyword: keyword.clone(),
+                                on: *on,
+                            },
+                            false,
+                        )
+                    }
+                    ActionIntent::ReplaceMailboxes { jmap_id: target } => {
+                        let next = mbox_replace(&mailbox_ids_json, target);
+                        patch_fields.insert("mailbox_ids_json".into(), json!(next));
+                        (
+                            MailAction::SetMailboxes {
+                                ids: vec![target.clone()],
+                            },
+                            false,
+                        )
+                    }
+                    ActionIntent::AddLabel { jmap_id: mbox } => {
+                        let next = mbox_add(&mailbox_ids_json, mbox);
+                        let ids: Vec<String> = serde_json::from_str(&next).unwrap_or_default();
+                        patch_fields.insert("mailbox_ids_json".into(), json!(next));
+                        (MailAction::SetMailboxes { ids }, false)
+                    }
+                    ActionIntent::RemoveLabel { jmap_id: mbox } => {
+                        let next = mbox_remove(&mailbox_ids_json, mbox);
+                        let ids: Vec<String> = serde_json::from_str(&next).unwrap_or_default();
+                        patch_fields.insert("mailbox_ids_json".into(), json!(next));
+                        (MailAction::SetMailboxes { ids }, false)
+                    }
+                    ActionIntent::Destroy => (MailAction::Destroy, true),
+                };
+
+                // The optimistic derived-row write: a tombstone for a permanent
+                // delete (drops it from reader + retrieval), else a module.doc
+                // update carrying only the changed JSON column(s) — the same
+                // shape sync ingest writes on a delta (fold-safe).
+                let mut drafts = Vec::new();
+                if tombstone {
+                    drafts.push(Draft::new(
+                        crate::oplog::kind::TOMBSTONE,
+                        &owner,
+                        &ts,
+                        json!({"kind": "mail", "id": message_id}),
+                    ));
+                } else {
+                    patch_fields.insert("updated_at".into(), json!(ts));
+                    drafts.push(Draft::new(
+                        crate::oplog::kind::MODULE_DOC,
+                        &owner,
+                        &ts,
+                        json!({"module": "mail", "doc_kind": "message", "id": message_id,
+                               "fields": serde_json::Value::Object(patch_fields)}),
+                    ));
+                }
+                core.commit(drafts)?;
+                if tombstone {
+                    // The fold dropped the persisted vectors; forget the ANN
+                    // entries too (mirrors mail_tombstone_batch).
+                    core.index.remove_embeddings("mail", &message_id)?;
+                }
+
+                // The durable job, inserted in the SAME writer tx so the patch
+                // and the queued work commit together. No secret in the payload.
+                let payload = serde_json::to_value(ActionJob {
+                    account_id,
+                    jmap_id,
+                    action,
+                })?;
+                let job_id = new_id("out");
+                core.conn().execute(
+                    "INSERT INTO outbox (id, kind, payload, status, attempts, last_error, run_after, created_at, completed_at) \
+                     VALUES (?1, ?2, ?3, 'pending', 0, NULL, ?4, ?4, NULL)",
+                    rusqlite::params![job_id, ACTION_KIND, payload.to_string(), ts],
+                )?;
+                Ok((job_id, owner))
+            })
+            .await?;
+        // Same post-enqueue signal the generic outbox_enqueue emits.
+        self.emit(
+            "outbox.enqueued",
+            &owner,
+            json!({"id": job_id, "kind": ACTION_KIND}),
+        )
+        .await?;
+        Ok(job_id)
+    }
+}
+
 const MAIL_ACCOUNT_ADMIN_SELECT: &str =
     "SELECT id, owner, address, jmap_url, jmap_username, jmap_account_id, backfill_status, \
      enabled, attempts, last_error, last_synced_at, last_status, created_at FROM mail_accounts";
@@ -876,7 +1221,7 @@ const MAIL_ACCOUNT_ADMIN_SELECT: &str =
 fn mail_message_select(suffix: &str) -> String {
     format!(
         "SELECT m.id, m.account_id, m.jmap_thread_id AS thread_id, m.keywords_json AS labels_json, \
-         m.subject, m.from_name, m.from_addr AS from_email, m.to_json, m.cc_json, \
+         m.mailbox_ids_json, m.subject, m.from_name, m.from_addr AS from_email, m.to_json, m.cc_json, \
          m.received_at, m.snippet, m.body_text, m.has_attachments \
          FROM mail_messages m \
          JOIN mail_accounts a ON a.id = m.account_id {suffix}"
@@ -1992,4 +2337,102 @@ fn gc_orphan_blobs(core: &mut Core, cutoff: Option<&str>) -> Result<u64> {
         }
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod action_helper_tests {
+    use super::{kw_set, mbox_add, mbox_remove, mbox_replace};
+    use std::collections::BTreeMap;
+
+    /// Parse a keywords_json object into a sorted map so assertions don't depend
+    /// on serialization order (which is stable, but this reads clearer).
+    fn kw_map(json: &str) -> BTreeMap<String, bool> {
+        serde_json::from_str::<BTreeMap<String, serde_json::Value>>(json)
+            .unwrap()
+            .into_iter()
+            .map(|(k, v)| (k, v.as_bool().unwrap_or(false)))
+            .collect()
+    }
+
+    fn ids(json: &str) -> Vec<String> {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn kw_set_adds_and_removes() {
+        // Add $seen to an object that already has a user keyword.
+        let after = kw_set(r#"{"work":true}"#, "$seen", true);
+        assert_eq!(
+            kw_map(&after),
+            BTreeMap::from([("work".to_string(), true), ("$seen".to_string(), true)])
+        );
+        // Removing $seen drops the key entirely (unread = object lacks $seen).
+        let unread = kw_set(&after, "$seen", false);
+        assert_eq!(
+            kw_map(&unread),
+            BTreeMap::from([("work".to_string(), true)])
+        );
+        assert!(!unread.contains("$seen"));
+    }
+
+    #[test]
+    fn kw_set_is_idempotent_and_deterministic() {
+        // Marking read twice = one $seen, byte-identical output.
+        let once = kw_set(r#"{}"#, "$seen", true);
+        let twice = kw_set(&once, "$seen", true);
+        assert_eq!(once, twice);
+        // Removing an absent keyword is a no-op.
+        assert_eq!(
+            kw_set(r#"{"$seen":true}"#, "$flagged", false),
+            r#"{"$seen":true}"#
+        );
+        // Deterministic across differently-ordered equivalent inputs (BTreeMap
+        // sorts keys) — both normalize to the same string.
+        assert_eq!(
+            kw_set(r#"{"b":true,"a":true}"#, "$seen", true),
+            kw_set(r#"{"a":true,"b":true}"#, "$seen", true)
+        );
+        // Unparseable input is treated as an empty object.
+        assert_eq!(kw_set("not json", "$seen", true), r#"{"$seen":true}"#);
+    }
+
+    #[test]
+    fn mbox_replace_collapses_to_single() {
+        assert_eq!(ids(&mbox_replace(r#"["a","b","c"]"#, "z")), vec!["z"]);
+        assert_eq!(ids(&mbox_replace("[]", "z")), vec!["z"]);
+        // Idempotent.
+        let once = mbox_replace(r#"["a"]"#, "z");
+        assert_eq!(mbox_replace(&once, "z"), once);
+    }
+
+    #[test]
+    fn mbox_add_is_idempotent() {
+        let added = mbox_add(r#"["a"]"#, "b");
+        assert_eq!(ids(&added), vec!["a", "b"]);
+        // Adding a present id changes nothing (round-trips unchanged).
+        assert_eq!(mbox_add(&added, "b"), added);
+        assert_eq!(mbox_add(&added, "a"), added);
+        // Adding to an empty / unparseable set.
+        assert_eq!(ids(&mbox_add("[]", "a")), vec!["a"]);
+        assert_eq!(ids(&mbox_add("garbage", "a")), vec!["a"]);
+    }
+
+    #[test]
+    fn mbox_remove_is_idempotent_noop_when_absent() {
+        let removed = mbox_remove(r#"["a","b"]"#, "a");
+        assert_eq!(ids(&removed), vec!["b"]);
+        // Removing an absent label is a no-op.
+        assert_eq!(mbox_remove(&removed, "a"), removed);
+        assert_eq!(mbox_remove(r#"["a","b"]"#, "z"), r#"["a","b"]"#);
+        // Removing the last id yields an empty array.
+        assert_eq!(mbox_remove(r#"["a"]"#, "a"), "[]");
+    }
+
+    #[test]
+    fn add_then_remove_round_trips() {
+        let start = r#"["inbox"]"#;
+        let with_label = mbox_add(start, "important");
+        let back = mbox_remove(&with_label, "important");
+        assert_eq!(ids(&back), ids(start));
+    }
 }
