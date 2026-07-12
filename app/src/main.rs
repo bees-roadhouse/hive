@@ -2106,32 +2106,46 @@ fn identity_row(
                     div {
                         style: "display: flex; align-items: center; gap: 0.45rem; flex-wrap: wrap; \
                                 justify-content: flex-end;",
-                        // Set-as-owner: repoint identity.owner at this slug (cheap, allowed).
-                        {
-                            let set_slug = person.slug.clone();
-                            rsx! {
-                                button {
-                                    id: "identity-setowner-{person.slug}",
-                                    disabled: busy(),
-                                    style: "background: {BG}; color: {DIM}; border: 1px solid {EDGE}; \
-                                            border-radius: 999px; padding: 0.25rem 0.7rem; font: inherit; \
-                                            font-size: 0.74rem; font-weight: 600; cursor: pointer;",
-                                    onclick: move |_| {
-                                        if busy() { return; }
-                                        let set_slug = set_slug.clone();
-                                        let store = store();
-                                        busy.set(true);
-                                        err.set(None);
-                                        spawn(async move {
-                                            match store.config_set(IDENTITY_OWNER_KEY, &set_slug).await {
-                                                Ok(()) => refresh += 1,
-                                                Err(e) => err.set(Some(format!("{e:#}"))),
-                                            }
-                                            busy.set(false);
-                                        });
-                                    },
-                                    "Set as owner"
+                        // "This is me": designate the OWNER. Only a HUMAN identity can
+                        // be the owner — an AI identity is owned BY you, never the
+                        // owner, so this control is withheld on AI rows (clicking it
+                        // on e.g. `pia` would have made pia the owner = made you pia).
+                        if !is_ai {
+                            {
+                                let set_slug = person.slug.clone();
+                                rsx! {
+                                    button {
+                                        id: "identity-setowner-{person.slug}",
+                                        disabled: busy(),
+                                        style: "background: {BG}; color: {DIM}; border: 1px solid {EDGE}; \
+                                                border-radius: 999px; padding: 0.25rem 0.7rem; font: inherit; \
+                                                font-size: 0.74rem; font-weight: 600; cursor: pointer;",
+                                        onclick: move |_| {
+                                            if busy() { return; }
+                                            let set_slug = set_slug.clone();
+                                            let store = store();
+                                            busy.set(true);
+                                            err.set(None);
+                                            spawn(async move {
+                                                match store.config_set(IDENTITY_OWNER_KEY, &set_slug).await {
+                                                    Ok(()) => refresh += 1,
+                                                    Err(e) => err.set(Some(format!("{e:#}"))),
+                                                }
+                                                busy.set(false);
+                                            });
+                                        },
+                                        "This is me"
+                                    }
                                 }
+                            }
+                        }
+                        // AI row with no human owner bound yet: it can't be claimed
+                        // until you designate yourself, so guide instead of leaving a
+                        // footgun. (Once an owner exists, "Claim as mine" appears below.)
+                        if is_ai && !has_owner {
+                            span {
+                                style: "font-size: 0.72rem; color: {FAINT};",
+                                "Set yourself (a human identity) as owner first, then claim this agent"
                             }
                         }
                         // AI: claim (link to you) unless already owned by you.
