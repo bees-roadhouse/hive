@@ -150,19 +150,43 @@ impl Store {
                     priority: patch.priority.unwrap_or(current.priority),
                     tags: patch.tags.unwrap_or(current.tags),
                     assignees: patch.assignees.unwrap_or(current.assignees),
+                    // Double Option (like EventPatch::at): absent keeps, null
+                    // clears to NULL, value sets. The fold's bind_value maps a
+                    // JSON null to SQL NULL, so an explicit clear round-trips.
+                    project: match &patch.project {
+                        Some(v) => v.clone(),
+                        None => current.project,
+                    },
+                    due: match &patch.due {
+                        Some(v) => v.clone(),
+                        None => current.due,
+                    },
                     updated_at: now_iso(),
                     ..current
                 };
+                // Emit only the fields this update touches. `project`/`due` are
+                // included ONLY when the patch specifies them (Some(_)) — so a
+                // task whose list/due wasn't edited produces the byte-identical
+                // record it always did. A specified clear emits JSON null →
+                // SQL NULL via the generic entity_update → update_row path.
+                let mut fields = json!({
+                    "title": next.title, "body": next.body,
+                    "status": next.status.as_str(), "priority": next.priority.as_str(),
+                    "tags": to_json(&next.tags), "assignees": to_json(&next.assignees),
+                    "updated_at": next.updated_at,
+                });
+                let map = fields.as_object_mut().expect("fields is an object");
+                if patch.project.is_some() {
+                    map.insert("project".into(), json!(next.project));
+                }
+                if patch.due.is_some() {
+                    map.insert("due".into(), json!(next.due));
+                }
                 core.commit(vec![Draft::new(
                     crate::oplog::kind::ENTITY_UPDATE,
                     &actor_s,
                     &next.updated_at,
-                    json!({"kind": "task", "id": next.id, "fields": {
-                        "title": next.title, "body": next.body,
-                        "status": next.status.as_str(), "priority": next.priority.as_str(),
-                        "tags": to_json(&next.tags), "assignees": to_json(&next.assignees),
-                        "updated_at": next.updated_at,
-                    }}),
+                    json!({"kind": "task", "id": next.id, "fields": fields}),
                 )])?;
                 Ok(Some(next))
             })
