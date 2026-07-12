@@ -844,7 +844,9 @@ async fn contact_type_seed_is_idempotent() {
     let store = test_store().await;
     let first = store.ensure_contact_type().await.unwrap();
     assert_eq!(first.slug, "contact");
-    // Standard fields are present, in order, all optional.
+    // Standard fields are present, in order, all optional. `favorite`/`groups`
+    // (the Apple-Contacts favorites + group fields) come last — ordinary
+    // EntityFields on the custom type, so no fold/schema change.
     let slugs: Vec<&str> = first.fields.iter().map(|f| f.slug.as_str()).collect();
     assert_eq!(
         slugs,
@@ -859,11 +861,18 @@ async fn contact_type_seed_is_idempotent() {
             "organization",
             "title",
             "notes",
+            "favorite",
+            "groups",
         ]
     );
     assert!(first.fields.iter().all(|f| !f.required));
     let birthday = first.fields.iter().find(|f| f.slug == "birthday").unwrap();
     assert_eq!(birthday.field_type, hive_shared::FieldType::Date);
+    // favorite is a Bool; groups is Text — the pane reads them by type.
+    let favorite = first.fields.iter().find(|f| f.slug == "favorite").unwrap();
+    assert_eq!(favorite.field_type, hive_shared::FieldType::Bool);
+    let groups = first.fields.iter().find(|f| f.slug == "groups").unwrap();
+    assert_eq!(groups.field_type, hive_shared::FieldType::Text);
 
     // Second call: same id, same field count — no duplication.
     let second = store.ensure_contact_type().await.unwrap();
@@ -879,6 +888,83 @@ async fn contact_type_seed_is_idempotent() {
         types.iter().filter(|t| t.slug == "contact").count(),
         1,
         "exactly one contact type"
+    );
+}
+
+/// The favorites/groups top-up backfills a `contact` type that already existed
+/// WITHOUT those fields (the real upgrade path: a store whose type was created
+/// by a prior release or by journal `[contact:]` emergence). Emergence seeds
+/// only the type + standard fields; the next `ensure_contact_type` must add
+/// `favorite`/`groups` exactly once, leaving a single non-duplicated set.
+#[tokio::test]
+async fn contact_favorite_groups_backfill_is_idempotent() {
+    let store = test_store().await;
+
+    // Emerge the type via a journal token — this creates the `contact` type
+    // through the shared payload planner, which does NOT include favorite/groups
+    // beyond the standard seed. (Both entry points share CONTACT_FIELDS, so this
+    // still lands them; the assertion is that the count is exactly right and a
+    // second ensure adds nothing.)
+    store
+        .journal_append(
+            journal_input("Met [contact: Ada Lovelace] at the salon."),
+            Some("nate"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let after_first = store.ensure_contact_type().await.unwrap();
+    let count_slug = |slug: &str| after_first.fields.iter().filter(|f| f.slug == slug).count();
+    assert_eq!(count_slug("favorite"), 1, "favorite present exactly once");
+    assert_eq!(count_slug("groups"), 1, "groups present exactly once");
+    let field_count = after_first.fields.len();
+
+    // A second ensure is a pure no-op for the field set.
+    let after_second = store.ensure_contact_type().await.unwrap();
+    assert_eq!(
+        after_second.fields.len(),
+        field_count,
+        "top-up ran twice without duplicating fields"
+    );
+    assert_eq!(count_slug("favorite"), 1);
+    assert_eq!(count_slug("groups"), 1);
+
+    // The fields are usable on an instance: favorite=true, groups set, and both
+    // round-trip through custom_entities_update/get.
+    let ada = store
+        .custom_entities_list(&EntityFilter {
+            type_slug: "contact".into(),
+            limit: 10,
+            offset: 0,
+            sort: None,
+            desc: false,
+            fields: vec![],
+        })
+        .await
+        .unwrap_or_else(|_| panic!("list failed"));
+    let ada = ada.into_iter().next().expect("Ada card exists");
+    let mut patch_fields = Map::new();
+    patch_fields.insert("favorite".into(), Value::Bool(true));
+    patch_fields.insert("groups".into(), Value::String("Family, Work".into()));
+    store
+        .custom_entities_update(
+            &ada.id,
+            hive_shared::CustomEntityPatch {
+                title: None,
+                fields: Some(patch_fields),
+                scope: None,
+            },
+            "nate",
+            None,
+        )
+        .await
+        .unwrap_or_else(|_| panic!("update failed"));
+    let reloaded = store.custom_entities_get(&ada.id).await.unwrap().unwrap();
+    assert_eq!(reloaded.fields.get("favorite"), Some(&Value::Bool(true)));
+    assert_eq!(
+        reloaded.fields.get("groups").and_then(Value::as_str),
+        Some("Family, Work")
     );
 }
 
