@@ -47,6 +47,13 @@ jobs:
       - name: Cargo build
         run: cargo build --workspace --all-targets
 
+      # The flatpak ships the RELEASE binary, and borrow-check can differ
+      # between opt levels (temporary lifetimes): a move-then-borrow that
+      # passes in debug/clippy/test can fail only under --release. Build the
+      # app in release so that class is caught in CI, not at packaging time.
+      - name: Cargo build (release, app)
+        run: cargo build --release -p hive-app
+
       - name: Cargo test
         # Belt and braces: hive-core injects the hash embedder in tests, but
         # hive-embed's own default (no HIVE_EMBED) is the transformers
