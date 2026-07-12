@@ -1328,6 +1328,16 @@ pub struct TaskPatch {
     pub body: Option<String>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// The list a task belongs to (its `project`). Double Option like
+    /// `EventPatch::at`: absent = keep, null = clear (No List), value = set. The
+    /// `project`/`due` columns already exist and the generic entity_update maps
+    /// them, so this persists without a fold change.
+    #[serde(default, deserialize_with = "double_option")]
+    pub project: Option<Option<String>>,
+    /// The due date (`due`). Double Option: absent = keep, null = clear, value =
+    /// set. Same fold-safe path as `project`.
+    #[serde(default, deserialize_with = "double_option")]
+    pub due: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

@@ -25,7 +25,7 @@ use hive_core::store::mail::{
     MailReplyMeta, MailThreadMessage,
 };
 use hive_core::store::mail_sync::{MailAddress, OutgoingEmail};
-use hive_core::store::tasks::TaskFilter;
+use hive_core::store::tasks::{TaskCreate, TaskFilter};
 use hive_core::store::Store;
 use hive_embed::{Backend, EmbedConfig, Embedder, RuntimeEmbedder};
 use hive_import::{Plan, RunOutcome, Summary};
@@ -1478,6 +1478,28 @@ fn MailPane(store: ReadOnlySignal<Store>) -> Element {
         return rsx! { MailAccountsManager { store, refresh, managing } };
     }
 
+    // Decide the full-pane empty state vs. the three-pane reader by whether any
+    // mail account exists. Re-pulled when `refresh` bumps (add/delete an
+    // account) so the empty state clears the moment the first mailbox lands.
+    let accounts = use_resource(move || {
+        let store = store();
+        async move {
+            let _ = refresh();
+            store
+                .mail_accounts_admin_list()
+                .await
+                .map_err(|e| format!("{e:#}"))
+        }
+    });
+
+    // No accounts yet → the prominent onboarding empty state (keeps the gear
+    // reachable via its own Add button, which lands on the add form).
+    if let Some(Ok(list)) = accounts() {
+        if list.is_empty() {
+            return rsx! { MailEmptyState { managing } };
+        }
+    }
+
     rsx! {
         div {
             id: "mail-pane",
@@ -1487,6 +1509,38 @@ fn MailPane(store: ReadOnlySignal<Store>) -> Element {
             MailReader { store, selected_msg, compose, mail_refresh }
             if compose().is_some() {
                 ComposeWindow { store, compose }
+            }
+        }
+    }
+}
+
+/// The full-pane onboarding empty state shown when no mail account is connected:
+/// a mark, a heading, a line, and a prominent Add Account button that opens the
+/// account manager (landing on the add form). Replaces the three empty reader
+/// panes so the first-run call to action is unmistakable.
+#[component]
+fn MailEmptyState(managing: Signal<bool>) -> Element {
+    rsx! {
+        div {
+            id: "mail-empty",
+            style: "display: flex; flex-direction: column; align-items: center; justify-content: center; \
+                    height: 100%; min-height: 0; background: {BG}; text-align: center; padding: 2rem;",
+            div { style: "font-size: 3.4rem; color: {GOLD}; line-height: 1;", "✉" }
+            div {
+                style: "font-size: 1.5rem; font-weight: 800; color: {INK}; margin-top: 1rem;",
+                "Set up Mail"
+            }
+            div {
+                style: "color: {DIM}; font-size: 0.95rem; line-height: 1.6; margin-top: 0.5rem; max-width: 30rem;",
+                "Connect a mailbox to start syncing. Each identity can have its own."
+            }
+            button {
+                id: "mail-empty-add",
+                style: "margin-top: 1.4rem; background: {GOLD}; color: #14120e; border: none; \
+                        border-radius: 10px; padding: 0.7rem 1.6rem; font: inherit; font-weight: 700; \
+                        font-size: 0.95rem; cursor: pointer;",
+                onclick: move |_| managing.set(true),
+                "Add Account"
             }
         }
     }
@@ -3137,17 +3191,6 @@ fn MailAccountsManager(
     refresh: Signal<u32>,
     managing: Signal<bool>,
 ) -> Element {
-    let accounts = use_resource(move || {
-        let store = store();
-        async move {
-            let _ = refresh();
-            store
-                .mail_accounts_admin_list()
-                .await
-                .map_err(|e| format!("{e:#}"))
-        }
-    });
-
     rsx! {
         div {
             id: "mail-pane",
@@ -3175,36 +3218,8 @@ fn MailAccountsManager(
                  background and weaves messages into the same searchable memory as your journal."
             }
 
-            // ── add-account form ─────────────────────────────────────────────
-            MailAddAccount { store, refresh }
-
-            // ── connected accounts, grouped by owner identity ────────────────
-            div {
-                style: "margin-top: 1.8rem;",
-                div {
-                    style: "font-size: 0.78rem; font-weight: 700; letter-spacing: 0.08em; \
-                            text-transform: uppercase; color: {DIM}; margin-bottom: 0.6rem;",
-                    "Connected"
-                }
-                div {
-                    id: "mail-account-list",
-                    match accounts() {
-                        None => muted("loading accounts…"),
-                        Some(Err(e)) => muted(&format!("accounts unavailable: {e}")),
-                        Some(Ok(list)) if list.is_empty() => rsx! {
-                            div {
-                                style: "color: {FAINT}; font-size: 0.9rem; padding: 1.2rem 0;",
-                                "No mailboxes yet. Add one above to start syncing."
-                            }
-                        },
-                        Some(Ok(list)) => rsx! {
-                            for acct in list.into_iter() {
-                                {mail_account_row(store, acct, refresh)}
-                            }
-                        },
-                    }
-                }
-            }
+            // ── the reusable add-form + connected-list panel ─────────────────
+            MailAccountsPanel { store, refresh }
 
             // quiet note about what's still to come
             div {
@@ -3212,6 +3227,60 @@ fn MailAccountsManager(
                         color: {FAINT}; font-size: 0.82rem; line-height: 1.6;",
                 "Composing and replying — sending as any of your identities — arrive in the next \
                  update. Reading, folders, threads, labels, and search are live now."
+            }
+        }
+    }
+}
+
+/// The reusable mail-accounts panel: the add-account form plus the list of
+/// connected accounts (with their toggle / resync / delete controls). Mounted
+/// BOTH in the Mail gear view (`MailAccountsManager`) and in the Settings →
+/// Accounts card, so the add flow lives in exactly one place. Preserves every
+/// existing element id (`mail-account-add`, `mail-add-*`, `mail-account-list`,
+/// row toggle/resync/delete). Account ops are immediate (their own store
+/// calls), independent of Settings' Save.
+#[component]
+fn MailAccountsPanel(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
+    let accounts = use_resource(move || {
+        let store = store();
+        async move {
+            let _ = refresh();
+            store
+                .mail_accounts_admin_list()
+                .await
+                .map_err(|e| format!("{e:#}"))
+        }
+    });
+
+    rsx! {
+        // ── add-account form ─────────────────────────────────────────────────
+        MailAddAccount { store, refresh }
+
+        // ── connected accounts ───────────────────────────────────────────────
+        div {
+            style: "margin-top: 1.8rem;",
+            div {
+                style: "font-size: 0.78rem; font-weight: 700; letter-spacing: 0.08em; \
+                        text-transform: uppercase; color: {DIM}; margin-bottom: 0.6rem;",
+                "Connected"
+            }
+            div {
+                id: "mail-account-list",
+                match accounts() {
+                    None => muted("loading accounts…"),
+                    Some(Err(e)) => muted(&format!("accounts unavailable: {e}")),
+                    Some(Ok(list)) if list.is_empty() => rsx! {
+                        div {
+                            style: "color: {FAINT}; font-size: 0.9rem; padding: 1.2rem 0;",
+                            "No mailboxes yet. Add one above to start syncing."
+                        }
+                    },
+                    Some(Ok(list)) => rsx! {
+                        for acct in list.into_iter() {
+                            {mail_account_row(store, acct, refresh)}
+                        }
+                    },
+                }
             }
         }
     }
@@ -5665,6 +5734,102 @@ fn event_time(at: &str) -> Option<String> {
     Some(format!("{hh}:{mm}"))
 }
 
+// ── task due helpers (chrono-free, pure, unit-tested) ─────────────────────────
+//
+// The Reminders smart views (Today / Scheduled) and the due chip need only:
+// which (y,m,d) a task's `due` string falls on, and how that day sits relative
+// to today (overdue / today / future / undated). `task_due_day` reuses the
+// calendar's `event_day` parser (it already accepts a bare date OR a
+// datetime-ish string and validates the calendar), so a task due and an event
+// `at` bucket identically. All integer comparison — no clock, no chrono.
+
+/// The (year, month, day) a task `due` string names, or None when it's absent
+/// or unparseable (which then reads as "undated", never a wrong day).
+fn task_due_day(due: &str) -> Option<(i32, u32, u32)> {
+    event_day(due)
+}
+
+/// Where a `due` sits relative to `today` (a `YYYY-MM-DD` string). Ordered so
+/// overdue sorts before today before future; undated sorts last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DueBucket {
+    Overdue,
+    Today,
+    Future,
+    Undated,
+}
+
+/// Classify a task `due` against `today` by plain (y,m,d) tuple comparison. An
+/// absent/garbage due is `Undated`; a valid past day is `Overdue`, an equal day
+/// `Today`, a later day `Future`. `today` is a `YYYY-MM-DD` (from `today_ymd`).
+fn due_bucket(due: Option<&str>, today: &str) -> DueBucket {
+    let Some(day) = due.and_then(task_due_day) else {
+        return DueBucket::Undated;
+    };
+    let Some(t) = parse_ymd(today) else {
+        // Without a valid "today" we can't order it — treat as future so it's
+        // never wrongly flagged overdue.
+        return DueBucket::Future;
+    };
+    match day.cmp(&t) {
+        std::cmp::Ordering::Less => DueBucket::Overdue,
+        std::cmp::Ordering::Equal => DueBucket::Today,
+        std::cmp::Ordering::Greater => DueBucket::Future,
+    }
+}
+
+/// A short, human due label for the chip: "Overdue", "Today", "Tomorrow", or a
+/// month-day like "Jul 15" (with the year when it's not `today`'s year). Garbage
+/// dues fall back to their trimmed raw text so nothing is silently dropped.
+fn due_label(due: &str, today: &str) -> String {
+    let Some((y, m, d)) = task_due_day(due) else {
+        return due.trim().to_string();
+    };
+    match due_bucket(Some(due), today) {
+        DueBucket::Overdue => "Overdue".to_string(),
+        DueBucket::Today => "Today".to_string(),
+        DueBucket::Future => {
+            // "Tomorrow" when it's exactly the next calendar day.
+            if let Some((ty, tm, td)) = parse_ymd(today) {
+                let (ny, nm, nd) = step_day(ty, tm, td, true);
+                if (y, m, d) == (ny, nm, nd) {
+                    return "Tomorrow".to_string();
+                }
+            }
+            short_month_day(y, m, d, today)
+        }
+        DueBucket::Undated => due.trim().to_string(),
+    }
+}
+
+/// "Jul 15" (same year as today) or "Jul 15 2027" (a different year).
+fn short_month_day(year: i32, month: u32, day: u32, today: &str) -> String {
+    const ABBR: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let name = ABBR
+        .get((month.saturating_sub(1)) as usize)
+        .copied()
+        .unwrap_or("");
+    let same_year = parse_ymd(today).map(|(ty, ..)| ty == year).unwrap_or(true);
+    if same_year {
+        format!("{name} {day}")
+    } else {
+        format!("{name} {day} {year}")
+    }
+}
+
+/// Priority as a sortable rank (higher = more urgent) so the checklist can put
+/// urgent/high tasks above normal/low. Mirrors the list's priority order.
+fn priority_rank(p: Priority) -> u8 {
+    match p {
+        Priority::Urgent => 3,
+        Priority::High => 2,
+        Priority::Normal => 1,
+        Priority::Low => 0,
+    }
+}
+
 /// Format a (year, month, day) as the `YYYY-MM-DD` key used for cell ids and
 /// as the clean value written into `at` from the date picker.
 fn ymd_key(year: i32, month: u32, day: u32) -> String {
@@ -6679,40 +6844,171 @@ fn entity_err(e: hive_core::store::custom_entities::EntityWriteError) -> String 
     }
 }
 
-// ── tasks pane ────────────────────────────────────────────────────────────────
+// ── tasks pane (Apple-Reminders-style) ────────────────────────────────────────
 
-/// The four status columns, in board order.
-const STATUS_COLUMNS: [TaskStatus; 4] = [
-    TaskStatus::Todo,
-    TaskStatus::Doing,
-    TaskStatus::Blocked,
-    TaskStatus::Done,
-];
-
-/// Group tasks into the four status buckets, preserving each bucket's incoming
-/// order (tasks_list already sorts priority-then-recency). Pure, so the
-/// grouping is unit-tested without a store.
-fn group_by_status(tasks: Vec<Task>) -> Vec<(TaskStatus, Vec<Task>)> {
-    let mut out: Vec<(TaskStatus, Vec<Task>)> =
-        STATUS_COLUMNS.iter().map(|s| (*s, Vec::new())).collect();
-    for t in tasks {
-        if let Some(slot) = out.iter_mut().find(|(s, _)| *s == t.status) {
-            slot.1.push(t);
-        }
-    }
-    out
+/// Which list the Reminders view is showing. Smart lists are computed views;
+/// a `List(project)` is a user list (a task `project`); `NoList` is the bucket
+/// of tasks with no project. `Clone`/`PartialEq` so it drives a signal cheaply.
+#[derive(Clone, PartialEq)]
+enum TaskListSel {
+    Today,
+    Scheduled,
+    Flagged,
+    All,
+    Completed,
+    List(String),
+    NoList,
 }
 
-/// The Tasks section: the task table grouped into status columns. Each row
-/// opens the reusable detail view; an inline status control changes status in
-/// place. Tasks emerge from journal [task:] tokens and anchors (there is no
-/// manual create here — that stays the journal's job).
+impl TaskListSel {
+    /// The header title the main column shows for this list.
+    fn title(&self) -> String {
+        match self {
+            TaskListSel::Today => "Today".into(),
+            TaskListSel::Scheduled => "Scheduled".into(),
+            TaskListSel::Flagged => "Flagged".into(),
+            TaskListSel::All => "All".into(),
+            TaskListSel::Completed => "Completed".into(),
+            TaskListSel::List(p) => p.clone(),
+            TaskListSel::NoList => "No List".into(),
+        }
+    }
+}
+
+/// A task is "open" when it hasn't been completed (any status but Done). The
+/// smart lists (Today/Scheduled/Flagged/All) are all over open tasks.
+fn task_is_open(t: &Task) -> bool {
+    t.status != TaskStatus::Done
+}
+
+/// A task's list name (its `project`) if it has a non-empty one.
+fn task_list_name(t: &Task) -> Option<String> {
+    t.project
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+}
+
+/// Does a task belong in the given list view? Smart rules per the spec; a user
+/// list matches by project; No List matches tasks without one. `today` is a
+/// `YYYY-MM-DD`. Completed lists tasks by Done; every other view filters to open
+/// tasks (a user list shows open first then completed — handled in ordering, so
+/// membership there includes both).
+fn task_in_list(t: &Task, sel: &TaskListSel, today: &str) -> bool {
+    match sel {
+        // open AND (overdue or due today)
+        TaskListSel::Today => {
+            task_is_open(t)
+                && matches!(
+                    due_bucket(t.due.as_deref(), today),
+                    DueBucket::Overdue | DueBucket::Today
+                )
+        }
+        // open AND has a real due day
+        TaskListSel::Scheduled => {
+            task_is_open(t) && t.due.as_deref().and_then(task_due_day).is_some()
+        }
+        // open AND priority ≥ High
+        TaskListSel::Flagged => {
+            task_is_open(t) && priority_rank(t.priority) >= priority_rank(Priority::High)
+        }
+        // open (any)
+        TaskListSel::All => task_is_open(t),
+        // done
+        TaskListSel::Completed => t.status == TaskStatus::Done,
+        // this project (open + completed; ordering puts open first)
+        TaskListSel::List(p) => task_list_name(t).as_deref() == Some(p.as_str()),
+        // no project (open + completed)
+        TaskListSel::NoList => task_list_name(t).is_none(),
+    }
+}
+
+/// The count a list shows in the rail. Smart lists count their membership;
+/// Completed counts done tasks; a user list / No List count only OPEN tasks
+/// (Reminders shows open counts beside lists).
+fn task_list_count(tasks: &[Task], sel: &TaskListSel, today: &str) -> usize {
+    tasks
+        .iter()
+        .filter(|t| {
+            task_in_list(t, sel, today)
+                && match sel {
+                    TaskListSel::List(_) | TaskListSel::NoList => task_is_open(t),
+                    _ => true,
+                }
+        })
+        .count()
+}
+
+/// Order a list's tasks for display: open first, completed last; within open,
+/// by due day ascending (undated last), then priority descending; completed by
+/// most-recently-updated. Pure, so it's unit-testable and stable.
+fn ordered_tasks(mut tasks: Vec<Task>, today: &str) -> Vec<Task> {
+    tasks.sort_by(|a, b| {
+        let ao = task_is_open(a);
+        let bo = task_is_open(b);
+        // Open before completed.
+        if ao != bo {
+            return bo.cmp(&ao); // open (true) first
+        }
+        if ao {
+            // Both open: due asc (undated last), then priority desc.
+            let ad = a.due.as_deref().and_then(task_due_day);
+            let bd = b.due.as_deref().and_then(task_due_day);
+            match (ad, bd) {
+                (Some(x), Some(y)) => {
+                    if x != y {
+                        return x.cmp(&y);
+                    }
+                }
+                (Some(_), None) => return std::cmp::Ordering::Less,
+                (None, Some(_)) => return std::cmp::Ordering::Greater,
+                (None, None) => {}
+            }
+            priority_rank(b.priority)
+                .cmp(&priority_rank(a.priority))
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+        } else {
+            // Both completed: most recently updated first.
+            let _ = today;
+            b.updated_at.cmp(&a.updated_at)
+        }
+    });
+    tasks
+}
+
+/// The distinct user lists (non-empty `project` values) present in the task
+/// set, sorted case-insensitively for a stable rail. Deterministic.
+fn distinct_lists(tasks: &[Task]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for t in tasks {
+        if let Some(name) = task_list_name(t) {
+            if !names.iter().any(|n| n == &name) {
+                names.push(name);
+            }
+        }
+    }
+    names.sort_by_key(|a| a.to_lowercase());
+    names
+}
+
+/// Do any tasks have no list? (drives whether the No List bucket shows).
+fn has_no_list_tasks(tasks: &[Task]) -> bool {
+    tasks.iter().any(|t| task_list_name(t).is_none())
+}
+
+/// The Tasks section — an Apple-Reminders-style app. A left rail of smart lists
+/// (Today / Scheduled / Flagged / All / Completed) plus the user's lists (task
+/// `project` values) and a No List bucket; a main column with a quick-add row
+/// and a tap-to-complete checklist. Row titles still open the shared
+/// `EntityDetail` for full editing (unchanged). Client-side filtering over a
+/// single `tasks_list` pull keeps it fold-neutral.
 #[component]
 fn TasksPane(store: ReadOnlySignal<Store>, selected: Signal<Option<Selected>>) -> Element {
-    // Re-list whenever a detail edit bumps the shared tick (status changes from
-    // a row, or a save in the detail view). `selected` going back to None after
-    // an edit also re-runs this via the tick.
+    // Re-list whenever a row action or a detail save bumps the tick.
     let tick = use_signal(|| 0u32);
+    // Which list is showing. Default = Today (Reminders' home).
+    let sel = use_signal(|| TaskListSel::Today);
     let tasks = use_resource(move || {
         let store = store();
         async move {
@@ -6727,60 +7023,327 @@ fn TasksPane(store: ReadOnlySignal<Store>, selected: Signal<Option<Selected>>) -
     rsx! {
         div {
             id: "tasks-pane",
-            style: "max-width: 900px; margin: 0 auto; padding: 1.6rem 1.2rem 3rem;",
-            {pane_header("Tasks", "Everything that emerged as a task from your journal — write \
-                                  [task: …] or anchor a line, and it lands here, grouped by \
-                                  where it stands.")}
-            div { style: "height: 1rem;" }
+            style: "display: flex; height: 100%; min-height: 0; background: {BG};",
             match tasks() {
-                None => muted("loading tasks…"),
-                Some(Err(e)) => muted(&format!("tasks unavailable: {e}")),
-                Some(Ok(list)) if list.is_empty() => muted(
-                    "No tasks yet. In the journal, wrap an intention in [task: …] or anchor a \
-                     sentence, and it shows up here to track.",
-                ),
-                Some(Ok(list)) => rsx! {
-                    div {
-                        style: "display: flex; gap: 0.8rem; align-items: flex-start; flex-wrap: wrap;",
-                        for (status, items) in group_by_status(list) {
-                            {task_column(status, items, store, selected, tick)}
-                        }
-                    }
+                None => rsx! {
+                    div { style: "margin: 2rem auto;", {muted("loading tasks…")} }
                 },
+                Some(Err(e)) => rsx! {
+                    div { style: "margin: 2rem auto;", {muted(&format!("tasks unavailable: {e}"))} }
+                },
+                Some(Ok(list)) => {
+                    let today = today_ymd();
+                    tasks_reminders_view(store, selected, tick, sel, list, today)
+                }
             }
         }
     }
 }
 
-/// One status column with its task rows. Plain fn: Task lacks PartialEq.
-fn task_column(
-    status: TaskStatus,
-    items: Vec<Task>,
+/// The two-column Reminders body: the sidebar rail + the main list column. A
+/// plain fn (Task lacks PartialEq, so `list` can't ride a memoized prop).
+fn tasks_reminders_view(
     store: ReadOnlySignal<Store>,
     selected: Signal<Option<Selected>>,
     tick: Signal<u32>,
+    sel: Signal<TaskListSel>,
+    list: Vec<Task>,
+    today: String,
 ) -> Element {
+    // The rows for the currently-selected list, ordered for display.
+    let current = sel();
+    let mut rows: Vec<Task> = list
+        .iter()
+        .filter(|t| task_in_list(t, &current, &today))
+        .cloned()
+        .collect();
+    rows = ordered_tasks(rows, &today);
+    let header_count = rows.iter().filter(|t| task_is_open(t)).count();
+
     rsx! {
+        // ── left rail ────────────────────────────────────────────────────────
+        {tasks_sidebar(sel, &list, &today)}
+
+        // ── main column ──────────────────────────────────────────────────────
         div {
-            style: "flex: 1; min-width: 190px; background: {PANEL}; border: 1px solid {EDGE}; \
-                    border-radius: 12px; padding: 0.7rem 0.7rem 0.9rem;",
+            id: "tasks-main",
+            style: "flex: 1; min-width: 0; height: 100%; overflow-y: auto; \
+                    padding: 1.4rem 1.6rem 3rem;",
+            // header: list name + open count
             div {
-                style: "display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.6rem; \
-                        font-size: 0.72rem; font-weight: 700; letter-spacing: 0.07em; \
-                        text-transform: uppercase; color: {DIM};",
-                span { style: "color: {GOLD};", "{status_label(status)}" }
-                span { style: "color: {FAINT};", "{items.len()}" }
-            }
-            if items.is_empty() {
+                style: "display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.2rem;",
                 div {
-                    style: "color: {FAINT}; font-size: 0.8rem; padding: 0.4rem 0.2rem;",
-                    "—"
+                    id: "tasks-main-title",
+                    style: "font-size: 1.6rem; font-weight: 800; color: {GOLD};",
+                    "{current.title()}"
+                }
+                span {
+                    id: "tasks-main-count",
+                    style: "font-size: 1.1rem; font-weight: 700; color: {FAINT};",
+                    "{header_count}"
                 }
             }
-            for t in items.iter() {
-                {task_row(t, store, selected, tick)}
+
+            // quick-add row
+            {tasks_quickadd(store, tick, sel)}
+
+            // checklist
+            if rows.is_empty() {
+                div {
+                    id: "tasks-empty",
+                    style: "color: {FAINT}; font-size: 0.9rem; padding: 1.4rem 0.2rem; line-height: 1.6;",
+                    {tasks_empty_hint(&current)}
+                }
+            } else {
+                div {
+                    id: "tasks-list",
+                    style: "margin-top: 1rem;",
+                    for t in rows.iter() {
+                        {task_item(t, store, selected, tick, &today)}
+                    }
+                }
             }
         }
+    }
+}
+
+/// The empty-state hint for a list with no matching tasks.
+fn tasks_empty_hint(sel: &TaskListSel) -> &'static str {
+    match sel {
+        TaskListSel::Today => "Nothing due today. Add a task above, or check Scheduled.",
+        TaskListSel::Scheduled => "No dated tasks yet. Give a task a due date to see it here.",
+        TaskListSel::Flagged => "No flagged tasks. Flag one with the ! to surface it here.",
+        TaskListSel::Completed => "Nothing completed yet.",
+        _ => "No tasks in this list yet. Add one above.",
+    }
+}
+
+/// The left rail: smart lists (with counts) then the user's lists + No List.
+/// Plain fn (borrows the task slice). `sel` drives the main column.
+fn tasks_sidebar(mut sel: Signal<TaskListSel>, tasks: &[Task], today: &str) -> Element {
+    let smart = [
+        ("tasks-smart-today", "Today", "◎", TaskListSel::Today),
+        (
+            "tasks-smart-scheduled",
+            "Scheduled",
+            "▤",
+            TaskListSel::Scheduled,
+        ),
+        ("tasks-smart-flagged", "Flagged", "⚑", TaskListSel::Flagged),
+        ("tasks-smart-all", "All", "≡", TaskListSel::All),
+        (
+            "tasks-smart-completed",
+            "Completed",
+            "✓",
+            TaskListSel::Completed,
+        ),
+    ];
+    let lists = distinct_lists(tasks);
+    let show_no_list = has_no_list_tasks(tasks);
+    let current = sel();
+
+    rsx! {
+        div {
+            id: "tasks-sidebar",
+            style: "width: 232px; flex: none; height: 100%; overflow-y: auto; \
+                    border-right: 1px solid {EDGE}; background: {PANEL}; \
+                    padding: 1.1rem 0.7rem 2rem;",
+
+            // section title
+            div {
+                style: "font-size: 1.15rem; font-weight: 800; color: {INK}; margin: 0.1rem 0.4rem 0.7rem;",
+                "Reminders"
+            }
+
+            // smart lists
+            for (id, label, icon, kind) in smart.iter() {
+                {tasks_rail_row(
+                    id, label, icon,
+                    task_list_count(tasks, kind, today),
+                    current == *kind,
+                    { let k = kind.clone(); move || sel.set(k.clone()) },
+                )}
+            }
+
+            // user lists header (only when there are any)
+            if !lists.is_empty() || show_no_list {
+                div {
+                    style: "font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; \
+                            text-transform: uppercase; color: {FAINT}; margin: 1rem 0.4rem 0.4rem;",
+                    "My Lists"
+                }
+            }
+            for name in lists.iter() {
+                {
+                    let kind = TaskListSel::List(name.clone());
+                    let count = task_list_count(tasks, &kind, today);
+                    let id = format!("tasks-list-{name}");
+                    tasks_rail_row(
+                        &id, name, "▸", count, current == kind,
+                        { let k = kind.clone(); move || sel.set(k.clone()) },
+                    )
+                }
+            }
+            if show_no_list {
+                {tasks_rail_row(
+                    "tasks-list-none", "No List", "▸",
+                    task_list_count(tasks, &TaskListSel::NoList, today),
+                    current == TaskListSel::NoList,
+                    move || sel.set(TaskListSel::NoList),
+                )}
+            }
+        }
+    }
+}
+
+/// One selectable rail row: icon, label, count; highlighted when active.
+fn tasks_rail_row(
+    id: &str,
+    label: &str,
+    icon: &str,
+    count: usize,
+    active: bool,
+    on_select: impl FnMut() + 'static,
+) -> Element {
+    let mut on_select = on_select;
+    let (bg, fg) = if active {
+        (GOLD, "#14120e")
+    } else {
+        ("transparent", INK)
+    };
+    let count_color = if active { "#14120e" } else { FAINT };
+    rsx! {
+        button {
+            id: "{id}",
+            style: "display: flex; align-items: center; gap: 0.55rem; width: 100%; \
+                    box-sizing: border-box; text-align: left; background: {bg}; color: {fg}; \
+                    border: none; border-radius: 8px; padding: 0.42rem 0.55rem; \
+                    font: inherit; font-size: 0.9rem; font-weight: 600; cursor: pointer; \
+                    margin-bottom: 0.15rem;",
+            onclick: move |_| on_select(),
+            span { style: "width: 1.1rem; text-align: center; opacity: 0.85;", "{icon}" }
+            span { style: "flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;", "{label}" }
+            span { style: "font-size: 0.82rem; font-weight: 700; color: {count_color};", "{count}" }
+        }
+    }
+}
+
+/// The quick-add row: a title input, an optional native date, an optional
+/// priority, and an Add button. Enter or Add creates the task into the selected
+/// user list (or no list under a smart view). Plain fn — no memoized props.
+fn tasks_quickadd(
+    store: ReadOnlySignal<Store>,
+    mut tick: Signal<u32>,
+    sel: Signal<TaskListSel>,
+) -> Element {
+    let mut title = use_signal(String::new);
+    let mut due = use_signal(String::new);
+    let mut priority = use_signal(|| Priority::Normal.as_str().to_string());
+    let mut error = use_signal(|| Option::<String>::None);
+
+    // Add: build a TaskCreate and persist, then clear + re-pull. Empty title is
+    // a no-op. `project` = the selected user list (None under a smart view).
+    let mut submit = move || {
+        let t = title().trim().to_string();
+        if t.is_empty() {
+            return; // empty title = no-op
+        }
+        let due_v = due().trim().to_string();
+        let due_opt = if due_v.is_empty() { None } else { Some(due_v) };
+        let prio = Priority::from_str_lossy(&priority());
+        let project = match sel() {
+            TaskListSel::List(p) => Some(p),
+            _ => None, // smart view / No List → unlisted
+        };
+        let store = store();
+        error.set(None);
+        spawn(async move {
+            let input = TaskCreate {
+                title: t,
+                body: String::new(),
+                status: TaskStatus::Todo,
+                priority: prio,
+                due: due_opt,
+                project,
+                ..Default::default()
+            };
+            match store.tasks_create(input, "system").await {
+                Ok(_) => {
+                    title.set(String::new());
+                    due.set(String::new());
+                    tick += 1;
+                }
+                Err(e) => error.set(Some(format!("{e:#}"))),
+            }
+        });
+    };
+
+    rsx! {
+        div {
+            id: "tasks-quickadd",
+            style: "display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; \
+                    background: {PANEL}; border: 1px solid {EDGE}; border-radius: 10px; \
+                    padding: 0.55rem 0.7rem; margin-top: 0.9rem;",
+            span { style: "color: {GOLD}; font-size: 1.1rem; line-height: 1;", "＋" }
+            input {
+                id: "tasks-quickadd-input",
+                style: "flex: 1; min-width: 160px; background: transparent; color: {INK}; \
+                        border: none; outline: none; font: inherit; font-size: 0.95rem;",
+                r#type: "text",
+                placeholder: "Add a task",
+                value: "{title}",
+                oninput: move |e| title.set(e.value()),
+                onkeydown: move |e| {
+                    if e.key() == Key::Enter {
+                        submit();
+                    }
+                },
+            }
+            input {
+                id: "tasks-quickadd-due",
+                style: "background: {BG}; color: {DIM}; border: 1px solid {EDGE}; border-radius: 7px; \
+                        padding: 0.3rem 0.4rem; font: inherit; font-size: 0.8rem; cursor: pointer; \
+                        color-scheme: dark;",
+                r#type: "date",
+                value: "{due}",
+                oninput: move |e| due.set(e.value()),
+            }
+            select {
+                id: "tasks-quickadd-priority",
+                style: "background: {BG}; color: {DIM}; border: 1px solid {EDGE}; border-radius: 7px; \
+                        padding: 0.32rem 0.4rem; font: inherit; font-size: 0.8rem; cursor: pointer;",
+                value: "{priority}",
+                onchange: move |e| priority.set(e.value()),
+                for p in PRIORITIES.iter() {
+                    option { value: "{p.as_str()}", "{priority_label(*p)}" }
+                }
+            }
+            button {
+                id: "tasks-quickadd-submit",
+                style: "background: {GOLD}; color: #14120e; border: none; border-radius: 7px; \
+                        padding: 0.4rem 0.9rem; font: inherit; font-weight: 700; font-size: 0.85rem; \
+                        cursor: pointer;",
+                onclick: move |_| submit(),
+                "Add"
+            }
+            if let Some(e) = error() {
+                div {
+                    id: "tasks-quickadd-error",
+                    style: "flex-basis: 100%; color: #e07a5f; font-size: 0.8rem; margin-top: 0.2rem;",
+                    "{e}"
+                }
+            }
+        }
+    }
+}
+
+/// A short human label for a priority in the quick-add dropdown.
+fn priority_label(p: Priority) -> &'static str {
+    match p {
+        Priority::Low => "Low",
+        Priority::Normal => "Normal",
+        Priority::High => "High",
+        Priority::Urgent => "Urgent",
     }
 }
 
@@ -6793,69 +7356,210 @@ fn status_label(s: TaskStatus) -> &'static str {
     }
 }
 
-/// One task card in a column: title, optional due/assignee, an inline status
-/// select, and a click-through to the detail view. Plain fn (Task: no
-/// PartialEq). The status select lives on the row so a quick status flip needs
-/// no drill-in; it bumps `tick` so the board re-groups.
-fn task_row(
+/// A red-ish palette const for overdue accents (matches the app's error red).
+const OVERDUE: &str = "#e07a5f";
+
+/// One checklist row: a tap-to-complete circle, the title (opens the detail
+/// view), a due chip, a priority flag, and a status chip for Doing/Blocked.
+/// Plain fn — Task has no PartialEq, and each control clones its own id before
+/// moving it into a closure (never borrowing `t` past a move — the release
+/// borrow-check trap).
+fn task_item(
     t: &Task,
     store: ReadOnlySignal<Store>,
     mut selected: Signal<Option<Selected>>,
     mut tick: Signal<u32>,
+    today: &str,
 ) -> Element {
-    let id = t.id.clone();
-    let id_for_status = t.id.clone();
+    let done = t.status == TaskStatus::Done;
     let due = t.due.clone().filter(|d| !d.trim().is_empty());
-    let assignee = t.assignees.first().cloned();
+    let bucket = due_bucket(t.due.as_deref(), today);
+    let due_text = due.as_deref().map(|d| due_label(d, today));
+    let due_color = match bucket {
+        DueBucket::Overdue => OVERDUE,
+        DueBucket::Today => GOLD,
+        _ => DIM,
+    };
     let current = t.status;
+    let priority = t.priority;
+    let show_flag = priority_rank(priority) >= priority_rank(Priority::High);
+    let flag_glyph = if priority == Priority::Urgent {
+        "‼"
+    } else {
+        "!"
+    };
+    let show_status_chip = matches!(current, TaskStatus::Doing | TaskStatus::Blocked);
+    let assignee = t.assignees.first().cloned();
+
+    // Circle: toggle Done ⇄ Todo.
+    let id_circle = t.id.clone();
+    let toggle_done = move |_: MouseEvent| {
+        let id = id_circle.clone();
+        let store = store();
+        let next = if done {
+            TaskStatus::Todo
+        } else {
+            TaskStatus::Done
+        };
+        spawn(async move {
+            let patch = TaskPatch {
+                status: Some(next),
+                ..Default::default()
+            };
+            let _ = store.tasks_update(&id, patch, "system").await;
+            tick += 1;
+        });
+    };
+
+    // Title: open the shared EntityDetail (full edit) — do NOT fork it.
+    let id_title = t.id.clone();
+    let open_detail = move |_: MouseEvent| {
+        selected.set(Some(Selected::Task(id_title.clone())));
+    };
+
+    // Flag: cycle Normal → High → Urgent → Normal.
+    let id_flag = t.id.clone();
+    let cycle_flag = move |_: MouseEvent| {
+        let id = id_flag.clone();
+        let store = store();
+        let next = match priority {
+            Priority::Normal => Priority::High,
+            Priority::High => Priority::Urgent,
+            Priority::Urgent => Priority::Normal,
+            Priority::Low => Priority::High,
+        };
+        spawn(async move {
+            let patch = TaskPatch {
+                priority: Some(next),
+                ..Default::default()
+            };
+            let _ = store.tasks_update(&id, patch, "system").await;
+            tick += 1;
+        });
+    };
+
+    let title_style = if done {
+        format!("color: {DIM}; text-decoration: line-through;")
+    } else {
+        format!("color: {INK};")
+    };
+    // Precomputed (rsx format strings and attributes can't hold an `if`).
+    let circle_color = if done { GOLD } else { FAINT };
+    let circle_glyph = if done { "⦿" } else { "○" };
+    let circle_title = if done {
+        "Mark as not done"
+    } else {
+        "Mark as done"
+    };
+
     rsx! {
         div {
-            id: "task-row-{t.id}",
-            style: "background: {BG}; border: 1px solid {EDGE}; border-radius: 9px; \
-                    padding: 0.55rem 0.6rem; margin-bottom: 0.5rem;",
+            id: "task-item-{t.id}",
+            style: "display: flex; align-items: flex-start; gap: 0.7rem; \
+                    padding: 0.6rem 0.3rem; border-bottom: 1px solid {EDGE};",
+
+            // tap-to-complete circle
             button {
-                style: "display: block; width: 100%; text-align: left; background: none; \
-                        border: none; color: {INK}; font: inherit; font-size: 0.9rem; \
-                        font-weight: 600; cursor: pointer; padding: 0;",
-                onclick: move |_| selected.set(Some(Selected::Task(id.clone()))),
-                "{t.title}"
+                id: "task-check-{t.id}",
+                style: "flex: none; background: none; border: none; cursor: pointer; padding: 0; \
+                        font-size: 1.15rem; line-height: 1.3; color: {circle_color};",
+                title: "{circle_title}",
+                onclick: toggle_done,
+                "{circle_glyph}"
             }
-            if due.is_some() || assignee.is_some() {
-                div {
-                    style: "display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.3rem; \
-                            font-size: 0.72rem; color: {FAINT};",
-                    if let Some(d) = due {
-                        span { "due {d}" }
-                    }
-                    if let Some(a) = assignee {
-                        span { "· {a}" }
-                    }
+
+            // title + meta
+            div {
+                style: "flex: 1; min-width: 0;",
+                button {
+                    id: "task-title-{t.id}",
+                    style: "display: block; width: 100%; text-align: left; background: none; \
+                            border: none; font: inherit; font-size: 0.95rem; font-weight: 600; \
+                            cursor: pointer; padding: 0; {title_style}",
+                    onclick: open_detail,
+                    "{t.title}"
                 }
-            }
-            select {
-                id: "task-status-{t.id}",
-                style: "margin-top: 0.45rem; width: 100%; box-sizing: border-box; background: {PANEL}; \
-                        color: {INK}; border: 1px solid {EDGE}; border-radius: 7px; \
-                        padding: 0.3rem 0.4rem; font: inherit; font-size: 0.78rem; cursor: pointer;",
-                value: "{current.as_str()}",
-                onchange: move |e| {
-                    let want = e.value();
-                    let id = id_for_status.clone();
-                    let store = store();
-                    spawn(async move {
-                        if let Some(status) = TaskStatus::parse(&want) {
-                            let patch = TaskPatch {
-                                status: Some(status),
-                                ..Default::default()
-                            };
-                            let _ = store.tasks_update(&id, patch, "system").await;
-                            tick += 1;
+                // chips row: due, status, assignee
+                if due_text.is_some() || show_status_chip || assignee.is_some() {
+                    div {
+                        style: "display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem; margin-top: 0.3rem;",
+                        if let Some(txt) = due_text.clone() {
+                            span {
+                                id: "task-due-{t.id}",
+                                style: "font-size: 0.74rem; font-weight: 600; color: {due_color}; \
+                                        border: 1px solid {due_color}; border-radius: 999px; padding: 0.05rem 0.5rem;",
+                                "{txt}"
+                            }
                         }
-                    });
-                },
-                for s in TASK_STATUSES.iter() {
-                    option { value: "{s.as_str()}", "{status_label(*s)}" }
+                        if show_status_chip {
+                            {task_status_chip(t.id.clone(), current, store, tick)}
+                        }
+                        if let Some(a) = assignee {
+                            span { style: "font-size: 0.74rem; color: {FAINT};", "· {a}" }
+                        }
+                    }
                 }
+            }
+
+            // priority flag (High/Urgent)
+            if show_flag {
+                button {
+                    id: "task-flag-{t.id}",
+                    style: "flex: none; background: none; border: none; cursor: pointer; padding: 0.1rem 0.2rem; \
+                            font-size: 0.95rem; font-weight: 800; color: {OVERDUE};",
+                    title: "Cycle priority (High → Urgent → Normal)",
+                    onclick: cycle_flag,
+                    "{flag_glyph}"
+                }
+            } else {
+                // A faint outline flag to RAISE priority from Normal/Low.
+                button {
+                    id: "task-flag-{t.id}",
+                    style: "flex: none; background: none; border: none; cursor: pointer; padding: 0.1rem 0.2rem; \
+                            font-size: 0.95rem; color: {FAINT}; opacity: 0.5;",
+                    title: "Flag (raise priority)",
+                    onclick: cycle_flag,
+                    "⚐"
+                }
+            }
+        }
+    }
+}
+
+/// The small status chip shown when a task is Doing or Blocked (states
+/// Reminders lacks but hive keeps). It's a select so a click sets any status —
+/// nothing is lost. Plain fn; clones its id into the closure.
+fn task_status_chip(
+    id: String,
+    current: TaskStatus,
+    store: ReadOnlySignal<Store>,
+    mut tick: Signal<u32>,
+) -> Element {
+    let color = match current {
+        TaskStatus::Blocked => OVERDUE,
+        _ => GOLD, // Doing
+    };
+    rsx! {
+        select {
+            id: "task-status-{id}",
+            style: "font: inherit; font-size: 0.72rem; font-weight: 700; color: {color}; \
+                    background: {BG}; border: 1px solid {color}; border-radius: 999px; \
+                    padding: 0.05rem 0.4rem; cursor: pointer;",
+            value: "{current.as_str()}",
+            onchange: move |e| {
+                let want = e.value();
+                let id = id.clone();
+                let store = store();
+                spawn(async move {
+                    if let Some(status) = TaskStatus::parse(&want) {
+                        let patch = TaskPatch { status: Some(status), ..Default::default() };
+                        let _ = store.tasks_update(&id, patch, "system").await;
+                        tick += 1;
+                    }
+                });
+            },
+            for s in TASK_STATUSES.iter() {
+                option { value: "{s.as_str()}", "{status_label(*s)}" }
             }
         }
     }
@@ -7659,6 +8363,16 @@ async fn save_detail(
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
+            // The detail form edits `due` (date field): a value sets it, a
+            // blank clears it (Some(None) → SQL NULL). `project` is owned by the
+            // Reminders rail (moving lists happens there), so detail Save leaves
+            // it untouched (None = keep).
+            let due_raw = get("due");
+            let due = if due_raw.trim().is_empty() {
+                Some(None)
+            } else {
+                Some(Some(due_raw.trim().to_string()))
+            };
             let patch = TaskPatch {
                 title: Some(get("title")),
                 body: Some(get("body")),
@@ -7666,6 +8380,8 @@ async fn save_detail(
                 priority: Some(Priority::from_str_lossy(&get("priority"))),
                 assignees: Some(assignees),
                 tags: None,
+                project: None,
+                due,
             };
             store
                 .tasks_update(id, patch, "system")
@@ -7788,6 +8504,9 @@ fn SettingsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
     let mut reembed = use_signal(|| ReembedState::Idle);
     // Bumped after a re-embed cycle to re-pull the embedded/total stat.
     let mut stats_tick = use_signal(|| 0u32);
+    // Independent of the settings Save: the Accounts card's add/toggle/resync/
+    // delete each write immediately and bump THIS to re-pull the account list.
+    let accounts_refresh = use_signal(|| 0u32);
 
     let _load = use_resource(move || {
         let store = store();
@@ -8079,6 +8798,20 @@ fn SettingsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
                         "Saved."
                     }
                 }
+            }
+
+            // ── Accounts ──
+            // The same mail-account add form + connected list as the Mail gear,
+            // reached here too. Its ops are immediate — no dependence on Save.
+            div {
+                id: "settings-accounts",
+                style: settings_card_style(),
+                div { style: "font-weight: 700; font-size: 1.02rem;", "Accounts" }
+                div {
+                    style: "color: {DIM}; font-size: 0.86rem; line-height: 1.55; margin-top: 0.25rem;",
+                    "Mailboxes connected to this hive. Each belongs to an identity and syncs on its own."
+                }
+                MailAccountsPanel { store, refresh: accounts_refresh }
             }
         }
     }
@@ -8454,51 +9187,6 @@ mod tests {
         assert_eq!(age_years("not-a-date", "2026-07-11"), None);
     }
 
-    /// Task grouping buckets every status column in board order and preserves
-    /// the incoming (priority-then-recency) order within each bucket.
-    #[test]
-    fn group_by_status_buckets_all_four_columns() {
-        use super::group_by_status;
-        use hive_shared::{Priority, Task, TaskStatus};
-
-        let task = |id: &str, status: TaskStatus| Task {
-            id: id.to_string(),
-            title: id.to_string(),
-            body: String::new(),
-            status,
-            priority: Priority::Normal,
-            tags: Vec::new(),
-            assignees: Vec::new(),
-            project: None,
-            phase: None,
-            due: None,
-            origin_entry_id: None,
-            anchor_text: None,
-            created_at: String::new(),
-            updated_at: String::new(),
-        };
-        let grouped = group_by_status(vec![
-            task("a", TaskStatus::Doing),
-            task("b", TaskStatus::Todo),
-            task("c", TaskStatus::Doing),
-            task("d", TaskStatus::Done),
-        ]);
-        // Four columns, in board order, even the empty one (blocked).
-        let cols: Vec<TaskStatus> = grouped.iter().map(|(s, _)| *s).collect();
-        assert_eq!(
-            cols,
-            vec![
-                TaskStatus::Todo,
-                TaskStatus::Doing,
-                TaskStatus::Blocked,
-                TaskStatus::Done
-            ]
-        );
-        let doing: Vec<&str> = grouped[1].1.iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(doing, vec!["a", "c"], "input order preserved in-bucket");
-        assert_eq!(grouped[2].1.len(), 0, "blocked column present but empty");
-    }
-
     // ── calendar library ──
 
     /// event_day accepts every shape the store/editor actually writes and
@@ -8665,6 +9353,239 @@ mod tests {
             compose_event_at(&m(json!({"date": "", "at_raw": ""}))),
             None
         );
+    }
+
+    // ── task due helpers + Reminders smart-view rules ──
+
+    /// A tiny task builder for the pure-fn tests (Task has no Default).
+    fn mk_task(
+        id: &str,
+        status: hive_shared::TaskStatus,
+        priority: hive_shared::Priority,
+        project: Option<&str>,
+        due: Option<&str>,
+    ) -> hive_shared::Task {
+        hive_shared::Task {
+            id: id.into(),
+            title: id.into(),
+            body: String::new(),
+            status,
+            priority,
+            tags: Vec::new(),
+            assignees: Vec::new(),
+            project: project.map(str::to_string),
+            phase: None,
+            due: due.map(str::to_string),
+            origin_entry_id: None,
+            anchor_text: None,
+            created_at: String::new(),
+            updated_at: id.into(),
+        }
+    }
+
+    /// task_due_day accepts the same shapes event_day does (bare date and
+    /// datetime-ish) and rejects garbage, so garbage reads as undated.
+    #[test]
+    fn task_due_day_parses_dates_and_datetimes() {
+        use super::task_due_day;
+        assert_eq!(task_due_day("2026-07-15"), Some((2026, 7, 15)));
+        assert_eq!(task_due_day("2026-08-01T09:30:00.000Z"), Some((2026, 8, 1)));
+        assert_eq!(task_due_day("  2026-12-31 23:59  "), Some((2026, 12, 31)));
+        // Garbage / vague → None (lands undated, never a wrong day).
+        assert_eq!(task_due_day(""), None);
+        assert_eq!(task_due_day("next Tuesday"), None);
+        assert_eq!(task_due_day("2026-13-01"), None);
+        assert_eq!(task_due_day("2026-02-30"), None);
+    }
+
+    /// due_bucket classifies Overdue / Today / Future / Undated by tuple
+    /// comparison, and is deterministic (no clock).
+    #[test]
+    fn due_bucket_classifies_relative_to_today() {
+        use super::{due_bucket, DueBucket};
+        let today = "2026-07-15";
+        assert_eq!(due_bucket(Some("2026-07-14"), today), DueBucket::Overdue);
+        assert_eq!(due_bucket(Some("2026-07-15"), today), DueBucket::Today);
+        assert_eq!(due_bucket(Some("2026-07-16"), today), DueBucket::Future);
+        // A datetime today still buckets as Today (day-granular).
+        assert_eq!(
+            due_bucket(Some("2026-07-15T23:00:00.000Z"), today),
+            DueBucket::Today
+        );
+        // Absent or garbage → Undated.
+        assert_eq!(due_bucket(None, today), DueBucket::Undated);
+        assert_eq!(due_bucket(Some("whenever"), today), DueBucket::Undated);
+        // Determinism: same inputs, same output.
+        assert_eq!(
+            due_bucket(Some("2026-07-14"), today),
+            due_bucket(Some("2026-07-14"), today)
+        );
+    }
+
+    /// due_label reads as Overdue / Today / Tomorrow / "Mon D" (with a year when
+    /// it differs), and falls back to raw text for an unparseable due.
+    #[test]
+    fn due_label_reads_relative_then_short_date() {
+        use super::due_label;
+        let today = "2026-07-15";
+        assert_eq!(due_label("2026-07-10", today), "Overdue");
+        assert_eq!(due_label("2026-07-15", today), "Today");
+        assert_eq!(due_label("2026-07-16", today), "Tomorrow");
+        assert_eq!(due_label("2026-07-20", today), "Jul 20");
+        // A different year carries the year.
+        assert_eq!(due_label("2027-01-03", today), "Jan 3 2027");
+        // Unparseable due → its trimmed raw text (never dropped).
+        assert_eq!(due_label("  someday  ", today), "someday");
+    }
+
+    /// The smart-view membership rules: Today = open & (overdue|today);
+    /// Scheduled = open & dated; Flagged = open & ≥High; All = open;
+    /// Completed = done; a user list = its project; No List = projectless.
+    #[test]
+    fn task_in_list_smart_and_user_rules() {
+        use super::{task_in_list, TaskListSel};
+        use hive_shared::{Priority, TaskStatus};
+        let today = "2026-07-15";
+
+        let overdue = mk_task(
+            "a",
+            TaskStatus::Todo,
+            Priority::Normal,
+            None,
+            Some("2026-07-01"),
+        );
+        let due_today = mk_task(
+            "b",
+            TaskStatus::Todo,
+            Priority::High,
+            Some("Work"),
+            Some("2026-07-15"),
+        );
+        let future = mk_task(
+            "c",
+            TaskStatus::Todo,
+            Priority::Urgent,
+            Some("Work"),
+            Some("2026-08-01"),
+        );
+        let undated = mk_task("d", TaskStatus::Doing, Priority::Normal, None, None);
+        let done = mk_task(
+            "e",
+            TaskStatus::Done,
+            Priority::Normal,
+            Some("Work"),
+            Some("2026-07-01"),
+        );
+
+        // Today: overdue + due-today open tasks; not future/undated/done.
+        assert!(task_in_list(&overdue, &TaskListSel::Today, today));
+        assert!(task_in_list(&due_today, &TaskListSel::Today, today));
+        assert!(!task_in_list(&future, &TaskListSel::Today, today));
+        assert!(!task_in_list(&undated, &TaskListSel::Today, today));
+        assert!(!task_in_list(&done, &TaskListSel::Today, today));
+
+        // Scheduled: any open dated task; not the undated one, not done.
+        assert!(task_in_list(&overdue, &TaskListSel::Scheduled, today));
+        assert!(task_in_list(&future, &TaskListSel::Scheduled, today));
+        assert!(!task_in_list(&undated, &TaskListSel::Scheduled, today));
+        assert!(!task_in_list(&done, &TaskListSel::Scheduled, today));
+
+        // Flagged: open & priority ≥ High.
+        assert!(task_in_list(&due_today, &TaskListSel::Flagged, today)); // High
+        assert!(task_in_list(&future, &TaskListSel::Flagged, today)); // Urgent
+        assert!(!task_in_list(&overdue, &TaskListSel::Flagged, today)); // Normal
+
+        // All: every open task; never a done one.
+        assert!(task_in_list(&overdue, &TaskListSel::All, today));
+        assert!(task_in_list(&undated, &TaskListSel::All, today));
+        assert!(!task_in_list(&done, &TaskListSel::All, today));
+
+        // Completed: only the done task.
+        assert!(task_in_list(&done, &TaskListSel::Completed, today));
+        assert!(!task_in_list(&overdue, &TaskListSel::Completed, today));
+
+        // User list "Work": tasks with that project (open + completed).
+        let work = TaskListSel::List("Work".into());
+        assert!(task_in_list(&due_today, &work, today));
+        assert!(task_in_list(&done, &work, today));
+        assert!(!task_in_list(&overdue, &work, today)); // no project
+
+        // No List: only projectless tasks.
+        assert!(task_in_list(&overdue, &TaskListSel::NoList, today));
+        assert!(task_in_list(&undated, &TaskListSel::NoList, today));
+        assert!(!task_in_list(&due_today, &TaskListSel::NoList, today));
+    }
+
+    /// ordered_tasks: open before completed; within open, due asc (undated
+    /// last) then priority desc; completed by most-recently-updated.
+    #[test]
+    fn ordered_tasks_open_first_then_due_then_priority() {
+        use super::ordered_tasks;
+        use hive_shared::{Priority, TaskStatus};
+        let today = "2026-07-15";
+
+        let a_undated_urgent = mk_task("a", TaskStatus::Todo, Priority::Urgent, None, None);
+        let b_soon = mk_task(
+            "b",
+            TaskStatus::Todo,
+            Priority::Low,
+            None,
+            Some("2026-07-16"),
+        );
+        let c_later = mk_task(
+            "c",
+            TaskStatus::Todo,
+            Priority::High,
+            None,
+            Some("2026-07-20"),
+        );
+        let d_done = mk_task(
+            "d",
+            TaskStatus::Done,
+            Priority::High,
+            None,
+            Some("2026-07-01"),
+        );
+
+        let ordered = ordered_tasks(
+            vec![
+                d_done.clone(),
+                a_undated_urgent.clone(),
+                c_later.clone(),
+                b_soon.clone(),
+            ],
+            today,
+        );
+        let ids: Vec<&str> = ordered.iter().map(|t| t.id.as_str()).collect();
+        // Dated open tasks come first in due order, then the undated open
+        // (urgent) task, then the completed one last.
+        assert_eq!(ids, vec!["b", "c", "a", "d"]);
+    }
+
+    /// distinct_lists dedupes non-empty projects (case-insensitive sort) and
+    /// has_no_list_tasks detects projectless tasks.
+    #[test]
+    fn distinct_lists_and_no_list_detection() {
+        use super::{distinct_lists, has_no_list_tasks};
+        use hive_shared::{Priority, TaskStatus};
+        let tasks = vec![
+            mk_task("a", TaskStatus::Todo, Priority::Normal, Some("Zeta"), None),
+            mk_task("b", TaskStatus::Todo, Priority::Normal, Some("alpha"), None),
+            mk_task("c", TaskStatus::Todo, Priority::Normal, Some("Zeta"), None),
+            mk_task("d", TaskStatus::Todo, Priority::Normal, Some("   "), None), // blank → No List
+            mk_task("e", TaskStatus::Todo, Priority::Normal, None, None),
+        ];
+        assert_eq!(distinct_lists(&tasks), vec!["alpha", "Zeta"]);
+        assert!(has_no_list_tasks(&tasks), "blank + none count as No List");
+
+        let all_listed = vec![mk_task(
+            "x",
+            TaskStatus::Todo,
+            Priority::Normal,
+            Some("A"),
+            None,
+        )];
+        assert!(!has_no_list_tasks(&all_listed));
     }
 
     /// Placement buckets events by parsed day and routes the undated/vague ones
