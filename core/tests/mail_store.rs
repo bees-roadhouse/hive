@@ -137,6 +137,124 @@ async fn mail_queries_read_unscoped() {
     assert_eq!(thread.messages.len(), 2, "whole thread, no viewer gate");
 }
 
+/// The reader's per-mailbox surface: `mail_mailboxes_list` reports total/unread
+/// counts by matching the mailbox's quoted jmap id inside each message's
+/// `mailbox_ids_json` (unread = no `$seen`), and `mail_messages_by_mailbox`
+/// returns exactly that folder's live messages, newest first — never another
+/// mailbox's, never another account's.
+#[tokio::test]
+async fn mailbox_list_counts_and_membership() {
+    let store = common::test_store().await;
+    // One account, two mailboxes.
+    exec(
+        &store,
+        "INSERT INTO mail_accounts (id, owner, address, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        vec!["acct-a".into(), "alice".into(), "alice@example.test".into(), NOW.into(), NOW.into()],
+    )
+    .await;
+    for (id, jmap, name, role, order) in [
+        ("mbox-inbox", "mb-inbox", "Inbox", "inbox", 0),
+        ("mbox-arch", "mb-arch", "Archive", "archive", 1),
+    ] {
+        exec(
+            &store,
+            "INSERT INTO mail_mailboxes (id, account_id, jmap_id, name, role, sort_order) VALUES (?, ?, ?, ?, ?, ?)",
+            vec![id.into(), "acct-a".into(), jmap.into(), name.into(), role.into(), order.into()],
+        )
+        .await;
+    }
+    // Three messages: two in the inbox (one unread, one seen), one in archive.
+    let seed = |id: &str, thread: &str, boxes: &str, keywords: &str, recv: &str| {
+        let store = &store;
+        let (id, thread, boxes, keywords, recv) = (
+            id.to_string(),
+            thread.to_string(),
+            boxes.to_string(),
+            keywords.to_string(),
+            recv.to_string(),
+        );
+        async move {
+            exec(
+                store,
+                "INSERT INTO mail_messages (id, account_id, user_scope, jmap_thread_id, jmap_id, subject, from_addr, to_json, cc_json, received_at, mailbox_ids_json, keywords_json, snippet, body_text, has_attachments, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                vec![
+                    id.clone().into(),
+                    "acct-a".into(),
+                    "alice".into(),
+                    thread.into(),
+                    format!("jmap-{id}").into(),
+                    format!("Subject {id}").into(),
+                    "sender@example.test".into(),
+                    "[]".into(),
+                    "[]".into(),
+                    recv.into(),
+                    boxes.into(),
+                    keywords.into(),
+                    "snip".into(),
+                    "body".into(),
+                    false.into(),
+                    NOW.into(),
+                    NOW.into(),
+                ],
+            )
+            .await;
+        }
+    };
+    seed(
+        "m-in-unread",
+        "t1",
+        r#"["mb-inbox"]"#,
+        "{}",
+        "2026-07-04T10:00:00.000Z",
+    )
+    .await;
+    seed(
+        "m-in-seen",
+        "t2",
+        r#"["mb-inbox"]"#,
+        r#"{"$seen":true}"#,
+        "2026-07-04T11:00:00.000Z",
+    )
+    .await;
+    seed(
+        "m-arch",
+        "t3",
+        r#"["mb-arch"]"#,
+        "{}",
+        "2026-07-04T09:00:00.000Z",
+    )
+    .await;
+
+    let boxes = store.mail_mailboxes_list("acct-a").await.unwrap();
+    assert_eq!(boxes.len(), 2);
+    let inbox = boxes.iter().find(|b| b.jmap_id == "mb-inbox").unwrap();
+    assert_eq!(inbox.total, 2, "both inbox messages counted");
+    assert_eq!(inbox.unread, 1, "only the $seen-less message is unread");
+    let arch = boxes.iter().find(|b| b.jmap_id == "mb-arch").unwrap();
+    assert_eq!((arch.total, arch.unread), (1, 1));
+
+    // The inbox listing is exactly its two messages, newest first; archive's
+    // message is absent.
+    let list = store
+        .mail_messages_by_mailbox("mbox-inbox", 50)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = list.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["m-in-seen", "m-in-unread"],
+        "newest first, inbox-only"
+    );
+
+    // An unknown mailbox id yields an empty list, never an error.
+    assert!(store
+        .mail_messages_by_mailbox("mbox-missing", 50)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 #[tokio::test]
 async fn account_lifecycle_create_toggle_resync_delete() {
     // Same constant every test uses; set_var is process-global but
