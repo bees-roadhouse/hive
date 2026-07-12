@@ -17,7 +17,7 @@ use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
 use rusqlite::OptionalExtension;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use super::cc_credentials::NewCcCredential;
@@ -123,6 +123,34 @@ pub struct MailThread {
     pub messages: Vec<MailThreadMessage>,
 }
 
+/// One mailbox participant, name + address. The stored address-list JSON shape
+/// (`{"email": ..., "name": ...}`) the sync sink writes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct EmailAddr {
+    pub email: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Everything the compose window needs to prefill a reply/reply-all from an open
+/// message: the account it lives in (so From defaults right), the parent's
+/// Message-ID + References (the threading headers a reply must carry), and the
+/// original participants (From / Reply-To / To / Cc) so recipients can be built
+/// without re-deriving them from display strings.
+#[derive(Debug, Clone, Serialize)]
+pub struct MailReplyMeta {
+    pub account_id: String,
+    pub account_address: String,
+    pub message_id_hdr: Option<String>,
+    pub references: Vec<String>,
+    pub from: Vec<EmailAddr>,
+    pub reply_to: Vec<EmailAddr>,
+    pub to: Vec<EmailAddr>,
+    pub cc: Vec<EmailAddr>,
+    pub subject: String,
+    pub received_at: String,
+}
+
 impl From<MailMessageRow> for MailThreadMessage {
     fn from(row: MailMessageRow) -> Self {
         let from = row
@@ -200,6 +228,24 @@ fn label_rank(label: &str) -> u8 {
         "seen" => 9,
         _ => 4,
     }
+}
+
+/// Parse a stored address-list JSON (`[{"email","name"}]`) into typed
+/// [`EmailAddr`]s, tolerating a bare `["a@b"]` string array too. Drops entries
+/// with no email.
+fn parse_addr_list(raw: &str) -> Vec<EmailAddr> {
+    if let Ok(list) = serde_json::from_str::<Vec<EmailAddr>>(raw) {
+        return list.into_iter().filter(|a| !a.email.is_empty()).collect();
+    }
+    // Fallback: a plain array of address strings.
+    serde_json::from_str::<Vec<String>>(raw)
+        .map(|v| {
+            v.into_iter()
+                .filter(|s| !s.is_empty())
+                .map(|email| EmailAddr { email, name: None })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn json_string_array(raw: &str) -> Vec<String> {
@@ -323,6 +369,74 @@ impl Store {
                 subject,
                 messages,
             })
+        })
+        .await
+    }
+
+    /// The reply-prefill facts for one message: its account's address plus the
+    /// parent's threading headers and participants. `None` when the message is
+    /// gone. Read-only — no fold, no derived state.
+    pub async fn mail_message_reply_meta(&self, id: &str) -> Result<Option<MailReplyMeta>> {
+        let id = id.to_string();
+        self.run(move |core| {
+            let row = core
+                .conn()
+                .query_row(
+                    "SELECT m.account_id, a.address, m.message_id_hdr, m.references_json, \
+                     m.from_addr, m.from_name, m.reply_to_json, m.to_json, m.cc_json, \
+                     m.subject, m.received_at \
+                     FROM mail_messages m JOIN mail_accounts a ON a.id = m.account_id \
+                     WHERE m.id = ?1 AND m.deleted_at IS NULL",
+                    rusqlite::params![id],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,         // account_id
+                            r.get::<_, String>(1)?,         // account address
+                            r.get::<_, Option<String>>(2)?, // message_id_hdr
+                            r.get::<_, String>(3)?,         // references_json
+                            r.get::<_, String>(4)?,         // from_addr
+                            r.get::<_, Option<String>>(5)?, // from_name
+                            r.get::<_, String>(6)?,         // reply_to_json
+                            r.get::<_, String>(7)?,         // to_json
+                            r.get::<_, String>(8)?,         // cc_json
+                            r.get::<_, String>(9)?,         // subject
+                            r.get::<_, String>(10)?,        // received_at
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                account_id,
+                account_address,
+                message_id_hdr,
+                references_json,
+                from_addr,
+                from_name,
+                reply_to_json,
+                to_json,
+                cc_json,
+                subject,
+                received_at,
+            )) = row
+            else {
+                return Ok(None);
+            };
+            Ok(Some(MailReplyMeta {
+                account_id,
+                account_address,
+                message_id_hdr,
+                references: serde_json::from_str::<Vec<String>>(&references_json)
+                    .unwrap_or_default(),
+                from: vec![EmailAddr {
+                    email: from_addr,
+                    name: from_name,
+                }],
+                reply_to: parse_addr_list(&reply_to_json),
+                to: parse_addr_list(&to_json),
+                cc: parse_addr_list(&cc_json),
+                subject,
+                received_at,
+            }))
         })
         .await
     }
@@ -1039,6 +1153,67 @@ impl Store {
                 })
             })?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+    }
+
+    /// One account's sync fields by id (minus the secret), regardless of
+    /// enabled/backoff state — the send flush needs the connection details for
+    /// an account even when it is not currently due for a poll. `None` when the
+    /// row is gone.
+    pub async fn mail_account_sync_get(&self, id: &str) -> Result<Option<MailAccountSync>> {
+        let id = id.to_string();
+        self.run(move |core| {
+            Ok(core
+                .conn()
+                .query_row(
+                    "SELECT id, owner, address, jmap_url, jmap_username, jmap_account_id, cred_id, \
+                     email_state, mailbox_state, backfill_status, backfill_cursor, attempts \
+                     FROM mail_accounts WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| {
+                        Ok(MailAccountSync {
+                            id: r.get(0)?,
+                            owner: r.get(1)?,
+                            address: r.get(2)?,
+                            jmap_url: r.get(3)?,
+                            jmap_username: r.get(4)?,
+                            jmap_account_id: r.get(5)?,
+                            cred_id: r.get(6)?,
+                            email_state: r.get(7)?,
+                            mailbox_state: r.get(8)?,
+                            backfill_status: r.get(9)?,
+                            backfill_cursor: r
+                                .get::<_, Option<String>>(10)?
+                                .and_then(|s| serde_json::from_str(&s).ok()),
+                            attempts: r.get(11)?,
+                        })
+                    },
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    /// The JMAP id of the first mailbox with the given role (e.g. `drafts`) for
+    /// an account, if one has been synced. The send path uses this to place the
+    /// draft before submitting; when absent it falls back to a live lookup.
+    pub async fn mail_mailbox_jmap_by_role(
+        &self,
+        account_id: &str,
+        role: &str,
+    ) -> Result<Option<String>> {
+        let (account_id, role) = (account_id.to_string(), role.to_string());
+        self.run(move |core| {
+            Ok(core
+                .conn()
+                .query_row(
+                    "SELECT jmap_id FROM mail_mailboxes \
+                     WHERE account_id = ?1 AND role = ?2 ORDER BY sort_order ASC LIMIT 1",
+                    rusqlite::params![account_id, role],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?)
         })
         .await
     }

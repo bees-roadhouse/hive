@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use hive_shared::{OutboxJob, OutboxStatus, WorkerOutboxCounts};
+use rusqlite::OptionalExtension;
 use serde_json::json;
 
 use super::{new_id, now_iso, placeholders_or_never, Store};
@@ -93,6 +94,23 @@ impl Store {
                 row_to_job,
             )?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+    }
+
+    /// One job by id, or `None` when it's gone. The compose UI polls this to
+    /// turn a queued send into a Sent/Failed status.
+    pub async fn outbox_get(&self, job_id: &str) -> Result<Option<OutboxJob>> {
+        let job_id = job_id.to_string();
+        self.run(move |core| {
+            Ok(core
+                .conn()
+                .query_row(
+                    "SELECT * FROM outbox WHERE id = ?1",
+                    rusqlite::params![job_id],
+                    row_to_job,
+                )
+                .optional()?)
         })
         .await
     }

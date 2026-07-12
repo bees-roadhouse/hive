@@ -8,12 +8,16 @@ use futures_util::{Stream, StreamExt};
 use jmap_client::client::{Client, Credentials};
 use jmap_client::core::error::MethodErrorType;
 use jmap_client::core::query::{Filter as CoreFilter, QueryResponse};
-use jmap_client::core::response::{EmailGetResponse, MailboxGetResponse};
-use jmap_client::email::{self, Email, Property};
+use jmap_client::core::response::{
+    EmailGetResponse, IdentityGetResponse, MailboxGetResponse, MethodResponse, TaggedMethodResponse,
+};
+use jmap_client::core::set::SetObject;
+use jmap_client::email::{self, Email, EmailBodyPart, Property};
+use jmap_client::email_submission::Address as SubmissionAddress;
 use jmap_client::mailbox::{self, Role};
 use jmap_client::{DataType, Error as JmapError};
 
-use crate::{AttachmentMeta, MailboxInfo, SyncConfig, SyncError};
+use crate::{AttachmentMeta, MailboxInfo, OutgoingEmail, SyncConfig, SyncError};
 
 pub(crate) type DoorbellStream = Pin<Box<dyn Stream<Item = Result<(), SyncError>> + Send>>;
 
@@ -334,6 +338,127 @@ impl RawClient {
         self.inner.download(blob_id).await.map_err(map_err)
     }
 
+    /// Pick the submission Identity for a From address: exact email match
+    /// (case-insensitive), else the first identity the account exposes. Errors
+    /// only when the account has no identities at all.
+    pub(crate) async fn resolve_identity(&self, from_address: &str) -> Result<String, SyncError> {
+        // No `.ids()` → the server returns every identity on the account.
+        let mut request = self.inner.build();
+        request.get_identity();
+        let mut resp = request
+            .send_single::<IdentityGetResponse>()
+            .await
+            .map_err(map_err)?;
+        let identities = resp.take_list();
+        let want = from_address.to_ascii_lowercase();
+        let chosen = identities
+            .iter()
+            .find(|i| {
+                i.email()
+                    .map(|e| e.eq_ignore_ascii_case(&want))
+                    .unwrap_or(false)
+            })
+            .or_else(|| identities.first())
+            .and_then(|i| i.id().map(|s| s.to_string()));
+        chosen.ok_or_else(|| {
+            SyncError::Protocol(format!(
+                "no JMAP identity is configured to send as {from_address}"
+            ))
+        })
+    }
+
+    /// The two-method send: `Email/set` create then `EmailSubmission/set` create
+    /// referencing it by `#creationId`, in one request. Returns the submission
+    /// id. Surfaces `notCreated` set errors on either method (bad recipient,
+    /// over quota, forbidden-from, …) as [`SyncError::Protocol`].
+    pub(crate) async fn send_email(
+        &self,
+        msg: &OutgoingEmail,
+        drafts_mailbox_id: &str,
+        identity_id: &str,
+    ) -> Result<String, SyncError> {
+        // Body part id links the bodyValue to the textBody structure.
+        const BODY_PART: &str = "text";
+
+        let mut request = self.inner.build();
+
+        // ── method s0: Email/set create (the draft) ──────────────────────────
+        let email_create_id = {
+            let email = request.set_email().create();
+            email
+                .mailbox_ids([drafts_mailbox_id])
+                .keywords(["$draft", "$seen"])
+                .from([email_address(&msg.from_address, msg.from_name.as_deref())])
+                .to(msg.to.iter().map(email_address_of))
+                .subject(msg.subject.clone())
+                .body_value(BODY_PART.to_string(), msg.body_text.clone())
+                .text_body(
+                    EmailBodyPart::new()
+                        .part_id(BODY_PART)
+                        .content_type("text/plain"),
+                );
+            if !msg.cc.is_empty() {
+                email.cc(msg.cc.iter().map(email_address_of));
+            }
+            if !msg.bcc.is_empty() {
+                email.bcc(msg.bcc.iter().map(email_address_of));
+            }
+            if let Some(irt) = msg.in_reply_to.as_ref().filter(|s| !s.is_empty()) {
+                email.in_reply_to([irt.clone()]);
+            }
+            if !msg.references.is_empty() {
+                email.references(msg.references.clone());
+            }
+            email
+                .create_id()
+                .ok_or_else(|| SyncError::Protocol("email create id missing".into()))?
+        };
+
+        // ── method s1: EmailSubmission/set create, back-referencing #c0 ──────
+        let submission_create_id = {
+            let sub = request.set_email_submission().create();
+            sub.email_id(format!("#{email_create_id}"))
+                .identity_id(identity_id)
+                .envelope(
+                    SubmissionAddress::new(msg.from_address.clone()),
+                    msg.envelope_rcpts().into_iter().map(SubmissionAddress::new),
+                );
+            sub.create_id()
+                .ok_or_else(|| SyncError::Protocol("submission create id missing".into()))?
+        };
+
+        let response: jmap_client::core::response::Response<TaggedMethodResponse> =
+            self.inner.send(&request).await.map_err(map_err)?;
+        // Responses come back tagged by call id (s0, s1); pull each by position.
+        let mut set_email = None;
+        let mut set_submission = None;
+        for tagged in response.unwrap_method_responses() {
+            match tagged.unwrap_method_response() {
+                MethodResponse::SetEmail(r) => set_email = Some(r),
+                MethodResponse::SetEmailSubmission(r) => set_submission = Some(r),
+                MethodResponse::Error(e) => return Err(map_err(e.into())),
+                _ => {}
+            }
+        }
+
+        // The email must have been created for the submission to reference it.
+        let mut set_email =
+            set_email.ok_or_else(|| SyncError::Protocol("no Email/set response".into()))?;
+        set_email
+            .created(&email_create_id)
+            .map_err(|e| SyncError::Protocol(format!("draft not created: {e}")))?;
+
+        let mut set_submission = set_submission
+            .ok_or_else(|| SyncError::Protocol("no EmailSubmission/set response".into()))?;
+        let submission = set_submission
+            .created(&submission_create_id)
+            .map_err(|e| SyncError::Protocol(format!("send rejected: {e}")))?;
+        submission
+            .id()
+            .map(|s| s.to_string())
+            .ok_or_else(|| SyncError::Protocol("submission created without an id".into()))
+    }
+
     /// An SSE doorbell: yields `()` whenever the server reports an Email
     /// state change. Errors/termination surface once; the caller drops the
     /// stream and re-establishes on the next wait.
@@ -352,6 +477,20 @@ impl RawClient {
             }
         })))
     }
+}
+
+/// A JMAP `EmailAddress` (the `Get`-state value the `Email<Set>` header setters
+/// accept) built from an email + optional display name. An empty/absent name
+/// serializes as no `name`, so the server emits a bare `<addr>`.
+fn email_address(email: &str, name: Option<&str>) -> email::EmailAddress {
+    match name.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => (n.to_string(), email.to_string()).into(),
+        None => email.to_string().into(),
+    }
+}
+
+fn email_address_of(addr: &crate::Address) -> email::EmailAddress {
+    email_address(&addr.email, addr.name.as_deref())
 }
 
 fn build_filter(

@@ -66,6 +66,51 @@ pub struct Address {
     pub name: Option<String>,
 }
 
+/// A message the user is sending: what [`Syncer::send_email`] turns into a JMAP
+/// `Email/set` create + `EmailSubmission/set` submit. Plaintext body only this
+/// slice. Serializable so it round-trips through the durable outbox payload.
+///
+/// `drafts_mailbox_id` is the JMAP id of the account's Drafts mailbox (the
+/// created email must live somewhere before it is submitted); `None` means the
+/// send path resolves it from the server's mailbox list. `identity_id` likewise
+/// may be pre-resolved or left for the send path to discover by From address.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutgoingEmail {
+    pub from_address: String,
+    pub from_name: Option<String>,
+    pub to: Vec<Address>,
+    #[serde(default)]
+    pub cc: Vec<Address>,
+    #[serde(default)]
+    pub bcc: Vec<Address>,
+    pub subject: String,
+    pub body_text: String,
+    /// RFC Message-ID of the message being replied to (goes into In-Reply-To).
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    /// The References chain for a reply (already includes the parent's id).
+    #[serde(default)]
+    pub references: Vec<String>,
+    /// JMAP id of the Drafts mailbox; resolved from the server when `None`.
+    #[serde(default)]
+    pub drafts_mailbox_id: Option<String>,
+    /// JMAP Identity id to submit as; resolved by From address when `None`.
+    #[serde(default)]
+    pub identity_id: Option<String>,
+}
+
+impl OutgoingEmail {
+    /// The MAIL FROM / rcpt-to recipients: To + Cc + Bcc, the whole envelope.
+    pub fn envelope_rcpts(&self) -> Vec<String> {
+        self.to
+            .iter()
+            .chain(self.cc.iter())
+            .chain(self.bcc.iter())
+            .map(|a| a.email.clone())
+            .collect()
+    }
+}
+
 /// How `body_text` was produced. Raw HTML is never stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodySource {
@@ -304,6 +349,44 @@ impl Syncer {
             return Ok(None);
         }
         Ok(Some(bytes))
+    }
+
+    /// Create the message as a draft and submit it in ONE JMAP request:
+    /// `Email/set` create (into the account's Drafts, keywords `$draft`+`$seen`)
+    /// followed by `EmailSubmission/set` create that back-references the new
+    /// email via `#creationId` and carries the SMTP envelope. Returns the server
+    /// EmailSubmission id.
+    ///
+    /// Resolving what the message itself doesn't carry:
+    ///   - Drafts mailbox: `msg.drafts_mailbox_id`, else the mailbox the server
+    ///     tags with the `drafts` role;
+    ///   - submission identity: `msg.identity_id`, else the Identity whose email
+    ///     equals the From address (case-insensitive), else the first identity.
+    ///
+    /// Network work only — no store, no secret (the driver decrypts and connects
+    /// before calling this).
+    pub async fn send_email(&mut self, msg: &OutgoingEmail) -> Result<String, SyncError> {
+        let drafts = match &msg.drafts_mailbox_id {
+            Some(id) if !id.is_empty() => id.clone(),
+            _ => self.resolve_drafts_mailbox().await?,
+        };
+        let identity = match &msg.identity_id {
+            Some(id) if !id.is_empty() => id.clone(),
+            _ => self.raw.resolve_identity(&msg.from_address).await?,
+        };
+        self.raw.send_email(msg, &drafts, &identity).await
+    }
+
+    /// Find the Drafts mailbox jmap id from the server's mailbox list.
+    async fn resolve_drafts_mailbox(&mut self) -> Result<String, SyncError> {
+        let (boxes, _) = self.raw.list_mailboxes().await?;
+        boxes
+            .into_iter()
+            .find(|b| b.role.as_deref() == Some("drafts"))
+            .map(|b| b.jmap_id)
+            .ok_or_else(|| {
+                SyncError::Protocol("account has no Drafts mailbox to compose into".into())
+            })
     }
 }
 
