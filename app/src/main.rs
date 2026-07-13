@@ -4790,6 +4790,103 @@ fn identity_row(
                         "{person.slug}"
                     }
                 }
+                // Kind correction. An identity imported or created with the wrong
+                // type is reclassified here. This is also the ESCAPE HATCH for an
+                // owner that came in as an AI: "This is me" is withheld on AI rows,
+                // so without this you could never designate yourself — and mail/
+                // pickers would keep labelling you "(AI)". Marking your row a person
+                // fixes both. Offered on every AI row (owner included); the reverse
+                // ("Mark as AI") is offered on non-owner human rows only — the owner
+                // is a person by definition.
+                if is_ai {
+                    {
+                        let k_slug = person.slug.clone();
+                        let k_author = if owner_slug.is_empty() {
+                            person.slug.clone()
+                        } else {
+                            owner_slug.clone()
+                        };
+                        rsx! {
+                            button {
+                                id: "identity-kind-{person.slug}",
+                                disabled: busy(),
+                                style: "background: {BG}; color: {DIM}; border: 1px solid {EDGE}; \
+                                        border-radius: 999px; padding: 0.25rem 0.7rem; font: inherit; \
+                                        font-size: 0.74rem; font-weight: 600; cursor: pointer; white-space: nowrap;",
+                                title: "This identity is a person, not an AI agent",
+                                onclick: move |_| {
+                                    if busy() { return; }
+                                    let (k_slug, k_author) = (k_slug.clone(), k_author.clone());
+                                    let store = store();
+                                    busy.set(true);
+                                    err.set(None);
+                                    spawn(async move {
+                                        match store
+                                            .people_update(
+                                                &k_slug,
+                                                PersonPatch {
+                                                    kind: Some(ActorKind::Human),
+                                                    ..Default::default()
+                                                },
+                                                &k_author,
+                                            )
+                                            .await
+                                        {
+                                            Ok(_) => refresh += 1,
+                                            Err(e) => err.set(Some(format!("{e:#}"))),
+                                        }
+                                        busy.set(false);
+                                    });
+                                },
+                                "Not an AI — mark as person"
+                            }
+                        }
+                    }
+                } else if !is_owner {
+                    {
+                        let k_slug = person.slug.clone();
+                        let k_author = if owner_slug.is_empty() {
+                            person.slug.clone()
+                        } else {
+                            owner_slug.clone()
+                        };
+                        rsx! {
+                            button {
+                                id: "identity-kind-{person.slug}",
+                                disabled: busy(),
+                                style: "background: none; color: {FAINT}; border: 1px solid {EDGE}; \
+                                        border-radius: 999px; padding: 0.25rem 0.7rem; font: inherit; \
+                                        font-size: 0.74rem; font-weight: 600; cursor: pointer; white-space: nowrap;",
+                                title: "Mark this identity as an AI agent",
+                                onclick: move |_| {
+                                    if busy() { return; }
+                                    let (k_slug, k_author) = (k_slug.clone(), k_author.clone());
+                                    let store = store();
+                                    busy.set(true);
+                                    err.set(None);
+                                    spawn(async move {
+                                        match store
+                                            .people_update(
+                                                &k_slug,
+                                                PersonPatch {
+                                                    kind: Some(ActorKind::Ai),
+                                                    ..Default::default()
+                                                },
+                                                &k_author,
+                                            )
+                                            .await
+                                        {
+                                            Ok(_) => refresh += 1,
+                                            Err(e) => err.set(Some(format!("{e:#}"))),
+                                        }
+                                        busy.set(false);
+                                    });
+                                },
+                                "Mark as AI"
+                            }
+                        }
+                    }
+                }
                 // Ownership controls — never on the owner's own row.
                 if !is_owner {
                     div {

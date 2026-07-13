@@ -1,9 +1,12 @@
 // The credential vault, encrypted at rest — today its ONLY consumer is mail
 // account credentials (mail_accounts.cred_id names a row here; store/mail.rs
 // writes and decrypts through it). Reversible (AES-256-GCM) because the mail
-// sync driver needs the real secret. The key derives from HIVE_CRED_KEY (any
-// string; SHA-256 → 32-byte key). Named cc_credentials for hosted-era
-// reasons; Phase 3 replaces it with the OS keychain.
+// sync driver needs the real secret. The key derives from the store's MASTER
+// key (the OS-keychain secret, resolved at open) via a domain-separated
+// SHA-256 — so the vault works wherever the store opens, with no external
+// configuration. `HIVE_CRED_KEY`, when set, overrides it (a hosted-era / test
+// escape hatch). Named cc_credentials for hosted-era reasons; Phase 3 folds
+// it fully into the OS keychain.
 //
 // Cutover decision (PR 1.6): this stays a RUNTIME table in the derived index
 // (see index/mod.rs) rather than becoming records — least churn, and the
@@ -54,19 +57,37 @@ pub struct NewCcCredential {
     pub secret: String,
 }
 
-fn cred_key() -> Result<[u8; 32]> {
-    let raw = std::env::var("HIVE_CRED_KEY")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| anyhow!("HIVE_CRED_KEY is not set; the credential vault is disabled"))?;
+/// Domain-separation label so the vault subkey is distinct from the SQLCipher
+/// database key even though both descend from the same master key.
+const VAULT_KDF_LABEL: &[u8] = b"hive:cc-credentials:v1";
+
+/// Derive the 32-byte AES-GCM vault key. Normally `SHA-256(master ‖ label)` so
+/// it is bound to the store's master key and available wherever the store
+/// opens. `env_override` (from `HIVE_CRED_KEY`), when present and non-blank,
+/// wins and is `SHA-256(override)` — kept as a hosted-era / test escape hatch.
+/// Pure: the caller reads the env so this stays unit-testable without touching
+/// process-global state.
+fn vault_key(master: &[u8; 32], env_override: Option<&str>) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(raw.as_bytes());
-    Ok(h.finalize().into())
+    match env_override {
+        Some(raw) if !raw.trim().is_empty() => h.update(raw.as_bytes()),
+        _ => {
+            h.update(master);
+            h.update(VAULT_KDF_LABEL);
+        }
+    }
+    h.finalize().into()
 }
 
-fn encrypt(plaintext: &str) -> Result<(String, String)> {
-    let key = cred_key()?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+/// The optional `HIVE_CRED_KEY` override, read once at a call site.
+fn env_override() -> Option<String> {
+    std::env::var("HIVE_CRED_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+fn encrypt(plaintext: &str, key: &[u8; 32]) -> Result<(String, String)> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -76,9 +97,8 @@ fn encrypt(plaintext: &str) -> Result<(String, String)> {
     Ok((STANDARD.encode(ct), STANDARD.encode(nonce_bytes)))
 }
 
-fn decrypt(ciphertext_b64: &str, nonce_b64: &str) -> Result<String> {
-    let key = cred_key()?;
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+fn decrypt(ciphertext_b64: &str, nonce_b64: &str, key: &[u8; 32]) -> Result<String> {
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let ct = STANDARD
         .decode(ciphertext_b64)
         .context("bad ciphertext base64")?;
@@ -86,7 +106,7 @@ fn decrypt(ciphertext_b64: &str, nonce_b64: &str) -> Result<String> {
     let nonce = Nonce::from_slice(&nonce_bytes);
     let pt = cipher
         .decrypt(nonce, ct.as_ref())
-        .map_err(|e| anyhow!("aes-gcm decrypt failed (wrong HIVE_CRED_KEY?): {e}"))?;
+        .map_err(|e| anyhow!("aes-gcm decrypt failed (vault key mismatch): {e}"))?;
     String::from_utf8(pt).context("decrypted credential is not utf-8")
 }
 
@@ -103,7 +123,8 @@ impl Store {
         owner: &str,
         input: NewCcCredential,
     ) -> Result<CcCredentialView> {
-        let (ciphertext, nonce) = encrypt(&input.secret)?;
+        let key = vault_key(&self.master, env_override().as_deref());
+        let (ciphertext, nonce) = encrypt(&input.secret, &key)?;
         let id = new_id("cred");
         let ts = now_iso();
         let runtime = normalize_runtime(input.runtime.as_deref());
@@ -176,6 +197,33 @@ impl Store {
         let Some((_, ciphertext, nonce)) = row else {
             return Ok(None);
         };
-        Ok(Some(decrypt(&ciphertext, &nonce)?))
+        let key = vault_key(&self.master, env_override().as_deref());
+        Ok(Some(decrypt(&ciphertext, &nonce, &key)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::vault_key;
+
+    #[test]
+    fn vault_key_is_deterministic_and_master_bound() {
+        let m1 = [7u8; 32];
+        let m2 = [9u8; 32];
+        // Same master → same key; different master → different key.
+        assert_eq!(vault_key(&m1, None), vault_key(&m1, None));
+        assert_ne!(vault_key(&m1, None), vault_key(&m2, None));
+    }
+
+    #[test]
+    fn env_override_wins_and_is_master_independent() {
+        let m1 = [1u8; 32];
+        let m2 = [2u8; 32];
+        // A set override ignores the master (same key across masters)…
+        assert_eq!(vault_key(&m1, Some("k")), vault_key(&m2, Some("k")));
+        // …a blank/whitespace override falls back to master derivation…
+        assert_eq!(vault_key(&m1, Some("   ")), vault_key(&m1, None));
+        // …and the override key differs from the master-derived one.
+        assert_ne!(vault_key(&m1, Some("k")), vault_key(&m1, None));
     }
 }

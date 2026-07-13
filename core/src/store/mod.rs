@@ -94,6 +94,11 @@ pub struct Store {
     embedder: Arc<dyn Embedder>,
     device: String,
     data_dir: PathBuf,
+    /// The master key (OS-keychain secret), resolved once at open. The
+    /// credential vault (`cc_credentials`) derives its AES-GCM key from this,
+    /// domain-separated, so it works wherever the store opens — no external
+    /// `HIVE_CRED_KEY` needed.
+    master: [u8; 32],
     /// The writer thread's handle, for `shutdown` (reopen-the-same-dir tests
     /// and an orderly app exit).
     writer: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
@@ -107,6 +112,9 @@ impl Store {
         keys: Arc<dyn KeySource + Send + Sync>,
         embedder: Arc<dyn Embedder>,
     ) -> Result<Store> {
+        // Resolve the master key once, before `keys` is moved into the core;
+        // the credential vault derives its AES-GCM key from it.
+        let master = keys.master_key()?;
         let mut core = core::open_core(data_dir, keys)?;
         let device = core.device.clone();
         let (jobs, mut rx) = mpsc::unbounded_channel::<Job>();
@@ -126,6 +134,7 @@ impl Store {
             embedder,
             device,
             data_dir: data_dir.to_path_buf(),
+            master,
             writer: Arc::new(Mutex::new(Some(writer))),
         })
     }
