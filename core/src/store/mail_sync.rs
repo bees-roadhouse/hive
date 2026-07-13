@@ -708,6 +708,32 @@ impl ActionTransport for JmapActionTransport<'_> {
 }
 
 impl Store {
+    /// Run ONE full sync pass for this account right now — the "Sync now"
+    /// button. Unlike the background tick, it returns the outcome to the caller
+    /// so the UI shows success or the EXACT failure immediately (no waiting on
+    /// the ~30s tick, no reading logs). It persists status exactly like the
+    /// driver (`mark_ok` clears the backoff on success; `mark_failed` records
+    /// the clipped `last_error`), so the row's status line and error update too.
+    /// Never carries a secret in its error — the message is anyhow context.
+    pub async fn mail_account_sync_now(&self, id: &str) -> Result<()> {
+        let acct = self
+            .mail_account_sync_get(id)
+            .await?
+            .ok_or_else(|| anyhow!("mail account not found"))?;
+        match sync_account(self, acct).await {
+            Ok(()) => {
+                self.mail_account_mark_ok(id).await?;
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                // Persist the failure like the driver, then surface it verbatim.
+                let _ = self.mail_account_mark_failed(id, &msg).await;
+                Err(anyhow!("{msg}"))
+            }
+        }
+    }
+
     /// Queue a message to send. Serializes it into a durable `mail.send` outbox
     /// job (kind the mail driver owns); the next driver tick flushes it. Returns
     /// the outbox job id the UI tracks. NO fold change — the outbox is runtime.

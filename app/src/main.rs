@@ -3500,6 +3500,8 @@ fn mail_account_row(
 ) -> Element {
     let mut armed = use_signal(|| None as ArmedDelete);
     let mut row_err = use_signal(|| Option::<String>::None);
+    // A "Sync now" pass in flight — drives the button's label + disables it.
+    let mut syncing = use_signal(|| false);
     let id = acct.id.clone();
 
     let toggle = {
@@ -3529,6 +3531,30 @@ fn mail_account_row(
                     Ok(_) => refresh += 1,
                     Err(e) => row_err.set(Some(format!("{e:#}"))),
                 }
+            });
+        }
+    };
+
+    // Run one sync pass right now and show the outcome inline — the immediate,
+    // feedback-giving force (Resync resets the cursor and waits for the tick;
+    // this runs a pass and returns the exact error on failure).
+    let sync_now = {
+        let id = id.clone();
+        move |_| {
+            if syncing() {
+                return;
+            }
+            let store = store();
+            let id = id.clone();
+            let mut refresh = refresh;
+            syncing.set(true);
+            row_err.set(None);
+            spawn(async move {
+                match store.mail_account_sync_now(&id).await {
+                    Ok(()) => refresh += 1,
+                    Err(e) => row_err.set(Some(format!("{e:#}"))),
+                }
+                syncing.set(false);
             });
         }
     };
@@ -3578,7 +3604,18 @@ fn mail_account_row(
                     onclick: toggle,
                     if acct.enabled { "Enabled" } else { "Disabled" }
                 }
-                // force-resync
+                // sync now — run one pass immediately, outcome shown inline
+                button {
+                    id: "mail-account-syncnow-{acct.id}",
+                    disabled: syncing(),
+                    style: "background: none; border: 1px solid {GOLD}; color: {GOLD}; \
+                            border-radius: 999px; padding: 0.35rem 0.8rem; font: inherit; \
+                            font-size: 0.8rem; font-weight: 700; cursor: pointer;",
+                    title: "Sync this mailbox right now and show the result",
+                    onclick: sync_now,
+                    if syncing() { "Syncing…" } else { "Sync now" }
+                }
+                // force-resync (full re-check from scratch)
                 button {
                     id: "mail-account-resync-{acct.id}",
                     style: "background: none; border: 1px solid {EDGE}; color: {DIM}; \
@@ -3618,8 +3655,14 @@ fn mail_account_row(
                     }
                 }
             }
-            // last error, if the last sync failed
-            if let Some(err) = acct.last_error.as_ref().filter(|_| !acct.enabled || acct.attempts > 0) {
+            // last error, whenever the last attempt failed (independent of the
+            // attempt counter, which a Resync resets — the reason must not hide
+            // while the status still reads "failed").
+            if let Some(err) = acct
+                .last_error
+                .as_ref()
+                .filter(|_| acct.last_status.as_deref() == Some("error") || !acct.enabled)
+            {
                 div {
                     style: "color: #e07a5f; font-size: 0.78rem; margin-top: 0.5rem; overflow-wrap: anywhere;",
                     "Last error: {err}"
