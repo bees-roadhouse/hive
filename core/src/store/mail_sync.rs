@@ -720,13 +720,18 @@ impl Store {
             .mail_account_sync_get(id)
             .await?
             .ok_or_else(|| anyhow!("mail account not found"))?;
+        // Log the same shape as the background driver so a manual "Sync now"
+        // failure is diagnosable in the journal, not only in the UI row.
+        let address = acct.address.clone();
         match sync_account(self, acct).await {
             Ok(()) => {
+                tracing::info!(account = %id, %address, "sync-now ok");
                 self.mail_account_mark_ok(id).await?;
                 Ok(())
             }
             Err(e) => {
                 let msg = format!("{e:#}");
+                tracing::warn!(account = %id, %address, error = %msg, "sync-now failed");
                 // Persist the failure like the driver, then surface it verbatim.
                 let _ = self.mail_account_mark_failed(id, &msg).await;
                 Err(anyhow!("{msg}"))
