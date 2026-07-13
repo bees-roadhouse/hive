@@ -513,9 +513,9 @@ impl Store {
     // a Phase 3 module — owns sync) ----
 
     /// Register a mail account: the credential lands in the AES-GCM vault
-    /// (which hard-requires HIVE_CRED_KEY) and the account row starts
-    /// 'pending' for mail sync to pick up. The caller has already validated
-    /// the credential against the server and captured `jmap_account_id`.
+    /// (keyed off the store's master key — no external config) and the account
+    /// row starts 'pending' for mail sync to pick up. The caller has already
+    /// validated the credential against the server and captured `jmap_account_id`.
     #[allow(clippy::too_many_arguments)]
     pub async fn mail_account_create(
         &self,
