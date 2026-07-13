@@ -51,6 +51,18 @@ pub struct MailAccountAdminView {
     pub created_at: String,
 }
 
+/// An edit to an existing account's connection details (see
+/// [`Store::mail_account_update`]). Owner is intentionally not editable here —
+/// moving a mailbox to another identity is a delete + re-add. A `None`/empty
+/// `new_password` keeps the current vaulted password.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MailAccountEdit {
+    pub address: String,
+    pub jmap_url: String,
+    pub jmap_username: Option<String>,
+    pub new_password: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MailMailboxView {
     pub id: String,
@@ -755,6 +767,139 @@ impl Store {
                 }}),
             )])?;
             Ok(true)
+        })
+        .await
+    }
+
+    /// Edit an existing account's connection details in place — the fix for a
+    /// wrong JMAP URL / username / address or a rotated password, without a
+    /// delete + re-add. Writes a partial `module.doc` update (same path as
+    /// `set_enabled`, so no fold change). When the server identity changed
+    /// (url / username / address), the discovered `jmap_account_id` and sync
+    /// cursor are stale, so it forces a clean re-discovery (the same
+    /// `force-resync` sentinel `mail_account_force_resync` uses); a
+    /// password-only edit just clears the backoff so the next tick retries.
+    /// A non-empty `new_password` is re-vaulted and the old vault row dropped;
+    /// blank keeps the current password. Returns `None` if the id is unknown.
+    pub async fn mail_account_update(
+        &self,
+        id: &str,
+        edit: MailAccountEdit,
+    ) -> Result<Option<MailAccountAdminView>> {
+        let Some(cur) = self.mail_account_admin_view(id).await? else {
+            return Ok(None);
+        };
+        let address = edit.address.trim().to_string();
+        let jmap_url = edit.jmap_url.trim().to_string();
+        let jmap_username = edit
+            .jmap_username
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty());
+        if address.is_empty() || jmap_url.is_empty() {
+            return Err(anyhow!("address and JMAP server URL are required"));
+        }
+        // Address stays unique per owner.
+        if address != cur.address {
+            let (owner_s, addr_s, self_id) = (cur.owner.clone(), address.clone(), id.to_string());
+            let clash = self
+                .run(move |core| {
+                    Ok(core
+                        .conn()
+                        .query_row(
+                            "SELECT id FROM mail_accounts \
+                             WHERE owner = ?1 AND address = ?2 AND id != ?3",
+                            rusqlite::params![owner_s, addr_s, self_id],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .optional()?)
+                })
+                .await?;
+            if clash.is_some() {
+                return Err(anyhow!(
+                    "another mailbox {address} is already connected for {}",
+                    cur.owner
+                ));
+            }
+        }
+        // Re-vault a new password BEFORE touching the writer (as create does).
+        let new_cred_id = match edit.new_password.filter(|s| !s.is_empty()) {
+            Some(pw) => Some(
+                self.cc_cred_put(
+                    &cur.owner,
+                    NewCcCredential {
+                        kind: "password".to_string(),
+                        runtime: Some("jmap".to_string()),
+                        provider: Some("stalwart".to_string()),
+                        label: Some(address.clone()),
+                        secret: pw,
+                    },
+                )
+                .await?
+                .id,
+            ),
+            None => None,
+        };
+        // Server identity changed → the discovered id + cursor are stale.
+        let connection_changed = address != cur.address
+            || jmap_url != cur.jmap_url
+            || jmap_username.as_deref() != cur.jmap_username.as_deref();
+        let id_s = id.to_string();
+        let owner = cur.owner.clone();
+        self.run(move |core| {
+            // Capture the OLD vault row before the fold overwrites cred_id.
+            let old_cred_id: Option<String> = core
+                .conn()
+                .query_row(
+                    "SELECT cred_id FROM mail_accounts WHERE id = ?1",
+                    rusqlite::params![id_s],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+
+            let ts = now_iso();
+            let mut fields = serde_json::Map::new();
+            fields.insert("address".into(), json!(address));
+            fields.insert("jmap_url".into(), json!(jmap_url));
+            fields.insert("jmap_username".into(), json!(jmap_username));
+            fields.insert("updated_at".into(), json!(ts));
+            if let Some(cid) = &new_cred_id {
+                fields.insert("cred_id".into(), json!(cid));
+            }
+            if connection_changed {
+                fields.insert("jmap_account_id".into(), json!(""));
+            }
+            let mut drafts = vec![Draft::new(
+                crate::oplog::kind::MODULE_DOC,
+                &owner,
+                &ts,
+                json!({"module": "mail", "doc_kind": "account", "id": id_s.clone(),
+                       "fields": serde_json::Value::Object(fields)}),
+            )];
+            let cursor = if connection_changed {
+                json!({"email_state": "force-resync", "attempts": 0,
+                       "next_attempt_at": null, "last_error": null})
+            } else {
+                json!({"attempts": 0, "next_attempt_at": null, "last_error": null})
+            };
+            drafts.push(Draft::new(
+                crate::oplog::kind::CURSOR_SET,
+                &owner,
+                &ts,
+                json!({"module": "mail", "account": id_s.clone(), "cursor": cursor}),
+            ));
+            core.commit(drafts)?;
+
+            // Drop the replaced vault row (after commit; only if it changed).
+            if let (Some(new), Some(old)) = (&new_cred_id, &old_cred_id) {
+                if new != old {
+                    core.conn().execute(
+                        "DELETE FROM cc_credentials WHERE id = ?1",
+                        rusqlite::params![old],
+                    )?;
+                }
+            }
+            mail_account_admin_view_core(core, &id_s)
         })
         .await
     }
