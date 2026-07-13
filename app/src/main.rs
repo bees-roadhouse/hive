@@ -21,8 +21,8 @@ use hive_core::keys::{KeySource, KeychainKeySource, MemoryKeySource};
 use hive_core::store::custom_entities::EntityFilter;
 use hive_core::store::events::EventCreate;
 use hive_core::store::mail::{
-    EmailAddr, MailAccountAdminView, MailAttachmentChip, MailMailboxView, MailMessageSummary,
-    MailReplyMeta, MailThreadMessage,
+    EmailAddr, MailAccountAdminView, MailAccountEdit, MailAttachmentChip, MailMailboxView,
+    MailMessageSummary, MailReplyMeta, MailThreadMessage,
 };
 use hive_core::store::mail_sync::{MailAddress, OutgoingEmail};
 use hive_core::store::tasks::{TaskCreate, TaskFilter};
@@ -3502,6 +3502,23 @@ fn mail_account_row(
     let mut row_err = use_signal(|| Option::<String>::None);
     // A "Sync now" pass in flight — drives the button's label + disables it.
     let mut syncing = use_signal(|| false);
+    // Inline edit form: open flag + prefilled connection fields (password blank
+    // = keep current) + a save-in-flight flag.
+    let mut editing = use_signal(|| false);
+    let mut edit_busy = use_signal(|| false);
+    let mut ed_address = use_signal({
+        let v = acct.address.clone();
+        move || v
+    });
+    let mut ed_url = use_signal({
+        let v = acct.jmap_url.clone();
+        move || v
+    });
+    let mut ed_username = use_signal({
+        let v = acct.jmap_username.clone().unwrap_or_default();
+        move || v
+    });
+    let mut ed_secret = use_signal(String::new);
     let id = acct.id.clone();
 
     let toggle = {
@@ -3555,6 +3572,49 @@ fn mail_account_row(
                     Err(e) => row_err.set(Some(format!("{e:#}"))),
                 }
                 syncing.set(false);
+            });
+        }
+    };
+
+    // Save the inline edit: update connection details (+ optional new password),
+    // which re-syncs cleanly against the possibly-new server.
+    let save = {
+        let id = id.clone();
+        move |_| {
+            if edit_busy() {
+                return;
+            }
+            let store = store();
+            let id = id.clone();
+            let mut refresh = refresh;
+            let username = ed_username();
+            let secret = ed_secret();
+            let edit = MailAccountEdit {
+                address: ed_address(),
+                jmap_url: ed_url(),
+                jmap_username: if username.trim().is_empty() {
+                    None
+                } else {
+                    Some(username)
+                },
+                new_password: if secret.is_empty() {
+                    None
+                } else {
+                    Some(secret)
+                },
+            };
+            edit_busy.set(true);
+            row_err.set(None);
+            spawn(async move {
+                match store.mail_account_update(&id, edit).await {
+                    Ok(_) => {
+                        ed_secret.set(String::new());
+                        editing.set(false);
+                        refresh += 1;
+                    }
+                    Err(e) => row_err.set(Some(format!("{e:#}"))),
+                }
+                edit_busy.set(false);
             });
         }
     };
@@ -3625,6 +3685,20 @@ fn mail_account_row(
                     onclick: resync,
                     "Resync"
                 }
+                // edit connection details (toggles the inline form below)
+                button {
+                    id: "mail-account-edit-{acct.id}",
+                    style: "background: none; border: 1px solid {EDGE}; color: {DIM}; \
+                            border-radius: 999px; padding: 0.35rem 0.8rem; font: inherit; \
+                            font-size: 0.8rem; cursor: pointer;",
+                    title: "Edit this mailbox's address, server URL, username, or password",
+                    onclick: move |_| {
+                        let open = !editing();
+                        editing.set(open);
+                        row_err.set(None);
+                    },
+                    if editing() { "Close" } else { "Edit" }
+                }
                 // delete (two-step)
                 if armed().as_deref() == Some(acct.id.as_str()) {
                     button {
@@ -3652,6 +3726,86 @@ fn mail_account_row(
                             move |_| armed.set(Some(rid.clone()))
                         },
                         "Delete"
+                    }
+                }
+            }
+            // inline edit form (address / JMAP URL / username / new password)
+            if editing() {
+                div {
+                    id: "mail-account-editform-{acct.id}",
+                    style: "margin-top: 0.7rem; border-top: 1px solid {EDGE}; padding-top: 0.7rem; \
+                            display: flex; flex-direction: column; gap: 0.45rem;",
+                    label {
+                        style: "color: {DIM}; font-size: 0.78rem; font-weight: 700;",
+                        "Email address"
+                    }
+                    input {
+                        id: "mail-edit-address-{acct.id}",
+                        style: "{text_input_style()}",
+                        r#type: "email",
+                        value: "{ed_address}",
+                        oninput: move |e| ed_address.set(e.value()),
+                    }
+                    label {
+                        style: "color: {DIM}; font-size: 0.78rem; font-weight: 700; margin-top: 0.3rem;",
+                        "JMAP server URL"
+                    }
+                    input {
+                        id: "mail-edit-url-{acct.id}",
+                        style: "{text_input_style()}",
+                        value: "{ed_url}",
+                        oninput: move |e| ed_url.set(e.value()),
+                    }
+                    label {
+                        style: "color: {DIM}; font-size: 0.78rem; font-weight: 700; margin-top: 0.3rem;",
+                        "Username (optional)"
+                    }
+                    input {
+                        id: "mail-edit-username-{acct.id}",
+                        style: "{text_input_style()}",
+                        placeholder: "defaults to the address",
+                        value: "{ed_username}",
+                        oninput: move |e| ed_username.set(e.value()),
+                    }
+                    label {
+                        style: "color: {DIM}; font-size: 0.78rem; font-weight: 700; margin-top: 0.3rem;",
+                        "New password"
+                    }
+                    input {
+                        id: "mail-edit-secret-{acct.id}",
+                        style: "{text_input_style()}",
+                        r#type: "password",
+                        placeholder: "leave blank to keep the current password",
+                        value: "{ed_secret}",
+                        oninput: move |e| ed_secret.set(e.value()),
+                    }
+                    div {
+                        style: "display: flex; gap: 0.5rem; margin-top: 0.3rem;",
+                        button {
+                            id: "mail-edit-save-{acct.id}",
+                            disabled: edit_busy(),
+                            style: "background: {GOLD}; color: #14120e; border: none; border-radius: 999px; \
+                                    padding: 0.4rem 0.9rem; font: inherit; font-weight: 700; \
+                                    font-size: 0.82rem; cursor: pointer;",
+                            onclick: save,
+                            if edit_busy() { "Saving…" } else { "Save changes" }
+                        }
+                        button {
+                            id: "mail-edit-cancel-{acct.id}",
+                            style: "background: none; border: 1px solid {EDGE}; color: {DIM}; \
+                                    border-radius: 999px; padding: 0.4rem 0.9rem; font: inherit; \
+                                    font-size: 0.82rem; cursor: pointer;",
+                            onclick: move |_| {
+                                editing.set(false);
+                                ed_secret.set(String::new());
+                                row_err.set(None);
+                            },
+                            "Cancel"
+                        }
+                    }
+                    div {
+                        style: "color: {FAINT}; font-size: 0.72rem;",
+                        "Changing the server, username, or address re-syncs this mailbox from scratch."
                     }
                 }
             }
