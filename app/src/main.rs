@@ -37,6 +37,8 @@ use hive_shared::{
 };
 use serde_json::Value;
 
+mod bridge_server;
+
 /// Config key naming the human behind the hive — the owner display name. The
 /// onboarding identity step writes it; Settings edits it; it's the fallback
 /// author everywhere. Dotted, matching the config table's conventions
@@ -292,6 +294,19 @@ fn mail_driver_tick_secs() -> u64 {
         .unwrap_or(30)
 }
 
+/// Whether the Shell binds the bridge socket at store open. On by default —
+/// the socket is how hive-bridge (Claude Code hooks, Claude Desktop) reaches
+/// the running app (D25 proxy mode, PLAN.md PR 2.4); opt out with
+/// `HIVE_BRIDGE_SOCKET=0` for headless/CI runs that want no listener.
+fn bridge_socket_enabled() -> bool {
+    !matches!(
+        std::env::var("HIVE_BRIDGE_SOCKET")
+            .unwrap_or_default()
+            .trim(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
 const BG: &str = "#14120e";
 const PANEL: &str = "#1a1712";
 const EDGE: &str = "#2c2818";
@@ -355,6 +370,12 @@ fn app() -> Element {
                 ..
             }
         ) {
+            // Deliberately NO bridge-socket cleanup here: this handler runs
+            // in every Mode, and a Failed/Onboarding instance (say, a
+            // double-launch refused by the store flock) must never unlink a
+            // socket a healthy instance is serving. The owner's next boot
+            // unlink-then-binds; a stale file just yields ECONNREFUSED,
+            // which the bridge already reports as "app not running".
             std::process::exit(0);
         }
     });
@@ -983,6 +1004,20 @@ fn Shell(store: ReadOnlySignal<Store>) -> Element {
                 tokio::time::sleep(tick).await;
             }
         });
+    });
+
+    // The bridge socket (D25, PR 2.4): hive-bridge proxies stdio MCP from
+    // Claude Code / Claude Desktop to THIS running app over
+    // <data_dir>/bridge.sock. Mounted with Shell so both boot paths (normal
+    // launch and the post-onboarding flip) serve it as soon as a store
+    // exists; the store's flock already guarantees this app is the only hive
+    // process on the data dir. tokio::spawn, not dioxus spawn — an accept
+    // loop has no business on the vdom scheduler.
+    use_hook(|| {
+        if !bridge_socket_enabled() {
+            return;
+        }
+        bridge_server::spawn(store.peek().clone(), author_name());
     });
 
     rsx! {

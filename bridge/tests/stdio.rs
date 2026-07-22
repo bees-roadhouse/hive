@@ -1,26 +1,74 @@
-// The bridge over its real transport: spawn the built binary, drive the MCP
-// stdio handshake (initialize → initialized → tools/list → tools/call), and
-// check the one-shot `call` mode hooks use. Hermetic: HIVE_DATA_DIR points
-// each test at its own tempdir and HIVE_MEMORY_KEY_HEX supplies the master
-// key, so no OS keychain is touched (both are bridge-only escape hatches).
+// Unix-only, like proxy mode itself (the binary refuses on Windows until
+// named pipes land with the Windows bundles).
+#![cfg(unix)]
+
+// The bridge over its real transport: stand up a socket host (a real Store
+// served through core's frame layer over a unix listener — exactly the
+// app-side shape, minus the GUI), spawn the built binary against it, drive
+// the MCP stdio handshake (initialize → initialized → tools/list →
+// tools/call), and check the one-shot `call` mode hooks use. Hermetic:
+// HIVE_DATA_DIR points each test at its own tempdir (socket and store
+// together), MemoryKeySource supplies the master key — no OS keychain.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
+use hive_core::keys::MemoryKeySource;
+use hive_core::mcp;
+use hive_core::store::Store;
+use hive_embed::HashEmbedder;
+use hive_shared::bridge_proto;
 use serde_json::{json, Value};
 
-/// 64 hex chars = 32 bytes; any fixed value works with MemoryKeySource.
-const KEY_HEX: &str = "0707070707070707070707070707070707070707070707070707070707070707";
+/// Any fixed 32 bytes work with MemoryKeySource.
+const KEY: [u8; 32] = [7u8; 32];
 const RECV_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The app side in miniature: open the store, bind `<dir>/bridge.sock`, and
+/// serve hello/ack + `mcp::handle_frame` per connection, concurrently, on a
+/// detached thread (it dies with the test process). Returns once the socket
+/// is bound, so a bridge spawned right after cannot race the listener.
+fn start_host(dir: &Path) {
+    let store = Store::new(dir, Arc::new(MemoryKeySource(KEY)), Arc::new(HashEmbedder))
+        .expect("host store opens");
+    let sock = dir.join(bridge_proto::BRIDGE_SOCKET_FILE);
+    let (bound_tx, bound_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("host runtime");
+        rt.block_on(async move {
+            let listener = tokio::net::UnixListener::bind(&sock).expect("bind host socket");
+            bound_tx.send(()).expect("signal bound");
+            loop {
+                let (stream, _) = listener.accept().await.expect("host accept");
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let _ = host_connection(store, stream).await;
+                });
+            }
+        });
+    });
+    bound_rx
+        .recv_timeout(RECV_TIMEOUT)
+        .expect("host socket bound within timeout");
+}
+
+async fn host_connection(store: Store, stream: tokio::net::UnixStream) -> std::io::Result<()> {
+    // The REAL app-side serving code (handshake + frame loop) — not a
+    // replica — so these tests exercise exactly what the app runs; only the
+    // peer-cred check and socket setup are app-only.
+    let (read, write) = stream.into_split();
+    mcp::serve_bridge_connection(&store, "owner", tokio::io::BufReader::new(read), write).await
+}
 
 fn bridge_command(dir: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hive-bridge"));
-    cmd.env("HIVE_DATA_DIR", dir)
-        .env("HIVE_MEMORY_KEY_HEX", KEY_HEX)
-        .args(["--actor", "nate"]);
+    cmd.env("HIVE_DATA_DIR", dir).args(["--actor", "nate"]);
     cmd
 }
 
@@ -84,7 +132,7 @@ impl Serving {
     }
 
     fn close(mut self) {
-        drop(self.stdin); // EOF ends the serve loop
+        drop(self.stdin); // EOF ends the pump
         let status = self.child.wait().expect("bridge exit");
         assert!(status.success(), "bridge must exit 0 on EOF: {status:?}");
     }
@@ -104,6 +152,7 @@ fn tool_payload(result: &Value) -> Value {
 #[test]
 fn stdio_handshake_tools_list_and_tool_calls_round_trip() {
     let dir = tempfile::tempdir().unwrap();
+    start_host(dir.path());
     let mut bridge = Serving::spawn(dir.path());
 
     // initialize: a supported requested version is echoed back.
@@ -187,7 +236,7 @@ fn stdio_handshake_tools_list_and_tool_calls_round_trip() {
     let reply = bridge.request(7, "resources/list", json!({}));
     assert_eq!(reply["error"]["code"], json!(-32601));
 
-    // Garbage line: -32700 parse error with a null id.
+    // Garbage line: forwarded verbatim; the app answers -32700, null id.
     bridge.send_raw("this is not json");
     let reply = bridge.recv();
     assert_eq!(reply["error"]["code"], json!(-32700));
@@ -199,6 +248,7 @@ fn stdio_handshake_tools_list_and_tool_calls_round_trip() {
 #[test]
 fn unsupported_protocol_version_gets_countered_with_latest() {
     let dir = tempfile::tempdir().unwrap();
+    start_host(dir.path());
     let mut bridge = Serving::spawn(dir.path());
     let reply = bridge.request(
         0,
@@ -219,9 +269,9 @@ fn run_call(dir: &Path, tool: &str, args: Value) -> Output {
 #[test]
 fn one_shot_call_mode_writes_and_reads_like_the_hooks_do() {
     let dir = tempfile::tempdir().unwrap();
+    start_host(dir.path());
 
-    // Write (each invocation opens, commits, releases — sequential is fine).
-    // The [task:] token emerges a task auto-assigned to the acting identity.
+    // Write. The [task:] token emerges a task auto-assigned to the actor.
     let out = run_call(
         dir.path(),
         "journal_append",
@@ -239,8 +289,7 @@ fn one_shot_call_mode_writes_and_reads_like_the_hooks_do() {
 
     // Read it back through the same mode (what session-start's recall does):
     // the emerged open task rides the brief. (The brief's JOURNAL section is
-    // semantic and stays empty until an embedding backfill runs — the
-    // backfill daemon returns with the Phase 2/3 app loop.)
+    // semantic and stays empty until an embedding backfill runs.)
     let out = run_call(dir.path(), "recall", json!({"identity": "nate"}));
     assert!(out.status.success());
     let result: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
@@ -260,35 +309,70 @@ fn one_shot_call_mode_writes_and_reads_like_the_hooks_do() {
     assert_eq!(result["isError"], json!(true));
 }
 
+/// The point of proxy mode (PR 2.4): concurrent clients share the one
+/// running app — the interim single-writer restriction is gone.
 #[test]
-fn a_second_process_on_the_same_data_dir_is_told_to_close_the_other() {
+fn concurrent_clients_share_the_running_app() {
     let dir = tempfile::tempdir().unwrap();
+    start_host(dir.path());
     let mut bridge = Serving::spawn(dir.path());
-    // The initialize reply proves the serving bridge holds the store (and
-    // therefore the data-dir lock) before the contender starts.
     bridge.request(
         0,
         "initialize",
         json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "x", "version": "0"}}),
     );
-
-    let out = run_call(dir.path(), "journal_list", json!({}));
-    assert!(
-        !out.status.success(),
-        "second opener must be refused while the bridge serves"
+    let reply = bridge.request(
+        1,
+        "tools/call",
+        json!({"name": "journal_append", "arguments": {"body": "Written while another client is connected."}}),
     );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("another hive process"),
-        "stderr must carry the mutual-exclusion message: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    tool_payload(&reply["result"]);
 
-    bridge.close();
-
-    // Lock released on exit: the same call now succeeds.
+    // A second client, WHILE the first serves: succeeds and sees the write.
     let out = run_call(dir.path(), "journal_list", json!({}));
     assert!(
         out.status.success(),
-        "lock must release when the bridge exits"
+        "a concurrent one-shot must succeed in proxy mode — stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result: Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    let entries = tool_payload(&result);
+    assert_eq!(entries.as_array().map(Vec::len), Some(1));
+
+    bridge.close();
+}
+
+/// D25's failure story: no store access of its own — when the app is not
+/// running the bridge says so on stderr, exits 1, and prints NOTHING on
+/// stdout. The marker text and that shape are the plugin's soft-fail
+/// contract (see AGENTS.md).
+#[test]
+fn no_running_app_is_a_clean_error() {
+    let dir = tempfile::tempdir().unwrap(); // no host: nothing listens
+
+    // call mode.
+    let out = run_call(dir.path(), "journal_list", json!({}));
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        out.stdout.is_empty(),
+        "no stdout on infrastructure failure: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("the hive app is not running"),
+        "stderr must carry the app-not-running marker: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // serve mode fails the same way, before ever reading stdin.
+    let out = bridge_command(dir.path())
+        .output()
+        .expect("run hive-bridge serve");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("the hive app is not running"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }

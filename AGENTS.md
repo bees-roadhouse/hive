@@ -37,13 +37,26 @@ then update the stale doc in the same change. `README.md` and parts of
   values; the PR 1.8 stdio bridge is its transport). `mcp::LocalCtx { actor }`
   supplies the acting identity — there is no authentication layer (single
   user, D16).
-- `bridge/`: the `hive-bridge` binary — the ONLY external doorway (D25).
-  A thin stdio transport over `core::mcp` (serve mode: JSON-RPC 2.0, one
-  message per line; `call` mode: one tool call for hooks/scripts). Interim
-  mode opens the store directly via `Store::new` with the app's exact
-  data-dir/keychain/actor resolution; Phase 2.4 flips it to a UDS proxy.
-  `HIVE_DATA_DIR` and `HIVE_MEMORY_KEY_HEX` are bridge-only escape hatches —
-  never teach core or the app to read them.
+- `bridge/`: the `hive-bridge` binary — the ONLY external doorway (D25),
+  in PROXY mode since PR 2.4: a sync stdio ↔ unix-socket pump (serve mode:
+  JSON-RPC 2.0, one message per line; `call` mode: one tool call for
+  hooks/scripts) against the RUNNING app's `<data_dir>/bridge.sock`, with
+  a one-line hello/ack handshake carrying the protocol version and the
+  `--actor` identity (wire contract: `hive_shared::bridge_proto`). The
+  bridge holds NO store access — deliberately no hive-core, tokio, or
+  keychain dependency (that is what keeps `cargo install --path bridge`
+  fast); when the app is not running it fails with the stable marker
+  "the hive app is not running" on stderr, exit 1, NOTHING on stdout —
+  the bridge tests and the plugin's soft-fail shape (stderr + no result
+  JSON) depend on exactly that surface. The app side lives in
+  `app/src/bridge_server.rs` (peer-cred checked, socket 0600, unlink at
+  BIND time only — a non-owning instance must never unlink a live
+  socket); the hello/ack + frame loop is
+  `core::mcp::serve_bridge_connection`, shared with the bridge's tests so
+  CI exercises the exact serving code the app runs. `HIVE_DATA_DIR` is the
+  one bridge-only escape hatch (relocates socket + store together for
+  tests/nonstandard homes) — never teach core or the app to read it;
+  `HIVE_MEMORY_KEY_HEX` died with interim mode.
 - `importer/`: the `hive-import` binary (PR 1.7) — one-shot migration of a
   hosted-era Postgres into a fresh data dir (refuses a non-empty one).
   Records ride the `#[doc(hidden)]` `Store::import_batch` seam
@@ -86,13 +99,16 @@ then update the stale doc in the same change. `README.md` and parts of
   `fold::FOLD_VERSION` — the index drops derived tables and rebuilds by
   replaying the op log at next open.
 - ONE hive process per data dir: `Store::new` takes an exclusive advisory
-  flock on `<data_dir>/lock` and holds it until shutdown/exit, so the app
-  and an interim-mode bridge can never co-write the log/index. The refusal
-  message contains "another hive process" (tests and the plugin's soft-fail
-  matching depend on that text). flock, not fcntl, deliberately: a second
-  open in the same process must conflict too. `Store::shutdown` releasing
-  the lock is what lets reopen-style tests (and users switching between app
-  and bridge) proceed.
+  flock on `<data_dir>/lock` and holds it until shutdown/exit, so two
+  store-opening processes (two apps, app + importer) can never co-write
+  the log/index. The refusal message contains "another hive process"
+  (core's cutover test matches that text). flock, not fcntl, deliberately:
+  a second open in the same process must conflict too. `Store::shutdown`
+  releasing the lock is what lets reopen-style tests proceed. The bridge
+  stopped competing for this lock in PR 2.4 (proxy mode) — the flock is
+  also what makes the app's unlink-then-bind of a leftover
+  `bridge.sock` safe: if the app holds the lock, no other hive process
+  can be serving that socket.
 - The bridge's stdout is the MCP protocol channel — frames only, one JSON
   message per line. Every diagnostic goes to stderr. Never add a print to
   stdout in `bridge/` (and keep HTTP stacks out of it: no reqwest/hyper/

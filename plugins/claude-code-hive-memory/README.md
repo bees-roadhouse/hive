@@ -33,11 +33,12 @@ cargo install --path bridge
 (Release packaging that bundles the binary lands with the Phase 2 app
 bundles; until then, installing from the repo is the supported path.)
 
-**Interim-mode caveat:** the bridge opens the same data dir as the hive
-desktop app, under a single-writer lock. The app and the bridge can't run at
-once — while the app is open, MCP calls and hooks fail with "another hive
-process has this data dir open". Close the app to use Claude Code with hive
-(the Phase 2.4 proxy removes this restriction).
+**The hive app must be running.** The bridge is a proxy (D25): it connects
+to the app over `<data_dir>/bridge.sock` and has no store access of its
+own. While the app is closed, MCP calls and hooks fail with "the hive app
+is not running" — start the app to use Claude Code with hive. Any number
+of bridge clients (Claude Code, Claude Desktop, hooks) can connect to the
+running app at once.
 
 ## Install
 
@@ -76,8 +77,8 @@ and writes the enabled artifacts into the session cwd:
 leave the enabled set — it never touches files you authored.
 
 The hook soft-fails: no `hive-bridge` on `PATH` means a silent no-op, and
-any other failure (store locked by the app, keychain unavailable) costs one
-stderr line — a broken hive never blocks a session.
+any other failure (the hive app not running) costs one stderr line — a
+broken hive never blocks a session.
 
 Note: the brief's *relevant journal* section rides the semantic index, whose
 backfill daemon is paused until the Phase 2/3 app loop — profile, tasks,

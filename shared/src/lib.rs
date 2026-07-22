@@ -14,6 +14,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub mod bridge_proto;
+
 pub const APP_VERSION: &str = "0.1.3";
 
 // ---- actors ----

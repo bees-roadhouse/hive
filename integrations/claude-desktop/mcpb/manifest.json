@@ -4,7 +4,7 @@
   "display_name": "Hive",
   "version": "0.7.0",
   "description": "Hive memory over MCP — journal, tasks, search, and recall from Claude Desktop, against the hive store on this machine.",
-  "long_description": "Connects Claude Desktop to the hive on THIS machine: the extension launches the `hive-bridge` binary (stdio MCP), which opens the local hive data dir directly. No server, no URL, no token — hive is personal and local-first (DIRECTION.md D25). Requires `hive-bridge` on PATH: `cargo install --path bridge` from the hive repo (the Phase 2 app bundles take over real packaging, including bundling the binary into this extension). Interim-mode caveat: the data dir takes a single-writer lock, so the hive desktop app and this extension can't run at the same time — close the app while Claude Desktop is connected. The Phase 2.4 proxy removes that restriction.",
+  "long_description": "Connects Claude Desktop to the hive on THIS machine: the extension launches the `hive-bridge` binary (stdio MCP), which proxies to the RUNNING hive desktop app over its bridge socket (D25 — the bridge has no store access of its own). No server, no URL, no token — hive is personal and local-first. Requires `hive-bridge` on PATH (`cargo install --path bridge` from the hive repo; the Phase 2 app bundles take over real packaging, including bundling the binary into this extension) and the hive app running — while it is closed, calls fail with \"the hive app is not running\". Multiple clients (Claude Desktop, Claude Code, hooks) can connect at once.",
   "author": {
     "name": "Bee's Roadhouse",
     "url": "https://github.com/bees-roadhouse"
