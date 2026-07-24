@@ -191,6 +191,9 @@ Gate: mailbox, chosen directories, calendar, contacts searchable + citable;
 
 ## Phase 4: iroh sync + relay (v0.9.0)
 
+> **Superseded:** Phase 4 onward is replaced by [PLAN-v2.1.md](./PLAN-v2.1.md)
+> (adopted 2026-07-24); Phases 1-2 above stand as history.
+
 - **PR 4.1 identity + pairing.** iroh node keypairs, ticket/QR pairing UX, paired
   device table + revocation.
 - **PR 4.2 replication.** Per-device head exchange, sealed-segment want/have, blob

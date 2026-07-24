@@ -6,7 +6,10 @@ These instructions apply to the whole `bees-roadhouse/hive` repository.
 
 GitHub `main` is canonical (the old `development`/`release` pair collapsed into
 it on 2026-07-05). This repo is mid-pivot to a personal P2P desktop app
-(docs/DIRECTION.md D16+; teardown/rebuild sequence in docs/PLAN.md):
+(decisions in docs/DIRECTION.md, D16+ amended by the v2.1 node program D29+;
+Phases 1-2 teardown/rebuild history in docs/PLAN.md, whose forward half is
+superseded by the active execution plan docs/PLAN-v2.1.md; test tiers and
+conventions in docs/TESTING-STRATEGY.md):
 
 - Rust workspace: `shared`, `embed`, `core`, `jmap-sync`, `app`, `bridge`,
   and `importer`. There is no Node/pnpm workspace anymore — the Solid SPA,
