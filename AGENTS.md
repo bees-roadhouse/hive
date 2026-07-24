@@ -56,10 +56,13 @@ then update the stale doc in the same change. `README.md` and parts of
   BIND time only — a non-owning instance must never unlink a live
   socket); the hello/ack + frame loop is
   `core::mcp::serve_bridge_connection`, shared with the bridge's tests so
-  CI exercises the exact serving code the app runs. `HIVE_DATA_DIR` is the
-  one bridge-only escape hatch (relocates socket + store together for
-  tests/nonstandard homes) — never teach core or the app to read it;
-  `HIVE_MEMORY_KEY_HEX` died with interim mode.
+  CI exercises the exact serving code the app runs. `HIVE_DATA_DIR`
+  relocates socket + store together for tests/nonstandard homes; since
+  PLAN-v2.1 PR 4.1 the app honors the same override as its test seam
+  (beside `HIVE_MASTER_KEY_FILE`, the 64-hex master file honored before
+  the keychain, and the `HIVE_TEST_NOW` frozen clock in `store::now_iso`)
+  — core still never reads it, the data dir is always passed down
+  explicitly; `HIVE_MEMORY_KEY_HEX` died with interim mode.
 - `importer/`: the `hive-import` binary (PR 1.7) — one-shot migration of a
   hosted-era Postgres into a fresh data dir (refuses a non-empty one).
   Records ride the `#[doc(hidden)]` `Store::import_batch` seam

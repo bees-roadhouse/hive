@@ -145,6 +145,38 @@ impl KeySource for KeychainKeySource {
     }
 }
 
+/// Parse the shared master-key *file* format (PLAN-v2.1 PR 4.1 /
+/// TESTING-STRATEGY §0.4): exactly 64 hex chars — one raw 32-byte master key
+/// — plus optional surrounding whitespace. ONE format, several consumers that
+/// must never drift: the app's `HIVE_MASTER_KEY_FILE` seam, the node's
+/// `FileKeySource` test/ops mode (PR 4.13), the smoke helpers' `test_domain()`
+/// (PR 4.2), and the screenshot seed-fixture bin (PR 5.0) — which is why the
+/// parser lives here and not in any one of them. Case-insensitive hex, strict
+/// about everything else.
+pub fn parse_master_key_hex(text: &str) -> Result<[u8; 32]> {
+    let cleaned = text.trim();
+    if cleaned.len() != 64 {
+        bail!(
+            "master key must be exactly 64 hex chars (32 raw bytes), got {} chars",
+            cleaned.len()
+        );
+    }
+    let bytes = data_encoding::HEXLOWER_PERMISSIVE
+        .decode(cleaned.as_bytes())
+        .context("master key is not valid hex")?;
+    Ok(bytes.try_into().expect("64 hex chars decode to 32 bytes"))
+}
+
+/// Read a `parse_master_key_hex`-format file from disk — the
+/// `HIVE_MASTER_KEY_FILE` shape. Test/ops seam: production custody stays the
+/// OS keychain (`KeychainKeySource`); this exists so headless containers and
+/// cross-process tests can open a store under an exact, injected key.
+pub fn read_master_key_file(path: &std::path::Path) -> Result<[u8; 32]> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading master key file {}", path.display()))?;
+    parse_master_key_hex(&text).with_context(|| format!("master key file {}", path.display()))
+}
+
 /// Deterministic SIV-style nonce for `wrap_key` (see module header).
 fn wrap_nonce(wrapping_key: &[u8; 32], plaintext_key: &[u8; 32]) -> [u8; 24] {
     let nonce_key = blake3::derive_key(KEYWRAP_NONCE_CONTEXT, wrapping_key);

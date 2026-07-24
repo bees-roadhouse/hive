@@ -53,3 +53,8 @@ tracing = { workspace = true }
 # Peer-credential check on the bridge socket (D25): same-euid clients only.
 # rustix over libc to match core's flock choice (core/src/store/core.rs).
 rustix = { version = "1.1", features = ["process"] }
+
+[dev-dependencies]
+# The boot() master-key-file seam test writes a throwaway key file
+# (PLAN-v2.1 PR 4.1).
+tempfile = { workspace = true }

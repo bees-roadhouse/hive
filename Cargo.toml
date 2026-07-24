@@ -91,6 +91,10 @@ rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"]
 # --- Dev/test only ---
 # Hermetic tempdir stores for the oplog/blockstore/keys tests.
 tempfile = "3"
+# HOSTILE-DECODE proptests (docs/TESTING-STRATEGY.md §2): adversarial-input
+# coverage over network-facing decoders — fixed seeds, bounded cases, runs
+# in normal CI (cargo-fuzz stays nightly-only and out of the workspace).
+proptest = "1"
 
 # --- Shared workspace crates ---
 hive-shared = { path = "shared" }

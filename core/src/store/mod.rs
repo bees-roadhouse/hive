@@ -59,7 +59,29 @@ pub(crate) use self::core::{Core, Draft};
 /// Current instant in the exact shape JS `new Date().toISOString()` produces —
 /// millisecond precision, trailing `Z` — the same 24-char shape the op-log
 /// envelope freezes (lexicographic order is chronological order).
+///
+/// Test seam (PLAN-v2.1 PR 4.1): `HIVE_TEST_NOW=<RFC 3339 instant>` freezes
+/// this clock so app-level tests and the screenshot tier render identical
+/// timestamps run to run. The value is re-rendered through the canonical
+/// formatter (so `2026-01-15T12:00:00Z` still yields the frozen 24-char
+/// shape the LogWriter enforces); a malformed value panics loudly — a silent
+/// fallback to the real clock would turn a harness typo into moving
+/// timestamps and flaky goldens. Command layer ONLY by construction: the
+/// determinism-fenced dirs (oplog/blockstore/fold/index) never read clocks
+/// or env (core/tests/determinism.rs), so this env read widens nothing.
 pub fn now_iso() -> String {
+    if let Ok(frozen) = std::env::var("HIVE_TEST_NOW") {
+        let frozen = frozen.trim().to_string();
+        if !frozen.is_empty() {
+            return chrono::DateTime::parse_from_rfc3339(&frozen)
+                .unwrap_or_else(|e| {
+                    panic!("HIVE_TEST_NOW {frozen:?} is not an RFC 3339 instant: {e}")
+                })
+                .with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string();
+        }
+    }
     chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string()
