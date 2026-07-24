@@ -157,8 +157,8 @@ fn acquire_dir_lock(data_dir: &Path) -> Result<std::fs::File> {
     let path = data_dir.join(LOCK_FILE);
     let busy = |detail: &dyn std::fmt::Display| {
         anyhow::anyhow!(
-            "another hive process has this data dir open (the app and hive-bridge \
-             can't run at once yet — close the other one): {} ({detail})",
+            "another hive process has this data dir open (one hive process per \
+             data dir — close the other one): {} ({detail})",
             path.display()
         )
     };

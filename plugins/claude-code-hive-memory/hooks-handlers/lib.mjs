@@ -5,9 +5,10 @@
 // local-first, and the OS user boundary is the auth.
 //
 // Requirements: `hive-bridge` on PATH (`cargo install --path bridge` from
-// the hive repo, or the release tarball). Interim-mode caveat: the bridge
-// opens the same data dir as the hive app under a single-writer lock, so a
-// hook that fires while the app is open soft-fails with one stderr line.
+// the hive repo, or the release tarball) and the hive app RUNNING — the
+// bridge proxies to it over the app's bridge socket (D25) and holds no
+// store access of its own. A hook that fires while the app is closed
+// soft-fails with one stderr line ("the hive app is not running").
 //
 // Env:
 //   HIVE_ACTOR            acting identity for hook calls (default: $USER —
@@ -86,7 +87,8 @@ export function hiveCall(cfg, tool, args) {
   }
   if (res.status !== 0) {
     // Exit 1 = tool-level isError (result text carries the reason); other
-    // failures (lock, keychain) report on stderr before any result exists.
+    // failures (hive app not running) report on stderr before any result
+    // exists.
     const detail =
       toolText(result) ||
       (res.stderr || "").trim().split("\n").pop() ||

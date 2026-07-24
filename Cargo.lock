@@ -2731,8 +2731,10 @@ dependencies = [
  "hive-embed",
  "hive-import",
  "hive-shared",
+ "rustix",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2740,14 +2742,12 @@ name = "hive-bridge"
 version = "0.7.0"
 dependencies = [
  "anyhow",
- "data-encoding",
  "hive-core",
  "hive-embed",
+ "hive-shared",
  "serde_json",
  "tempfile",
  "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

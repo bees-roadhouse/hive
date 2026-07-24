@@ -45,3 +45,11 @@ serde_json = { workspace = true }
 # network). base64 is already in the lock (hive-core uses it); this pins it as a
 # direct dep for the reader's attachment path.
 base64 = { workspace = true }
+# The bridge socket server (D25 proxy mode) logs through tracing like the
+# store's drivers do; dioxus's launch installs the subscriber.
+tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Peer-credential check on the bridge socket (D25): same-euid clients only.
+# rustix over libc to match core's flock choice (core/src/store/core.rs).
+rustix = { version = "1.1", features = ["process"] }
