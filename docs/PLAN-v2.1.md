@@ -248,18 +248,27 @@ scenarios, `CARGO_BIN_EXE` spawn only in node/tests/.
   written down as untestable-because-X.
 - **PR 4.8 desktop push + restore.** App side: address-first enrollment settings
   panel — `nate@<zone>` resolves via `_hive._tcp.<zone>` SRV and same-LAN mDNS
-  into a multi-space candidate set (public / tailnet / ZeroTier / LAN),
-  happy-eyeballs dial ordered by SRV priority, pinned-key mTLS decides, last-good
-  path cached per network, raw `hive://host:port` kept as the resolver-less
+  into a multi-space candidate set (public / tailnet / ZeroTier / LAN; multiple
+  SRV targets and multiple A/AAAA per target all become candidates), then a
+  parallel race where **latency governs**: fastest pinned-key-verified path wins,
+  with a ~250 ms decision window after first success so a quicker late finisher
+  displaces it; per-network RTT ranking cached under a network fingerprint,
+  revalidated each connect, re-raced on interface change; SRV priority is
+  administrative override/tie-break only (documented RFC 2782 deviation); raw
+  `hive://host:port` kept as the resolver-less
   fallback (D35) — and a background push loop beside the mail driver (read-only
   against 4.3's surface — segments and referenced blocks stream up;
   tombstone/redact records replicate as ordinary records). CLI side: `hive-sync restore --node --into
   <empty-dir>` — verbatim files down, then the store's own heal folds everything
   at next open; **zero core write API needed** (the app is closed, the flock is
   free). Tests: resolver unit tests over fixture DNS answers (multi-space
-  candidates, priority ordering; garbage answers are HOSTILE-DECODE territory for
-  the candidate builder); impostor-candidate smoke — dialer skips a wrong-key
-  listener and lands on the pinned one; smoke = push a seeded domain,
+  candidates, multi-target/multi-A fan-out; garbage answers are HOSTILE-DECODE
+  territory for the candidate builder); latency-selection units with an
+  injected-RTT mock dialer — fastest reachable wins, a slower candidate that
+  connected first is displaced inside the decision window, unreachable candidates
+  never delay the winner, priority override honored when configured,
+  network-change re-race re-ranks; impostor-candidate smoke — dialer skips a
+  wrong-key listener and lands on the pinned one; smoke = push a seeded domain,
   kill-mid-segment, resume, restore
   into a fresh dir, open a Store over it, canonical dump equals the source;
   restore honesty assertions (mail rows present but mail-FTS empty until 4.10 —
@@ -770,7 +779,8 @@ Decisions made and closed — reopening any of these is a new decision record:
 - Real-device/manual gates, stated in each PR per repo convention (CI cannot
   boot two boxes or a tailnet): M1 restore on real second hardware **reached via
   its published candidates — tailnet path with LAN unplugged, LAN path with
-  tailnet down (D35 multi-path dial on real networks)**; 4.16
+  tailnet down, and with both live the lower-latency path visibly chosen in the
+  sync log (D35 latency-governed dial on real networks)**; 4.16
   two-box divergent-edit + shred propagation; 4.20 container deploy on the
   household box, restore-from-ZFS-snapshot boot, backup-exclusion audit; 5.4
   non-tailnet refusal + cross-member refusal + browser download semantics; 6.4

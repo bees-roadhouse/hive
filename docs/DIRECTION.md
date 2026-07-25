@@ -724,10 +724,22 @@ A/AAAA, tailnet (Tailscale MagicDNS), ZeroTier (ZeroNS), LAN RFC1918/ULA. Publis
 private addresses in public answers is legal, useful, and chosen per zone with delta
 14 in view (split-horizon preferred; the household zones already run it). The same
 record shape over mDNS (`_hive._tcp.local`) gives zero-config same-LAN discovery —
-default-on for personal deployments, off in the enterprise paper design. Dialing is
-happy-eyeballs across the candidate set: SRV priority/weight orders the stagger,
-first candidate to complete pinned-key mTLS wins, last-good path is cached per
-network. The invariant over all of it: **DNS and mDNS are addressing, never
+default-on for personal deployments, off in the enterprise paper design. Dialing
+races the whole candidate set in parallel, and **latency governs**: every candidate
+that completes pinned-key mTLS reports its measured RTT, and the dialer commits to
+the fastest verified path — a short decision window (~250 ms after first success)
+lets a quicker late finisher displace it, so "first to connect" never beats
+"fastest". Private and public records published side by side is the intended
+steady state: on the LAN the private path wins the race outright; away from home
+the private candidates cost nothing (parallel dials, short per-candidate timeouts)
+and tailnet vs public settles on measured RTT. The choice is continuous, not
+once-at-setup: the per-network ranking is cached under a network fingerprint,
+revalidated on every connect, and re-raced on interface or network change, so a
+laptop moving from couch to coffee shop re-selects without user action. SRV
+priority demotes to an administrative override and tie-break (weight splits
+equal-RTT ties) — a deliberate, documented deviation from RFC 2782's strict
+priority ordering: the record set says what exists, measurement says what's best.
+The invariant over all of it: **DNS and mDNS are addressing, never
 authentication** — the enrollment-pinned node key decides, so a spoofed answer, a
 hijacked zone, or a hostile LAN beacon degrades to a failed handshake and a skipped
 candidate (delta 13), and discovery never introduces a key.
