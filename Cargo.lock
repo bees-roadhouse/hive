@@ -2979,6 +2979,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "hive-node"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "ciborium",
+ "data-encoding",
+ "hive-core",
+ "hive-smoke-support",
+ "hive-sync",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "hive-shared"
 version = "0.7.0"
 dependencies = [

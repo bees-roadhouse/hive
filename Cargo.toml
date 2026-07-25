@@ -1,5 +1,5 @@
 [workspace]
-members = ["shared", "embed", "core", "jmap-sync", "sync", "app", "bridge", "importer", "smoke-support", "smoke"]
+members = ["shared", "embed", "core", "jmap-sync", "sync", "node", "app", "bridge", "importer", "smoke-support", "smoke"]
 resolver = "2"
 
 [workspace.package]
@@ -109,6 +109,13 @@ rustls-webpki = { version = "0.103", default-features = false, features = ["std"
 # Minting the device's own self-signed cert. ring backend, no x509-parser: we
 # generate certificates, we never introspect foreign ones here.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+
+# --- Node config (PLAN-v2.1 PR 4.6) ---
+# node.toml / tenant.toml. TOML rather than the JSON already in the tree
+# because these files are hand-edited by whoever runs the box, and comments
+# are the difference between a config someone maintains and one they retype.
+# Already in the lock as a transitive dependency, so it costs no new crate.
+toml = "0.8"
 
 # --- Derived index (PR 1.5/1.6: the SQLite store) ---
 # Bundled SQLCipher (SQLite 3.45, FTS5 compiled in, JSON core) with vendored

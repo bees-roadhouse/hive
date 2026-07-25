@@ -7,8 +7,11 @@
 // `test_domain()` is to a smoke scenario, and it carries the same AGENTS.md
 // clause: no test constructs a domain, device identity, node, or device pair
 // any other way.
-// That is what lets the seam grow (`test_node()`, `test_pair()` arrive with
-// the node) without rewriting a single scenario body.
+// That is what lets the seam grow without rewriting a single scenario body:
+// `test_node()`/`test_pair()` arrive when a node has a protocol to hand them
+// (the listener + enrollment at PR 4.7, the push loop at 4.8) — the PR 4.6
+// node holds vaults and binds a socket, and its own boot contract is tested
+// by spawning the real binary from `node/tests/`.
 //
 // Three rules this crate exists to make unavoidable:
 //

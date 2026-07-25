@@ -24,7 +24,9 @@ target_dir="${CARGO_TARGET_DIR:-$repo_root/target}"
 
 # "<crate dir>:<package>:<binary env var>", package name == binary name — a
 # crate that has not landed yet is skipped, so this script keeps working
-# unchanged as node/ and sync/ arrive (hive-node: PR 4.13).
+# unchanged as crates arrive (hive-node landed at PLAN-v2.1 PR 4.6; its own
+# boot smoke uses CARGO_BIN_EXE, but multi-binary scenarios in smoke/ read
+# HIVE_NODE_BIN from here).
 binaries=(
   "bridge:hive-bridge:HIVE_BRIDGE_BIN"
   "node:hive-node:HIVE_NODE_BIN"
