@@ -128,6 +128,22 @@ then update the stale doc in the same change. `README.md` and parts of
   cross-backend parity oracle. Regenerate only consciously
   (`HIVE_GOLDEN_REGEN=1`) and diff; PR 1.6 may relax the score tolerance but
   must keep the label-set and top-3 order assertions.
+- The smoke tier (real binaries, real sockets, multi-component scenarios —
+  docs/TESTING-STRATEGY.md §4) lives in `smoke/` plus each binary crate's own
+  `tests/`, and every one of its tests opens with `require_smoke!()`: without
+  `HIVE_SMOKE=1` it skips loudly and passes, so `cargo test --workspace` stays
+  green offline. `smoke-support/` holds its seams — `test_domain()` today,
+  `test_node()`/`test_pair()` as the node lands — and carries the same clause
+  `test_store()` does: no test constructs a domain, node, or device pair any
+  other way. Harness rules: bind `127.0.0.1:0` and parse the port from the
+  child's own output (never a fixed port), wait only through `wait_until` (no
+  bare sleeps), stay under 60s per test, tee child stdout/stderr into the test
+  log, and kill spawned children on drop. Binaries come from
+  `HIVE_APP_BIN`/`HIVE_BRIDGE_BIN`/`HIVE_NODE_BIN` via `require_bin!` —
+  `CARGO_BIN_EXE_*` exists only inside the crate that owns the binary and a
+  two-binary scenario needs both — and an unset path env is another loud skip.
+  Run the tier with `./scripts/smoke.sh` (it builds the binaries, exports the
+  paths, and is what the CI `smoke` job runs).
 - Use `HIVE_EMBED=hash` for CI, local smoke tests, and offline checks.
 
 ## Branching

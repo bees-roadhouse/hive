@@ -109,3 +109,37 @@ jobs:
           HIVE_EMBED: hash
           DATABASE_URL: postgres://hive:hive@localhost:5432/hive
         run: cargo test -p hive-import
+
+  # The smoke tier (docs/TESTING-STRATEGY.md §4): real binaries, real sockets,
+  # multi-process scenarios. Merge-gating from day one, and the reason the
+  # `rust` job above stays honest — those tests skip themselves loudly without
+  # HIVE_SMOKE=1, so without this job they would never run anywhere.
+  #
+  # Crate-scoped, not --workspace: no hive-app means no webkit/gtk stack here
+  # (the one scenario that boots the app needs a display and rides the shots
+  # rig instead), so this job's system deps match the importer's. Its own cache
+  # key keeps that smaller dependency closure from thrashing `hive-rust`.
+  #
+  # scripts/smoke.sh is the single source of truth for what the tier builds,
+  # exports, and runs — CI calls it so local and CI cannot drift.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev cmake
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: hive-rust-smoke
+
+      - name: Smoke tier
+        run: ./scripts/smoke.sh

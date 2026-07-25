@@ -2844,6 +2844,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "hive-smoke"
+version = "0.7.0"
+dependencies = [
+ "hive-core",
+ "hive-smoke-support",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "hive-smoke-support"
+version = "0.7.0"
+dependencies = [
+ "data-encoding",
+ "hive-core",
+ "hive-embed",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "hkdf"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

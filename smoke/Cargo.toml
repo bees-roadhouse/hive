@@ -1,0 +1,20 @@
+[package]
+name = "hive-smoke"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The crate itself ships nothing (see src/lib.rs) — the scenarios live in
+# tests/, so everything here is a dev-dependency.
+[dependencies]
+
+[dev-dependencies]
+# The seams. Nothing in tests/ may construct a domain, node, or device pair
+# any other way (AGENTS.md).
+hive-smoke-support = { path = "../smoke-support" }
+hive-core = { path = "../core" }
+tokio = { workspace = true }
+serde_json = { workspace = true }

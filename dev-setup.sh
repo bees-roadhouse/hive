@@ -41,7 +41,7 @@ echo "     cargo clippy --workspace --all-targets -- -D warnings"
 echo "     HIVE_EMBED=hash cargo test --workspace"
 echo
 echo "   Test tiers beyond that (docs/TESTING-STRATEGY.md; loud-skip without the var):"
-echo "     HIVE_SMOKE=1 HIVE_EMBED=hash cargo test --workspace   # smoke tier: real binaries/sockets (crates land with PR 4.2)"
+echo "     ./scripts/smoke.sh                                    # smoke tier: real binaries/sockets (what CI's smoke job runs)"
 echo "     HIVE_SHOTS=1 ...                                      # screenshot tier: pinned container only (PR 5.0)"
 echo
 echo "   Importer DB tests (the one Postgres exception; needs ./dev-setup.sh --importer-db):"
