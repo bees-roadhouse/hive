@@ -2865,6 +2865,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "hive-sync"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "ciborium",
+ "data-encoding",
+ "hive-core",
+ "hive-smoke-support",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "hkdf"
 version = "0.12.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

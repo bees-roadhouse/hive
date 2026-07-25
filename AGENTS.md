@@ -11,8 +11,9 @@ Phases 1-2 teardown/rebuild history in docs/PLAN.md, whose forward half is
 superseded by the active execution plan docs/PLAN-v2.1.md; test tiers and
 conventions in docs/TESTING-STRATEGY.md):
 
-- Rust workspace: `shared`, `embed`, `core`, `jmap-sync`, `app`, `bridge`,
-  and `importer`. There is no Node/pnpm workspace anymore — the Solid SPA,
+- Rust workspace: `shared`, `embed`, `core`, `jmap-sync`, `sync`, `app`,
+  `bridge`, and `importer`, plus the test-tier crates `smoke-support` and
+  `smoke`. There is no Node/pnpm workspace anymore — the Solid SPA,
   the legacy Node packages, the worker/mail daemons (PR 1.2), and the api
   crate with its REST/auth/OAuth surface (PR 1.3) were deleted in Phase 1
   teardown. The shipping binaries are the app, `hive-bridge` (PR 1.8), and
@@ -46,6 +47,19 @@ then update the stale doc in the same change. `README.md` and parts of
   `has_block`/`get_block`/`put_block`/`list_block_ids`, all exposed as
   `Store::sync_*`. Read-only apart from `sync_put_block`; foreign segment
   ingest is PR 4.10's job, not this surface's.
+- `sync/`: hive-sync — the replication protocol (PLAN-v2.1 PR 4.4, D29), lib
+  plus a skeleton binary. Length-prefixed CBOR control frames with raw
+  payload streams behind the two that carry bytes, generic over
+  `AsyncRead + AsyncWrite` (the `serve_bridge_connection` discipline), and a
+  session state machine scoped to ONE domain. Stage A is one-way backup, so
+  the halves are a `SyncSource` (implemented for `Store`, over PR 4.3's read
+  surface) and a `SyncSink` (implemented by `DirVault`, a directory in exact
+  store shape — the node's SegmentVault at PR 4.6 is that plus a server's
+  bookkeeping). Two things move and nothing else: verbatim segment bytes and
+  ciphertext blocks by bare id. The wire is deliberately NOT byte-frozen
+  while it churns (round-trips + HOSTILE-DECODE instead; compat fixtures at
+  the v0.8.0 proto-v1 tag), and every peer-declared length is capped before
+  it sizes an allocation.
 - `bridge/`: the `hive-bridge` binary — the ONLY external doorway (D25),
   in PROXY mode since PR 2.4: a sync stdio ↔ unix-socket pump (serve mode:
   JSON-RPC 2.0, one message per line; `call` mode: one tool call for
