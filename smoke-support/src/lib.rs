@@ -5,7 +5,8 @@
 // multi-process scenarios. This crate is its ONE-SEAM half — what
 // `core/tests/common/mod.rs::test_store()` is to hive-core's unit tests,
 // `test_domain()` is to a smoke scenario, and it carries the same AGENTS.md
-// clause: no test constructs a domain, node, or device pair any other way.
+// clause: no test constructs a domain, device identity, node, or device pair
+// any other way.
 // That is what lets the seam grow (`test_node()`, `test_pair()` arrive with
 // the node) without rewriting a single scenario body.
 //
@@ -18,8 +19,9 @@
 //   * KEY-INJECT — a domain's master key is a tempdir file in the ONE shared
 //     64-hex format (`hive_core::keys::parse_master_key_hex`): the app's
 //     `HIVE_MASTER_KEY_FILE` seam, the node's `FileKeySource`, the screenshot
-//     fixture seeder, and this seam all read the same bytes. CI never touches
-//     an OS keychain.
+//     fixture seeder, and this seam all read the same bytes. Device transport
+//     identities (`test_identity`, PR 4.5) are injected the same way, derived
+//     from their name. CI never touches an OS keychain.
 //   * No bare sleeps — `wait_until` is the only sanctioned wait primitive.
 //     Bounded (10s default), polled (50ms), and it names what it waited for
 //     when it gives up, so a hung scenario fails with a sentence instead of a
@@ -37,6 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use hive_core::identity::DeviceIdentity;
 use hive_core::keys::{KeySource, MemoryKeySource};
 use hive_core::store::Store;
 
@@ -227,6 +230,14 @@ impl TestDomain {
         self.dir.path().join("devices").join(name)
     }
 
+    /// Device `name`'s TRANSPORT identity (PLAN-v2.1 PR 4.5) — the ed25519 +
+    /// x25519 keypair a peer pins, as distinct from the domain master above.
+    /// Same name, same device, every run: a scenario can mint the identity
+    /// before the store exists (enrollment, PR 4.7) and get the same keys.
+    pub fn device_identity(&self, name: &str) -> DeviceIdentity {
+        test_identity(name)
+    }
+
     /// Open a device store under this domain's master, creating its data dir
     /// if absent — and opening whatever is already there if not, which is how
     /// a restored (copied) dir gets opened. Deterministic hash embedder, so
@@ -237,6 +248,22 @@ impl TestDomain {
         Store::new(&dir, self.key_source(), Arc::new(hive_embed::HashEmbedder))
             .unwrap_or_else(|e| panic!("opening smoke device {name:?} at {}: {e:#}", dir.display()))
     }
+}
+
+// ── device identities (ONE-SEAM + KEY-INJECT) ───────────────────────────────
+
+/// blake3 derive_key context for the tier's device seeds. Test-only material
+/// by construction: the context string says so, so a seed minted here can
+/// never collide with one a real device generated.
+const TEST_IDENTITY_CONTEXT: &str = "hive-smoke-device-identity-v1";
+
+/// A named throwaway device identity — deterministic in the name, so a
+/// failing transport scenario names the same keys on every rerun and a pinned
+/// key can be written into a fixture. The identity half of KEY-INJECT: the
+/// tier never asks an OS keychain for a device key, exactly as it never asks
+/// for a master key.
+pub fn test_identity(name: &str) -> DeviceIdentity {
+    DeviceIdentity::from_seed(&blake3::derive_key(TEST_IDENTITY_CONTEXT, name.as_bytes()))
 }
 
 #[cfg(test)]
@@ -287,6 +314,27 @@ mod tests {
         );
         alpha.shutdown().await.unwrap();
         beta.shutdown().await.unwrap();
+    }
+
+    /// The identity seam is deterministic in the name and separate per device
+    /// — the two properties every pinning scenario leans on.
+    #[test]
+    fn named_device_identities_are_stable_and_distinct() {
+        let alpha = test_identity("alpha");
+        assert_eq!(
+            alpha.ed25519_public(),
+            test_identity("alpha").ed25519_public(),
+            "same name, same device, every run"
+        );
+        assert_ne!(
+            alpha.ed25519_public(),
+            test_identity("beta").ed25519_public()
+        );
+        assert_eq!(
+            test_domain().device_identity("alpha").ed25519_public(),
+            alpha.ed25519_public(),
+            "the domain method is the same seam"
+        );
     }
 
     /// A store opened by the seam reopens on the same dir under the same key —

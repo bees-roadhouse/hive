@@ -27,6 +27,14 @@ tracing = { workspace = true }
 # encoding, so an id in a log line greps against the disk).
 data-encoding = { workspace = true }
 
+# The mTLS carrier (PLAN-v2.1 PR 4.5): self-signed device certificates pinned
+# by SPKI. The device KEY comes from hive-core (`identity`); this crate only
+# carries it, which is why rustls/rcgen stop here and never reach the engine.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-webpki = { workspace = true }
+rcgen = { workspace = true }
+
 [dev-dependencies]
 # HOSTILE-DECODE over every frame (docs/TESTING-STRATEGY.md §2, §3.4): fixed
 # seeds, bounded cases, normal CI. The wire gets round-trips + proptests and

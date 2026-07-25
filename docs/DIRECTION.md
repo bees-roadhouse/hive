@@ -926,9 +926,15 @@ New, numbered continuing from v2:
    either way.)
 9. Recovery-blob fetch policy: throttle-plus-audit only, or gated behind approval from
    a surviving enrolled device?
-10. Crypto stack spike outcome: dalek family vs aws-lc-rs, and rustls raw-public-key
-    vs self-signed-cert carrier — one spike PR before the listener lands, delivering
-    the tls_loopback harness as its artifact either way.
+10. ~~Crypto stack spike outcome~~ — **settled by PLAN-v2.1 PR 4.5**: the dalek family
+    (ed25519-dalek + x25519-dalek, seed-in/keypair-out, so `DeviceIdentity::from_seed`
+    is a pure function with its own golden) for the device key, and self-signed
+    certificates carrying that key, pinned by SPKI, for the carrier — rustls'
+    raw-public-key mode needs both peers to negotiate RFC 7250 and leaves a field
+    failure with nothing any ordinary tool can dump. The certificate is a carrier,
+    never a trust root: no chain, no name, no expiry is read. ring remains the one
+    TLS backend. Code: `core/src/identity.rs`, `sync/src/tls.rs`; harness:
+    `sync/tests/tls_loopback.rs`. Ratification pending with Nate.
 11. Vector strategy: recompute-per-replica stands for v2.1; does a low-power device
     class eventually force node-computed vector distribution (a new non-record sync
     surface with model negotiation) onto the roadmap?

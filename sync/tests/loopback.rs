@@ -3,8 +3,9 @@
 // with a store, a vault, and two concurrent session tasks — so every test
 // opens with `require_smoke!()` and the domain comes from the ONE-SEAM helper
 // (AGENTS.md). No binaries and no sockets: the transport is an in-memory
-// duplex, which is all the sessions ask for, and the TLS carrier lands at PR
-// 4.5.
+// duplex, which is all the sessions ask for — the PR 4.5 TLS carrier
+// (`hive_sync::tls`, exercised by tests/tls_loopback.rs) wraps the same
+// `AsyncRead + AsyncWrite` without a session noticing.
 //
 // What these pin, beyond "it works":
 //

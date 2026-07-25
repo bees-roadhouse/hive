@@ -25,6 +25,8 @@
 //   [`sink`]     what a peer lands; implemented by [`DirVault`], a directory
 //                in exact store shape (the node's SegmentVault, PR 4.6, is
 //                this plus a server's bookkeeping)
+//   [`tls`]      the carrier (PR 4.5) — self-signed device certificates
+//                pinned by SPKI, under which the sessions above run unchanged
 //
 // The binary half (`src/main.rs`) is a skeleton: the operator-facing commands
 // — `restore` first (PR 4.8) — grow onto this library, and the smoke tier
@@ -35,8 +37,10 @@ pub mod frame;
 pub mod session;
 pub mod sink;
 pub mod source;
+pub mod tls;
 
 pub use frame::{Frame, Hello, ProtoError, Role, PROTO_VERSION};
 pub use session::{push_session, receive_session, PushReport, ReceiveReport, SessionConfig};
 pub use sink::{DirVault, LandedSegment, SyncSink};
 pub use source::SyncSource;
+pub use tls::{DeviceCert, PinSet, PinnedKeys, SpkiPin};

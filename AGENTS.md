@@ -34,7 +34,8 @@ then update the stale doc in the same change. `README.md` and parts of
 ## Architecture
 
 - `core/`: hive-core — the op log (`oplog`), blockstore, key custody
-  (`keys`), the SQLCipher index + fold projector (`index`, `fold`), and the
+  (`keys` for the domain master, `identity` for the per-device transport
+  keypair), the SQLCipher index + fold projector (`index`, `fold`), and the
   store layer riding ONE writer thread (`store/core.rs`: mpsc commands,
   oneshot replies; the public `Store` surface stays async), plus the MCP tool
   layer (`core/src/mcp.rs`, transport-free: request/response over serde_json
@@ -46,7 +47,12 @@ then update the stale doc in the same change. `README.md` and parts of
   verifies structure holding none) and the blockstore's bare-32-byte-id
   `has_block`/`get_block`/`put_block`/`list_block_ids`, all exposed as
   `Store::sync_*`. Read-only apart from `sync_put_block`; foreign segment
-  ingest is PR 4.10's job, not this surface's.
+  ingest is PR 4.10's job, not this surface's. `identity` (PR 4.5) is the ONE
+  asymmetric introduction — ed25519 + x25519 (dalek) derived from a single
+  32-byte device seed, custody in the OS keychain beside the master key or in
+  the same 64-hex file format — reused by the mTLS carrier, control-record
+  signing, and sharing. It is NOT the master key: per-device, never shared,
+  encrypts nothing.
 - `sync/`: hive-sync — the replication protocol (PLAN-v2.1 PR 4.4, D29), lib
   plus a skeleton binary. Length-prefixed CBOR control frames with raw
   payload streams behind the two that carry bytes, generic over
@@ -59,7 +65,14 @@ then update the stale doc in the same change. `README.md` and parts of
   ciphertext blocks by bare id. The wire is deliberately NOT byte-frozen
   while it churns (round-trips + HOSTILE-DECODE instead; compat fixtures at
   the v0.8.0 proto-v1 tag), and every peer-declared length is capped before
-  it sizes an allocation.
+  it sizes an allocation. `tls` (PR 4.5) is the carrier those sessions ride:
+  self-signed certificates carrying the device's ed25519 key from
+  `hive_core::identity`, mutually pinned by SPKI (`SpkiPin`), TLS 1.3 only,
+  ring provider. The certificate is a CARRIER, never a trust root — nothing
+  validates a chain, checks a name, or reads an expiry, and the pin is the
+  whole verdict in both directions (`sync/tests/tls_loopback.rs` is the
+  harness every later transport PR extends). rustls/rcgen stop here: the
+  engine mints device keys, this crate carries them.
 - `bridge/`: the `hive-bridge` binary — the ONLY external doorway (D25),
   in PROXY mode since PR 2.4: a sync stdio ↔ unix-socket pump (serve mode:
   JSON-RPC 2.0, one message per line; `call` mode: one tool call for
@@ -152,10 +165,11 @@ then update the stale doc in the same change. `README.md` and parts of
   docs/TESTING-STRATEGY.md §4) lives in `smoke/` plus each binary crate's own
   `tests/`, and every one of its tests opens with `require_smoke!()`: without
   `HIVE_SMOKE=1` it skips loudly and passes, so `cargo test --workspace` stays
-  green offline. `smoke-support/` holds its seams — `test_domain()` today,
-  `test_node()`/`test_pair()` as the node lands — and carries the same clause
-  `test_store()` does: no test constructs a domain, node, or device pair any
-  other way. Harness rules: bind `127.0.0.1:0` and parse the port from the
+  green offline. `smoke-support/` holds its seams — `test_domain()` and
+  `test_identity()` today, `test_node()`/`test_pair()` as the node lands — and
+  carries the same clause `test_store()` does: no test constructs a domain,
+  device identity, node, or device pair any other way. Harness rules: bind
+  `127.0.0.1:0` and parse the port from the
   child's own output (never a fixed port), wait only through `wait_until` (no
   bare sleeps), stay under 60s per test, tee child stdout/stderr into the test
   log, and kill spawned children on drop. Binaries come from
