@@ -39,7 +39,13 @@ then update the stale doc in the same change. `README.md` and parts of
   layer (`core/src/mcp.rs`, transport-free: request/response over serde_json
   values; the PR 1.8 stdio bridge is its transport). `mcp::LocalCtx { actor }`
   supplies the acting identity — there is no authentication layer (single
-  user, D16).
+  user, D16). Since PLAN-v2.1 PR 4.3 core also carries the sync READ
+  surface replication rides: `oplog::keyless` (segment enumeration, header
+  parse, frame walk — no master key anywhere, because D29's blind node
+  verifies structure holding none) and the blockstore's bare-32-byte-id
+  `has_block`/`get_block`/`put_block`/`list_block_ids`, all exposed as
+  `Store::sync_*`. Read-only apart from `sync_put_block`; foreign segment
+  ingest is PR 4.10's job, not this surface's.
 - `bridge/`: the `hive-bridge` binary — the ONLY external doorway (D25),
   in PROXY mode since PR 2.4: a sync stdio ↔ unix-socket pump (serve mode:
   JSON-RPC 2.0, one message per line; `call` mode: one tool call for

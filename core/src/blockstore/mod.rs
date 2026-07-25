@@ -76,6 +76,19 @@
 // Same plaintext with a different mime shares every chunk block but gets its
 // own manifest block (mime lives inside the manifest bytes).
 //
+// ── The bare-id surface (PLAN-v2.1 PR 4.3, D29) ─────────────────────────────
+//
+// Blocks move between peers as `(32-byte ciphertext id, bytes)` and nothing
+// else: the id IS blake3 of the bytes, so a receiver holding no key still
+// verifies everything it stores (`put_block` re-hashes and refuses a
+// misaddressed body). `has_block`/`get_block`/`put_block`/`list_block_ids`
+// are that surface; `blob_block_ids` is its keyed counterpart, because
+// "which blocks make up this blob" lives inside the encrypted manifest.
+//
+// `has(&BlobRef)` is NOT "the blob is complete" — it probes the manifest
+// block alone. Completeness is a keyed-side judgment tracked per block
+// (D29): enumerate with `blob_block_ids`, then ask `has_block` about each.
+//
 // ── Determinism boundary ────────────────────────────────────────────────────
 //
 // Like the oplog, this module reads no clocks, no environment, no randomness
@@ -254,6 +267,94 @@ impl BlockStore {
         self.block_path(&blob.manifest_hash).is_file()
     }
 
+    /// True when this bare ciphertext id is on disk. Keyless — the existence
+    /// probe a want-list is built from.
+    pub fn has_block(&self, id: &[u8; 32]) -> bool {
+        self.block_path(id).is_file()
+    }
+
+    /// One block's exact ciphertext bytes, verified against its content
+    /// address (bit rot is an error, never silently served). Keyless: what
+    /// comes back is what a peer stores verbatim under the same id.
+    pub fn get_block(&self, id: &[u8; 32]) -> Result<Vec<u8>> {
+        self.read_block(id)
+    }
+
+    /// Land one block by bare id, blake3-verify-on-write: bytes whose hash is
+    /// not `id` are refused outright — the only integrity check a keyless
+    /// receiver has, and the one that makes the id trustworthy afterwards.
+    /// Idempotent (an id already on disk is by definition these bytes).
+    pub fn put_block(&self, id: &[u8; 32], bytes: &[u8]) -> Result<()> {
+        let actual = *blake3::hash(bytes).as_bytes();
+        if actual != *id {
+            bail!(
+                "block bytes hash to {}, not the claimed id {} — refusing misaddressed content",
+                data_encoding::HEXLOWER.encode(&actual),
+                data_encoding::HEXLOWER.encode(id)
+            );
+        }
+        self.write_block(id, bytes)
+    }
+
+    /// Every block id on disk, sorted. Keyless, and the blind-backup push
+    /// loop's "what do I hold?" — it says nothing about which blob a block
+    /// belongs to (that is `blob_block_ids`, and it needs the key).
+    ///
+    /// Names that are not a 64-char lowercase-hex block id are skipped, not
+    /// errors: a crash can leave a `<id>.tmp` behind (write_block) and
+    /// desktop file managers leave their own droppings in any directory.
+    pub fn list_block_ids(&self) -> Result<Vec<[u8; 32]>> {
+        let mut out = Vec::new();
+        let fanouts = match std::fs::read_dir(&self.root) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("reading blockstore root {}", self.root.display()))
+            }
+        };
+        for fanout in fanouts {
+            let fanout = fanout.context("reading blockstore root entry")?;
+            if !fanout
+                .file_type()
+                .context("stat blockstore entry")?
+                .is_dir()
+            {
+                continue;
+            }
+            let dir = fanout.path();
+            for entry in
+                std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?
+            {
+                let entry = entry.with_context(|| format!("reading entry in {}", dir.display()))?;
+                let name = entry.file_name();
+                if let Some(id) = parse_block_name(&name.to_string_lossy()) {
+                    out.push(id);
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// The block ids one blob is made of: its chunks in manifest order, then
+    /// the manifest block itself. Keyed — the chunk list lives inside the
+    /// encrypted manifest — which is exactly why "is this blob complete?" is
+    /// a keyed-side judgment (D29): the pusher enumerates here and asks
+    /// `has_block` per id.
+    ///
+    /// Manifest LAST mirrors `delete`'s order and is the safe upload order: a
+    /// manifest that lands only after its chunks never advertises blocks the
+    /// far side does not have yet. Also the enumeration PR 4.9's Forget needs
+    /// while the key still exists — after crypto-shredding, nothing can list
+    /// these ids again.
+    pub fn blob_block_ids(&self, keys: &dyn KeySource, blob: &BlobRef) -> Result<Vec<[u8; 32]>> {
+        let (_, manifest) = self.read_manifest(keys, blob)?;
+        let mut ids: Vec<[u8; 32]> = manifest.chunks.iter().map(|c| c.h).collect();
+        ids.push(blob.manifest_hash);
+        Ok(ids)
+    }
+
     /// Remove a blob's blocks from disk: chunks first, manifest last, dir
     /// entries fsynced. Idempotent: a missing manifest is a no-op Ok.
     ///
@@ -362,6 +463,16 @@ impl BlockStore {
             Err(e) => Err(e).with_context(|| format!("removing block {}", path.display())),
         }
     }
+}
+
+/// A block filename back to its id: exactly 64 lowercase hex chars, or None
+/// (temp files, foreign droppings — see `list_block_ids`).
+fn parse_block_name(name: &str) -> Option<[u8; 32]> {
+    if name.len() != 64 {
+        return None;
+    }
+    let bytes = data_encoding::HEXLOWER.decode(name.as_bytes()).ok()?;
+    bytes.try_into().ok()
 }
 
 /// Frozen content-key derivation (see module header).

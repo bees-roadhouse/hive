@@ -100,6 +100,14 @@
 // frame and reports the first invalid frame as an error (chain break, auth
 // failure, seq gap, torn tail — all distinct messages).
 //
+// ── The keyless read surface (PLAN-v2.1 PR 4.3) ─────────────────────────────
+//
+// Everything above the wrapped key in the header, and every frame's length
+// word and blake3, is plaintext — deliberately, since D29's blind node must
+// verify a segment's structure holding no keys at all. `keyless` is that
+// read-only view (enumeration, header parse, frame walk); the keyed reader
+// below is untouched and stays the only thing that opens a frame.
+//
 // ── Determinism boundary ────────────────────────────────────────────────────
 //
 // This module and blockstore never read clocks, environment, or randomness;
@@ -112,6 +120,7 @@
 // on they live behind the single writer thread that owns the SQLite
 // connection, not on the async runtime.
 
+pub mod keyless;
 mod reader;
 mod segment;
 mod writer;
@@ -119,6 +128,10 @@ mod writer;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+pub use keyless::{
+    heads, list_devices, list_segments, parse_header, segment_path, walk_segment, FrameInfo,
+    HeadsSnapshot, SegmentHeader, SegmentInfo, SegmentWalk,
+};
 pub use reader::LogReader;
 pub use writer::LogWriter;
 

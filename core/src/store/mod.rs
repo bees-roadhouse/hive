@@ -50,6 +50,7 @@ pub mod recall;
 pub mod search;
 pub mod semantic;
 pub mod sources;
+pub mod sync;
 pub mod tasks;
 pub mod topics;
 pub mod workerstatus;
