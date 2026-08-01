@@ -72,15 +72,23 @@ then update the stale doc in the same change. `README.md` and parts of
   validates a chain, checks a name, or reads an expiry, and the pin is the
   whole verdict in both directions (`sync/tests/tls_loopback.rs` is the
   harness every later transport PR extends). rustls/rcgen stop here: the
-  engine mints device keys, this crate carries them.
-- `node/`: hive-node — the always-on peer (PLAN-v2.1 PR 4.6, D29/D33/D35),
-  lib plus a thin `main`. Stage A is the BLIND tier and only that: the node
+  engine mints device keys, this crate carries them. `enroll` (PR 4.7) is the
+  ceremony's CLIENT half — code format (base32 over OS entropy), normalization,
+  the at-rest hash, and the six lines that redeem one — split from the node's
+  POLICY along the dependency arrow: the desktop redeems (PR 4.8) and must not
+  link the node crate. `UnpinnedEnrollment` is the ONE acceptor that takes any
+  key, named so the exception is greppable: a device redeeming a code has not
+  been told the node's key yet, and the grant is what ends the exception.
+- `node/`: hive-node — the always-on peer (PLAN-v2.1 PR 4.6, listener and
+  enrollment at 4.7; D29/D30/D33/D35), lib plus a thin `main`. Stage A is the
+  BLIND tier and only that: the node
   holds no domain key, opens no Store, folds nothing. A domain is a
   `SegmentVault` under `tenants/<t>/domains/<d>/` — hive-sync's `DirVault`
   (verbatim `log/<device>/*.seg` + `blocks/<hh>/<id>`, exact store shape, so
   restore is a copy) plus `node-meta.db`, PLAIN SQLite holding lengths,
-  hashes, sizes, pinned device keys, control epochs, the pending-forget
-  queue, and every integrity alarm. The invariant the vault exists for is
+  hashes, sizes, pinned device keys, control epochs, hashed enrollment codes,
+  the auth audit, the pending-forget queue, and every integrity alarm. The
+  invariant the vault exists for is
   WRITE-ONCE: a differing re-upload of an existing (device, start_seq) is an
   alarm and a refusal, never an overwrite; a segment may only extend at its
   end with its byte prefix intact; an identical re-upload is a silent no-op.
@@ -91,10 +99,36 @@ then update the stale doc in the same change. `README.md` and parts of
   per-class A/AAAA and refuses every other name before a request is made
   (delta 13's code half) — the Cloudflare rail ships, `provider = "rfc2136"`
   parses but refuses at boot rather than shipping an untestable wire.
-  `node.toml` is listen addr + node key + optional `[dns]`; `tenant.toml` is
+  `node.toml` is listen addr + `bind_scope` + node key + optional `[dns]`;
+  `tenant.toml` is
   name, tier, and quotas, and D33 keeps IdP/KMS/console fields OUT. The two
   GREP-FENCEs live in `node/tests/fences.rs` because this crate is their
   exception (see Core Invariants).
+  `listen` (PR 4.7) is the door: PR 4.5's mTLS carrier with **node-meta as the
+  guest list, re-read per connection** — that is what makes `hive-node device
+  revoke` bite on the NEXT handshake with nothing restarted, and why a rustls
+  `ServerConfig` is built per connection rather than per listener. An unpinned
+  key completes a handshake only while some domain has a LIVE enrollment code
+  (there is no other way to enroll a key nobody has seen); with none
+  outstanding the pin set is the whole guest list. One opening frame then
+  decides — `enroll` or `hello`, read under `MAX_OPENING_FRAME` — and the
+  session's domain follows from the PIN, never from the hello. A handshake
+  deadline, an accept-rate token bucket, and a connection cap bound a stranger;
+  they are constants, not config. `enroll` is the POLICY half of the ceremony
+  (the wire half is `hive_sync::enroll`): codes are ~104 bits of OS randomness,
+  **hashed at rest**, single-use via one conditional UPDATE, ten-minute TTL,
+  and CHANNEL-BOUND — the ed25519 key in the request must be the key that
+  terminated the connection, or a relay could enroll keys it does not hold. v1
+  enrolls the domain's FIRST device only; a second needs the SAS ceremony
+  (PR 4.14) and is refused rather than quietly approved. Revocations are
+  PERMANENT tombstones (by device id and by key) and bump a monotonic
+  per-domain control epoch that never regresses. Every decision, granted or
+  refused, is written to the domain's `auth_audit` before it is answered, while
+  the wire says one sentence for every enrollment refusal — a redeemer that
+  could tell "wrong" from "expired" apart could probe the code space.
+  CLI: `hive-node [serve]`, `hive-node enroll --domain <t>/<d>`,
+  `hive-node device list|revoke`; the one-shots run beside the running node
+  against the same WAL database.
 - `bridge/`: the `hive-bridge` binary — the ONLY external doorway (D25),
   in PROXY mode since PR 2.4: a sync stdio ↔ unix-socket pump (serve mode:
   JSON-RPC 2.0, one message per line; `call` mode: one tool call for
@@ -187,11 +221,16 @@ then update the stale doc in the same change. `README.md` and parts of
   docs/TESTING-STRATEGY.md §4) lives in `smoke/` plus each binary crate's own
   `tests/`, and every one of its tests opens with `require_smoke!()`: without
   `HIVE_SMOKE=1` it skips loudly and passes, so `cargo test --workspace` stays
-  green offline. `smoke-support/` holds its seams — `test_domain()` and
-  `test_identity()` today, `test_node()`/`test_pair()` when the node has a
-  protocol to hand them (PR 4.7/4.8) — and carries the same clause
+  green offline. `smoke-support/` holds its seams — `test_domain()`,
+  `test_identity()`, and `test_node()` (PR 4.7: spawns the REAL `hive-node`
+  from `HIVE_NODE_BIN`, pre-creates its domains, parses its contract lines, and
+  drives `enroll`/`device` beside it; `test_pair()` arrives with the push loop
+  at 4.8) — and carries the same clause
   `test_store()` does: no test constructs a domain, device identity, node, or
-  device pair any other way. Harness rules: bind
+  device pair any other way. That crate deliberately does NOT depend on
+  hive-node or hive-sync: it drives the node as a process, which keeps the
+  dependency arrow one-way and lets hive-node's own tests dev-depend on it.
+  Harness rules: bind
   `127.0.0.1:0` and parse the port from the
   child's own output (never a fixed port), wait only through `wait_until` (no
   bare sleeps), stay under 60s per test, tee child stdout/stderr into the test
@@ -201,7 +240,12 @@ then update the stale doc in the same change. `README.md` and parts of
   two-binary scenario needs both — and an unset path env is another loud skip.
   Single-binary smoke stays in the crate that owns it: `node/tests/boot.rs`
   spawns the real `hive-node` through `CARGO_BIN_EXE_hive-node` and pins its
-  stdout contract (`node key <hex>`, `domain <t>/<d>`, `listening on <addr>`).
+  stdout contract (`node key <hex>`, `domain <t>/<d>`, `listening on <addr>`,
+  and from `enroll`: `enrollment code <code>`, `expires <unix>`).
+  ADVERSARIAL-SMOKE (docs/TESTING-STRATEGY.md §2, §4.4) starts at
+  `smoke/tests/enrollment.rs`: every transport-auth claim PR 4.7 makes is a
+  scenario against the real binary with an in-proc device, and each asserts the
+  operator's audit trail, not just the wire outcome.
   Run the tier with `./scripts/smoke.sh` (it builds the binaries, exports the
   paths, and is what the CI `smoke` job runs).
 - Two GREP-FENCEs guard architecture rules the compiler cannot

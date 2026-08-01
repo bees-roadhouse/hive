@@ -12,22 +12,31 @@
 // What is here, and who fills it:
 //
 //   segments      lengths + whole-file hashes + sealed  — the write-once
-//                 evidence (this PR: a differing re-upload is checked
+//                 evidence (PR 4.6: a differing re-upload is checked
 //                 against these rows, not against a memory of the session)
 //   blocks        ciphertext block sizes                — quota accounting (4.9)
 //   device_pins   enrolled devices' pinned public keys  — enrollment (4.7)
 //   control       the monotonic per-domain control epoch — enrollment (4.7)
+//   enroll_codes  one-time enrollment codes, HASHED     — enrollment (4.7)
+//   auth_audit    every enrollment and every auth failure — enrollment (4.7)
 //   forget_queue  block ids the keyed pusher asked to shred, until acked (4.9)
-//   alarms        integrity ALARMS, permanently retained — this PR
+//   alarms        integrity ALARMS, permanently retained — PR 4.6
 //
-// The later columns land now because the vault's file shape and this schema
-// are what an operator backs up: growing it under a running deployment is a
-// migration, and there is nothing here worth migrating for.
+// The later columns land ahead of their consumers because the vault's file
+// shape and this schema are what an operator backs up: growing it under a
+// running deployment is a migration, and there is nothing here worth migrating
+// for.
 //
 // It is NOT rebuildable-by-replay the way the fold's index is. The segment
-// and block rows are (rescan the tree), but pins, epochs, the forget queue,
-// and the alarm history are the node's own memory and exist nowhere else —
-// which is why a version mismatch here REFUSES rather than dropping.
+// and block rows are (rescan the tree), but pins, epochs, codes, the audit
+// trail, the forget queue, and the alarm history are the node's own memory and
+// exist nowhere else — which is why a version mismatch here REFUSES rather
+// than dropping.
+//
+// Two things are deliberately NOT in the clear here, on a database that is
+// otherwise entirely metadata: an enrollment code (only its blake3 hash, D30's
+// "hashed at rest" — a stolen node-meta.db must not yield a live credential)
+// and, forever, anything a domain wrote.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -38,10 +47,21 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// The database file inside a domain's vault directory.
 pub const META_DB_FILE: &str = "node-meta.db";
 
+/// Auth-audit rows kept per domain. Big enough that a real incident is still
+/// legible days later, small enough that an unauthenticated stranger holding a
+/// socket open cannot grow the file without bound (the alarms table has no
+/// such cap because only a real integrity failure can write to it).
+pub const AUTH_AUDIT_KEEP: i64 = 10_000;
+
 /// Schema version, stamped in `PRAGMA user_version`. Bumping it is a real
 /// migration (see the module header): this database holds state that exists
 /// nowhere else.
-pub const META_VERSION: u32 = 1;
+///
+/// 2 (PLAN-v2.1 PR 4.7) added `enroll_codes` and `auth_audit`. Purely
+/// additive — `CREATE TABLE IF NOT EXISTS` carries a v1 file forward with
+/// every row intact — but the stamp still moves, because a v1 build opening a
+/// v2 file would silently ignore pins it cannot see the provenance of.
+pub const META_VERSION: u32 = 2;
 
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS segments (
@@ -72,6 +92,23 @@ CREATE TABLE IF NOT EXISTS device_pins (
 CREATE TABLE IF NOT EXISTS control (
     id    INTEGER PRIMARY KEY CHECK (id = 1),
     epoch INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS enroll_codes (
+    code_hash  BLOB    PRIMARY KEY,
+    minted_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    expires_at INTEGER NOT NULL,
+    redeemed_at TEXT,
+    redeemed_by TEXT
+);
+
+CREATE TABLE IF NOT EXISTS auth_audit (
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    kind   TEXT NOT NULL,
+    peer   TEXT,
+    pin    TEXT,
+    detail TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS forget_queue (
@@ -113,6 +150,84 @@ pub struct DevicePin {
     pub ed25519_pk: [u8; 32],
     pub x25519_pk: [u8; 32],
     pub revoked: bool,
+}
+
+/// What happened when a code was redeemed (PR 4.7). The three refusals are
+/// deliberately distinguished HERE and collapsed into one wire error: the
+/// operator's audit trail is where "wrong" and "expired" differ, and a peer
+/// that could tell them apart could probe the code space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeVerdict {
+    /// Live, unredeemed, and now marked used — atomically, so two racing
+    /// redemptions cannot both win.
+    Redeemed,
+    /// No such code. (Also what a code someone made up looks like.)
+    Unknown,
+    /// Past its TTL. Still on file: an expired code that shows up is worth
+    /// seeing in the audit trail.
+    Expired,
+    /// Already used, once. Single-use is what makes a code a credential for
+    /// one device rather than for whoever else saw the operator's terminal.
+    AlreadyRedeemed,
+}
+
+/// A security-relevant event on this domain, for the operator's trail
+/// (PR 4.7's auth-failure audit logging). Closed set, like [`AlarmKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthEventKind {
+    /// An operator minted a one-time enrollment code.
+    CodeMinted,
+    /// A device redeemed one and is now pinned.
+    Enrolled,
+    /// A redemption was refused — the interesting half of the trail.
+    EnrollRefused,
+    /// A session opened from a pinned, unrevoked device.
+    SessionOpened,
+    /// A connection was refused after the handshake: unpinned, revoked,
+    /// wrong domain, or a frame that has no business opening a connection.
+    SessionRefused,
+    /// A device was revoked. Paired with a permanent tombstone in
+    /// `device_pins` and a bump of the control epoch.
+    DeviceRevoked,
+}
+
+impl AuthEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthEventKind::CodeMinted => "code_minted",
+            AuthEventKind::Enrolled => "enrolled",
+            AuthEventKind::EnrollRefused => "enroll_refused",
+            AuthEventKind::SessionOpened => "session_opened",
+            AuthEventKind::SessionRefused => "session_refused",
+            AuthEventKind::DeviceRevoked => "device_revoked",
+        }
+    }
+
+    /// Whether this event is a refusal. Refusals log at WARN; the rest at
+    /// INFO — an operator watching the journal should see failures without
+    /// having to filter successes out.
+    fn is_refusal(self) -> bool {
+        matches!(
+            self,
+            AuthEventKind::EnrollRefused | AuthEventKind::SessionRefused
+        )
+    }
+}
+
+/// One audited security event, as read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthEvent {
+    pub id: i64,
+    pub at: String,
+    pub kind: String,
+    /// The peer's own claim about who it is (a device id from a hello), or
+    /// none when nothing was claimed. Never trusted — it is evidence, not
+    /// identity.
+    pub peer: Option<String>,
+    /// The SPKI pin the connection actually presented, lowercase hex. THIS is
+    /// the identity half, and it is what an operator greps.
+    pub pin: Option<String>,
+    pub detail: String,
 }
 
 /// What an integrity alarm is about. The set is closed: a new kind is a new
@@ -392,6 +507,211 @@ impl NodeMeta {
         row.transpose()
     }
 
+    /// Every pin this domain has ever issued, revoked ones included, ordered
+    /// by device. The listener snapshots this per connection (PR 4.7) — a
+    /// household's worth of rows, re-read every time so a `device revoke`
+    /// takes effect on the NEXT handshake with no restart.
+    pub fn device_pins(&self) -> Result<Vec<DevicePin>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT device, ed25519_pk, x25519_pk, revoked_at FROM device_pins
+                 ORDER BY device",
+            )
+            .context("preparing device-pin scan")?;
+        let rows = stmt
+            .query_map([], device_pin_row)
+            .context("scanning device pins")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("scanning device pins")??);
+        }
+        Ok(out)
+    }
+
+    // ── enrollment codes (PR 4.7) ───────────────────────────────────────────
+
+    /// Record a minted code by its HASH and its expiry (unix seconds). The
+    /// code itself is never written anywhere: the operator's terminal is the
+    /// only place it exists, which is what "hashed at rest" buys.
+    pub fn mint_code(&self, code_hash: &[u8; 32], expires_at: i64) -> Result<()> {
+        self.conn()
+            .execute(
+                "INSERT INTO enroll_codes (code_hash, expires_at) VALUES (?1, ?2)
+                 ON CONFLICT(code_hash) DO NOTHING",
+                params![&code_hash[..], expires_at],
+            )
+            .context("recording a minted enrollment code")?;
+        Ok(())
+    }
+
+    /// Spend a code, in ONE statement.
+    ///
+    /// The update is conditional on the row still being unredeemed and unexpired
+    /// and reports whether it changed a row, so "check then mark" cannot be
+    /// raced by two redemptions of the same code — the loser sees
+    /// [`CodeVerdict::AlreadyRedeemed`], which is exactly right.
+    ///
+    /// `now` is passed in rather than read from the clock so the TTL is
+    /// testable without waiting ten minutes.
+    pub fn redeem_code(&self, code_hash: &[u8; 32], now: i64, device: &str) -> Result<CodeVerdict> {
+        let conn = self.conn();
+        let spent = conn
+            .execute(
+                "UPDATE enroll_codes
+                 SET redeemed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), redeemed_by = ?3
+                 WHERE code_hash = ?1 AND redeemed_at IS NULL AND expires_at > ?2",
+                params![&code_hash[..], now, device],
+            )
+            .context("redeeming an enrollment code")?;
+        if spent > 0 {
+            return Ok(CodeVerdict::Redeemed);
+        }
+        // It did not apply. Say why, for the audit trail only.
+        let row: Option<(i64, Option<String>)> = conn
+            .query_row(
+                "SELECT expires_at, redeemed_at FROM enroll_codes WHERE code_hash = ?1",
+                params![&code_hash[..]],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .context("reading an enrollment code")?;
+        Ok(match row {
+            None => CodeVerdict::Unknown,
+            Some((_, Some(_))) => CodeVerdict::AlreadyRedeemed,
+            Some(_) => CodeVerdict::Expired,
+        })
+    }
+
+    /// How many codes are live at `now` — unredeemed and unexpired.
+    ///
+    /// The listener asks this per connection, and the answer is a door: while
+    /// it is above zero, an UNPINNED key may complete a handshake (there is no
+    /// other way to enroll a key nobody has seen). At zero, the pin set is the
+    /// whole guest list and an unpinned peer is refused by rustls itself.
+    pub fn live_codes(&self, now: i64) -> Result<u64> {
+        let n: i64 = self
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM enroll_codes
+                 WHERE redeemed_at IS NULL AND expires_at > ?1",
+                params![now],
+                |r| r.get(0),
+            )
+            .context("counting live enrollment codes")?;
+        Ok(n as u64)
+    }
+
+    /// Whether this domain ever minted the code behind `code_hash`.
+    ///
+    /// ROUTING only, and deliberately blind to expiry and to redemption: a
+    /// spent or stale code must still find its way to the domain it was minted
+    /// for, so that its refusal lands in THAT domain's audit trail instead of
+    /// nowhere. Whether it is still spendable is [`NodeMeta::redeem_code`]'s
+    /// atomic business.
+    pub fn knows_code(&self, code_hash: &[u8; 32]) -> Result<bool> {
+        let n: i64 = self
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM enroll_codes WHERE code_hash = ?1",
+                params![&code_hash[..]],
+                |r| r.get(0),
+            )
+            .context("looking up an enrollment code")?;
+        Ok(n > 0)
+    }
+
+    // ── auth audit (PR 4.7) ─────────────────────────────────────────────────
+
+    /// Record a security event, and log it — a refusal at WARN, everything
+    /// else at INFO. Both surfaces matter: the journal is what an operator
+    /// watches live, the table is what they read afterwards.
+    ///
+    /// Bounded, unlike `alarms`. An alarm needs a deliberate integrity failure
+    /// to raise; an auth failure needs only a stranger with a socket, so the
+    /// trail keeps the most recent [`AUTH_AUDIT_KEEP`] events and lets the
+    /// rest go rather than handing anyone a disk-fill.
+    pub fn record_auth_event(
+        &self,
+        kind: AuthEventKind,
+        peer: Option<&str>,
+        pin: Option<&str>,
+        detail: &str,
+    ) -> Result<i64> {
+        if kind.is_refusal() {
+            tracing::warn!(
+                event = kind.as_str(),
+                peer = peer.unwrap_or("-"),
+                pin = pin.unwrap_or("-"),
+                "{detail}"
+            );
+        } else {
+            tracing::info!(
+                event = kind.as_str(),
+                peer = peer.unwrap_or("-"),
+                pin = pin.unwrap_or("-"),
+                "{detail}"
+            );
+        }
+        let id = {
+            let conn = self.conn();
+            conn.execute(
+                "INSERT INTO auth_audit (kind, peer, pin, detail) VALUES (?1, ?2, ?3, ?4)",
+                params![kind.as_str(), peer, pin, detail],
+            )
+            .context("recording an auth event")?;
+            conn.last_insert_rowid()
+        };
+        self.trim_auth_audit(AUTH_AUDIT_KEEP)?;
+        Ok(id)
+    }
+
+    /// Drop all but the newest `keep` audit rows, returning how many went.
+    ///
+    /// The cutoff is the id of the `keep`-th newest row rather than
+    /// `last_id - keep`, so it stays right when the ids are not dense — which
+    /// they are in production and are not the moment anything else has touched
+    /// the table. `keep` is a parameter rather than the constant so the bound
+    /// is testable without ten thousand inserts (the same reason the
+    /// enrollment TTL takes its clock as an argument).
+    pub fn trim_auth_audit(&self, keep: i64) -> Result<usize> {
+        let n = self
+            .conn()
+            .execute(
+                "DELETE FROM auth_audit WHERE id <= (
+                     SELECT id FROM auth_audit ORDER BY id DESC LIMIT 1 OFFSET ?1
+                 )",
+                params![keep],
+            )
+            .context("trimming the auth audit")?;
+        Ok(n)
+    }
+
+    /// The retained audit trail, oldest first.
+    pub fn auth_events(&self) -> Result<Vec<AuthEvent>> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare("SELECT id, at, kind, peer, pin, detail FROM auth_audit ORDER BY id")
+            .context("preparing auth-audit scan")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AuthEvent {
+                    id: r.get(0)?,
+                    at: r.get(1)?,
+                    kind: r.get(2)?,
+                    peer: r.get(3)?,
+                    pin: r.get(4)?,
+                    detail: r.get(5)?,
+                })
+            })
+            .context("scanning the auth audit")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("scanning the auth audit")?);
+        }
+        Ok(out)
+    }
+
     // ── control epoch (PR 4.7) ──────────────────────────────────────────────
 
     /// The domain's control epoch. 0 before anything has been enrolled.
@@ -648,6 +968,114 @@ mod tests {
         assert!(pin.revoked, "a tombstone, not a deletion");
         assert_eq!(pin.ed25519_pk, [3u8; 32]);
         assert!(!meta.revoke_device("laptop").unwrap(), "already revoked");
+    }
+
+    /// The listener snapshots every pin per connection, tombstones included —
+    /// it is the revoked ones that have to stay visible.
+    #[test]
+    fn every_pin_is_listed_including_the_tombstones() {
+        let (_dir, meta) = meta();
+        assert!(meta.device_pins().unwrap().is_empty());
+        meta.pin_device("laptop", &[3u8; 32], &[4u8; 32]).unwrap();
+        meta.pin_device("desktop", &[5u8; 32], &[6u8; 32]).unwrap();
+        meta.revoke_device("laptop").unwrap();
+
+        let pins = meta.device_pins().unwrap();
+        assert_eq!(pins.len(), 2);
+        assert_eq!(pins[0].device, "desktop", "ordered by device");
+        assert!(!pins[0].revoked);
+        assert_eq!(pins[1].device, "laptop");
+        assert!(pins[1].revoked, "a revoked device is still listed");
+    }
+
+    /// Single-use, TTL-bounded, and never stored in the clear — the three
+    /// properties D30 asks of an enrollment code, in one test.
+    #[test]
+    fn an_enrollment_code_is_hashed_single_use_and_short_lived() {
+        let (dir, meta) = meta();
+        let hash = blake3::derive_key("hive-node-enroll-code-v1", b"K4RT9X2M");
+        meta.mint_code(&hash, 1_000).unwrap();
+        assert_eq!(meta.live_codes(999).unwrap(), 1);
+
+        // Expired: the TTL is a comparison against the caller's clock, so the
+        // test does not have to wait ten minutes for it.
+        assert_eq!(meta.live_codes(1_000).unwrap(), 0, "expiry is exclusive");
+        assert_eq!(
+            meta.redeem_code(&hash, 1_001, "laptop").unwrap(),
+            CodeVerdict::Expired
+        );
+        // Still live a second earlier — and spendable exactly once.
+        assert_eq!(
+            meta.redeem_code(&hash, 999, "laptop").unwrap(),
+            CodeVerdict::Redeemed
+        );
+        assert_eq!(
+            meta.redeem_code(&hash, 999, "laptop").unwrap(),
+            CodeVerdict::AlreadyRedeemed
+        );
+        assert_eq!(meta.live_codes(999).unwrap(), 0, "spent, not merely used");
+        assert_eq!(
+            meta.redeem_code(&[0xff; 32], 999, "laptop").unwrap(),
+            CodeVerdict::Unknown
+        );
+
+        // Hashed at rest: the plaintext code appears nowhere in the file.
+        let raw = std::fs::read(dir.path().join(META_DB_FILE)).unwrap();
+        assert!(
+            !raw.windows(8).any(|w| w == b"K4RT9X2M"),
+            "a stolen node-meta.db must not yield a live credential"
+        );
+    }
+
+    #[test]
+    fn the_audit_trail_records_who_and_is_bounded() {
+        let (_dir, meta) = meta();
+        meta.record_auth_event(
+            AuthEventKind::SessionRefused,
+            Some("laptop"),
+            Some("ab00"),
+            "unpinned device key",
+        )
+        .unwrap();
+        let events = meta.auth_events().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "session_refused");
+        assert_eq!(events[0].peer.as_deref(), Some("laptop"));
+        assert_eq!(events[0].pin.as_deref(), Some("ab00"));
+        assert!(events[0].detail.contains("unpinned"));
+        assert_eq!(events[0].at.len(), 24, "the store's ISO shape");
+
+        // Bounded: an unauthenticated stranger with a socket must not be able
+        // to grow this file without limit. The trim runs on every insert
+        // against [`AUTH_AUDIT_KEEP`]; the bound itself is exercised at a size
+        // a test can hold, which is why `keep` is a parameter.
+        for i in 0..3 {
+            meta.record_auth_event(AuthEventKind::SessionRefused, None, None, &format!("n{i}"))
+                .unwrap();
+        }
+        assert_eq!(meta.auth_events().unwrap().len(), 4);
+        assert_eq!(
+            meta.trim_auth_audit(2).unwrap(),
+            2,
+            "all but the newest two"
+        );
+        let kept: Vec<String> = meta
+            .auth_events()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.detail)
+            .collect();
+        assert_eq!(kept, vec!["n1", "n2"], "the NEWEST survive");
+        assert_eq!(
+            meta.trim_auth_audit(2).unwrap(),
+            0,
+            "idempotent under the cap"
+        );
+        assert_eq!(
+            meta.trim_auth_audit(AUTH_AUDIT_KEEP).unwrap(),
+            0,
+            "a trail under the real cap loses nothing"
+        );
     }
 
     #[test]

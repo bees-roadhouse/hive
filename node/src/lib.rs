@@ -20,12 +20,18 @@
 //   [`config`]  `node.toml` + per-tenant `tenant.toml` (name, tier, quotas —
 //               and deliberately no IdP/KMS/console fields, D33)
 //   [`meta`]    `node-meta.db`, plain SQLite: lengths, hashes, sizes, pinned
-//               device keys, control epochs, the pending-forget queue, alarms
+//               device keys, control epochs, enrollment codes, the auth audit,
+//               the pending-forget queue, alarms
 //   [`vault`]   the write-once blind vault, `tenants/<t>/domains/<d>/`
 //   [`dns`]     the address publisher — `_hive._tcp.<zone>` plus the node's
 //               own per-interface-class A/AAAA, and nothing else, ever
 //   [`server`]  boot: open the root, resolve the key, discover the vaults,
 //               bind, announce, serve
+//   [`enroll`]  enrollment POLICY (PR 4.7) — mint, redeem, revoke; the wire
+//               half of the ceremony is `hive_sync::enroll`
+//   [`listen`]  the mTLS accept loop (PR 4.7): node-meta IS the guest list,
+//               re-read per connection, and one opening frame decides whether
+//               a connection is an enrollment or a session
 //
 // lib + thin `main` on purpose (docs/TESTING-STRATEGY.md §4.1): `node/tests/`
 // spawns the real binary for the boot contract, and multi-party smoke
@@ -38,14 +44,19 @@
 
 pub mod config;
 pub mod dns;
+pub mod enroll;
+pub mod listen;
 pub mod meta;
 pub mod server;
 pub mod vault;
 
 pub use config::{
-    AddressClass, AdvertisedAddress, DnsConfig, DnsProvider, NodeConfig, Quotas, TenantConfig, Tier,
+    AddressClass, AdvertisedAddress, BindScope, DnsConfig, DnsProvider, NodeConfig, Quotas,
+    TenantConfig, Tier,
 };
 pub use dns::{allowed_names, DnsPublisher, PublishReport, RecordType, ZoneApi};
-pub use meta::{Alarm, AlarmKind, DevicePin, NodeMeta, SegmentRow};
+pub use enroll::{MintedCode, CODE_TTL};
+pub use listen::{NodeGate, ServeReport};
+pub use meta::{Alarm, AlarmKind, AuthEvent, AuthEventKind, DevicePin, NodeMeta, SegmentRow};
 pub use server::{Bound, Node};
 pub use vault::SegmentVault;

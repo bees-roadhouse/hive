@@ -26,3 +26,8 @@ tempfile = { workspace = true }
 data-encoding = { workspace = true }
 # Derives the tier's device seeds from their names (test_identity, PR 4.5).
 blake3 = { workspace = true }
+# Reads (and ages) the node's `node-meta.db` for `test_node()` (PR 4.7). That
+# file is PLAIN SQLite on purpose — a blind node holds no key, so its
+# bookkeeping is an operator's to inspect — which is exactly what lets the tier
+# assert an audit trail and expire a code without waiting ten minutes.
+rusqlite = { workspace = true }

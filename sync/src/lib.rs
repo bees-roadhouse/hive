@@ -20,6 +20,9 @@
 //   [`frame`]    the wire — length-prefixed CBOR control frames + raw payload
 //                streams, with every peer-declared length capped before it
 //                sizes an allocation
+//   [`enroll`]   the enrollment ceremony's client half (PR 4.7) — code format,
+//                at-rest hash, and the six lines that redeem one; the POLICY
+//                that answers is the node's
 //   [`session`]  the state machine, generic over `AsyncRead + AsyncWrite`
 //   [`source`]   what a peer serves; implemented for `hive_core::store::Store`
 //   [`sink`]     what a peer lands; implemented by [`DirVault`], a directory
@@ -33,14 +36,18 @@
 // drives the library in-proc rather than spawning it
 // (docs/TESTING-STRATEGY.md §4.1).
 
+pub mod enroll;
 pub mod frame;
 pub mod session;
 pub mod sink;
 pub mod source;
 pub mod tls;
 
-pub use frame::{Frame, Hello, ProtoError, Role, PROTO_VERSION};
-pub use session::{push_session, receive_session, PushReport, ReceiveReport, SessionConfig};
+pub use frame::{EnrollGrant, EnrollRequest, Frame, Hello, ProtoError, Role, PROTO_VERSION};
+pub use session::{
+    push_session, receive_session, receive_session_with_hello, PushReport, ReceiveReport,
+    SessionConfig,
+};
 pub use sink::{DirVault, LandedSegment, SyncSink};
 pub use source::SyncSource;
-pub use tls::{DeviceCert, PinSet, PinnedKeys, SpkiPin};
+pub use tls::{DeviceCert, PinSet, PinnedKeys, SpkiPin, UnpinnedEnrollment};

@@ -225,7 +225,30 @@ where
     W: AsyncWrite + Unpin,
     K: SyncSink + ?Sized,
 {
-    let peer = handshake(&mut reader, &mut writer, cfg, Role::Receive).await?;
+    let hello = read_hello(&mut reader, &mut writer).await?;
+    receive_session_with_hello(reader, writer, sink, cfg, hello).await
+}
+
+/// `receive_session` for a caller that has ALREADY read the opening frame.
+///
+/// The node's listener (PR 4.7) reads the first frame itself, because that
+/// frame is what says whether the connection is a session or an enrollment
+/// redemption — and because the domain a session may address follows from the
+/// device's pin, which the listener resolved before any of this. Everything
+/// after the hello is identical.
+pub async fn receive_session_with_hello<R, W, K>(
+    mut reader: R,
+    mut writer: W,
+    sink: &K,
+    cfg: &SessionConfig,
+    hello: Hello,
+) -> Result<ReceiveReport>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    K: SyncSink + ?Sized,
+{
+    let peer = answer_hello(&mut writer, hello, cfg, Role::Receive).await?;
     tracing::debug!(
         domain = %cfg.domain,
         peer = %peer.peer,
@@ -491,9 +514,9 @@ where
     Ok(report)
 }
 
-/// Both sides announce, then check. A mismatch is refused rather than
-/// negotiated: version, domain, and role are the three things a session
-/// cannot proceed without agreeing on.
+/// The dialing side: announce, then check what came back. A mismatch is
+/// refused rather than negotiated — version, domain, and role are the three
+/// things a session cannot proceed without agreeing on.
 async fn handshake<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -514,21 +537,73 @@ where
         }),
     )
     .await?;
-    let hello = match read_frame(reader)
+    let hello = read_hello(reader, writer).await?;
+    check_hello(writer, &hello, cfg, mine).await?;
+    Ok(hello)
+}
+
+/// The listening side: read the peer's hello, check it, THEN announce.
+///
+/// The order is the listener's, and it is the reason the two halves are split:
+/// a node cannot name a domain in its own hello until it knows which domain
+/// the connection is for, and a connection might not be a session at all
+/// ([`Frame::Enroll`] arrives in exactly this slot).
+async fn answer_hello<W>(
+    writer: &mut W,
+    hello: Hello,
+    cfg: &SessionConfig,
+    mine: Role,
+) -> Result<Hello>
+where
+    W: AsyncWrite + Unpin,
+{
+    check_hello(writer, &hello, cfg, mine).await?;
+    write_frame(
+        writer,
+        &Frame::Hello(Hello {
+            proto: PROTO_VERSION,
+            domain: cfg.domain.clone(),
+            peer: cfg.peer.clone(),
+            role: mine,
+        }),
+    )
+    .await?;
+    Ok(hello)
+}
+
+/// One hello off the wire, with anything else turned into a refusal.
+async fn read_hello<R, W>(reader: &mut R, writer: &mut W) -> Result<Hello>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    match read_frame(reader)
         .await
         .context("waiting for the peer's hello")?
     {
-        Frame::Hello(h) => h,
+        Frame::Hello(h) => Ok(h),
         Frame::Error(e) => bail!("peer refused the session: {} ({})", e.message, e.code),
         other => {
-            return refuse(
+            refuse(
                 writer,
                 err_code::UNEXPECTED,
                 format!("a session opens with a hello, not a {}", other.variant()),
             )
             .await
         }
-    };
+    }
+}
+
+/// The three agreements, checked identically whichever side asked first.
+async fn check_hello<W>(
+    writer: &mut W,
+    hello: &Hello,
+    cfg: &SessionConfig,
+    mine: Role,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     if hello.proto != PROTO_VERSION {
         return refuse(
             writer,
@@ -562,7 +637,7 @@ where
         )
         .await;
     }
-    Ok(hello)
+    Ok(())
 }
 
 /// Answer one `WantSegment`, returning the bytes served.

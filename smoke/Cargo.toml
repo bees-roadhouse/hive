@@ -16,5 +16,13 @@ repository.workspace = true
 # any other way (AGENTS.md).
 hive-smoke-support = { path = "../smoke-support" }
 hive-core = { path = "../core" }
+# The device half of the enrollment ceremony (PLAN-v2.1 PR 4.7): the scenarios
+# dial the REAL node binary's mTLS listener in-proc — code redemption, pinned
+# reconnect, and the refusals — over hive-sync's own carrier and frames. The
+# node crate is deliberately NOT here: a scenario must see what a device sees.
+hive-sync = { path = "../sync" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+# The scenario helpers return the same `Result` the protocol does, so a
+# refusal reads as the error chain the node actually produced.
+anyhow = { workspace = true }

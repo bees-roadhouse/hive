@@ -22,9 +22,10 @@
 
 use hive_core::oplog::{HeadsSnapshot, SegmentInfo};
 use hive_sync::frame::{
-    self, read_frame, read_payload, write_frame, write_payload, BlockIds, BlockLanded, Frame,
-    Hello, ProtoError, PutBlock, Role, Segment, SegmentLanded, WantSegment, MAX_BLOCK_BYTES,
-    MAX_BLOCK_IDS_PER_FRAME, MAX_CONTROL_FRAME, MAX_SEGMENT_CHUNK, PROTO_VERSION,
+    self, read_frame, read_frame_capped, read_payload, write_frame, write_payload, BlockIds,
+    BlockLanded, EnrollGrant, EnrollRequest, Frame, Hello, ProtoError, PutBlock, Role, Segment,
+    SegmentLanded, WantSegment, MAX_BLOCK_BYTES, MAX_BLOCK_IDS_PER_FRAME, MAX_CONTROL_FRAME,
+    MAX_OPENING_FRAME, MAX_SEGMENT_CHUNK, PROTO_VERSION,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
@@ -65,6 +66,18 @@ fn corpus() -> Vec<Frame> {
             domain: "bierlysmith.com".to_string(),
             peer: "dev-æ-01".to_string(),
             role: Role::Push,
+        }),
+        Frame::Enroll(EnrollRequest {
+            proto: PROTO_VERSION,
+            code: "K4RT9X2MABCDEFGHIJKLM".to_string(),
+            device: "dev-æ-01".to_string(),
+            ed25519_pk: [0x11; 32],
+            x25519_pk: [0x22; 32],
+        }),
+        Frame::Enrolled(EnrollGrant {
+            domain: "bierlysmith.com".to_string(),
+            node_ed25519_pk: [0x33; 32],
+            epoch: u64::MAX,
         }),
         Frame::Heads(HeadsSnapshot {
             segments: vec![
@@ -430,6 +443,48 @@ fn any_declared_length_is_bounded_by_its_cap() {
             Ok(())
         })
         .unwrap();
+}
+
+/// The opening frame — the one a listener reads before it has authorized
+/// anything — is bounded far tighter than the session cap (PR 4.7). A caller
+/// may narrow the cap and may never widen it.
+#[tokio::test]
+async fn the_opening_read_is_capped_tighter_than_a_session_frame() {
+    const { assert!(MAX_OPENING_FRAME < MAX_CONTROL_FRAME) };
+
+    // Both frames that may legally open a connection fit, with room to spare.
+    for frame in corpus()
+        .into_iter()
+        .filter(|f| matches!(f, Frame::Hello(_) | Frame::Enroll(_)))
+    {
+        let (mut a, mut b) = tokio::io::duplex(64 * 1024);
+        write_frame(&mut a, &frame).await.unwrap();
+        assert_eq!(
+            read_frame_capped(&mut b, MAX_OPENING_FRAME).await.unwrap(),
+            frame
+        );
+    }
+
+    // A heads snapshot is a legitimate session frame and an illegitimate
+    // opening one: over the opening cap, it is refused before it allocates.
+    let heads = Frame::Heads(HeadsSnapshot {
+        segments: (0..1000u64).map(|i| seg("dev-alpha", i, i, true)).collect(),
+    });
+    let (mut a, mut b) = tokio::io::duplex(256 * 1024);
+    write_frame(&mut a, &heads).await.unwrap();
+    let err = read_frame_capped(&mut b, MAX_OPENING_FRAME)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("refused unread"), "{err:#}");
+
+    // And the cap only ever narrows: asking for more than the protocol's own
+    // ceiling gets the ceiling.
+    let mut over = &u32::MAX.to_le_bytes()[..];
+    let err = read_frame_capped(&mut over, u32::MAX).await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains(&MAX_CONTROL_FRAME.to_string()),
+        "{err:#}"
+    );
 }
 
 /// A frame body that decodes must still fit the framing: the reader's cap and

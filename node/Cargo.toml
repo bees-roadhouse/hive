@@ -31,6 +31,11 @@ blake3 = { workspace = true }
 # Lowercase-hex block ids and key fingerprints in log lines and node-meta
 # rows, so an id in the journal greps against the disk.
 data-encoding = { workspace = true }
+# The OS RNG behind a one-time enrollment code (PLAN-v2.1 PR 4.7). The ONE
+# place this crate samples anything: everything downstream of a code is
+# derivation and comparison, and `hive_sync::enroll` stays RNG-free so the
+# encoding can be unit-tested against fixed entropy.
+rand = { workspace = true }
 
 # node-meta.db. Deliberately PLAIN SQLite on a SQLCipher build: an unkeyed
 # connection writes an ordinary database, and node-meta holds no plaintext of

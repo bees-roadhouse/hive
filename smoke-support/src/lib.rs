@@ -8,10 +8,16 @@
 // clause: no test constructs a domain, device identity, node, or device pair
 // any other way.
 // That is what lets the seam grow without rewriting a single scenario body:
-// `test_node()`/`test_pair()` arrive when a node has a protocol to hand them
-// (the listener + enrollment at PR 4.7, the push loop at 4.8) — the PR 4.6
-// node holds vaults and binds a socket, and its own boot contract is tested
-// by spawning the real binary from `node/tests/`.
+// `test_node()` arrived with the node's protocol (the listener + enrollment at
+// PR 4.7) and `test_pair()` arrives with the push loop (4.8).
+//
+// `test_node()` drives the REAL `hive-node` binary from `HIVE_NODE_BIN` rather
+// than embedding the library, and it is the crate's only process-owning seam.
+// Two reasons, both about what the tier is for: an enrollment scenario has to
+// exercise the operator's actual `hive-node enroll` command (a second process
+// writing the same node-meta.db is the deployment, not an approximation of
+// it), and this crate stays free of a hive-node dependency, so hive-node's own
+// tests can keep dev-depending on it without a cycle.
 //
 // Three rules this crate exists to make unavoidable:
 //
@@ -267,6 +273,300 @@ const TEST_IDENTITY_CONTEXT: &str = "hive-smoke-device-identity-v1";
 /// for a master key.
 pub fn test_identity(name: &str) -> DeviceIdentity {
     DeviceIdentity::from_seed(&blake3::derive_key(TEST_IDENTITY_CONTEXT, name.as_bytes()))
+}
+
+// ── the node seam (ONE-SEAM, PLAN-v2.1 PR 4.7) ──────────────────────────────
+
+/// How long a scenario waits for the node to announce its port. The tier's cap
+/// is 60s per test; a bind is instant, so this is a stuck-process detector.
+pub const NODE_BOOT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// A throwaway node: its own root, the domains it was asked to hold, and a
+/// REAL `hive-node` process serving them on an ephemeral port.
+///
+/// `bin` is `require_bin!("HIVE_NODE_BIN")` — the seam takes the path rather
+/// than reading the env itself, because a missing binary is a LOUD-SKIP the
+/// test body has to return from.
+///
+/// `domains` are `<tenant>/<domain>` strings, created BEFORE the node boots.
+/// That ordering is load-bearing rather than cosmetic: the node discovers its
+/// vault tree at open (`server.rs`), so a domain minted after boot is one the
+/// running listener cannot serve until it restarts.
+pub async fn test_node(bin: &Path, domains: &[&str]) -> TestNode {
+    let root = tempfile::tempdir().expect("smoke node root");
+    for domain in domains {
+        let (tenant, name) = domain
+            .split_once('/')
+            .unwrap_or_else(|| panic!("{domain:?} is not <tenant>/<domain>"));
+        let dir = root
+            .path()
+            .join("tenants")
+            .join(tenant)
+            .join("domains")
+            .join(name);
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+    }
+    TestNode::boot(bin.to_path_buf(), root).await
+}
+
+/// One smoke node. Holds its tempdir and its child process — keep it alive for
+/// the whole test, and let it drop to kill the node (`kill_on_drop`).
+pub struct TestNode {
+    bin: PathBuf,
+    root: tempfile::TempDir,
+    child: tokio::process::Child,
+    addr: std::net::SocketAddr,
+    node_key: [u8; 32],
+    domains: Vec<String>,
+}
+
+impl TestNode {
+    async fn boot(bin: PathBuf, root: tempfile::TempDir) -> TestNode {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let mut child = tokio::process::Command::new(&bin)
+            .arg("--root")
+            .arg(root.path())
+            .args(["--listen", "127.0.0.1:0"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            // The harness rule: a panicking test must not leave a listener
+            // behind for the next one to collide with.
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawning {}: {e}", bin.display()));
+
+        tee(child.stderr.take().expect("piped stderr"));
+
+        let stdout = child.stdout.take().expect("piped stdout");
+        let mut reader = BufReader::new(stdout).lines();
+        let mut node_key = None;
+        let mut domains = Vec::new();
+        let addr = tokio::time::timeout(NODE_BOOT_DEADLINE, async {
+            while let Some(line) = reader.next_line().await.expect("reading node stdout") {
+                eprintln!("[hive-node] {line}");
+                if let Some(hex) = line.strip_prefix("node key ") {
+                    node_key = Some(parse_key_hex(hex));
+                } else if let Some(domain) = line.strip_prefix("domain ") {
+                    domains.push(domain.to_string());
+                } else if let Some(addr) = line.strip_prefix("listening on ") {
+                    return addr.parse().expect("an announced address");
+                }
+            }
+            panic!("hive-node exited before it announced a port");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("hive-node never announced a port in {NODE_BOOT_DEADLINE:?}"));
+
+        // Whatever the node says afterwards belongs in the log, not in a
+        // buffer nobody drains (a full pipe would wedge it).
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = reader.next_line().await {
+                eprintln!("[hive-node] {line}");
+            }
+        });
+
+        TestNode {
+            bin,
+            root,
+            child,
+            addr,
+            node_key: node_key.expect("the node announces the key a device pins"),
+            domains,
+        }
+    }
+
+    /// Where the listener is, from the node's own `listening on` line. Never a
+    /// fixed port — the tier binds `:0` and reads what it got.
+    pub fn addr(&self) -> std::net::SocketAddr {
+        self.addr
+    }
+
+    /// The node's ed25519 public key, from its `node key` line: what a device
+    /// pins, and what a scenario checks a handshake against.
+    pub fn node_key(&self) -> [u8; 32] {
+        self.node_key
+    }
+
+    pub fn root(&self) -> &Path {
+        self.root.path()
+    }
+
+    /// The `<tenant>/<domain>` lines the node announced at boot.
+    pub fn domains(&self) -> &[String] {
+        &self.domains
+    }
+
+    /// Run a one-shot `hive-node` subcommand against this node's root, the way
+    /// an operator does beside a running node. Panics if the binary cannot be
+    /// run at all; a non-zero exit is returned for the caller to assert on.
+    pub async fn run(&self, args: &[&str]) -> std::process::Output {
+        let out = tokio::process::Command::new(&self.bin)
+            .args(args)
+            .arg("--root")
+            .arg(self.root.path())
+            .output()
+            .await
+            .unwrap_or_else(|e| panic!("running hive-node {args:?}: {e}"));
+        for line in String::from_utf8_lossy(&out.stderr).lines() {
+            eprintln!("[hive-node {}] {line}", args.first().unwrap_or(&""));
+        }
+        out
+    }
+
+    /// `hive-node enroll --domain <domain>` — the one-time code, as printed.
+    pub async fn mint_code(&self, domain: &str) -> String {
+        let out = self.run(&["enroll", "--domain", domain]).await;
+        assert!(
+            out.status.success(),
+            "hive-node enroll failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout_field(&out, "enrollment code ")
+            .unwrap_or_else(|| panic!("no `enrollment code` line: {out:?}"))
+    }
+
+    /// `hive-node device revoke` — the control epoch it left behind.
+    pub async fn revoke(&self, domain: &str, device: &str) -> u64 {
+        let out = self
+            .run(&["device", "revoke", "--domain", domain, "--device", device])
+            .await;
+        assert!(
+            out.status.success(),
+            "hive-node device revoke failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout_field(&out, "control epoch ")
+            .unwrap_or_else(|| panic!("no `control epoch` line: {out:?}"))
+            .parse()
+            .expect("an epoch")
+    }
+
+    /// `hive-node device list` — one `<id> <pin> active|revoked` line each.
+    pub async fn device_list(&self, domain: &str) -> Vec<String> {
+        let out = self.run(&["device", "list", "--domain", domain]).await;
+        assert!(
+            out.status.success(),
+            "hive-node device list failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.strip_prefix("device ").map(str::to_string))
+            .collect()
+    }
+
+    /// One domain's `node-meta.db`. Plain SQLite by design (a blind node holds
+    /// no key, so its bookkeeping is the operator's to read) — which is what
+    /// makes the two affordances below possible without a production knob.
+    pub fn meta_db(&self, domain: &str) -> PathBuf {
+        let (tenant, name) = domain
+            .split_once('/')
+            .unwrap_or_else(|| panic!("{domain:?} is not <tenant>/<domain>"));
+        self.root
+            .path()
+            .join("tenants")
+            .join(tenant)
+            .join("domains")
+            .join(name)
+            .join("node-meta.db")
+    }
+
+    /// Age every outstanding enrollment code in `domain` past its TTL,
+    /// returning how many were aged.
+    ///
+    /// The alternative is waiting ten minutes for the real one, and a smoke
+    /// tier with a 60s cap cannot. The node's own clock is untouched: what
+    /// moves is the recorded expiry, which is the same fact the TTL is made
+    /// of. (The TTL arithmetic itself is unit-tested against an injected clock
+    /// in `hive_node::enroll`.)
+    pub fn expire_codes(&self, domain: &str) -> usize {
+        let db = self.meta_db(domain);
+        let conn = rusqlite::Connection::open(&db)
+            .unwrap_or_else(|e| panic!("opening {}: {e}", db.display()));
+        conn.execute("UPDATE enroll_codes SET expires_at = 0", [])
+            .unwrap_or_else(|e| panic!("expiring codes in {}: {e}", db.display()))
+    }
+
+    /// The domain's auth-audit trail as `(kind, detail)`, oldest first — the
+    /// operator-facing evidence every enrollment scenario asserts against.
+    pub fn auth_events(&self, domain: &str) -> Vec<(String, String)> {
+        let db = self.meta_db(domain);
+        let conn = rusqlite::Connection::open(&db)
+            .unwrap_or_else(|e| panic!("opening {}: {e}", db.display()));
+        let mut stmt = conn
+            .prepare("SELECT kind, detail FROM auth_audit ORDER BY id")
+            .unwrap_or_else(|e| panic!("reading the audit trail in {}: {e}", db.display()));
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap_or_else(|e| panic!("reading the audit trail in {}: {e}", db.display()));
+        rows.map(|r| r.expect("an audit row")).collect()
+    }
+
+    /// SIGTERM, then the exit status. Not `Child::kill` — that is SIGKILL,
+    /// which would prove nothing about a clean shutdown.
+    #[cfg(unix)]
+    pub async fn terminate(mut self) -> std::process::ExitStatus {
+        self.stop().await
+    }
+
+    /// Stop and start again on the SAME root, keeping the tempdir alive.
+    ///
+    /// What a reboot is for, in this tier: everything a node remembers —
+    /// pins, revocation tombstones, the control epoch — lives in node-meta and
+    /// nowhere else, so "it survived a restart" is the only honest way to say
+    /// it was persisted. The port is NOT preserved: `:0` means a new one, and
+    /// the returned node has re-read its own `listening on` line.
+    #[cfg(unix)]
+    pub async fn reboot(mut self) -> TestNode {
+        let status = self.stop().await;
+        assert!(status.success(), "a reboot starts from a clean exit");
+        TestNode::boot(self.bin, self.root).await
+    }
+
+    #[cfg(unix)]
+    async fn stop(&mut self) -> std::process::ExitStatus {
+        let pid = self.child.id().expect("a running child");
+        let status = tokio::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .await
+            .expect("sending SIGTERM");
+        assert!(status.success(), "kill -TERM {pid} failed");
+        tokio::time::timeout(NODE_BOOT_DEADLINE, self.child.wait())
+            .await
+            .expect("hive-node did not exit after SIGTERM")
+            .expect("waiting for hive-node")
+    }
+}
+
+/// The node's own key line and every other 64-hex field share one parser, so a
+/// malformed one fails here rather than three assertions later.
+fn parse_key_hex(hex: &str) -> [u8; 32] {
+    let raw = data_encoding::HEXLOWER
+        .decode(hex.trim().as_bytes())
+        .unwrap_or_else(|e| panic!("node key {hex:?} is not lowercase hex: {e}"));
+    raw.try_into()
+        .unwrap_or_else(|v: Vec<u8>| panic!("node key is {} bytes, want 32", v.len()))
+}
+
+/// The value after `prefix` on the one stdout line that carries it.
+fn stdout_field(out: &std::process::Output, prefix: &str) -> Option<String> {
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix(prefix).map(str::to_string))
+}
+
+/// Tee a child's pipe into the test log, so a failure here reads like a
+/// failure there (a harness rule, docs/TESTING-STRATEGY.md §4.1).
+fn tee(pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(pipe).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("[hive-node] {line}");
+        }
+    });
 }
 
 #[cfg(test)]

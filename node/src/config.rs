@@ -55,6 +55,11 @@ pub struct NodeConfig {
     /// it (the smoke tier always binds `127.0.0.1:0`).
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
+    /// How wide the listener is allowed to bind (PLAN-v2.1 PR 4.7). See
+    /// [`BindScope`] — the default is the permissive one, and declaring
+    /// `interface` is how an operator makes the wildcard a refusal.
+    #[serde(default)]
+    pub bind_scope: BindScope,
     /// The node key's 64-hex seed file, relative to the root unless absolute.
     /// Absent means `<root>/node.key`, minted on first boot.
     #[serde(default)]
@@ -70,8 +75,39 @@ impl Default for NodeConfig {
     fn default() -> Self {
         NodeConfig {
             listen: default_listen(),
+            bind_scope: BindScope::default(),
             node_key_file: None,
             dns: None,
+        }
+    }
+}
+
+/// How wide the replication listener may bind (PLAN-v2.1 PR 4.7).
+///
+/// The question this answers is not "which addresses exist" — that is the
+/// host's business and the `[dns] address` block's — but "may a bind address
+/// mean ALL of them". A node reachable only over a tailnet, or only over the
+/// LAN, is a deliberate deployment choice that one wildcard address silently
+/// undoes, and the moment it is undone is a boot nobody is watching.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BindScope {
+    /// Any address, wildcard included — the household node behind a router,
+    /// which is the common case and therefore the default.
+    #[default]
+    Any,
+    /// One named interface. `0.0.0.0` and `[::]` are REFUSED: an operator who
+    /// scoped the node to an interface asked for exactly one, and a wildcard
+    /// is every interface the box will ever have, including the one it grows
+    /// next week.
+    Interface,
+}
+
+impl BindScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BindScope::Any => "any",
+            BindScope::Interface => "interface",
         }
     }
 }
@@ -113,7 +149,25 @@ impl NodeConfig {
         }
     }
 
+    /// Check a bind address against [`NodeConfig::bind_scope`].
+    ///
+    /// Taken as an argument rather than read off `self` because the address
+    /// that actually reaches the socket is the CLI's `--listen` when one was
+    /// given — so this is checked at the bind (`Node::bind`), not only at the
+    /// parse, and an override cannot widen what the file narrowed.
+    pub fn check_bind(&self, addr: SocketAddr) -> Result<()> {
+        if self.bind_scope == BindScope::Interface && addr.ip().is_unspecified() {
+            bail!(
+                "bind_scope = \"interface\" but the listener was asked to bind {addr} — the \
+                 wildcard address is every interface this host has, which is the opposite of \
+                 what an interface-scoped node asked for; name the address to listen on"
+            );
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
+        self.check_bind(self.listen)?;
         if let Some(dns) = &self.dns {
             dns.validate()?;
         }

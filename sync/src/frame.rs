@@ -50,6 +50,15 @@ pub const PROTO_VERSION: u32 = 1;
 /// segments, i.e. ~130 GiB of log at the 8 MiB rotation threshold.
 pub const MAX_CONTROL_FRAME: u32 = 1024 * 1024;
 
+/// Largest OPENING frame — the first one a listener reads, before it has
+/// authorized anything (PR 4.7). Both frames that may legally open a
+/// connection are small and fixed-shape: a [`Hello`] is a version, a domain,
+/// a peer name and a role; an [`EnrollRequest`] adds a code and two 32-byte
+/// keys. Nothing that opens a session has any business being a megabyte, so
+/// the pre-authorization allocation is bounded two orders of magnitude tighter
+/// than the session cap that follows it.
+pub const MAX_OPENING_FRAME: u32 = 8 * 1024;
+
 /// Largest payload one `Segment` frame may carry. A segment is transferred in
 /// chunks of at most this, so a killed transfer costs at most one chunk of
 /// re-request and the receiver's landing loop stays bounded.
@@ -174,6 +183,52 @@ pub struct BlockLanded {
     pub id: [u8; 32],
 }
 
+/// A device redeeming a one-time enrollment code (PLAN-v2.1 PR 4.7, D30).
+///
+/// It is an OPENING frame, not part of a session: a device sending this has no
+/// pin yet, and what it is asking for is to be given one. The three fields
+/// after the code are the whole of a device's public identity — the id it will
+/// write its log under, the ed25519 key a peer pins, and the x25519 key a
+/// later master-wrap is sealed to (PR 4.14).
+///
+/// The keys here are ALSO the channel binding: the listener refuses a request
+/// whose `ed25519_pk` is not the key the TLS certificate on this very
+/// connection carried. Without that check a relay could redeem a code with
+/// keys it did not hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollRequest {
+    pub proto: u32,
+    /// The one-time code, as minted by `hive-node enroll`. Normalized by the
+    /// redeeming side ([`crate::enroll::normalize_code`]) so a human retyping
+    /// it with dashes or in lowercase still hashes to what the node stored.
+    pub code: String,
+    /// The device id this device writes its log under (the frozen allowlist
+    /// applies — it becomes a directory name on the node).
+    pub device: String,
+    #[serde(with = "bytes32")]
+    pub ed25519_pk: [u8; 32],
+    #[serde(with = "bytes32")]
+    pub x25519_pk: [u8; 32],
+}
+
+/// The node's answer to a redeemed code: you are pinned, here is who I am.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollGrant {
+    /// The one domain this device is now enrolled in — and, from here on, the
+    /// only one its sessions may address (D29's hub-only boundary).
+    pub domain: String,
+    /// The node's own ed25519 public key. What the device pins for every later
+    /// dial, which is what makes a spoofed SRV answer harmless at PR 4.8.
+    #[serde(with = "bytes32")]
+    pub node_ed25519_pk: [u8; 32],
+    /// The domain's control epoch after this enrollment. Monotonic and
+    /// per-domain: it never regresses, so a replayed statement carrying an
+    /// older epoch cannot un-revoke anything (D30).
+    pub epoch: u64,
+}
+
 /// A session-fatal refusal. Sent best-effort before hanging up, so the peer
 /// logs a reason instead of a bare EOF.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +252,12 @@ pub mod err_code {
     pub const UNEXPECTED: &str = "unexpected-frame";
     /// A well-formed request this side will not serve.
     pub const REFUSED: &str = "refused";
+    /// The enrollment ceremony refused this redemption — wrong, expired, or
+    /// already-used code, or a policy this node will not bend (PR 4.7). One
+    /// code for all of them on purpose: a peer that could tell "wrong" from
+    /// "expired" apart could probe the code space, and the operator's audit
+    /// log is where the distinction actually belongs.
+    pub const ENROLLMENT: &str = "enrollment-refused";
 }
 
 /// One control frame.
@@ -209,6 +270,12 @@ pub mod err_code {
 #[serde(rename_all = "snake_case")]
 pub enum Frame {
     Hello(Hello),
+    /// Redeem a one-time enrollment code (PR 4.7). An OPENING frame: it
+    /// arrives instead of a hello, from a device that has no session to be in
+    /// yet, and a session state machine treats it as unexpected.
+    Enroll(EnrollRequest),
+    /// The node's answer to [`Frame::Enroll`].
+    Enrolled(EnrollGrant),
     /// The pusher's segment inventory (PR 4.3's snapshot type, unchanged).
     Heads(HeadsSnapshot),
     /// The pusher's block inventory, batched.
@@ -231,6 +298,8 @@ pub enum Frame {
 /// coverage.
 pub const VARIANTS: &[&str] = &[
     "hello",
+    "enroll",
+    "enrolled",
     "heads",
     "have_blocks",
     "done",
@@ -248,6 +317,8 @@ impl Frame {
     pub fn variant(&self) -> &'static str {
         match self {
             Frame::Hello(_) => "hello",
+            Frame::Enroll(_) => "enroll",
+            Frame::Enrolled(_) => "enrolled",
             Frame::Heads(_) => "heads",
             Frame::HaveBlocks(_) => "have_blocks",
             Frame::Done => "done",
@@ -314,13 +385,25 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, frame: &Frame) -> Res
 /// [`MAX_CONTROL_FRAME`] before anything is allocated, so a peer claiming
 /// 4 GiB costs one refused read, not 4 GiB of memory.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame> {
+    read_frame_capped(r, MAX_CONTROL_FRAME).await
+}
+
+/// Read one control frame under a caller-chosen cap.
+///
+/// Split from [`read_frame`] at PR 4.7 for the listener's opening read: the
+/// frame that decides whether a connection is a session or an enrollment
+/// arrives before anything has been authorized, so it is bounded by
+/// [`MAX_OPENING_FRAME`] rather than by the session cap. `cap` may only ever
+/// narrow — nothing raises the protocol's own ceiling.
+pub async fn read_frame_capped<R: AsyncRead + Unpin>(r: &mut R, cap: u32) -> Result<Frame> {
+    let cap = cap.min(MAX_CONTROL_FRAME);
     let mut prefix = [0u8; 4];
     r.read_exact(&mut prefix)
         .await
         .context("reading the control-frame length prefix")?;
     let len = u32::from_le_bytes(prefix);
-    if len == 0 || len > MAX_CONTROL_FRAME {
-        bail!("control frame declares {len} bytes (cap {MAX_CONTROL_FRAME}) — refused unread");
+    if len == 0 || len > cap {
+        bail!("control frame declares {len} bytes (cap {cap}) — refused unread");
     }
     let mut body = vec![0u8; len as usize];
     r.read_exact(&mut body)
@@ -458,7 +541,7 @@ mod tests {
         }
         assert_eq!(
             VARIANTS.len(),
-            11,
+            13,
             "a new frame needs round-trip and hostile-decode coverage"
         );
     }

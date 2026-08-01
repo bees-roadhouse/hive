@@ -2990,6 +2990,7 @@ dependencies = [
  "hive-core",
  "hive-smoke-support",
  "hive-sync",
+ "rand 0.8.6",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",
@@ -3013,8 +3014,10 @@ dependencies = [
 name = "hive-smoke"
 version = "0.7.0"
 dependencies = [
+ "anyhow",
  "hive-core",
  "hive-smoke-support",
+ "hive-sync",
  "serde_json",
  "tokio",
 ]
@@ -3027,6 +3030,7 @@ dependencies = [
  "data-encoding",
  "hive-core",
  "hive-embed",
+ "rusqlite",
  "tempfile",
  "tokio",
 ]

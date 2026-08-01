@@ -161,6 +161,25 @@ impl PinnedKeys for PinSet {
     }
 }
 
+/// Accepts ANY peer key. The one legitimate use is the dialer's half of the
+/// enrollment ceremony (PR 4.7): a device redeeming a code has not been told
+/// the node's key yet — [`crate::frame::EnrollGrant`] is what tells it — so
+/// there is nothing to pin against on that one connection.
+///
+/// What authorizes it is the CODE, which is single-use, ten-minute, and
+/// verified by the node against a hash it minted; from the grant onwards the
+/// device pins the node and this type is never used again. It is deliberately
+/// a named type rather than an inline closure so that "what accepts an
+/// unknown key, and why" is one greppable answer.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UnpinnedEnrollment;
+
+impl PinnedKeys for UnpinnedEnrollment {
+    fn accepts(&self, _pin: &SpkiPin) -> bool {
+        true
+    }
+}
+
 /// A device's transport certificate: its ed25519 identity wrapped in the
 /// X.509 the handshake needs, plus the pin a peer will compute for it.
 ///
@@ -540,6 +559,19 @@ mod tests {
         assert!(pins.accepts(&alpha));
         assert!(!pins.accepts(&beta));
         assert!(PinSet::default().is_empty());
+    }
+
+    /// The enrollment dialer's acceptor takes anything, because on that one
+    /// connection there is nothing to pin against yet — the code is the
+    /// authorization and the grant is what ends the exception (PR 4.7).
+    #[test]
+    fn the_enrollment_dialer_pins_nothing_and_says_so() {
+        let stranger = SpkiPin::of(&DeviceIdentity::from_seed(&[3; 32]));
+        assert!(UnpinnedEnrollment.accepts(&stranger));
+        assert!(
+            !PinSet::default().accepts(&stranger),
+            "and the ordinary answer is still no"
+        );
     }
 
     /// Garbage is an Err, never a panic: the pin is computed from bytes a

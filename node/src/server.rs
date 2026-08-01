@@ -14,10 +14,10 @@
 //     scanned at open. That is what makes "rsync a vault directory onto a
 //     second box and start a node" work (D36's cheap multi-node story) and
 //     what keeps `node.toml` from carrying a second copy of the truth.
-//   * The listener accepts connections and closes them. The mTLS carrier and
-//     the enrollment ceremony are PR 4.7 — this PR's socket exists so the
-//     boot contract (bind, announce the port, serve, exit cleanly on SIGTERM)
-//     is settled and tested before there is a protocol riding on it.
+//   * Binding is HERE; serving is [`crate::listen`] (PR 4.7). The split is the
+//     boot contract's: a `Bound` exists so the ACTUAL port can be announced
+//     before a single connection is accepted, which is what makes
+//     `--listen 127.0.0.1:0` a usable thing for a harness to parse.
 //   * Nothing here holds a master key, opens a Store, or folds a record. The
 //     blind tier is the whole product at this stage (D29).
 
@@ -129,7 +129,12 @@ impl Node {
     /// Bind the replication listener. Split from `serve` so the caller can
     /// announce the ACTUAL port before accepting — `--listen 127.0.0.1:0` is
     /// how every test binds, and the port only exists after the bind.
+    ///
+    /// The bind-scope check happens HERE and not only at config parse, because
+    /// `--listen` overrides the file: the address that reaches the socket is
+    /// the one that has to satisfy the scope (PR 4.7).
     pub async fn bind(&self, addr: SocketAddr) -> Result<Bound> {
+        self.config.check_bind(addr)?;
         let tcp = TcpListener::bind(addr)
             .await
             .with_context(|| format!("binding the replication listener to {addr}"))?;
@@ -171,6 +176,7 @@ impl Node {
 }
 
 /// A bound listener, before anything is served on it.
+#[derive(Debug)]
 pub struct Bound {
     tcp: TcpListener,
     local: SocketAddr,
@@ -183,34 +189,10 @@ impl Bound {
         self.local
     }
 
-    /// Accept until `shutdown` resolves.
-    ///
-    /// A connection is accepted and closed: this PR has no protocol on the
-    /// wire (the mTLS carrier and enrollment are PR 4.7). Accepting anyway is
-    /// deliberate — it makes the socket a real liveness probe rather than a
-    /// port that merely exists, and it is the shape the 4.7 accept loop grows
-    /// into.
-    pub async fn serve(self, shutdown: impl std::future::Future<Output = ()>) -> Result<u64> {
-        let mut connections = 0u64;
-        tokio::pin!(shutdown);
-        loop {
-            tokio::select! {
-                _ = &mut shutdown => return Ok(connections),
-                accepted = self.tcp.accept() => match accepted {
-                    Ok((stream, peer)) => {
-                        connections += 1;
-                        tracing::info!(%peer, "connection accepted and closed: the replication \
-                                                transport lands with PLAN-v2.1 PR 4.7");
-                        drop(stream);
-                    }
-                    // A per-connection accept error (fd exhaustion, a peer
-                    // that vanished between the SYN and the accept) must not
-                    // take the listener down: the node is the always-on half
-                    // of the pair.
-                    Err(e) => tracing::warn!("accept failed: {e}"),
-                },
-            }
-        }
+    /// The socket itself, for the accept loop in [`crate::listen`]. Consuming
+    /// keeps "bound" and "serving" from being two live handles on one port.
+    pub(crate) fn into_listener(self) -> TcpListener {
+        self.tcp
     }
 }
 
@@ -387,34 +369,29 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let node = Node::open(root.path()).unwrap();
         let bound = node.bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
-        assert_ne!(bound.local_addr().port(), 0);
-
-        let addr = bound.local_addr();
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-        let serving = tokio::spawn(async move {
-            bound
-                .serve(async {
-                    let _ = stopped.await;
-                })
-                .await
-        });
-        // Wait for the accept to be OBSERVABLE before asking for shutdown:
-        // this PR's listener accepts and closes, so EOF on the probe is proof
-        // the connection was handled. Stopping on a bare `connect()` would
-        // race the accept branch against the shutdown branch.
-        let mut probe = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut buf = [0u8; 1];
-        assert_eq!(
-            tokio::io::AsyncReadExt::read(&mut probe, &mut buf)
-                .await
-                .unwrap(),
+        assert_ne!(
+            bound.local_addr().port(),
             0,
-            "accepted and closed (the transport lands at PR 4.7)"
+            "the announced port is the bound one — the whole reason bind and serve are split"
         );
+        // Serving is `listen::serve` (PR 4.7); its own tests drive real
+        // handshakes through this socket.
+    }
 
-        let _ = stop.send(());
-        let connections = serving.await.unwrap().unwrap();
-        assert_eq!(connections, 1, "the socket is a real liveness probe");
+    /// An interface-scoped node refuses the wildcard at the BIND, not at the
+    /// parse — `--listen` overrides node.toml, so the address that reaches the
+    /// socket is the one that has to satisfy the scope (PR 4.7).
+    #[tokio::test]
+    async fn an_interface_scoped_node_refuses_a_wildcard_override() {
+        let root = tempfile::tempdir().unwrap();
+        let config = NodeConfig::parse("listen = \"127.0.0.1:0\"\nbind_scope = \"interface\"\n")
+            .expect("a scoped config with a concrete address");
+        let node = Node::open_with_config(root.path(), config).unwrap();
+
+        let err = node.bind("0.0.0.0:0".parse().unwrap()).await.unwrap_err();
+        assert!(format!("{err:#}").contains("wildcard"), "{err:#}");
+        // ...and the address the config named still binds.
+        assert!(node.bind("127.0.0.1:0".parse().unwrap()).await.is_ok());
     }
 
     #[tokio::test]
