@@ -649,6 +649,174 @@ engine, native messaging), 7.2 bridge native-messaging entry + manifest
 installers, 7.3 capture pipeline with `[web:<id>]` citations + audit
 crypto-shred, 7.4 distribution + e2e capture test. Gate carried; tag v0.13.0.
 
+## WISHLIST — Phase 8: perception (multimodal + local identity; v0.14.0)
+
+**Not phase-committed.** This section is a wishlist, not a schedule: it exists
+so the shape is agreed before anyone writes code, and so PR 8.0 gets pulled
+forward on its own merits. Design note:
+[MULTIMODAL-IDENTITY.md](./MULTIMODAL-IDENTITY.md). Proposed decisions D37-D40
+in [DIRECTION.md](./DIRECTION.md), **also unratified** — 8.1 is where they get
+adopted or killed, and no PR below may open first.
+
+Trigger, stated: **Phase 3 closed (v0.12.0) and a decided answer to open
+question 20** (whether source captures are retained at all). Not before. The
+honest ordering against the existing roadmap is that everything here sits
+behind the node program, the web head, sharing, and modules — this is the
+seventh thing, not the next thing.
+
+Prerequisites, and why each is real rather than tidy:
+
+- **PR 8.0 is not a prerequisite of Phase 8, it is a prerequisite of PR 4.11**
+  (below).
+- **PR 4.19 (usearch/HNSW behind `AnnIndex`)** — the space registry rebuilds
+  the same seam. Landing 8.2 first means doing it twice.
+- **PR 4.15 (scheduler in hive-core)** — the image and template derive drains
+  are cadence work and belong on the owned scheduler, not in `app/` hooks.
+- **PR 3.3 (filesystem module)** — nothing puts a photograph in hive today.
+  Mail attachments are the only image source that exists, which is a real but
+  thin first corpus.
+- **Contact cards** — *already shipped* (`core/src/store/contacts.rs`, slug
+  `contact`, `[contact: Name]` emergence, Contacts pane). The brief listed
+  these as missing; only the identity↔contact link (PR 3.4, slice 2) is.
+
+- **PR 8.0 blob-key durability (out of band; land before PR 4.11).** Not
+  really Phase 8's — this is a live data-loss defect that this design would
+  merely inherit. `blob_refs` holds the only copy of every blob's wrapped
+  content key, is fold-blind, and sits in `DROP_DERIVED`
+  (`core/src/index/mod.rs:629`), so FOLD_VERSION 4 destroys every stored mail
+  attachment while leaving `mail_attachments` rows looking healthy. The two
+  mitigations claimed in the comment at `core/src/index/mod.rs:74` are both
+  stale and get fixed here: the pending-attachment drain keys off
+  `blob_hash IS NULL` and replay repopulates it, so nothing re-queues; and
+  `hive-import` routes bytes through the same `mail_attachment_store_blob`
+  runtime path (`importer/src/lib.rs:1384`), so imported blobs carry no refs
+  in log records either. Fix per open question 17 (removing `blob_refs` from
+  `DROP_DERIVED` is one line and is probably the actual defect; making the
+  wrapped key durable in the log is a frozen-format change). Tests: the
+  missing coverage is the deliverable — store an attachment, bump
+  FOLD_VERSION, assert the bytes still serve
+  (`core/tests/fold_replay.rs:820` bumps versions over journal and config rows
+  only today). Gate: attachment survives a fold-version bump; comment fixed in
+  the same change per AGENTS.md's stale-doc rule.
+- **PR 8.1 v2.2 decision record (doc-only).** Ratify, amend, or kill D37-D40:
+  plural named embedding spaces with prose staying on BGE; biometric templates
+  as blobs; identification as a closed-set proposal never written unconfirmed;
+  the append-only AI-correction principle. Record the format decisions —
+  per-space `ref_kind` naming (which is what avoids a schema change), the
+  cross-space fusion rule (reciprocal rank, never score), random-key put for
+  biometric blobs per D31, and the correction-layer record shape with its
+  anchor-binding rule. **D40 is separable and should be adopted early
+  regardless of this phase** — PR 3.6's dreaming wants the principle settled.
+  Gate: merged doc = the citable source for every PR below.
+
+### Stage A — multimodal search (no biometrics)
+
+- **PR 8.2 the space registry (pure refactor, no new modality).** Replace
+  `Store`'s single `Arc<dyn Embedder>` with a registry of named spaces (model,
+  dim, embedder, covered `ref_kind`s); route `ann_candidates` and the backfill
+  skip-map per space instead of per global model
+  (`core/src/store/embed_backfill.rs:45,54`); replace the literal
+  `dim() == 384 && q.len() == 384` at `core/src/store/semantic.rs:371` with a
+  per-space property **that keeps its second job** — it is also the latch guard
+  stopping a 256-dim hash vector probing a 384-dim structure after a mid-flight
+  ONNX failure. Add the byte-input sibling trait (not a widened `embed()`) and
+  its hash counterpart so `HIVE_EMBED=hash` stays offline and deterministic.
+  Tests: golden retrieval fixture **unchanged, byte for byte** — that is the
+  whole gate; registry unit tests; a two-space fixture proving isolation. Gate:
+  `golden_retrieval.json` does not move; no behaviour change anywhere.
+- **PR 8.3 blob producer #2 (the generic attach path).** Break blobs out of
+  mail-only: a table for non-mail blobs, the record kind or `module.doc`
+  convention that binds one to its owner, a refcount source for GC, and a
+  redaction fold rule — the four things `mail_attachments` provides today and
+  nothing else does. Random-key put available per D31. Tests: crypto-shred
+  parity — a non-mail blob shreds with the same end-to-end proof
+  `core/tests/crypto_shred.rs` gives attachments, including through replay.
+  Gate: shred parity green; mail path untouched.
+- **PR 8.4 the image space.** Timeboxed spike inside the PR decides SigLIP-base
+  vs CLIP ViT-B/32 on ONNX-export viability under `ort` 2.0.0-rc.12, CPU
+  latency, and measured retrieval quality **on Nate's own photographs, not a
+  benchmark**. Image decode and preprocessing (resize, center-crop, normalize)
+  arrive Rust-side with a parity test against the Python reference — hive has
+  no image decoding today, so this is a new dependency and a new correctness
+  surface. Image derive drain on the 4.15 scheduler. Tests: preprocessing
+  parity vectors; drain eligibility/budget units. Gate: images embed
+  unattended; a known image retrieves itself top-1.
+- **PR 8.5 cross-space query + fusion.** Reciprocal-rank fusion of the image
+  space into the existing ranking, with the text-space weighted blend
+  untouched inside its own space; search-by-image and search-by-text-for-image
+  surfaces; the MCP tool; UI that labels which space a hit came from rather
+  than silently interleaving. Tests: text-only queries return **byte-identical**
+  results to pre-8.5 (the fixture again); RRF unit tests; a mixed-query
+  scenario. Gate: fixture unmoved; both query directions work end to end.
+- **Batching, if the benchmark says so.** `Embedder` has no batch API
+  (`embed/src/onnx.rs:436`, one pair per run). Fine for journal entries
+  arriving singly, possibly not for ten thousand photographs. Measure at 8.4;
+  if it bites, batching is a prerequisite of 8.4, not an optimisation after it.
+
+Gate (Stage A): a photograph is findable by describing it and by another
+photograph; prose retrieval is provably unchanged.
+
+### Stage B — spoken capture and the correction layer
+
+Independent of Stage A except for 8.3's blob path, and deliverable without any
+biometrics at all. This is the more useful half and the cheaper one.
+
+- **PR 8.6 audio capture + local ASR.** Push-to-talk capture, audio blobs via
+  8.3, Whisper-class local transcription. Runtime decided by timeboxed spike
+  per open question 19 (`ort` against the encoder-decoder loop, vs a
+  `whisper.cpp` binding at the cost of a C dependency and a second model-cache
+  story). Transcript enters through `journal_append` unchanged — no new
+  emergence rules, no new entity kinds, no new pane. Gate: speaking a
+  `[task:]` into the composer materialises the task through the normal path.
+- **PR 8.7 the correction layer (D40).** Correction records referencing an
+  original, carrying model id, prompt version, and run time; emergence over
+  the corrected layer; anchors binding the layer they were computed against.
+  UI renders corrected-by-default with a "view original" toggle. Tests: a
+  second, better correction does not disturb the first layer's anchors — that
+  assertion is the point of the PR. Gate: raw capture recoverable and visibly
+  distinct at every step; nothing overwrites.
+
+Gate (Stage B): dictate a journal entry; the cleaned version renders, the raw
+one is one click away, and emergence materialised from the cleaned text.
+
+### Stage C — local identity
+
+- **PR 8.8 speaker embedding + enrollment.** Model spike (ECAPA-TDNN 192-dim
+  lineage vs the WeSpeaker ResNet family; ONNX availability is unverified for
+  the former). Enrollment ceremony: explicit, consented, N clips, one template
+  blob per capture, centroid derived at load. Contact binding via the PR 3.4
+  identity↔contact seam. Gate: a contact enrolls; templates shred with the
+  contact.
+- **PR 8.9 matching, thresholds, proposals (D39).** Similarity-and-margin
+  gating with `unknown` first-class; per-contact thresholds in `config`
+  records; calibration against the free impostor set (everyone else enrolled);
+  the proposal UI. **Nothing writes to the log without confirmation** — the
+  confirmation is the record, with provenance. Tests: an unenrolled speaker
+  resolves to `unknown`, not to the nearest friend; a confirmed match appends
+  exactly one record; a rejected one appends none. Gate: measured false-match
+  and false-reject rates on real household audio, stated in the PR.
+- **PR 8.10 faces (conditional on open question 18).** Two models —
+  detect-and-align, then embed — and therefore a real question about whether it
+  earns its complexity before voice has proven the pattern. Same storage,
+  matching, and proposal machinery; only the encoder differs. Gate: as 8.9, on
+  images.
+- **PR 8.11 shred, retention, threat-model amendments.** Per-contact destroy
+  proving templates *and* source captures unrecoverable through replay;
+  "forget the source captures" as a distinct action that keeps the templates
+  and records plainly that re-derivation is gone; re-derivation drain when a
+  model is replaced. THREAT-MODEL.md amendments: trusted tier means the
+  always-on box reads the household's faces and voices (delta 1 gets a
+  sentence, not an exemption); D19's stated limits — RAM, swap, pre-shred
+  backups, filesystem forensics — land differently on a faceprint than a PDF
+  and get said; consent belongs to third parties who cannot revoke and cannot
+  rotate a face; closed-set-only as an invariant; templates are never
+  credentials. **ADVERSARIAL-SMOKE:** every one of those maps 1:1 to a test or
+  a written untestable-because-X. Gate: tag v0.14.0.
+
+Gate (Phase 8): a photograph is findable by description; a dictated entry
+emerges tasks from cleaned text with the raw audio intact; a household voice
+is proposed, confirmed by a human, and destroyed on demand with proof.
+
 ## Deferred: multi-node + thin clients (D36)
 
 Trigger: the first second-node deployment (offsite trusted replica, or DTC
