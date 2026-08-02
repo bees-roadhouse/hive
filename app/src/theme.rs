@@ -97,7 +97,7 @@ impl Appearance {
         format!(
             ":root {{ \
              --bg: {}; --panel: {}; --edge: {}; --ink: {}; --dim: {}; --faint: {}; \
-             --gold: {}; --gold-text: {}; --danger: {}; --accent: {}; \
+             --gold: {}; --gold-text: {}; --on-gold: {}; --danger: {}; --accent: {}; \
              color-scheme: {}; }} \
              ::selection {{ background: {}; color: {}; }} \
              :focus-visible {{ outline: 2px solid {}; outline-offset: 2px; }}",
@@ -109,6 +109,7 @@ impl Appearance {
             p.faint,
             p.gold,
             p.gold_text,
+            ON_GOLD,
             p.danger,
             accent,
             if self.dark { "dark" } else { "light" },
@@ -135,6 +136,14 @@ struct Palette {
     gold_text: &'static str,
     danger: &'static str,
 }
+
+/// Text and icons that sit ON a gold fill.
+///
+/// One value for BOTH themes, because the fill is one value for both themes.
+/// Pairing gold with `--bg` looked right in the dark theme by coincidence —
+/// near-black on gold is 8.7:1 — and became near-white on gold at about 2:1
+/// the moment a light theme existed, which is a button you cannot read.
+const ON_GOLD: &str = "#14120e";
 
 /// The shipped look: warm dark, honey gold.
 const DARK: Palette = Palette {
@@ -327,6 +336,21 @@ mod tests {
             css.contains("--accent: #e2a921"),
             "an unset accent must still resolve, or focus rings vanish"
         );
+    }
+
+    #[test]
+    fn text_on_a_gold_fill_stays_dark_in_both_themes() {
+        // The bug this pins: gold buttons were written `color: var(--bg)`,
+        // which is near-black in the dark theme (8.7:1, fine) and near-white
+        // in the light one (about 2:1, unreadable). The fill does not change
+        // between themes, so its text must not either.
+        for dark in [true, false] {
+            let css = Appearance { dark, accent: None }.css_root();
+            assert!(
+                css.contains("--on-gold: #14120e"),
+                "dark={dark}: text on gold must not follow the background"
+            );
+        }
     }
 
     #[test]

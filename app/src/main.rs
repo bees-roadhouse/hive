@@ -771,7 +771,7 @@ fn Onboarding(mode: Signal<Mode>, master: [u8; 32], dir: PathBuf) -> Element {
                                 span { style: "flex: 1;" }
                                 button {
                                     id: "onb-continue",
-                                    style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
+                                    style: "background: {GOLD}; color: var(--on-gold); border: none; border-radius: 8px; \
                                             padding: 0.6rem 1.5rem; font-weight: 700; font-size: 0.95rem; \
                                             cursor: pointer;",
                                     onclick: move |_| step.set(OnbStep::Choice),
@@ -869,7 +869,7 @@ fn Onboarding(mode: Signal<Mode>, master: [u8; 32], dir: PathBuf) -> Element {
                                 }
                                 button {
                                     id: "onb-import",
-                                    style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
+                                    style: "background: {GOLD}; color: var(--on-gold); border: none; border-radius: 8px; \
                                             padding: 0.6rem 1.5rem; font-weight: 700; font-size: 0.95rem; \
                                             cursor: pointer;",
                                     disabled: run_off,
@@ -912,7 +912,7 @@ fn Onboarding(mode: Signal<Mode>, master: [u8; 32], dir: PathBuf) -> Element {
                                     {summary_card(&summary)}
                                     button {
                                         id: "onb-open-journal",
-                                        style: "background: {GOLD}; color: var(--bg); border: none; \
+                                        style: "background: {GOLD}; color: var(--on-gold); border: none; \
                                                 border-radius: 8px; padding: 0.7rem 1.6rem; font-weight: 700; \
                                                 font-size: 1rem; cursor: pointer; margin-top: 0.9rem;",
                                         onclick: open_journal,
@@ -1468,7 +1468,7 @@ fn JournalPane(store: ReadOnlySignal<Store>, active: Signal<String>) -> Element 
                     span { style: "flex: 1;" }
                     button {
                         id: "journal-append",
-                        style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
+                        style: "background: {GOLD}; color: var(--on-gold); border: none; border-radius: 8px; \
                                 padding: 0.5rem 1.2rem; font-weight: 700; font-size: 0.9rem; \
                                 cursor: pointer;",
                         onclick: move |_| append(),
@@ -1664,7 +1664,7 @@ fn MailEmptyState(managing: Signal<bool>) -> Element {
             }
             button {
                 id: "mail-empty-add",
-                style: "margin-top: 1.4rem; background: {GOLD}; color: var(--bg); border: none; \
+                style: "margin-top: 1.4rem; background: {GOLD}; color: var(--on-gold); border: none; \
                         border-radius: 10px; padding: 0.7rem 1.6rem; font: inherit; font-weight: 700; \
                         font-size: 0.95rem; cursor: pointer;",
                 onclick: move |_| managing.set(true),
@@ -1739,7 +1739,7 @@ fn MailSidebar(
             // New Message — opens the compose overlay with a blank seed.
             button {
                 id: "mail-compose-new",
-                style: "width: 100%; box-sizing: border-box; background: {GOLD}; color: var(--bg); \
+                style: "width: 100%; box-sizing: border-box; background: {GOLD}; color: var(--on-gold); \
                         border: none; border-radius: 8px; padding: 0.5rem 0.8rem; font: inherit; \
                         font-weight: 700; font-size: 0.86rem; cursor: pointer; margin-bottom: 0.7rem;",
                 onclick: move |_| {
@@ -1889,7 +1889,7 @@ fn mail_mailbox_row(
             }
             if mbox.unread > 0 {
                 span {
-                    style: "font-size: 0.72rem; font-weight: 700; color: var(--bg); background: {GOLD}; \
+                    style: "font-size: 0.72rem; font-weight: 700; color: var(--on-gold); background: {GOLD}; \
                             border-radius: 999px; padding: 0.05rem 0.42rem; min-width: 1rem; text-align: center;",
                     "{mbox.unread}"
                 }
@@ -3015,7 +3015,7 @@ fn ComposeWindow(store: ReadOnlySignal<Store>, compose: Signal<Option<ComposeSee
                     button {
                         id: "compose-send",
                         disabled: sending || account_list.is_empty(),
-                        style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
+                        style: "background: {GOLD}; color: var(--on-gold); border: none; border-radius: 8px; \
                                 padding: 0.55rem 1.3rem; font-weight: 700; font-size: 0.9rem; \
                                 cursor: pointer; opacity: {send_opacity};",
                         onclick: submit,
@@ -3593,7 +3593,7 @@ fn MailAddAccount(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element
                 button {
                     id: "mail-add-submit",
                     disabled: busy(),
-                    style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
+                    style: "background: {GOLD}; color: var(--on-gold); border: none; border-radius: 8px; \
                             padding: 0.55rem 1.1rem; font-weight: 700; font-size: 0.88rem; \
                             cursor: pointer; opacity: {submit_opacity};",
                     onclick: submit,
@@ -3912,7 +3912,7 @@ fn mail_account_row(
                         button {
                             id: "mail-edit-save-{acct.id}",
                             disabled: edit_busy(),
-                            style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 999px; \
+                            style: "background: {GOLD}; color: var(--on-gold); border: none; border-radius: 999px; \
                                     padding: 0.4rem 0.9rem; font: inherit; font-weight: 700; \
                                     font-size: 0.82rem; cursor: pointer;",
                             onclick: save,
@@ -3992,7 +3992,7 @@ fn account_status_line(a: &MailAccountAdminView) -> String {
 fn mail_pill_style(enabled: bool) -> String {
     if enabled {
         format!(
-            "background: {GOLD}; color: var(--bg); border: none; border-radius: 999px; \
+            "background: {GOLD}; color: var(--on-gold); border: none; border-radius: 999px; \
              padding: 0.35rem 0.8rem; font-weight: 700; font-size: 0.8rem; cursor: pointer;"
         )
     } else {
@@ -4152,7 +4152,7 @@ fn CalendarPane(
                     }
                     button {
                         id: "cal-new",
-                        style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
+                        style: "background: {GOLD}; color: var(--on-gold); border: none; border-radius: 8px; \
                                 padding: 0.6rem 1.3rem; font-weight: 700; font-size: 0.9rem; cursor: pointer;",
                         onclick: move |_| create(),
                         "+ New event"
@@ -4972,7 +4972,7 @@ fn IdentitiesPane(
                     }
                     button {
                         id: "identity-create",
-                        style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
+                        style: "background: {GOLD}; color: var(--on-gold); border: none; border-radius: 8px; \
                                 padding: 0.6rem 1.3rem; font-weight: 700; font-size: 0.9rem; cursor: pointer;",
                         onclick: move |_| create(),
                         "Create"
@@ -5269,7 +5269,7 @@ fn identity_row(
                                     button {
                                         id: "identity-claim-{person.slug}",
                                         disabled: busy() || owner_slug.is_empty(),
-                                        style: "background: {GOLD}; color: var(--bg); border: none; \
+                                        style: "background: {GOLD}; color: var(--on-gold); border: none; \
                                                 border-radius: 999px; padding: 0.25rem 0.8rem; font: inherit; \
                                                 font-size: 0.74rem; font-weight: 700; cursor: pointer;",
                                         onclick: move |_| {
@@ -5453,7 +5453,7 @@ fn takeover_preview(
                 button {
                     id: "takeover-confirm",
                     disabled: busy() || owner_slug.is_empty(),
-                    style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
+                    style: "background: {GOLD}; color: var(--on-gold); border: none; border-radius: 8px; \
                             padding: 0.4rem 1rem; font: inherit; font-size: 0.82rem; \
                             font-weight: 700; cursor: pointer;",
                     onclick: move |_| {
@@ -6681,7 +6681,7 @@ fn ContactsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
                             }
                             button {
                                 id: "contact-create",
-                                style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
+                                style: "background: {GOLD}; color: var(--on-gold); border: none; border-radius: 8px; \
                                         padding: 0.5rem 0.9rem; font-weight: 700; font-size: 0.85rem; cursor: pointer;",
                                 onclick: move |_| create(),
                                 "Add"
@@ -7742,7 +7742,7 @@ fn tasks_quickadd(
             }
             button {
                 id: "tasks-quickadd-submit",
-                style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 7px; \
+                style: "background: {GOLD}; color: var(--on-gold); border: none; border-radius: 7px; \
                         padding: 0.4rem 0.9rem; font: inherit; font-weight: 700; font-size: 0.85rem; \
                         cursor: pointer;",
                 onclick: move |_| submit(),
@@ -8375,7 +8375,7 @@ fn EntityDetail(
                             style: "display: flex; align-items: center; gap: 0.7rem; margin-top: 1.1rem;",
                             button {
                                 id: "detail-save",
-                                style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
+                                style: "background: {GOLD}; color: var(--on-gold); border: none; border-radius: 8px; \
                                         padding: 0.5rem 1.2rem; font-weight: 700; font-size: 0.9rem; cursor: pointer;",
                                 onclick: move |_| save(),
                                 "Save"
@@ -9208,7 +9208,7 @@ fn SettingsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
                 style: "display: flex; align-items: center; gap: 0.8rem; margin-top: 0.4rem;",
                 button {
                     id: "settings-save",
-                    style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
+                    style: "background: {GOLD}; color: var(--on-gold); border: none; border-radius: 8px; \
                             padding: 0.6rem 1.5rem; font-weight: 700; font-size: 0.92rem; cursor: pointer;",
                     onclick: move |_| save(),
                     "Save settings"
