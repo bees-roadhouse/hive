@@ -381,10 +381,25 @@ async fn attachment_survives_a_fold_version_bump() {
     // exactly what shipping a new FOLD_VERSION does on a user's dir: the
     // mismatch fires DROP_DERIVED, and reopening replays the log into the
     // re-laid schema.
+    //
+    // Assert INSIDE this scope, not just after the store reopens: reopening at
+    // the real FOLD_VERSION is a second mismatch (bumped -> current) and fires
+    // DROP_DERIVED again, so an assertion made only at the end cannot say which
+    // of the two opens preserved the row. This one pins the bump itself.
     {
         let keys = MemoryKeySource(MASTER);
         let idx =
             SqliteIndex::open_with_fold_version(dir.path(), &keys, fold::FOLD_VERSION + 1).unwrap();
+        let n: i64 = idx
+            .conn()
+            .query_row("SELECT COUNT(*) FROM blob_refs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "the bump itself must not drop blob_refs — losing the wrapped \
+             content key is an unintentional crypto-shred, and no record can \
+             rebuild it"
+        );
         drop(idx);
     }
 
@@ -392,8 +407,7 @@ async fn attachment_survives_a_fold_version_bump() {
     assert_eq!(
         count(&store, "SELECT COUNT(*) FROM blob_refs", vec![]).await,
         1,
-        "the wrapped content key must survive a fold-version bump — losing it \
-         is an unintentional crypto-shred, and no record can rebuild it"
+        "and it must still be there after replay rebuilds everything around it"
     );
     let served = store.mail_attachment_serve(&att_id).await.unwrap().unwrap();
     assert_eq!(
