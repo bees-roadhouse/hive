@@ -48,6 +48,10 @@ base64 = { workspace = true }
 # The bridge socket server (D25 proxy mode) logs through tracing like the
 # store's drivers do; dioxus's launch installs the subscriber.
 tracing = { workspace = true }
+# The XDG appearance portal (light/dark + accent). Already in the tree via
+# keyring's secret-service; named here because this crate calls it directly,
+# and it is the ONE way the app learns anything about the desktop.
+zbus = "4"
 
 [target.'cfg(unix)'.dependencies]
 # Peer-credential check on the bridge socket (D25): same-euid clients only.
