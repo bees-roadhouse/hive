@@ -41,9 +41,10 @@ Phase 1 (the engine) is complete; Phase 2 (the app) is underway:
 
 Honest gaps, per plan: **mail sync is paused** (the archive is readable;
 the sync daemon returns as a WASM module in Phase 3), **device sync is
-Phase 4** (single machine until then), and in the interim bridge mode
-**the app and hive-bridge can't run at the same time** (single-writer lock;
-the Phase 2.4 proxy lifts this).
+Phase 4** (single machine until then), and **hive-bridge needs the app
+running** (D25 proxy mode: the bridge talks to the app over
+`<data_dir>/bridge.sock` and holds no store access of its own — when the
+app is closed, bridge calls fail with "the hive app is not running").
 
 ## Workspace
 
@@ -132,7 +133,8 @@ hive-bridge call recall --json '{"identity": "nate"}'
 ```
 
 The acting identity defaults to `$USER` (`--actor` overrides), matching the
-app. Remember the interim caveat: close the app while a bridge is connected.
+app. The app must be running — the bridge is a proxy to it (D25), and any
+number of bridge clients can connect at once.
 
 ## Data dir
 

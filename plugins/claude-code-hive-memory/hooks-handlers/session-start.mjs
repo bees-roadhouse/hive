@@ -14,7 +14,7 @@
 // acting identity is HIVE_ACTOR (default $USER, the app's author default).
 // No bridge on PATH -> silent no-op (don't nag machines without hive). Any
 // other failure -> stderr + exit 0 (a broken hive must never block a
-// session) — including the interim-mode lock when the hive app is open.
+// session) — including "the hive app is not running" when it is closed.
 
 import {
   existsSync,

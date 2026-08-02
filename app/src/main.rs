@@ -37,6 +37,8 @@ use hive_shared::{
 };
 use serde_json::Value;
 
+mod bridge_server;
+
 /// Config key naming the human behind the hive — the owner display name. The
 /// onboarding identity step writes it; Settings edits it; it's the fallback
 /// author everywhere. Dotted, matching the config table's conventions
@@ -191,14 +193,33 @@ fn main() {
 
 /// The store lives under XDG data: the flatpak maps this to
 /// `~/.var/app/com.beesroadhouse.Hive/data/hive`, plain runs to
-/// `~/.local/share/hive`.
+/// `~/.local/share/hive`. `HIVE_DATA_DIR` overrides the whole path — the
+/// test seam every app-level test needs (PLAN-v2.1 PR 4.1; same override the
+/// bridge and importer already honor). Core still never reads it: the dir is
+/// resolved here and passed down explicitly.
 fn data_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
+    resolve_data_dir(
+        std::env::var_os("HIVE_DATA_DIR"),
+        std::env::var_os("XDG_DATA_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// Pure half of `data_dir()` — env values in, path out — so the resolution
+/// order is unit-testable without racing on process-global env vars.
+fn resolve_data_dir(
+    override_dir: Option<std::ffi::OsString>,
+    xdg_data_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(dir) = override_dir.filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    let base = xdg_data_home
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
+            home.map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join(".local")
                 .join("share")
@@ -206,16 +227,33 @@ fn data_dir() -> PathBuf {
     base.join("hive")
 }
 
+/// Master-key resolution order (PLAN-v2.1 PR 4.1): `HIVE_MASTER_KEY_FILE`
+/// (64 hex chars = the raw 32-byte master — the shared format in
+/// `hive_core::keys::read_master_key_file`) is honored BEFORE the keychain.
+/// Headless containers have no Secret Service, and a seeded fixture store
+/// only opens under its exact key — so a set-but-unreadable file is a hard
+/// error, never a silent keychain fallback (falling through would mint a
+/// fresh key and refuse the fixture's store).
+fn resolve_master_key() -> anyhow::Result<[u8; 32]> {
+    if let Some(path) = std::env::var_os("HIVE_MASTER_KEY_FILE").filter(|v| !v.is_empty()) {
+        return hive_core::keys::read_master_key_file(std::path::Path::new(&path));
+    }
+    KeychainKeySource::new()
+        .master_key()
+        .map_err(|e| anyhow::anyhow!("OS keychain unavailable: {e:#}"))
+}
+
 fn boot() -> Boot {
-    // Master key: resolved from the OS keychain exactly once, here, before
-    // the UI exists (created on first boot); the store then works from the
-    // in-memory copy so no later wrap/unwrap blocks on D-Bus mid-frame.
-    // Inside the flatpak this is the org.freedesktop.secrets hole in the
-    // manifest. Onboarding never touches the keychain again — it carries
-    // these bytes.
-    let master = match KeychainKeySource::new().master_key() {
+    // Master key: resolved exactly once, here, before the UI exists — from
+    // the HIVE_MASTER_KEY_FILE seam when set (tests/headless), otherwise
+    // from the OS keychain (created on first boot); the store then works
+    // from the in-memory copy so no later wrap/unwrap blocks on D-Bus
+    // mid-frame. Inside the flatpak this is the org.freedesktop.secrets hole
+    // in the manifest. Onboarding never touches the keychain again — it
+    // carries these bytes.
+    let master = match resolve_master_key() {
         Ok(key) => key,
-        Err(e) => return Boot::Failed(format!("OS keychain unavailable: {e:#}")),
+        Err(e) => return Boot::Failed(format!("{e:#}")),
     };
     // First-launch probe: the importer's own fresh-dir rule (device file or
     // op-log segments), shared so the app and hive-import can never disagree
@@ -292,6 +330,19 @@ fn mail_driver_tick_secs() -> u64 {
         .unwrap_or(30)
 }
 
+/// Whether the Shell binds the bridge socket at store open. On by default —
+/// the socket is how hive-bridge (Claude Code hooks, Claude Desktop) reaches
+/// the running app (D25 proxy mode, PLAN.md PR 2.4); opt out with
+/// `HIVE_BRIDGE_SOCKET=0` for headless/CI runs that want no listener.
+fn bridge_socket_enabled() -> bool {
+    !matches!(
+        std::env::var("HIVE_BRIDGE_SOCKET")
+            .unwrap_or_default()
+            .trim(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
 const BG: &str = "#14120e";
 const PANEL: &str = "#1a1712";
 const EDGE: &str = "#2c2818";
@@ -355,6 +406,12 @@ fn app() -> Element {
                 ..
             }
         ) {
+            // Deliberately NO bridge-socket cleanup here: this handler runs
+            // in every Mode, and a Failed/Onboarding instance (say, a
+            // double-launch refused by the store flock) must never unlink a
+            // socket a healthy instance is serving. The owner's next boot
+            // unlink-then-binds; a stale file just yields ECONNREFUSED,
+            // which the bridge already reports as "app not running".
             std::process::exit(0);
         }
     });
@@ -983,6 +1040,20 @@ fn Shell(store: ReadOnlySignal<Store>) -> Element {
                 tokio::time::sleep(tick).await;
             }
         });
+    });
+
+    // The bridge socket (D25, PR 2.4): hive-bridge proxies stdio MCP from
+    // Claude Code / Claude Desktop to THIS running app over
+    // <data_dir>/bridge.sock. Mounted with Shell so both boot paths (normal
+    // launch and the post-onboarding flip) serve it as soon as a store
+    // exists; the store's flock already guarantees this app is the only hive
+    // process on the data dir. tokio::spawn, not dioxus spawn — an accept
+    // loop has no business on the vdom scheduler.
+    use_hook(|| {
+        if !bridge_socket_enabled() {
+            return;
+        }
+        bridge_server::spawn(store.peek().clone(), author_name());
     });
 
     rsx! {
@@ -10268,5 +10339,66 @@ mod tests {
             reply_references(&meta),
             vec!["<root@ex.test>".to_string(), "<parent@ex.test>".to_string()]
         );
+    }
+
+    // ── boot() seams (PLAN-v2.1 PR 4.1) ─────────────────────────────────────
+    //
+    // The env-reading wrappers stay thin; the tests exercise the pure
+    // resolution half (`resolve_data_dir`) and the shared key-file format
+    // directly, so nothing here mutates process-global env (unit tests in
+    // this binary run in parallel threads).
+
+    #[test]
+    fn data_dir_override_wins_over_xdg_and_home() {
+        use super::resolve_data_dir;
+        use std::ffi::OsString;
+        use std::path::PathBuf;
+
+        let over = |s: &str| Some(OsString::from(s));
+
+        // HIVE_DATA_DIR wins outright.
+        assert_eq!(
+            resolve_data_dir(over("/tmp/hive-test"), over("/xdg"), over("/home/nate")),
+            PathBuf::from("/tmp/hive-test")
+        );
+        // Empty override is ignored (unset-via-empty, the bridge's rule).
+        assert_eq!(
+            resolve_data_dir(over(""), over("/xdg"), over("/home/nate")),
+            PathBuf::from("/xdg/hive")
+        );
+        // No override: absolute XDG_DATA_HOME is honored…
+        assert_eq!(
+            resolve_data_dir(None, over("/xdg"), over("/home/nate")),
+            PathBuf::from("/xdg/hive")
+        );
+        // …a relative XDG_DATA_HOME is ignored per the basedir spec…
+        assert_eq!(
+            resolve_data_dir(None, over("relative"), over("/home/nate")),
+            PathBuf::from("/home/nate/.local/share/hive")
+        );
+        // …and with neither, the resolution stays rooted somewhere sane.
+        assert_eq!(
+            resolve_data_dir(None, None, None),
+            PathBuf::from("./.local/share/hive")
+        );
+    }
+
+    #[test]
+    fn master_key_file_reads_the_shared_hex_format() {
+        // The exact file test_domain()/seed-fixture will write (TESTING-
+        // STRATEGY §0.4): 64 hex chars + newline = one raw 32-byte master.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("master.hex");
+        std::fs::write(&path, format!("{}\n", "ab".repeat(32))).unwrap();
+        assert_eq!(
+            hive_core::keys::read_master_key_file(&path).unwrap(),
+            [0xabu8; 32]
+        );
+
+        // Malformed files are hard errors — boot() must fail loudly, never
+        // fall through to the keychain and open the wrong store.
+        std::fs::write(&path, "not-a-key\n").unwrap();
+        assert!(hive_core::keys::read_master_key_file(&path).is_err());
+        assert!(hive_core::keys::read_master_key_file(&dir.path().join("absent.hex")).is_err());
     }
 }

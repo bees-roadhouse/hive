@@ -1,0 +1,33 @@
+[package]
+name = "hive-smoke-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The smoke tier's seams open REAL stores over real dirs, so unlike
+# hive-bridge (store-free by design) this crate does link the engine: hive-core
+# for Store/KeySource, hive-embed for the deterministic hash embedder that
+# keeps every smoke run offline. hive-node (lib) joins the list when it lands —
+# `test_node()`/`test_pair()` are this crate's next growth ring (PLAN-v2.1
+# PR 4.6+), and test bodies must not have to change when they do. hive-sync
+# stays OUT deliberately: it dev-depends on this crate for its loopback
+# scenarios, and the transport seams it needs (`test_identity`) are pure
+# hive-core, so the dependency arrow keeps pointing one way.
+hive-core = { path = "../core" }
+hive-embed = { workspace = true }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+# Writes the 64-hex master-key file whose reader lives in hive-core
+# (keys::parse_master_key_hex) — one format, several consumers.
+data-encoding = { workspace = true }
+# Derives the tier's device seeds from their names (test_identity, PR 4.5).
+blake3 = { workspace = true }
+# Reads (and ages) the node's `node-meta.db` for `test_node()` (PR 4.7). That
+# file is PLAIN SQLite on purpose — a blind node holds no key, so its
+# bookkeeping is an operator's to inspect — which is exactly what lets the tier
+# assert an audit trail and expire a code without waiting ten minutes.
+rusqlite = { workspace = true }

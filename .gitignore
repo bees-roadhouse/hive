@@ -22,8 +22,9 @@ data/*.db-wal
 # agent worktrees (managed by the Agent tool)
 .claude/worktrees/
 
-# Stale duplicate of the old node/ layout (app lives under packages/ at root)
-/node/
+# `/node/` used to be ignored here as a stale duplicate of the pre-teardown
+# Node layout. That directory is long gone and `node/` is now the hive-node
+# crate (PLAN-v2.1 PR 4.6) — the rule would silently hide a whole crate.
 hive.local.env
 
 # flatpak local build artifacts

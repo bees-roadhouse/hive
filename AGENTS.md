@@ -6,14 +6,18 @@ These instructions apply to the whole `bees-roadhouse/hive` repository.
 
 GitHub `main` is canonical (the old `development`/`release` pair collapsed into
 it on 2026-07-05). This repo is mid-pivot to a personal P2P desktop app
-(docs/DIRECTION.md D16+; teardown/rebuild sequence in docs/PLAN.md):
+(decisions in docs/DIRECTION.md, D16+ amended by the v2.1 node program D29+;
+Phases 1-2 teardown/rebuild history in docs/PLAN.md, whose forward half is
+superseded by the active execution plan docs/PLAN-v2.1.md; test tiers and
+conventions in docs/TESTING-STRATEGY.md):
 
-- Rust workspace: `shared`, `embed`, `core`, `jmap-sync`, `app`, `bridge`,
-  and `importer`. There is no Node/pnpm workspace anymore — the Solid SPA,
+- Rust workspace: `shared`, `embed`, `core`, `jmap-sync`, `sync`, `node`,
+  `app`, `bridge`, and `importer`, plus the test-tier crates `smoke-support`
+  and `smoke`. There is no Node/pnpm workspace anymore — the Solid SPA,
   the legacy Node packages, the worker/mail daemons (PR 1.2), and the api
   crate with its REST/auth/OAuth surface (PR 1.3) were deleted in Phase 1
-  teardown. The shipping binaries are the app, `hive-bridge` (PR 1.8), and
-  the `hive-import` one-shot (PR 1.7).
+  teardown. The shipping binaries are the app, `hive-bridge` (PR 1.8),
+  the `hive-import` one-shot (PR 1.7), and `hive-node` (PLAN-v2.1 PR 4.6).
 - The datastore is the append-only op log + SQLCipher SQLite index under a
   local data dir (the PR 1.6 cutover; D18). Postgres left the workspace —
   the PR 1.7 importer is the one remaining Postgres reader and declares its
@@ -30,20 +34,124 @@ then update the stale doc in the same change. `README.md` and parts of
 ## Architecture
 
 - `core/`: hive-core — the op log (`oplog`), blockstore, key custody
-  (`keys`), the SQLCipher index + fold projector (`index`, `fold`), and the
+  (`keys` for the domain master, `identity` for the per-device transport
+  keypair), the SQLCipher index + fold projector (`index`, `fold`), and the
   store layer riding ONE writer thread (`store/core.rs`: mpsc commands,
   oneshot replies; the public `Store` surface stays async), plus the MCP tool
   layer (`core/src/mcp.rs`, transport-free: request/response over serde_json
   values; the PR 1.8 stdio bridge is its transport). `mcp::LocalCtx { actor }`
   supplies the acting identity — there is no authentication layer (single
-  user, D16).
-- `bridge/`: the `hive-bridge` binary — the ONLY external doorway (D25).
-  A thin stdio transport over `core::mcp` (serve mode: JSON-RPC 2.0, one
-  message per line; `call` mode: one tool call for hooks/scripts). Interim
-  mode opens the store directly via `Store::new` with the app's exact
-  data-dir/keychain/actor resolution; Phase 2.4 flips it to a UDS proxy.
-  `HIVE_DATA_DIR` and `HIVE_MEMORY_KEY_HEX` are bridge-only escape hatches —
-  never teach core or the app to read them.
+  user, D16). Since PLAN-v2.1 PR 4.3 core also carries the sync READ
+  surface replication rides: `oplog::keyless` (segment enumeration, header
+  parse, frame walk — no master key anywhere, because D29's blind node
+  verifies structure holding none) and the blockstore's bare-32-byte-id
+  `has_block`/`get_block`/`put_block`/`list_block_ids`, all exposed as
+  `Store::sync_*`. Read-only apart from `sync_put_block`; foreign segment
+  ingest is PR 4.10's job, not this surface's. `identity` (PR 4.5) is the ONE
+  asymmetric introduction — ed25519 + x25519 (dalek) derived from a single
+  32-byte device seed, custody in the OS keychain beside the master key or in
+  the same 64-hex file format — reused by the mTLS carrier, control-record
+  signing, and sharing. It is NOT the master key: per-device, never shared,
+  encrypts nothing.
+- `sync/`: hive-sync — the replication protocol (PLAN-v2.1 PR 4.4, D29), lib
+  plus a skeleton binary. Length-prefixed CBOR control frames with raw
+  payload streams behind the two that carry bytes, generic over
+  `AsyncRead + AsyncWrite` (the `serve_bridge_connection` discipline), and a
+  session state machine scoped to ONE domain. Stage A is one-way backup, so
+  the halves are a `SyncSource` (implemented for `Store`, over PR 4.3's read
+  surface) and a `SyncSink` (implemented by `DirVault`, a directory in exact
+  store shape — the node's SegmentVault at PR 4.6 is that plus a server's
+  bookkeeping). Two things move and nothing else: verbatim segment bytes and
+  ciphertext blocks by bare id. The wire is deliberately NOT byte-frozen
+  while it churns (round-trips + HOSTILE-DECODE instead; compat fixtures at
+  the v0.8.0 proto-v1 tag), and every peer-declared length is capped before
+  it sizes an allocation. `tls` (PR 4.5) is the carrier those sessions ride:
+  self-signed certificates carrying the device's ed25519 key from
+  `hive_core::identity`, mutually pinned by SPKI (`SpkiPin`), TLS 1.3 only,
+  ring provider. The certificate is a CARRIER, never a trust root — nothing
+  validates a chain, checks a name, or reads an expiry, and the pin is the
+  whole verdict in both directions (`sync/tests/tls_loopback.rs` is the
+  harness every later transport PR extends). rustls/rcgen stop here: the
+  engine mints device keys, this crate carries them. `enroll` (PR 4.7) is the
+  ceremony's CLIENT half — code format (base32 over OS entropy), normalization,
+  the at-rest hash, and the six lines that redeem one — split from the node's
+  POLICY along the dependency arrow: the desktop redeems (PR 4.8) and must not
+  link the node crate. `UnpinnedEnrollment` is the ONE acceptor that takes any
+  key, named so the exception is greppable: a device redeeming a code has not
+  been told the node's key yet, and the grant is what ends the exception.
+- `node/`: hive-node — the always-on peer (PLAN-v2.1 PR 4.6, listener and
+  enrollment at 4.7; D29/D30/D33/D35), lib plus a thin `main`. Stage A is the
+  BLIND tier and only that: the node
+  holds no domain key, opens no Store, folds nothing. A domain is a
+  `SegmentVault` under `tenants/<t>/domains/<d>/` — hive-sync's `DirVault`
+  (verbatim `log/<device>/*.seg` + `blocks/<hh>/<id>`, exact store shape, so
+  restore is a copy) plus `node-meta.db`, PLAIN SQLite holding lengths,
+  hashes, sizes, pinned device keys, control epochs, hashed enrollment codes,
+  the auth audit, the pending-forget queue, and every integrity alarm. The
+  invariant the vault exists for is
+  WRITE-ONCE: a differing re-upload of an existing (device, start_seq) is an
+  alarm and a refusal, never an overwrite; a segment may only extend at its
+  end with its byte prefix intact; an identical re-upload is a silent no-op.
+  A SEALED segment may still be extended — sealing is a fact about the source,
+  not about what arrived here, and refusing it would strand a transfer that
+  was interrupted before the device rotated (`vault.rs::check_write`). The
+  DNS publisher (`dns`) upserts `_hive._tcp.<zone>` plus the node's own
+  per-class A/AAAA and refuses every other name before a request is made
+  (delta 13's code half) — the Cloudflare rail ships, `provider = "rfc2136"`
+  parses but refuses at boot rather than shipping an untestable wire.
+  `node.toml` is listen addr + `bind_scope` + node key + optional `[dns]`;
+  `tenant.toml` is
+  name, tier, and quotas, and D33 keeps IdP/KMS/console fields OUT. The two
+  GREP-FENCEs live in `node/tests/fences.rs` because this crate is their
+  exception (see Core Invariants).
+  `listen` (PR 4.7) is the door: PR 4.5's mTLS carrier with **node-meta as the
+  guest list, re-read per connection** — that is what makes `hive-node device
+  revoke` bite on the NEXT handshake with nothing restarted, and why a rustls
+  `ServerConfig` is built per connection rather than per listener. An unpinned
+  key completes a handshake only while some domain has a LIVE enrollment code
+  (there is no other way to enroll a key nobody has seen); with none
+  outstanding the pin set is the whole guest list. One opening frame then
+  decides — `enroll` or `hello`, read under `MAX_OPENING_FRAME` — and the
+  session's domain follows from the PIN, never from the hello. A handshake
+  deadline, an accept-rate token bucket, and a connection cap bound a stranger;
+  they are constants, not config. `enroll` is the POLICY half of the ceremony
+  (the wire half is `hive_sync::enroll`): codes are ~104 bits of OS randomness,
+  **hashed at rest**, single-use via one conditional UPDATE, ten-minute TTL,
+  and CHANNEL-BOUND — the ed25519 key in the request must be the key that
+  terminated the connection, or a relay could enroll keys it does not hold. v1
+  enrolls the domain's FIRST device only; a second needs the SAS ceremony
+  (PR 4.14) and is refused rather than quietly approved. Revocations are
+  PERMANENT tombstones (by device id and by key) and bump a monotonic
+  per-domain control epoch that never regresses. Every decision, granted or
+  refused, is written to the domain's `auth_audit` before it is answered, while
+  the wire says one sentence for every enrollment refusal — a redeemer that
+  could tell "wrong" from "expired" apart could probe the code space.
+  CLI: `hive-node [serve]`, `hive-node enroll --domain <t>/<d>`,
+  `hive-node device list|revoke`; the one-shots run beside the running node
+  against the same WAL database.
+- `bridge/`: the `hive-bridge` binary — the ONLY external doorway (D25),
+  in PROXY mode since PR 2.4: a sync stdio ↔ unix-socket pump (serve mode:
+  JSON-RPC 2.0, one message per line; `call` mode: one tool call for
+  hooks/scripts) against the RUNNING app's `<data_dir>/bridge.sock`, with
+  a one-line hello/ack handshake carrying the protocol version and the
+  `--actor` identity (wire contract: `hive_shared::bridge_proto`). The
+  bridge holds NO store access — deliberately no hive-core, tokio, or
+  keychain dependency (that is what keeps `cargo install --path bridge`
+  fast); when the app is not running it fails with the stable marker
+  "the hive app is not running" on stderr, exit 1, NOTHING on stdout —
+  the bridge tests and the plugin's soft-fail shape (stderr + no result
+  JSON) depend on exactly that surface. The app side lives in
+  `app/src/bridge_server.rs` (peer-cred checked, socket 0600, unlink at
+  BIND time only — a non-owning instance must never unlink a live
+  socket); the hello/ack + frame loop is
+  `core::mcp::serve_bridge_connection`, shared with the bridge's tests so
+  CI exercises the exact serving code the app runs. `HIVE_DATA_DIR`
+  relocates socket + store together for tests/nonstandard homes; since
+  PLAN-v2.1 PR 4.1 the app honors the same override as its test seam
+  (beside `HIVE_MASTER_KEY_FILE`, the 64-hex master file honored before
+  the keychain, and the `HIVE_TEST_NOW` frozen clock in `store::now_iso`)
+  — core still never reads it, the data dir is always passed down
+  explicitly; `HIVE_MEMORY_KEY_HEX` died with interim mode.
 - `importer/`: the `hive-import` binary (PR 1.7) — one-shot migration of a
   hosted-era Postgres into a fresh data dir (refuses a non-empty one).
   Records ride the `#[doc(hidden)]` `Store::import_batch` seam
@@ -86,13 +194,16 @@ then update the stale doc in the same change. `README.md` and parts of
   `fold::FOLD_VERSION` — the index drops derived tables and rebuilds by
   replaying the op log at next open.
 - ONE hive process per data dir: `Store::new` takes an exclusive advisory
-  flock on `<data_dir>/lock` and holds it until shutdown/exit, so the app
-  and an interim-mode bridge can never co-write the log/index. The refusal
-  message contains "another hive process" (tests and the plugin's soft-fail
-  matching depend on that text). flock, not fcntl, deliberately: a second
-  open in the same process must conflict too. `Store::shutdown` releasing
-  the lock is what lets reopen-style tests (and users switching between app
-  and bridge) proceed.
+  flock on `<data_dir>/lock` and holds it until shutdown/exit, so two
+  store-opening processes (two apps, app + importer) can never co-write
+  the log/index. The refusal message contains "another hive process"
+  (core's cutover test matches that text). flock, not fcntl, deliberately:
+  a second open in the same process must conflict too. `Store::shutdown`
+  releasing the lock is what lets reopen-style tests proceed. The bridge
+  stopped competing for this lock in PR 2.4 (proxy mode) — the flock is
+  also what makes the app's unlink-then-bind of a leftover
+  `bridge.sock` safe: if the app holds the lock, no other hive process
+  can be serving that socket.
 - The bridge's stdout is the MCP protocol channel — frames only, one JSON
   message per line. Every diagnostic goes to stderr. Never add a print to
   stdout in `bridge/` (and keep HTTP stacks out of it: no reqwest/hyper/
@@ -106,6 +217,48 @@ then update the stale doc in the same change. `README.md` and parts of
   cross-backend parity oracle. Regenerate only consciously
   (`HIVE_GOLDEN_REGEN=1`) and diff; PR 1.6 may relax the score tolerance but
   must keep the label-set and top-3 order assertions.
+- The smoke tier (real binaries, real sockets, multi-component scenarios —
+  docs/TESTING-STRATEGY.md §4) lives in `smoke/` plus each binary crate's own
+  `tests/`, and every one of its tests opens with `require_smoke!()`: without
+  `HIVE_SMOKE=1` it skips loudly and passes, so `cargo test --workspace` stays
+  green offline. `smoke-support/` holds its seams — `test_domain()`,
+  `test_identity()`, and `test_node()` (PR 4.7: spawns the REAL `hive-node`
+  from `HIVE_NODE_BIN`, pre-creates its domains, parses its contract lines, and
+  drives `enroll`/`device` beside it; `test_pair()` arrives with the push loop
+  at 4.8) — and carries the same clause
+  `test_store()` does: no test constructs a domain, device identity, node, or
+  device pair any other way. That crate deliberately does NOT depend on
+  hive-node or hive-sync: it drives the node as a process, which keeps the
+  dependency arrow one-way and lets hive-node's own tests dev-depend on it.
+  Harness rules: bind
+  `127.0.0.1:0` and parse the port from the
+  child's own output (never a fixed port), wait only through `wait_until` (no
+  bare sleeps), stay under 60s per test, tee child stdout/stderr into the test
+  log, and kill spawned children on drop. Binaries come from
+  `HIVE_APP_BIN`/`HIVE_BRIDGE_BIN`/`HIVE_NODE_BIN` via `require_bin!` —
+  `CARGO_BIN_EXE_*` exists only inside the crate that owns the binary and a
+  two-binary scenario needs both — and an unset path env is another loud skip.
+  Single-binary smoke stays in the crate that owns it: `node/tests/boot.rs`
+  spawns the real `hive-node` through `CARGO_BIN_EXE_hive-node` and pins its
+  stdout contract (`node key <hex>`, `domain <t>/<d>`, `listening on <addr>`,
+  and from `enroll`: `enrollment code <code>`, `expires <unix>`).
+  ADVERSARIAL-SMOKE (docs/TESTING-STRATEGY.md §2, §4.4) starts at
+  `smoke/tests/enrollment.rs`: every transport-auth claim PR 4.7 makes is a
+  scenario against the real binary with an in-proc device, and each asserts the
+  operator's audit trail, not just the wire outcome.
+  Run the tier with `./scripts/smoke.sh` (it builds the binaries, exports the
+  paths, and is what the CI `smoke` job runs).
+- Two GREP-FENCEs guard architecture rules the compiler cannot
+  (`node/tests/fences.rs`, PLAN-v2.1 PR 4.6). Identity: sessions, cookies,
+  JWTs and OIDC — `openidconnect`, `jsonwebtoken`, `use oauth2`, `oauth2::`,
+  `tower-sessions`, `axum-extra` — appear in no crate but `node/`, in sources
+  OR manifests, and a cargo-metadata walk proves none is reachable in any
+  other workspace crate's dependency tree. Tenancy: the identifiers
+  `tenant_id`, `Tenant`, `tenants/` appear nowhere under `core/` — the data
+  plane is tenancy-blind (D33). Both fence identifiers and dependency names,
+  never English words: the `"oauth_token"` credential kind in
+  `store/cc_credentials.rs` and a comment saying "tenancy-blind" are legal
+  and must stay that way.
 - Use `HIVE_EMBED=hash` for CI, local smoke tests, and offline checks.
 
 ## Branching
@@ -227,8 +380,9 @@ Prioritize these when reviewing before real use:
 
 - Do not commit `target/`, `node_modules/`, package `dist/`, `.tsbuildinfo`, or
   generated database/model-cache files.
-- `.claude/worktrees/` and `/node/` are historical/local state. Do not treat
-  them as source.
+- `.claude/worktrees/` is local state. Do not treat it as source. (`/node/`
+  used to be listed here too — the pre-teardown Node layout. It is the
+  hive-node crate now, and its `.gitignore` rule went with the rename.)
 - Do not add secrets, real tokens, credentials, or personal data.
 - Use reserved fictional values in tests and docs.
 

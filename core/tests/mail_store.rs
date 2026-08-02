@@ -1512,3 +1512,104 @@ async fn driver_force_resync_resets_cursor_and_rearms() {
         "force-resync re-arms the account so the next tick runs it"
     );
 }
+
+/// DOCUMENTING PIN (PLAN-v2.1 PR 4.1; TESTING-STRATEGY §7.8), #[ignore]d
+/// because it asserts the DESIRED behavior and today's code FAILS it: mail
+/// FTS does not rebuild from replay. Mail search rows are command-layer
+/// direct writes (see the module header of core/src/store/mail.rs), so after
+/// a rebuild-by-replay — index deleted, same op-log records — the
+/// mail_messages rows return but keyword search over mail comes back EMPTY.
+/// Replication (PR 4.10) folds exactly such records on every replica, which
+/// makes the hole user-visible there; 4.10's post-fold FTS re-stamp closes
+/// it and UN-IGNORES this test. See it fail on purpose:
+///   cargo test -p hive-core --test mail_store -- --ignored mail_fts
+#[tokio::test]
+#[ignore = "pins a known hole: mail FTS does not rebuild from replay — PR 4.10's post-fold re-stamp un-ignores this"]
+async fn mail_fts_rebuilds_from_replay() {
+    use hive_core::keys::MemoryKeySource;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        Store::new(
+            dir.path(),
+            Arc::new(MemoryKeySource([7u8; 32])),
+            Arc::new(hive_embed::HashEmbedder),
+        )
+        .expect("open store")
+    };
+    let store = open();
+
+    // Everything rides the REAL record paths (account create, mailbox sync,
+    // ingest toggle, message ingest) so the whole chain replays — mail FTS
+    // membership is the one piece that cannot, being a command-layer direct
+    // write. (The vaulted credential is runtime state and legitimately dies
+    // with the index; nothing here depends on it.)
+    let acct = store
+        .mail_account_create(
+            "nate",
+            "nate@example.test",
+            "https://jmap.example.test",
+            None,
+            "acc-jmap-1",
+            "fictional-password",
+        )
+        .await
+        .unwrap();
+    store
+        .mail_sync_mailboxes(
+            &acct.id,
+            &[(
+                "inbox".to_string(),
+                "Inbox".to_string(),
+                Some("inbox".to_string()),
+                0,
+            )],
+        )
+        .await
+        .unwrap();
+    let mbox_id = store.mail_mailboxes_list(&acct.id).await.unwrap()[0]
+        .id
+        .clone();
+    assert!(store.mail_mailbox_set_ingest(&mbox_id, true).await.unwrap());
+    let (ingest, inbox) = store.mail_mailbox_sets(&acct.id).await.unwrap();
+    store
+        .mail_ingest_batch(
+            &acct.id,
+            "nate",
+            &ingest,
+            &inbox,
+            vec![ingest_msg("j-replay-1", "inbox", &[])],
+        )
+        .await
+        .unwrap();
+
+    // Live store: the message row exists AND is keyword-searchable.
+    let msg_rows = "SELECT COUNT(*) FROM mail_messages WHERE jmap_id = 'j-replay-1'";
+    let fts_rows =
+        "SELECT COUNT(*) FROM search WHERE kind = 'mail' AND title = 'subject j-replay-1'";
+    assert_eq!(count(&store, msg_rows, vec![]).await, 1);
+    assert_eq!(count(&store, fts_rows, vec![]).await, 1);
+    store.shutdown().await.unwrap();
+
+    // Rebuild by replay: drop the derived index; the op log is the only
+    // source at reopen (the cutover.rs idiom).
+    std::fs::remove_file(dir.path().join("index.db")).unwrap();
+    let _ = std::fs::remove_file(dir.path().join("index.db-wal"));
+    let _ = std::fs::remove_file(dir.path().join("index.db-shm"));
+    let store = open();
+
+    // The message row replays (module.doc) — this half already holds…
+    assert_eq!(
+        count(&store, msg_rows, vec![]).await,
+        1,
+        "mail rows must rebuild from replay (holds today)"
+    );
+    // …and THIS is the hole: replayed mail must become searchable again.
+    assert_eq!(
+        count(&store, fts_rows, vec![]).await,
+        1,
+        "mail FTS must rebuild from replay — PR 4.10's post-fold re-stamp closes this"
+    );
+    store.shutdown().await.unwrap();
+}

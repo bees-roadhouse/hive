@@ -1,0 +1,60 @@
+[package]
+name = "hive-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The engine, for the artifacts a vault holds and the keys it is known by:
+# `oplog::keyless` (segment naming, keyless header parse and frame walk — a
+# blind vault verifies structure holding no master), `blockstore` (bare-id
+# ciphertext blocks), and `identity` (the node's OWN transport keypair, the
+# one key a blind node has).
+hive-core = { path = "../core" }
+# The protocol. `SegmentVault` implements hive-sync's `SyncSink` and composes
+# its `DirVault`: same store shape, same refusals, plus the bookkeeping and
+# the integrity ALARMS a server owes its operator (PLAN-v2.1 PR 4.6).
+hive-sync = { path = "../sync" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+# node.toml + tenants/<t>/tenant.toml.
+toml = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+# Lowercase-hex block ids and key fingerprints in log lines and node-meta
+# rows, so an id in the journal greps against the disk.
+data-encoding = { workspace = true }
+# The OS RNG behind a one-time enrollment code (PLAN-v2.1 PR 4.7). The ONE
+# place this crate samples anything: everything downstream of a code is
+# derivation and comparison, and `hive_sync::enroll` stays RNG-free so the
+# encoding can be unit-tested against fixed entropy.
+rand = { workspace = true }
+
+# node-meta.db. Deliberately PLAIN SQLite on a SQLCipher build: an unkeyed
+# connection writes an ordinary database, and node-meta holds no plaintext of
+# the domain's — only lengths, hashes, sizes, pinned public keys, epochs and
+# queues. Encrypting it would imply the node holds a key it must not have.
+rusqlite = { workspace = true }
+
+# The DNS publisher's Cloudflare provider (D35/delta 13). Same client the
+# rest of the tree uses; rustls-tls, no system OpenSSL.
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# The write-once kill-tests mint REAL segment bytes with the frozen writer
+# (`hive_core::oplog::LogWriter`), whose records carry CBOR payloads — a
+# hand-rolled header would test this repo's idea of the format instead of the
+# format itself.
+ciborium = { workspace = true }
+# The boot smoke spawns the REAL binary (`CARGO_BIN_EXE_hive-node`, which only
+# exists inside this crate) — smoke tier, so it opens with `require_smoke!()`.
+hive-smoke-support = { path = "../smoke-support" }
