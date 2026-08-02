@@ -197,12 +197,33 @@ fn main() {
 /// test seam every app-level test needs (PLAN-v2.1 PR 4.1; same override the
 /// bridge and importer already honor). Core still never reads it: the dir is
 /// resolved here and passed down explicitly.
+///
+/// DEBUG BUILDS ONLY. The override is a test seam, and a test seam in a
+/// shipped binary is an attack surface: paired with `HIVE_MASTER_KEY_FILE` it
+/// lets anything that can set this process's environment — a rewritten
+/// `.desktop` file, a user unit, `flatpak override --env=` — point the app at
+/// a store the setter chose under a key the setter holds, with no keychain
+/// prompt and nothing in the log. `scripts/smoke.sh` builds debug binaries, so
+/// the tier keeps its seam and the release flatpak does not carry it.
 fn data_dir() -> PathBuf {
     resolve_data_dir(
-        std::env::var_os("HIVE_DATA_DIR"),
+        env_seam("HIVE_DATA_DIR"),
         std::env::var_os("XDG_DATA_HOME"),
         std::env::var_os("HOME"),
     )
+}
+
+/// Read an environment override that exists for TESTS, not for operators.
+///
+/// One function so "which env vars does a release build trust?" has one
+/// greppable answer, and so adding a seam cannot accidentally add it to the
+/// shipped binary too.
+fn env_seam(name: &str) -> Option<std::ffi::OsString> {
+    if cfg!(debug_assertions) {
+        std::env::var_os(name)
+    } else {
+        None
+    }
 }
 
 /// Pure half of `data_dir()` — env values in, path out — so the resolution
@@ -234,8 +255,16 @@ fn resolve_data_dir(
 /// only opens under its exact key — so a set-but-unreadable file is a hard
 /// error, never a silent keychain fallback (falling through would mint a
 /// fresh key and refuse the fixture's store).
+///
+/// DEBUG BUILDS ONLY, via [`env_seam`]. In a release build the OS keychain is
+/// the only answer, which is what the threat model has always claimed and what
+/// the flatpak's `--talk-name=org.freedesktop.secrets` hole is for. Leaving
+/// the seam in the shipped binary meant one environment variable could
+/// substitute the master key of a running install without a prompt or a log
+/// line — a strictly larger hatch than the bridge's `HIVE_MEMORY_KEY_HEX`,
+/// which this same milestone deliberately removed.
 fn resolve_master_key() -> anyhow::Result<[u8; 32]> {
-    if let Some(path) = std::env::var_os("HIVE_MASTER_KEY_FILE").filter(|v| !v.is_empty()) {
+    if let Some(path) = env_seam("HIVE_MASTER_KEY_FILE").filter(|v| !v.is_empty()) {
         return hive_core::keys::read_master_key_file(std::path::Path::new(&path));
     }
     KeychainKeySource::new()

@@ -62,7 +62,7 @@ pub const MAX_NAME_LEN: usize = 64;
 /// Whether `name` may become a tenant or domain directory. Deliberately
 /// narrower than a filesystem allows: letters, digits, dot, dash, underscore,
 /// no leading dot, and never `.` or `..`. A domain name like
-/// `bierlysmith.com` passes; anything that could climb out of the root does
+/// `example.com` passes; anything that could climb out of the root does
 /// not.
 pub fn name_ok(name: &str) -> bool {
     !name.is_empty()
@@ -336,18 +336,51 @@ impl VaultInner {
         let bytes =
             std::fs::read(&path).with_context(|| format!("reading back {}", path.display()))?;
         let len = bytes.len() as u64;
-        let hash = *blake3::hash(&bytes).as_bytes();
+        // What this node ATTESTS is the whole-frame prefix, never the raw file.
+        // A chunk boundary lands inside a frame all the time, and those
+        // trailing bytes are not yet anything the sender can be held to — the
+        // sender describes the same prefix (`oplog::list_segments`) and
+        // `DirVault::landed` cuts to the same place. One meaning for the
+        // attestation across all three is what lets `landed` below treat ANY
+        // shortfall as divergence instead of having to guess whether a drop
+        // was an honest trim.
+        let attested = match hive_core::oplog::walk_segment(&bytes) {
+            Ok(walk) => &bytes[..walk.whole_end as usize],
+            // An unparseable header is corruption, not a torn tail: describe
+            // what is there and let the comparison below judge it.
+            Err(_) => &bytes[..],
+        };
+        let attested_len = attested.len() as u64;
+        let hash = *blake3::hash(attested).as_bytes();
 
         if let Some(row) = self.meta.segment(device, start_seq)? {
-            if len >= row.len
-                && *blake3::hash(&bytes[..row.len as usize]).as_bytes() != row.file_hash
-            {
+            // Two ways the file can fail to reproduce what we attested, and
+            // BOTH are divergence:
+            //
+            //   * it still covers `row.len` bytes but they hash differently —
+            //     the bytes were substituted;
+            //   * it no longer reaches `row.len` at all — the attested bytes
+            //     are simply gone.
+            //
+            // The short file is the case the length guard used to skip, which
+            // meant a truncated segment fell through to `record_segment` and
+            // was silently re-attested at its new, shorter content: the node
+            // would forget it had ever vouched for the missing bytes. A guard
+            // that only keeps the slice below in bounds must not double as the
+            // decision about whether to check at all.
+            let diverged = if attested_len < row.len {
+                true
+            } else {
+                *blake3::hash(&attested[..row.len as usize]).as_bytes() != row.file_hash
+            };
+            if diverged {
                 self.meta.raise_alarm(
                     AlarmKind::SegmentDivergence,
                     Some(device),
                     Some(start_seq),
                     &format!(
-                        "{}/{}/{start_seq} no longer reproduces the {} bytes this node attested",
+                        "{}/{}/{start_seq} no longer reproduces the {} bytes this node attested \
+                         (now {len} bytes)",
                         self.tenant, self.domain, row.len
                     ),
                 )?;
@@ -369,10 +402,12 @@ impl VaultInner {
 
         let sealed = self.is_sealed(device, start_seq)?;
         self.meta
-            .record_segment(device, start_seq, len, &hash, sealed)?;
+            .record_segment(device, start_seq, attested_len, &hash, sealed)?;
         // A new tail seals everything below it — the only event that ever
         // seals anything.
         self.meta.seal_below(device, start_seq)?;
+        // The RAW length is what the write path resumes from; only the
+        // attestation is trimmed to whole frames.
         Ok(len)
     }
 }
@@ -382,16 +417,61 @@ impl SyncSink for SegmentVault {
     async fn landed(&self, device: &str, start_seq: u64) -> Result<Option<LandedSegment>> {
         let landed = self.inner.files.landed(device, start_seq).await?;
         if let Some(landed) = &landed {
-            // `DirVault::landed` cuts a torn partial frame; the memory has to
-            // follow the file, not the other way round.
             let inner = self.inner.clone();
-            let device = device.to_string();
+            let device_owned = device.to_string();
             let (len, hash) = (landed.len, landed.file_hash);
-            tokio::task::spawn_blocking(move || {
-                let sealed = inner.is_sealed(&device, start_seq)?;
-                inner
-                    .meta
-                    .record_segment(&device, start_seq, len, &hash, sealed)
+            let (tenant, domain) = (self.tenant().to_string(), self.domain().to_string());
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                let device = device_owned;
+                // This runs BEFORE the transfer, on whatever is on disk right
+                // now. It must therefore never overwrite the attestation it is
+                // about to be checked against: doing so let a tampered file
+                // re-describe itself, and `after_write` then compared the new
+                // bytes against a hash derived from those same new bytes and
+                // matched trivially. The divergence alarm could not fire.
+                //
+                // Both sides now describe the whole-frame prefix, so a row that
+                // exists is directly comparable:
+                match inner.meta.segment(&device, start_seq)? {
+                    // Nothing vouched for yet — this is the first sighting.
+                    None => {
+                        let sealed = inner.is_sealed(&device, start_seq)?;
+                        inner
+                            .meta
+                            .record_segment(&device, start_seq, len, &hash, sealed)?;
+                    }
+                    // Exactly what we vouched for. Nothing to write.
+                    Some(row) if row.len == len && row.file_hash == hash => {}
+                    // The attested bytes are gone or were replaced in place.
+                    // Neither is something an honest peer can do to a file this
+                    // node already holds.
+                    Some(row) if len <= row.len => {
+                        inner.meta.raise_alarm(
+                            AlarmKind::SegmentDivergence,
+                            Some(&device),
+                            Some(start_seq),
+                            &format!(
+                                "{tenant}/{domain}/{start_seq} was attested at {} bytes but the \
+                                 file on disk now offers {len} — the bytes this node vouched for \
+                                 are not there",
+                                row.len
+                            ),
+                        )?;
+                        bail!(
+                            "refusing to resume segment {device}/{start_seq}: it no longer \
+                             reproduces the {} bytes this node attested (integrity alarm raised)",
+                            row.len
+                        );
+                    }
+                    // Longer than we attested. That is what honest growth looks
+                    // like, but the prefix cannot be checked without the bytes,
+                    // and re-reading them here would double the cost of every
+                    // session. So leave the attestation ALONE: `after_write`
+                    // holds the bytes and does the verified update on the write
+                    // path, which is the only path that should move it.
+                    Some(_) => {}
+                }
+                Ok(())
             })
             .await
             .context("vault landed-bookkeeping task")??;
@@ -510,7 +590,7 @@ mod tests {
     #[test]
     fn path_components_are_checked_where_they_are_made() {
         assert!(name_ok("household"));
-        assert!(name_ok("bierlysmith.com"));
+        assert!(name_ok("example.com"));
         assert!(name_ok("nate_1-2"));
         assert!(!name_ok(""));
         assert!(!name_ok("."));
@@ -534,19 +614,19 @@ mod tests {
     #[test]
     fn the_layout_is_the_one_restore_expects() {
         let root = tempfile::tempdir().unwrap();
-        let vault = SegmentVault::open(root.path(), "household", "bierlysmith.com").unwrap();
+        let vault = SegmentVault::open(root.path(), "household", "example.com").unwrap();
         assert_eq!(
             vault.dir(),
             root.path()
                 .join("tenants")
                 .join("household")
                 .join("domains")
-                .join("bierlysmith.com")
+                .join("example.com")
         );
         assert!(vault.dir().join("blocks").is_dir(), "store shape");
         assert!(vault.dir().join("node-meta.db").is_file());
         assert_eq!(vault.tenant(), "household");
-        assert_eq!(vault.domain(), "bierlysmith.com");
+        assert_eq!(vault.domain(), "example.com");
     }
 
     #[test]

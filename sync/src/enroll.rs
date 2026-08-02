@@ -34,6 +34,7 @@ use crate::frame::{
     read_frame_capped, write_frame, EnrollGrant, EnrollRequest, Frame, MAX_OPENING_FRAME,
     PROTO_VERSION,
 };
+use crate::tls::SpkiPin;
 
 /// Bytes of entropy behind one code. 13 bytes is 104 bits, which encodes to 21
 /// base32 characters with no padding — short enough to read aloud, far past
@@ -106,16 +107,31 @@ pub fn format_code(code: &str) -> String {
 }
 
 /// Redeem a code over an already-established (mTLS) stream: send the request,
-/// read the node's verdict.
+/// read the node's verdict, and CHECK THE VERDICT AGAINST THE PEER THAT SENT IT.
 ///
 /// The caller MUST have dialed with the same device key it names in `request`
 /// — the node checks the two against each other, because a relay that could
 /// redeem with keys it does not hold would be exactly the substitution D30's
 /// SAS exists to prevent.
+///
+/// `peer` is the pin the enrollment handshake actually terminated on, and the
+/// grant is refused unless it names that same key. This is the OTHER HALF of
+/// that channel binding, and it is what the enrollment dial's
+/// [`crate::tls::UnpinnedEnrollment`] exception is paid for: the dial accepts
+/// any server key precisely because the device has not been told the node's
+/// key yet, so the grant is the first and only moment the device can learn it
+/// — and a grant naming some third key means the connection was terminated by
+/// something that is not the node that minted the code. Without this check a
+/// machine-in-the-middle on a spoofed SRV answer reads the code off the wire,
+/// redeems it upstream under ITS own device key (satisfying the node's half of
+/// the binding, since it genuinely holds that key), and hands back a grant
+/// naming ITSELF — which the device would then pin forever, shipping every
+/// segment to the attacker while the real node never sees a backup.
 pub async fn redeem<R, W>(
     reader: &mut R,
     writer: &mut W,
     request: EnrollRequest,
+    peer: &SpkiPin,
 ) -> Result<EnrollGrant>
 where
     R: AsyncRead + Unpin,
@@ -128,7 +144,17 @@ where
         .await
         .context("waiting for the node's enrollment verdict")?
     {
-        Frame::Enrolled(grant) => Ok(grant),
+        Frame::Enrolled(grant) => {
+            let granted = SpkiPin::from_ed25519_public(&grant.node_ed25519_pk);
+            if granted != *peer {
+                bail!(
+                    "refusing an enrollment grant for node key {granted}: the connection was \
+                     terminated by {peer}, so whatever answered is not the node that minted \
+                     this code"
+                );
+            }
+            Ok(grant)
+        }
         Frame::Error(e) => bail!("the node refused enrollment: {} ({})", e.message, e.code),
         other => bail!(
             "the node answered an enrollment with a {} frame",
@@ -155,6 +181,68 @@ pub fn request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Answer one enrollment with a grant naming `granted_node_pk`, then hand
+    /// back what [`redeem`] made of it while pinning `peer`.
+    ///
+    /// The two keys being separate arguments is the whole point: an honest node
+    /// passes the same key twice, and a machine-in-the-middle is exactly the
+    /// case where they differ.
+    async fn grant_naming(
+        granted_node_pk: [u8; 32],
+        peer: &SpkiPin,
+    ) -> Result<crate::frame::EnrollGrant> {
+        let (mut node_end, device_end) = tokio::io::duplex(64 * 1024);
+        let (mut reader, mut writer) = tokio::io::split(device_end);
+        let answering = tokio::spawn(async move {
+            // Read the request the device sends, then answer it.
+            let _ = read_frame_capped(&mut node_end, MAX_OPENING_FRAME).await;
+            write_frame(
+                &mut node_end,
+                &Frame::Enrolled(crate::frame::EnrollGrant {
+                    domain: "household/example.com".to_string(),
+                    node_ed25519_pk: granted_node_pk,
+                    epoch: 1,
+                }),
+            )
+            .await
+        });
+        let request = EnrollRequest {
+            proto: PROTO_VERSION,
+            code: "K4RT9X2MABCDE".to_string(),
+            device: "dev-laptop".to_string(),
+            ed25519_pk: [9u8; 32],
+            x25519_pk: [10u8; 32],
+        };
+        let out = redeem(&mut reader, &mut writer, request, peer).await;
+        let _ = answering.await;
+        out
+    }
+
+    #[tokio::test]
+    async fn a_grant_naming_a_key_that_did_not_answer_is_refused() {
+        // The node that actually terminated the connection.
+        let real = [1u8; 32];
+        // What a machine-in-the-middle would hand back: itself.
+        let impostor = [2u8; 32];
+
+        let honest = grant_naming(real, &SpkiPin::from_ed25519_public(&real))
+            .await
+            .expect("a grant naming the key that answered is the whole happy path");
+        assert_eq!(honest.node_ed25519_pk, real);
+
+        let err = grant_naming(impostor, &SpkiPin::from_ed25519_public(&real))
+            .await
+            .expect_err(
+                "a grant naming a key other than the one that terminated the connection is the \
+                 substitution the ceremony exists to refuse",
+            );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not the node that minted"),
+            "the refusal must say what happened, got: {msg}"
+        );
+    }
 
     #[test]
     fn a_typed_code_normalizes_to_what_the_node_hashed() {

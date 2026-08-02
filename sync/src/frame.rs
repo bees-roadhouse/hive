@@ -80,6 +80,22 @@ pub const MAX_BLOCK_BYTES: u64 = 4 * 1024 * 1024;
 /// comfortably inside the control-frame cap; longer lists are batched.
 pub const MAX_BLOCK_IDS_PER_FRAME: usize = 4096;
 
+/// Block ids one peer may offer across a WHOLE session, however many frames it
+/// batches them into.
+///
+/// The per-frame cap bounds one allocation; it does not bound a peer that
+/// simply never stops sending frames. Without a total, an authenticated device
+/// could stream `HaveBlocks` indefinitely and the receiver would accumulate all
+/// of it before `Done` ever arrived — about 128 KiB of resident memory per
+/// frame, which is an OOM on a node serving every other domain from the same
+/// process. The heads half already refuses a second frame; this is the same
+/// idea for the half that is legitimately repeated.
+///
+/// 1M ids is 32 MiB of raw ids and describes a store far past personal scale
+/// (the whole blockstore is content-addressed 1 MiB chunks), so a peer that
+/// trips this is malfunctioning or hostile, not large.
+pub const MAX_OFFERED_BLOCK_IDS: usize = 1_000_000;
+
 /// Which half of a session a peer is speaking. Stage A is one-way backup
 /// (D29): the device pushes, the node receives, and neither ingests the
 /// other's records. Roles are declared in the hello and must be complementary

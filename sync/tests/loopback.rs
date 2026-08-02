@@ -32,7 +32,7 @@ use hive_sync::{push_session, receive_session, DirVault, SessionConfig};
 use serde_json::json;
 use tokio::io::AsyncWrite;
 
-const DOMAIN: &str = "bierlysmith.com";
+const DOMAIN: &str = "example.com";
 
 /// Enough log that a transfer spans several chunks, and enough shape that a
 /// broken restore cannot pass by accident (prose the FTS indexes, emerged

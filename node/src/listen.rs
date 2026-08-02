@@ -29,6 +29,17 @@
 //     get past. With no code outstanding, an unpinned key cannot complete a
 //     handshake at all.
 //
+//     That door is NODE-WIDE, not per-domain, and it cannot be otherwise: the
+//     handshake happens before any frame, so there is no code yet and nothing
+//     to scope the exception to. What a stranger gets from it is one opening
+//     frame under `MAX_OPENING_FRAME`, inside the handshake deadline, against
+//     the connection cap — it reaches no domain's data, because a `hello` needs
+//     a pin and an `enroll` routes by a code it does not have. What bounds it
+//     instead is WHO MAY OPEN IT: `enroll::mint` refuses a domain that already
+//     has an enrolled device, so the window only ever opens for a domain still
+//     waiting for its first one, and a fully-enrolled node cannot be put behind
+//     an open door at all.
+//
 // A rustls `ServerConfig` is therefore built per connection rather than once
 // per listener. That is a few hundred microseconds against a TLS handshake and
 // a SQLite read, and it is what buys "revoke takes effect now" — a listener
@@ -74,6 +85,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
+use hive_core::oplog::device_id_ok;
 use hive_sync::frame::{
     err_code, read_frame_capped, write_frame, Frame, Hello, ProtoError, MAX_OPENING_FRAME,
 };
@@ -84,7 +96,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::enroll;
-use crate::meta::{AuthEventKind, DevicePin};
+use crate::meta::{unix_seconds, AuthEventKind, DevicePin};
 use crate::server::{Bound, Node};
 use crate::vault::SegmentVault;
 
@@ -190,7 +202,9 @@ impl Node {
     /// The gate for one connection: every unrevoked pin this node holds, plus
     /// whether any domain has a live enrollment code.
     pub fn gate(&self, now: SystemTime) -> Result<NodeGate> {
-        let now = unix_seconds(now);
+        // A clock this node cannot read is a refusal, not a zero: see
+        // `meta::unix_seconds`.
+        let now = unix_seconds(now)?;
         let mut pins = Vec::new();
         let mut enrolling = false;
         for vault in self.vaults() {
@@ -212,9 +226,24 @@ impl Node {
     /// A revoked pin resolves to nothing: the session path treats it as
     /// unknown, which is the same refusal an unpinned key gets.
     pub fn vault_for_pin(&self, pin: &SpkiPin) -> Result<Option<(SegmentVault, DevicePin)>> {
+        Ok(self
+            .vault_for_known_pin(pin)?
+            .filter(|(_, row)| !row.revoked))
+    }
+
+    /// The domain a pin is ON FILE in, revoked or not.
+    ///
+    /// [`vault_for_pin`](Self::vault_for_pin) deliberately resolves a revoked
+    /// pin to nothing, which is the right answer for authorization and the
+    /// wrong one for the audit trail: a revoked device trying to come back is
+    /// the single most interesting thing an operator can read after a theft,
+    /// and routing it to "no domain" meant it was logged nowhere at all. The
+    /// tombstone still says which domain it belongs to, so the refusal can be
+    /// written where the person who revoked it will look.
+    pub fn vault_for_known_pin(&self, pin: &SpkiPin) -> Result<Option<(SegmentVault, DevicePin)>> {
         for vault in self.vaults() {
             for row in vault.meta().device_pins()? {
-                if !row.revoked && SpkiPin::from_ed25519_public(&row.ed25519_pk) == *pin {
+                if SpkiPin::from_ed25519_public(&row.ed25519_pk) == *pin {
                     return Ok(Some((vault.clone(), row)));
                 }
             }
@@ -430,7 +459,14 @@ where
     let node_pk = node.identity().ed25519_public();
     let grant = meta_op(node, move |node| {
         let now = SystemTime::now();
-        match node.vault_for_code(&request.code)? {
+        // A code that does not even normalize is an auth failure like any
+        // other, not a reason to abandon the connection. Propagating that error
+        // dropped the peer with NO audit row and NO wire answer, so a stranger
+        // could probe an open window with empty or oversized codes and leave
+        // the operator's trail completely silent, while every well-formed bad
+        // code was dutifully recorded.
+        let routed = node.vault_for_code(&request.code).unwrap_or_default();
+        match routed {
             Some(vault) => match enroll::redeem(&vault, node_pk, &request, pin, now) {
                 // `redeem` has already written the specific reason to the
                 // vault's audit trail.
@@ -465,10 +501,22 @@ where
 ///
 /// Blocking; called only from inside a [`meta_op`] hop.
 fn audit_unrouted_code(node: &Node, device: &str, pin: SpkiPin, now: SystemTime) -> Result<()> {
+    // This is the ONE audit path that runs before any policy has looked at the
+    // request, so the device id here is still whatever the peer sent — up to
+    // MAX_OPENING_FRAME of it. Writing that verbatim let a stranger who holds
+    // no valid code push multi-kilobyte rows at the accept rate until
+    // AUTH_AUDIT_KEEP evicted the real evidence, from every domain with an open
+    // window, including domains it was never routed to. Naming it only when it
+    // is a name keeps the row bounded and the trail readable.
+    let device = if device_id_ok(device) {
+        device
+    } else {
+        "<malformed device id>"
+    };
     let why = format!(
         "an enrollment for device {device:?} presented a code no domain on this node minted"
     );
-    let now = unix_seconds(now);
+    let now = unix_seconds(now)?;
     let mut recorded = false;
     for vault in node.vaults() {
         if vault.meta().live_codes(now)? == 0 {
@@ -514,7 +562,37 @@ where
             "a session opened from an unpinned or revoked device key (it claimed {:?})",
             hello.peer
         );
-        tracing::warn!(%pin, "{why}");
+        // A REVOKED key still names the domain that revoked it, and that is the
+        // trail its operator reads after a theft. Logging this to tracing only
+        // meant a stolen device probing its way back left no record where
+        // anyone would look for one.
+        let recorded = {
+            meta_op(node, move |node| {
+                let Some((vault, row)) = node.vault_for_known_pin(&pin)? else {
+                    return Ok(false);
+                };
+                vault.meta().record_auth_event(
+                    AuthEventKind::SessionRefused,
+                    Some(&row.device),
+                    Some(&pin.to_string()),
+                    &format!(
+                        "device {:?} was revoked from {}/{} and tried to open a session anyway",
+                        row.device,
+                        vault.tenant(),
+                        vault.domain()
+                    ),
+                )?;
+                Ok(true)
+            })
+            .await
+        };
+        match recorded {
+            Ok(true) => {}
+            // Genuinely unknown to every domain: there is no trail that owns
+            // it, so the journal is the honest place.
+            Ok(false) => tracing::warn!(%pin, "{why}"),
+            Err(e) => tracing::error!(%pin, "could not record a refused session ({why}): {e:#}"),
+        }
         return refuse(&mut writer, err_code::REFUSED, why).await;
     };
 
@@ -542,7 +620,38 @@ where
     // wrong-domain scoping property (docs/TESTING-STRATEGY.md §4.3), and it is
     // a property of the pin rather than of anything the peer said.
     let cfg = SessionConfig::new(vault.domain(), node.node_key_hex());
-    let report = receive_session_with_hello(reader, writer, &vault, &cfg, hello).await?;
+    let outcome = receive_session_with_hello(reader, writer, &vault, &cfg, hello).await;
+    // `session_opened` is written before the hello is validated, because the
+    // pin is what the row is about. That left the cross-domain probe — the one
+    // D29 boundary an operator most wants to see — reading as a healthy session
+    // with no refusal after it, so a repeated campaign looked like normal
+    // traffic. Whatever the session decided is recorded next to the open.
+    let report = match outcome {
+        Ok(report) => report,
+        Err(e) => {
+            let why = format!(
+                "session for device {:?} on {}/{} was refused after opening: {e:#}",
+                row.device,
+                vault.tenant(),
+                vault.domain()
+            );
+            let vault_for_audit = vault.clone();
+            let device = row.device.clone();
+            let recorded = meta_op(node, move |_| {
+                vault_for_audit.meta().record_auth_event(
+                    AuthEventKind::SessionRefused,
+                    Some(&device),
+                    Some(&pin.to_string()),
+                    &why,
+                )
+            })
+            .await;
+            if let Err(audit) = recorded {
+                tracing::error!("could not record a refused session: {audit:#}");
+            }
+            return Err(e);
+        }
+    };
     tracing::info!(
         domain = vault.domain(),
         device = row.device,
@@ -568,14 +677,6 @@ where
     )
     .await;
     anyhow::bail!("refused ({code}): {message}")
-}
-
-/// Seconds since the epoch, saturating at 0 for a clock before 1970 — a node
-/// whose clock is that wrong should refuse every code, and 0 does that.
-fn unix_seconds(at: SystemTime) -> i64 {
-    at.duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -634,7 +735,7 @@ mod tests {
     fn the_gate_follows_node_meta_without_a_restart() {
         let root = tempfile::tempdir().unwrap();
         let mut node = Node::open(root.path()).unwrap();
-        let vault = node.open_vault("household", "bierlysmith.com").unwrap();
+        let vault = node.open_vault("household", "example.com").unwrap();
         let laptop = DeviceIdentity::from_seed(&[1; 32]);
         let pin = SpkiPin::of(&laptop);
 
@@ -661,7 +762,7 @@ mod tests {
     fn a_live_code_opens_the_door_and_expiry_closes_it() {
         let root = tempfile::tempdir().unwrap();
         let mut node = Node::open(root.path()).unwrap();
-        let vault = node.open_vault("household", "bierlysmith.com").unwrap();
+        let vault = node.open_vault("household", "example.com").unwrap();
         let now = SystemTime::now();
         assert!(!node.gate(now).unwrap().is_open_door());
 
@@ -669,7 +770,7 @@ mod tests {
         assert!(node.gate(now).unwrap().is_open_door());
         assert_eq!(
             node.vault_for_code(&minted.code).unwrap().unwrap().domain(),
-            "bierlysmith.com"
+            "example.com"
         );
         assert!(node
             .vault_for_code("AAAAAAAAAAAAAAAAAAAAA")

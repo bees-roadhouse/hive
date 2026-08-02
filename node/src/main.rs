@@ -33,10 +33,11 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
 use hive_node::config::NodeConfig;
+use hive_node::meta::unix_seconds;
 use hive_node::server::Node;
 use hive_node::{enroll, SegmentVault};
 
@@ -111,10 +112,10 @@ struct DomainRef {
 impl DomainRef {
     fn parse(raw: &str) -> Result<DomainRef> {
         let (tenant, domain) = raw.split_once('/').with_context(|| {
-            format!("--domain {raw:?} is not <tenant>/<domain> (e.g. household/bierlysmith.com)")
+            format!("--domain {raw:?} is not <tenant>/<domain> (e.g. household/example.com)")
         })?;
         if tenant.is_empty() || domain.is_empty() || domain.contains('/') {
-            bail!("--domain {raw:?} is not <tenant>/<domain> (e.g. household/bierlysmith.com)");
+            bail!("--domain {raw:?} is not <tenant>/<domain> (e.g. household/example.com)");
         }
         Ok(DomainRef {
             tenant: tenant.to_string(),
@@ -229,7 +230,7 @@ fn mint_code(root: &PathBuf, domain: &DomainRef) -> Result<()> {
     println!("enrollment code {}", minted.display);
     println!("domain {domain}");
     println!("node key {}", node.node_key_hex());
-    println!("expires {}", unix_seconds(minted.expires_at));
+    println!("expires {}", unix_seconds(minted.expires_at)?);
     if fresh {
         // The running listener discovered its vaults at boot (server.rs), so a
         // domain that did not exist a moment ago is one it cannot serve yet.
@@ -274,12 +275,6 @@ fn open_existing(root: &PathBuf, domain: &DomainRef) -> Result<SegmentVault> {
     node.vault(&domain.tenant, &domain.domain)
         .cloned()
         .with_context(|| format!("node root {} holds no domain {domain}", root.display()))
-}
-
-fn unix_seconds(at: SystemTime) -> u64 {
-    at.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Resolves when the supervisor asks us to stop. SIGTERM is what a container
@@ -453,13 +448,13 @@ mod tests {
                 "--root",
                 "/srv/hive",
                 "--domain",
-                "household/bierlysmith.com"
+                "household/example.com"
             ])
             .command,
             Command::Enroll {
                 domain: DomainRef {
                     tenant: "household".to_string(),
-                    domain: "bierlysmith.com".to_string(),
+                    domain: "example.com".to_string(),
                 },
             }
         );
@@ -470,7 +465,7 @@ mod tests {
                 "--root",
                 "/srv/hive",
                 "--domain",
-                "household/bierlysmith.com",
+                "household/example.com",
                 "--device",
                 "dev-laptop"
             ])
@@ -478,7 +473,7 @@ mod tests {
             Command::DeviceRevoke {
                 domain: DomainRef {
                     tenant: "household".to_string(),
-                    domain: "bierlysmith.com".to_string(),
+                    domain: "example.com".to_string(),
                 },
                 device: "dev-laptop".to_string(),
             }
@@ -496,7 +491,7 @@ mod tests {
             "--root",
             "/srv/hive",
             "--domain",
-            "household/bierlysmith.com",
+            "household/example.com",
         ]))
         .unwrap_err();
         assert!(format!("{err:#}").contains("--device"), "{err:#}");
@@ -511,7 +506,7 @@ mod tests {
     #[test]
     fn a_domain_reference_is_exactly_two_parts() {
         assert_eq!(DomainRef::parse("a/b").unwrap().to_string(), "a/b");
-        for bad in ["", "household", "/bierlysmith.com", "household/", "a/b/c"] {
+        for bad in ["", "household", "/example.com", "household/", "a/b/c"] {
             assert!(DomainRef::parse(bad).is_err(), "{bad:?} must be refused");
         }
     }

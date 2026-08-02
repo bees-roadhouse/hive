@@ -323,13 +323,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         {
             let mut node = Node::open(root.path()).unwrap();
-            node.open_vault("household", "bierlysmith.com").unwrap();
+            node.open_vault("household", "example.com").unwrap();
             node.open_vault("household", "maggie").unwrap();
         }
         // The second boot is told nothing: the tree is the declaration.
         let node = Node::open(root.path()).unwrap();
         assert_eq!(node.vaults().len(), 2);
-        assert_eq!(node.vaults()[0].domain(), "bierlysmith.com");
+        assert_eq!(node.vaults()[0].domain(), "example.com");
         assert_eq!(node.vaults()[1].domain(), "maggie");
         assert!(node.vault("household", "maggie").is_some());
         assert!(node.vault("household", "nobody").is_none());
@@ -342,7 +342,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(
             root.path()
-                .join("tenants/household/domains/bierlysmith.com/log/alpha"),
+                .join("tenants/household/domains/example.com/log/alpha"),
         )
         .unwrap();
         let node = Node::open(root.path()).unwrap();
@@ -354,7 +354,7 @@ mod tests {
     fn a_trusted_tenant_refuses_to_boot_as_blind() {
         let root = tempfile::tempdir().unwrap();
         let tenant = root.path().join("tenants/household");
-        std::fs::create_dir_all(tenant.join("domains/bierlysmith.com")).unwrap();
+        std::fs::create_dir_all(tenant.join("domains/example.com")).unwrap();
         std::fs::write(
             tenant.join("tenant.toml"),
             "name = \"Household\"\ntier = \"trusted\"\n",

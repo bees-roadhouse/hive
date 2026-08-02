@@ -34,9 +34,9 @@
 // sentence: a redeemer who could tell "expired" from "wrong" apart could probe
 // the code space, and the distinction belongs in the operator's log.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use hive_core::oplog::device_id_ok;
 use hive_sync::enroll::{code_hash, encode_code, format_code, normalize_code, CODE_BYTES};
 use hive_sync::frame::{EnrollGrant, EnrollRequest, PROTO_VERSION};
@@ -44,7 +44,7 @@ use hive_sync::SpkiPin;
 use rand::rngs::OsRng;
 use rand::RngCore;
 
-use crate::meta::{AuthEventKind, CodeVerdict};
+use crate::meta::{unix_seconds, AuthEventKind, CodeVerdict};
 use crate::vault::SegmentVault;
 
 /// How long a minted code stays redeemable (D30: short-TTL).
@@ -67,6 +67,28 @@ pub struct MintedCode {
 /// The randomness is the OS RNG, which is the one place this crate samples
 /// anything: everything downstream of the code is derivation and comparison.
 pub fn mint(vault: &SegmentVault, now: SystemTime) -> Result<MintedCode> {
+    // FIRST DEVICE ONLY, enforced where the WINDOW opens and not only where a
+    // code is spent.
+    //
+    // A live code anywhere on the node opens the listener's door to unpinned
+    // keys, because at handshake time there is no code yet and so no domain to
+    // scope the exception to — the door is necessarily node-wide. What CAN be
+    // scoped is whether a domain is entitled to open it at all. Minting for a
+    // domain that already has an enrolled device could only ever produce a
+    // redemption `redeem` refuses, so the code buys nothing and costs every
+    // OTHER domain on the node a ten-minute window during which any key on the
+    // internet completes a handshake. Refusing here means the door only ever
+    // opens for a domain genuinely waiting for its first device.
+    if let Some(existing) = vault.meta().device_pins()?.iter().find(|p| !p.revoked) {
+        bail!(
+            "domain {}/{} already has an enrolled device ({:?}); a second device needs the \
+             short-auth-string ceremony (PLAN-v2.1 PR 4.14), so there is nothing a code could \
+             authorize here",
+            vault.tenant(),
+            vault.domain(),
+            existing.device
+        );
+    }
     let mut entropy = [0u8; CODE_BYTES];
     OsRng.fill_bytes(&mut entropy);
     let code = encode_code(&entropy);
@@ -191,7 +213,19 @@ pub fn redeem(
     // a second copy, so the two can never disagree (sync/src/tls.rs pins the
     // equality of the two constructions). The x25519 half is pinned now and
     // used at PR 4.14, where a second device's master-wrap is sealed to it.
-    meta.pin_device(&request.device, &request.ed25519_pk, &request.x25519_pk)?;
+    // The first-device check above is what gives the operator a readable
+    // refusal; THIS is what makes it true. Two codes redeemed at the same
+    // instant both pass that read, so the pin itself re-decides under a write
+    // lock and the loser is refused rather than quietly becoming a second
+    // enrolled device.
+    if !meta.pin_first_device(&request.device, &request.ed25519_pk, &request.x25519_pk)? {
+        return Err(refuse(format!(
+            "domain {}/{} was enrolled by another device while this request was in flight; \
+             a second device needs the short-auth-string ceremony (PLAN-v2.1 PR 4.14)",
+            vault.tenant(),
+            vault.domain()
+        )));
+    }
     let epoch = meta.set_control_epoch(meta.control_epoch()? + 1)?;
     meta.record_auth_event(
         AuthEventKind::Enrolled,
@@ -247,18 +281,11 @@ pub fn revoke(vault: &SegmentVault, device: &str) -> Result<u64> {
     Ok(epoch)
 }
 
-/// Seconds since the epoch, as node-meta stores them.
-fn unix_seconds(at: SystemTime) -> Result<i64> {
-    let secs = at
-        .duration_since(UNIX_EPOCH)
-        .context("a clock before 1970 cannot express an enrollment TTL")?
-        .as_secs();
-    i64::try_from(secs).context("a clock past year 292277026596")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::time::UNIX_EPOCH;
 
     use hive_core::identity::DeviceIdentity;
 
@@ -267,7 +294,7 @@ mod tests {
     fn rig() -> (tempfile::TempDir, SegmentVault, [u8; 32]) {
         let root = tempfile::tempdir().expect("node root");
         let vault =
-            SegmentVault::open(root.path(), "household", "bierlysmith.com").expect("open vault");
+            SegmentVault::open(root.path(), "household", "example.com").expect("open vault");
         let node = DeviceIdentity::from_seed(&[0x4e; 32]);
         (root, vault, node.ed25519_public())
     }
@@ -306,7 +333,7 @@ mod tests {
             now(),
         )
         .expect("the first device enrolls");
-        assert_eq!(grant.domain, "bierlysmith.com");
+        assert_eq!(grant.domain, "example.com");
         assert_eq!(grant.node_ed25519_pk, node_pk, "the key the device pins");
         assert_eq!(grant.epoch, 1, "an enrollment is a control event");
 

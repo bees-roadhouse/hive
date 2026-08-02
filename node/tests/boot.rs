@@ -204,9 +204,7 @@ async fn a_reboot_reopens_the_same_node_and_the_same_domains() {
     let root = tempfile::tempdir().expect("node root");
     // A vault tree that arrived by ordinary means (rsync, a restored
     // snapshot — D36). The node discovers domains; it is not told them.
-    let domain = root
-        .path()
-        .join("tenants/household/domains/bierlysmith.com");
+    let domain = root.path().join("tenants/household/domains/example.com");
     std::fs::create_dir_all(&domain).unwrap();
 
     let first = Booted::spawn(root.path()).await;
@@ -219,7 +217,7 @@ async fn a_reboot_reopens_the_same_node_and_the_same_domains() {
         .into_iter()
         .map(str::to_string)
         .collect();
-    assert_eq!(first_domains, vec!["domain household/bierlysmith.com"]);
+    assert_eq!(first_domains, vec!["domain household/example.com"]);
     assert!(
         domain.join("node-meta.db").is_file(),
         "the vault got its bookkeeping at open"
@@ -257,7 +255,7 @@ async fn a_config_the_node_cannot_honour_fails_the_boot() {
     let root = tempfile::tempdir().expect("node root");
     std::fs::write(
         root.path().join("node.toml"),
-        "[dns]\nprovider = \"rfc2136\"\nzone = \"bierlysmith.com\"\n",
+        "[dns]\nprovider = \"rfc2136\"\nzone = \"example.com\"\n",
     )
     .unwrap();
 

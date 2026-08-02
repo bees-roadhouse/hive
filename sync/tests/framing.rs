@@ -63,7 +63,7 @@ fn corpus() -> Vec<Frame> {
     vec![
         Frame::Hello(Hello {
             proto: PROTO_VERSION,
-            domain: "bierlysmith.com".to_string(),
+            domain: "example.com".to_string(),
             peer: "dev-æ-01".to_string(),
             role: Role::Push,
         }),
@@ -75,7 +75,7 @@ fn corpus() -> Vec<Frame> {
             x25519_pk: [0x22; 32],
         }),
         Frame::Enrolled(EnrollGrant {
-            domain: "bierlysmith.com".to_string(),
+            domain: "example.com".to_string(),
             node_ed25519_pk: [0x33; 32],
             epoch: u64::MAX,
         }),

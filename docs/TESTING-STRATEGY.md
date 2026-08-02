@@ -40,7 +40,7 @@ and executed at PR 4.0; if 4.0 lands differently, §3.6 carries the fallback.
    reuse across roots would mint identical keys). The new context is an additive format decision
    with its own golden fixtures (§3.1).
 3. **hive-node is a lib plus a thin `main`.** `CARGO_BIN_EXE_hive-node` spawning happens only in
-   `node/tests/`; multi-party scenarios embed the node lib in-proc in `smoke/`. The whole smoke
+   `node/tests/`; multi-party scenarios drive the real node BINARY from `smoke/`. The whole smoke
    tier assumes this shape.
 4. **One key-file format everywhere: 64 hex chars = one raw 32-byte master.** The node's
    `FileKeySource` accepts this raw-hex mode (documented as test/ops mode; the KEK-sealed mode is
@@ -146,7 +146,7 @@ first tagged release that carries proto v1 (see §3.4 and §8 rejections).
 (AGENTS.md:117). v2.1 extends the family in a new `smoke-support` helper crate:
 
 - `test_domain()` — tempdir domain dir + a written 64-hex master file (the §0.4 format).
-- `test_node(root, tier)` — in-proc node (lib) listening on `127.0.0.1:0`, returns the bound addr;
+- `test_node(root, tier)` — the real `hive-node` from `HIVE_NODE_BIN` on `127.0.0.1:0`, port parsed from its own stdout;
   `tier` selects blind (no key) vs trusted (key file).
 - `test_pair()` — two device Stores + one node over the same master; the standard two-device rig.
 - `wait_until(cond, deadline, poll)` — the only sanctioned wait primitive (see §4.1).
@@ -328,10 +328,10 @@ that owns the binary):
 - `sync/` = hive-sync. `sync/tests/` holds framing round-trips, the TLS loopback suite (§4.3), and
   loopback two-dir sync + kill/resume tests — all in-proc, no spawned binaries.
 - `smoke-support/` = the ONE-SEAM helper lib (`test_domain`/`test_node`/`test_pair`/`wait_until`,
-  `require_smoke!`); depends on hive-core + hive-node(lib) + hive-sync; consumed as a
+  `require_smoke!`); depends on hive-core + hive-embed ONLY — never hive-node or hive-sync; consumed as a
   dev-dependency (dev-dep cycles are permitted by cargo where needed).
 - `smoke/` = hive-smoke, the cross-component scenario crate: `#![cfg(unix)]`, every test opens
-  with `require_smoke!()`. Embeds the node lib and device Stores in-proc for multi-party
+  with `require_smoke!()`. Spawns the node BINARY and holds device Stores in-proc for multi-party
   scenarios.
 
 **Cross-crate binary paths** (critique fix — the app-boot round-trip needs two real binaries and
@@ -358,7 +358,7 @@ required path env is unset skips loudly (LOUD-SKIP).
    probe; SIGTERM → clean exit; reboot on the same root re-opens and serves the same heads. Blind
    variant: boot with no key file, hello succeeds, tier reported blind.
 2. **Two-device convergence through a node** (`smoke/`): `test_pair()` — tempdir domain, file
-   KeySource, in-proc node on `:0`. Device A `journal_append` → sync to node; device B syncs from
+   KeySource, the node binary on `:0`. Device A `journal_append` → sync to node; device B syncs from
    node; `wait_until` canonical dumps are byte-equal and per-device watermarks match (the bounded
    convergence wait — never an unbounded loop). Then concurrent edits in both directions → the
    LWW outcome asserted per the CONVERGE-ORACLE matrix. Blind-tier variant: node holds no key,

@@ -472,7 +472,7 @@ mod tests {
             r#"
             [dns]
             provider = "cloudflare"
-            zone = "bierlysmith.com"
+            zone = "example.com"
             ttl = 120
             port = 443
 
@@ -492,7 +492,7 @@ mod tests {
         .unwrap();
         let dns = config.dns.expect("a [dns] block");
         assert_eq!(dns.provider, DnsProvider::Cloudflare);
-        assert_eq!(dns.zone, "bierlysmith.com");
+        assert_eq!(dns.zone, "example.com");
         assert_eq!(dns.ttl, 120);
         assert_eq!(dns.port, Some(443));
         assert_eq!(dns.address.len(), 2);
@@ -510,7 +510,7 @@ mod tests {
             r#"
             [dns]
             provider = "none"
-            zone = "bierlysmith.com"
+            zone = "example.com"
             "#,
         )
         .unwrap();
@@ -524,7 +524,7 @@ mod tests {
             ("rfc2136", "[dns.rfc2136]"),
         ] {
             let err = NodeConfig::parse(&format!(
-                "[dns]\nprovider = \"{provider}\"\nzone = \"bierlysmith.com\"\n"
+                "[dns]\nprovider = \"{provider}\"\nzone = \"example.com\"\n"
             ))
             .unwrap_err();
             assert!(
@@ -540,7 +540,7 @@ mod tests {
             r#"
             [dns]
             provider = "rfc2136"
-            zone = "bierlysmith.com"
+            zone = "example.com"
 
             [dns.rfc2136]
             server = "192.0.2.53:53"
@@ -559,7 +559,7 @@ mod tests {
     /// nobody is watching. Refuse it while someone is reading the error.
     #[test]
     fn a_zone_with_stray_dots_is_refused() {
-        for zone in ["", ".bierlysmith.com", "bierlysmith.com."] {
+        for zone in ["", ".example.com", "example.com."] {
             let err =
                 NodeConfig::parse(&format!("[dns]\nprovider = \"none\"\nzone = \"{zone}\"\n"))
                     .unwrap_err();
@@ -573,7 +573,7 @@ mod tests {
             r#"
             [dns]
             provider = "none"
-            zone = "bierlysmith.com"
+            zone = "example.com"
 
             [[dns.address]]
             class = "lan"
