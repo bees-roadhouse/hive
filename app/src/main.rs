@@ -389,6 +389,14 @@ const INK: &str = "var(--ink)";
 const DIM: &str = "var(--dim)";
 const FAINT: &str = "var(--faint)";
 const GOLD: &str = "var(--gold)";
+const GOLD_TEXT: &str = "var(--gold-text)";
+const ON_GOLD: &str = "var(--on-gold)";
+const OK: &str = "var(--ok)";
+/// Initials sit on `avatar_color`'s FIXED palette, which is tuned for the dark
+/// theme and does not change with it. Following `--ink` put near-black text on
+/// a deep-slate disc in the light theme; this stays light because the disc
+/// under it always is dark.
+const ON_AVATAR: &str = "#f4eeda";
 const ACCENT: &str = "var(--accent)";
 
 /// Scoped dark-theme styling for the Markdown-rendered journal bodies. Every
@@ -482,7 +490,7 @@ fn app() -> Element {
                         align-items: center; justify-content: center; gap: 0.8rem; \
                         background: {BG}; color: {INK}; font-family: system-ui, sans-serif; \
                         padding: 2rem; text-align: center;",
-                div { style: "font-size: 2.6rem; color: {GOLD};", "⬡" }
+                div { style: "font-size: 2.6rem; color: {GOLD_TEXT};", "⬡" }
                 div { style: "font-size: 1.3rem; font-weight: 700;", "hive can't open its store" }
                 div {
                     style: "max-width: 34rem; color: {DIM}; line-height: 1.6; font-size: 0.92rem;",
@@ -735,7 +743,7 @@ fn Onboarding(mode: Signal<Mode>, master: [u8; 32], dir: PathBuf) -> Element {
                 // header
                 div {
                     style: "display: flex; align-items: baseline; gap: 0.55rem; margin-bottom: 1.6rem;",
-                    span { style: "font-size: 1.5rem; color: {GOLD};", "⬡" }
+                    span { style: "font-size: 1.5rem; color: {GOLD_TEXT};", "⬡" }
                     span { style: "font-size: 1.25rem; font-weight: 700; letter-spacing: 0.04em;", "hive" }
                     span { style: "flex: 1;" }
                     span { style: "font-size: 0.78rem; color: {FAINT};", "first launch" }
@@ -789,7 +797,7 @@ fn Onboarding(mode: Signal<Mode>, master: [u8; 32], dir: PathBuf) -> Element {
                             span { style: "font-size: 0.8rem; color: {FAINT};", "writing as {name}" }
                             button {
                                 tabindex: "-1",
-                                style: "background: none; border: none; color: {GOLD}; font-size: 0.8rem; \
+                                style: "background: none; border: none; color: {GOLD_TEXT}; font-size: 0.8rem; \
                                         cursor: pointer; padding: 0;",
                                 onclick: move |_| step.set(OnbStep::Identity),
                                 "change"
@@ -948,7 +956,7 @@ fn working(text: &str) -> Element {
             id: "onb-working",
             style: "display: flex; align-items: center; gap: 0.6rem; margin-top: 0.9rem; \
                     color: {DIM}; font-size: 0.9rem;",
-            span { class: "onb-spin", style: "color: {GOLD}; font-size: 1.1rem;", "⬡" }
+            span { class: "onb-spin", style: "color: {GOLD_TEXT}; font-size: 1.1rem;", "⬡" }
             "{text}"
         }
     }
@@ -964,7 +972,7 @@ fn plan_card(plan: &Plan) -> Element {
                     padding: 0.85rem 1rem; margin-top: 0.9rem;",
             div {
                 style: "font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; \
-                        text-transform: uppercase; color: {GOLD}; margin-bottom: 0.45rem;",
+                        text-transform: uppercase; color: {GOLD_TEXT}; margin-bottom: 0.45rem;",
                 "found in your old hive"
             }
             for (label, n) in plan.grouped() {
@@ -1000,7 +1008,7 @@ fn summary_card(summary: &Summary) -> Element {
                     padding: 0.85rem 1rem; margin-top: 0.9rem;",
             div {
                 style: "font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; \
-                        text-transform: uppercase; color: {GOLD}; margin-bottom: 0.45rem;",
+                        text-transform: uppercase; color: {GOLD_TEXT}; margin-bottom: 0.45rem;",
                 "import complete"
             }
             div {
@@ -1191,7 +1199,7 @@ fn Sidebar(
             // brand
             div {
                 style: "display: flex; align-items: baseline; gap: 0.5rem; padding: 1.1rem 1rem 0.9rem;",
-                span { style: "font-size: 1.35rem; color: {GOLD};", "⬡" }
+                span { style: "font-size: 1.35rem; color: {GOLD_TEXT};", "⬡" }
                 span { style: "font-size: 1.1rem; font-weight: 700; letter-spacing: 0.04em;", "hive" }
             }
 
@@ -1217,7 +1225,7 @@ fn Sidebar(
                 span {
                     style: "display: inline-flex; align-items: center; justify-content: center; \
                             width: 1.9rem; height: 1.9rem; border-radius: 50%; background: {EDGE}; \
-                            color: {GOLD}; font-size: 0.95rem; flex-shrink: 0;",
+                            color: {GOLD_TEXT}; font-size: 0.95rem; flex-shrink: 0;",
                     "⬡"
                 }
                 span {
@@ -1227,7 +1235,7 @@ fn Sidebar(
                 }
                 span {
                     style: "font-size: 0.62rem; font-weight: 700; letter-spacing: 0.05em; \
-                            text-transform: uppercase; color: {BG}; background: {badge_bg}; \
+                            text-transform: uppercase; color: {ON_GOLD}; background: {badge_bg}; \
                             border-radius: 5px; padding: 0.1rem 0.35rem; flex-shrink: 0;",
                     "{badge}"
                 }
@@ -1270,7 +1278,7 @@ fn sidebar_row(
                 selected.set(None);
                 section.set(s);
             },
-            span { style: "width: 1.2rem; text-align: center; color: {GOLD};", "{s.icon()}" }
+            span { style: "width: 1.2rem; text-align: center; color: {GOLD_TEXT};", "{s.icon()}" }
             span { "{s.label()}" }
         }
     }
@@ -1443,7 +1451,7 @@ fn JournalPane(store: ReadOnlySignal<Store>, active: Signal<String>) -> Element 
                     style: "display: flex; align-items: baseline; gap: 0.4rem; margin-bottom: 0.6rem; \
                             font-size: 0.78rem; color: {FAINT};",
                     "writing as"
-                    span { style: "color: {GOLD}; font-weight: 600;", "{active_name}" }
+                    span { style: "color: {GOLD_TEXT}; font-weight: 600;", "{active_name}" }
                 }
                 textarea {
                     id: "journal-composer",
@@ -1653,7 +1661,7 @@ fn MailEmptyState(managing: Signal<bool>) -> Element {
             id: "mail-empty",
             style: "display: flex; flex-direction: column; align-items: center; justify-content: center; \
                     height: 100%; min-height: 0; background: {BG}; text-align: center; padding: 2rem;",
-            div { style: "font-size: 3.4rem; color: {GOLD}; line-height: 1;", "✉" }
+            div { style: "font-size: 3.4rem; color: {GOLD_TEXT}; line-height: 1;", "✉" }
             div {
                 style: "font-size: 1.5rem; font-weight: 800; color: {INK}; margin-top: 1rem;",
                 "Set up Mail"
@@ -1723,7 +1731,7 @@ fn MailSidebar(
                 div {
                     style: "display: flex; align-items: baseline; gap: 0.4rem;",
                     div { style: "font-size: 1.1rem; font-weight: 700;", "Mail" }
-                    div { style: "color: {GOLD};", "✉" }
+                    div { style: "color: {GOLD_TEXT};", "✉" }
                 }
                 button {
                     id: "mail-accounts-manage",
@@ -1784,7 +1792,7 @@ fn MailSidebar(
                                     style: "margin-bottom: 1rem;",
                                     div {
                                         style: "font-size: 0.72rem; font-weight: 700; letter-spacing: 0.07em; \
-                                                text-transform: uppercase; color: {GOLD}; margin: 0.2rem 0.2rem 0.4rem;",
+                                                text-transform: uppercase; color: {GOLD_TEXT}; margin: 0.2rem 0.2rem 0.4rem;",
                                         "{owner}"
                                     }
                                     for acct in accts.into_iter() {
@@ -2526,7 +2534,7 @@ fn MailActionBar(
                 if confirm_perm() {
                     button {
                         id: "mail-delete-perm-{message_id}",
-                        style: "background: #7a2e22; border: 1px solid var(--danger); color: #ffe; \
+                        style: "background: var(--danger); border: 1px solid var(--danger); color: {ON_GOLD}; \
                                 border-radius: 8px; padding: 0.35rem 0.8rem; font: inherit; \
                                 font-size: 0.82rem; font-weight: 700; cursor: pointer;",
                         disabled: busy(),
@@ -2918,7 +2926,7 @@ fn ComposeWindow(store: ReadOnlySignal<Store>, compose: Signal<Option<ComposeSee
                     div {
                         style: "display: flex; align-items: baseline; gap: 0.5rem;",
                         div { style: "font-size: 1.2rem; font-weight: 700;", "New message" }
-                        div { style: "color: {GOLD};", "✉" }
+                        div { style: "color: {GOLD_TEXT};", "✉" }
                     }
                     button {
                         id: "mail-compose-close",
@@ -3051,7 +3059,7 @@ fn compose_status(state: SendState) -> Element {
             span { style: "color: {DIM}; font-size: 0.84rem;", "Queued — sending…" }
         },
         SendState::Sent => rsx! {
-            span { style: "color: #7fb069; font-size: 0.84rem;", "Sent ✓" }
+            span { style: "color: {OK}; font-size: 0.84rem;", "Sent ✓" }
         },
         SendState::Failed(reason) => rsx! {
             span {
@@ -3338,7 +3346,7 @@ fn MailAccountsManager(
             div {
                 style: "display: flex; align-items: baseline; gap: 0.6rem;",
                 div { style: "font-size: 1.5rem; font-weight: 700;", "Mail accounts" }
-                div { style: "font-size: 1.6rem; color: {GOLD};", "✉" }
+                div { style: "font-size: 1.6rem; color: {GOLD_TEXT};", "✉" }
             }
             div {
                 style: "color: {DIM}; font-size: 0.9rem; line-height: 1.6; margin-top: 0.4rem;",
@@ -3601,7 +3609,7 @@ fn MailAddAccount(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element
                 }
                 if ok() {
                     span {
-                        style: "color: #7fb069; font-size: 0.84rem;",
+                        style: "color: {OK}; font-size: 0.84rem;",
                         "Mailbox added — syncing will begin shortly."
                     }
                 }
@@ -3780,7 +3788,7 @@ fn mail_account_row(
                     div {
                         style: "color: {DIM}; font-size: 0.8rem; margin-top: 0.15rem;",
                         "owned by "
-                        span { style: "color: {GOLD};", "{acct.owner}" }
+                        span { style: "color: {GOLD_TEXT};", "{acct.owner}" }
                         " · "
                         span { "{account_status_line(&acct)}" }
                     }
@@ -3796,7 +3804,7 @@ fn mail_account_row(
                 button {
                     id: "mail-account-syncnow-{acct.id}",
                     disabled: syncing(),
-                    style: "background: none; border: 1px solid {GOLD}; color: {GOLD}; \
+                    style: "background: none; border: 1px solid {GOLD}; color: {GOLD_TEXT}; \
                             border-radius: 999px; padding: 0.35rem 0.8rem; font: inherit; \
                             font-size: 0.8rem; font-weight: 700; cursor: pointer;",
                     title: "Sync this mailbox right now and show the result",
@@ -5001,7 +5009,7 @@ fn IdentitiesPane(
                     style: "color: {INK}; font-size: 0.88rem; line-height: 1.55; background: {PANEL}; \
                             border: 1px solid {GOLD}; border-radius: 10px; padding: 0.7rem 0.9rem; \
                             margin: 0 0 1rem;",
-                    span { style: "font-weight: 700; color: {GOLD};", "Pick which identity is you." }
+                    span { style: "font-weight: 700; color: {GOLD_TEXT};", "Pick which identity is you." }
                     " Choose your identity below with "
                     span { style: "font-weight: 700;", "Set as owner" }
                     ". Until then, claiming and taking over other identities is disabled."
@@ -5085,7 +5093,7 @@ fn identity_row(
                 span {
                     style: "display: inline-flex; align-items: center; justify-content: center; \
                             width: 2.1rem; height: 2.1rem; border-radius: 50%; background: {EDGE}; \
-                            color: {GOLD}; font-size: 1rem; flex-shrink: 0;",
+                            color: {GOLD_TEXT}; font-size: 1rem; flex-shrink: 0;",
                     "⬡"
                 }
                 div {
@@ -5095,7 +5103,7 @@ fn identity_row(
                         span { style: "font-weight: 700; font-size: 0.98rem;", "{person.name}" }
                         span {
                             style: "font-size: 0.62rem; font-weight: 700; letter-spacing: 0.05em; \
-                                    text-transform: uppercase; color: {BG}; background: {badge_bg}; \
+                                    text-transform: uppercase; color: {ON_GOLD}; background: {badge_bg}; \
                                     border-radius: 5px; padding: 0.1rem 0.35rem;",
                             "{badge}"
                         }
@@ -5104,7 +5112,7 @@ fn identity_row(
                             span {
                                 id: "identity-owned-{person.slug}",
                                 style: "font-size: 0.62rem; font-weight: 700; letter-spacing: 0.04em; \
-                                        text-transform: uppercase; color: {GOLD}; border: 1px solid {GOLD}; \
+                                        text-transform: uppercase; color: {GOLD_TEXT}; border: 1px solid {GOLD}; \
                                         border-radius: 5px; padding: 0.1rem 0.35rem;",
                                 "owned by you"
                             }
@@ -5363,7 +5371,7 @@ fn identity_row(
                 }
                 if is_active {
                     span {
-                        style: "font-size: 0.75rem; font-weight: 700; color: {GOLD}; \
+                        style: "font-size: 0.75rem; font-weight: 700; color: {GOLD_TEXT}; \
                                 border: 1px solid {GOLD}; border-radius: 999px; padding: 0.2rem 0.7rem;",
                         "active"
                     }
@@ -5427,7 +5435,7 @@ fn takeover_preview(
                 "This merges "
                 span { style: "font-weight: 700;", "{from}" }
                 " into "
-                span { style: "font-weight: 700; color: {GOLD};", "{owner_slug}" }
+                span { style: "font-weight: 700; color: {GOLD_TEXT};", "{owner_slug}" }
                 ". It rewrites "
                 span { style: "font-weight: 700;", "{res.journal}" }
                 " journal entries, "
@@ -5443,7 +5451,7 @@ fn takeover_preview(
                 " entities and "
                 span { style: "font-weight: 700;", "{res.sources}" }
                 " sources to "
-                span { style: "font-weight: 700; color: {GOLD};", "{owner_slug}" }
+                span { style: "font-weight: 700; color: {GOLD_TEXT};", "{owner_slug}" }
                 ", then removes "
                 span { style: "font-weight: 700;", "{from}" }
                 ". This can't be undone."
@@ -5511,7 +5519,7 @@ fn search_results(hits: Option<Result<Vec<SearchHit>, String>>) -> Element {
                         style: "display: flex; align-items: baseline; gap: 0.6rem;",
                         span {
                             style: "font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em; \
-                                    text-transform: uppercase; color: {GOLD};",
+                                    text-transform: uppercase; color: {GOLD_TEXT};",
                             "{hit.kind}"
                         }
                         span { style: "font-weight: 600; font-size: 0.98rem;", "{hit.title}" }
@@ -5577,7 +5585,7 @@ fn entry_card(view: &JournalEntryView) -> Element {
                     style: "display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.55rem;",
                     for tag in e.tags.iter() {
                         span {
-                            style: "font-size: 0.74rem; color: {GOLD};",
+                            style: "font-size: 0.74rem; color: {GOLD_TEXT};",
                             "#{tag}"
                         }
                     }
@@ -5586,7 +5594,7 @@ fn entry_card(view: &JournalEntryView) -> Element {
                         span {
                             style: "font-size: 0.74rem; color: {INK}; border: 1px solid {EDGE}; \
                                     border-radius: 999px; padding: 0.1rem 0.55rem; background: {BG};",
-                            span { style: "color: {GOLD}; margin-right: 0.3rem;", "{r.kind.as_str()}" }
+                            span { style: "color: {GOLD_TEXT}; margin-right: 0.3rem;", "{r.kind.as_str()}" }
                             "{r.name}"
                         }
                     }
@@ -6647,7 +6655,7 @@ fn ContactsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
                     div { style: "font-size: 1.25rem; font-weight: 700; flex: 1;", "Contacts" }
                     button {
                         id: "contact-new",
-                        style: "background: {EDGE}; color: {GOLD}; border: none; border-radius: 50%; \
+                        style: "background: {EDGE}; color: {GOLD_TEXT}; border: none; border-radius: 50%; \
                                 width: 1.9rem; height: 1.9rem; font-size: 1.15rem; line-height: 1; \
                                 cursor: pointer; flex-shrink: 0;",
                         title: "New contact",
@@ -6892,7 +6900,7 @@ fn contact_source_list(
                         if let Some(h) = header {
                             div {
                                 class: "contact-section-header",
-                                style: "font-size: 0.72rem; font-weight: 700; color: {GOLD}; \
+                                style: "font-size: 0.72rem; font-weight: 700; color: {GOLD_TEXT}; \
                                         letter-spacing: 0.08em; padding: 0.6rem 0.6rem 0.25rem;",
                                 "{h}"
                             }
@@ -6927,7 +6935,7 @@ fn contact_row(c: &CustomEntity, mut card_sel: Signal<Option<Selected>>) -> Elem
             span {
                 style: "display: inline-flex; align-items: center; justify-content: center; \
                         width: 2rem; height: 2rem; border-radius: 50%; background: {color}; \
-                        color: var(--ink); font-size: 0.8rem; font-weight: 700; flex-shrink: 0;",
+                        color: {ON_AVATAR}; font-size: 0.8rem; font-weight: 700; flex-shrink: 0;",
                 "{initials}"
             }
             span {
@@ -6936,7 +6944,7 @@ fn contact_row(c: &CustomEntity, mut card_sel: Signal<Option<Selected>>) -> Elem
                 "{name}"
             }
             if favorite {
-                span { style: "color: {GOLD}; font-size: 0.8rem; flex-shrink: 0;", "⭐" }
+                span { style: "color: {GOLD_TEXT}; font-size: 0.8rem; flex-shrink: 0;", "⭐" }
             }
         }
     }
@@ -7048,7 +7056,7 @@ fn ContactCard(
                         // EntityDetail hides its own back button)
                         button {
                             id: "contact-card-back",
-                            style: "background: none; border: none; color: {GOLD}; font: inherit; \
+                            style: "background: none; border: none; color: {GOLD_TEXT}; font: inherit; \
                                     font-size: 0.85rem; cursor: pointer; padding: 0; margin-bottom: 0.8rem;",
                             onclick: move |_| {
                                 let mut card_sel = card_sel;
@@ -7064,7 +7072,7 @@ fn ContactCard(
                             span {
                                 style: "display: inline-flex; align-items: center; justify-content: center; \
                                         width: 5rem; height: 5rem; border-radius: 50%; background: {color}; \
-                                        color: var(--ink); font-size: 1.8rem; font-weight: 700; margin-bottom: 0.7rem;",
+                                        color: {ON_AVATAR}; font-size: 1.8rem; font-weight: 700; margin-bottom: 0.7rem;",
                                 "{initials}"
                             }
                             div {
@@ -7496,7 +7504,7 @@ fn tasks_reminders_view(
                 style: "display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.2rem;",
                 div {
                     id: "tasks-main-title",
-                    style: "font-size: 1.6rem; font-weight: 800; color: {GOLD};",
+                    style: "font-size: 1.6rem; font-weight: 800; color: {GOLD_TEXT};",
                     "{current.title()}"
                 }
                 span {
@@ -7706,7 +7714,7 @@ fn tasks_quickadd(
             style: "display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; \
                     background: {PANEL}; border: 1px solid {EDGE}; border-radius: 10px; \
                     padding: 0.55rem 0.7rem; margin-top: 0.9rem;",
-            span { style: "color: {GOLD}; font-size: 1.1rem; line-height: 1;", "＋" }
+            span { style: "color: {GOLD_TEXT}; font-size: 1.1rem; line-height: 1;", "＋" }
             input {
                 id: "tasks-quickadd-input",
                 style: "flex: 1; min-width: 160px; background: transparent; color: {INK}; \
@@ -8330,7 +8338,7 @@ fn EntityDetail(
             if !embedded {
                 button {
                     id: "detail-back",
-                    style: "background: none; border: none; color: {GOLD}; font: inherit; \
+                    style: "background: none; border: none; color: {GOLD_TEXT}; font: inherit; \
                             font-size: 0.85rem; cursor: pointer; padding: 0; margin-bottom: 0.9rem;",
                     onclick: move |_| selected.set(None),
                     "← Back"
@@ -8349,7 +8357,7 @@ fn EntityDetail(
                             div { id: "detail-name", style: "font-size: 1.5rem; font-weight: 700;", "{d.name}" }
                             span {
                                 style: "font-size: 0.66rem; font-weight: 700; letter-spacing: 0.06em; \
-                                        text-transform: uppercase; color: {BG}; background: {GOLD}; \
+                                        text-transform: uppercase; color: {ON_GOLD}; background: {GOLD}; \
                                         border-radius: 5px; padding: 0.12rem 0.4rem;",
                                 "{d.kind_label}"
                             }
@@ -9166,7 +9174,7 @@ fn SettingsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
                 if pending_restart {
                     div {
                         id: "settings-restart-hint",
-                        style: "font-size: 0.82rem; color: {GOLD}; line-height: 1.5; margin-top: 0.6rem;",
+                        style: "font-size: 0.82rem; color: {GOLD_TEXT}; line-height: 1.5; margin-top: 0.6rem;",
                         "Saved. Restart hive to switch the engine to your new backend — "
                         "the readout above keeps showing what's actually running until then."
                     }
@@ -9216,7 +9224,7 @@ fn SettingsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
                 if saved() {
                     span {
                         id: "settings-saved",
-                        style: "color: {GOLD}; font-size: 0.85rem; font-weight: 600;",
+                        style: "color: {GOLD_TEXT}; font-size: 0.85rem; font-weight: 600;",
                         "Saved."
                     }
                 }
@@ -9329,7 +9337,7 @@ fn reembed_status(state: &ReembedState) -> Element {
         ReembedState::Done { embedded } => rsx! {
             span {
                 id: "settings-reembed-done",
-                style: "font-size: 0.85rem; color: {GOLD}; font-weight: 600;",
+                style: "font-size: 0.85rem; color: {GOLD_TEXT}; font-weight: 600;",
                 "Done — {embedded} item(s) (re)embedded."
             }
         },

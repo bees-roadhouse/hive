@@ -93,11 +93,24 @@ impl Appearance {
         // The accent tints chrome only. `--gold` is the brand and does not
         // move; `--accent` falls back to it so a desktop with no accent still
         // looks deliberate rather than grey.
+        //
+        // The accent is USER DATA off a bus — Plasma will happily derive it
+        // from a wallpaper — so nothing may assume it contrasts with anything.
+        // An accent too close to the page is refused for the parts that have
+        // to be SEEN against the page (the focus ring, the nav rail), while
+        // selection keeps it and picks a readable ink to sit on top instead.
         let accent = self.accent.as_deref().unwrap_or(p.gold_text);
+        let visible_accent = if contrast(accent, p.bg) >= 3.0 {
+            accent
+        } else {
+            p.gold_text
+        };
+        let on_accent = readable_on(accent);
         format!(
             ":root {{ \
              --bg: {}; --panel: {}; --edge: {}; --ink: {}; --dim: {}; --faint: {}; \
-             --gold: {}; --gold-text: {}; --on-gold: {}; --danger: {}; --accent: {}; \
+             --gold: {}; --gold-text: {}; --on-gold: {}; --ok: {}; --danger: {}; \
+             --accent: {}; --on-accent: {}; \
              color-scheme: {}; }} \
              ::selection {{ background: {}; color: {}; }} \
              :focus-visible {{ outline: 2px solid {}; outline-offset: 2px; }}",
@@ -110,12 +123,14 @@ impl Appearance {
             p.gold,
             p.gold_text,
             ON_GOLD,
+            p.ok,
             p.danger,
-            accent,
+            visible_accent,
+            on_accent,
             if self.dark { "dark" } else { "light" },
             accent,
-            p.bg,
-            accent,
+            on_accent,
+            visible_accent,
         )
     }
 }
@@ -134,6 +149,8 @@ struct Palette {
     /// Gold as TEXT, on that theme's background. Darker in the light theme,
     /// because #e2a921 on white is about 2:1 and unreadable.
     gold_text: &'static str,
+    /// Success. A confirmation nobody can read is not a confirmation.
+    ok: &'static str,
     danger: &'static str,
 }
 
@@ -155,6 +172,7 @@ const DARK: Palette = Palette {
     faint: "#6f684f",
     gold: "#e2a921",
     gold_text: "#e2a921",
+    ok: "#7fb069",
     danger: "#e07a5f",
 };
 
@@ -170,8 +188,51 @@ const LIGHT: Palette = Palette {
     gold: "#e2a921",
     // Contrast, not taste: the fill gold fails on paper as text.
     gold_text: "#8a6410",
+    // #7fb069 is 2.5:1 on paper — under AA for the small text it labels.
+    ok: "#3d6b28",
     danger: "#b8412a",
 };
+
+/// sRGB relative luminance (WCAG 2.1), or `None` for anything not `#rrggbb`.
+fn luminance(hex: &str) -> Option<f64> {
+    let h = hex.strip_prefix('#')?;
+    if h.len() != 6 {
+        return None;
+    }
+    let mut chan = [0f64; 3];
+    for (i, c) in chan.iter_mut().enumerate() {
+        let v = u8::from_str_radix(h.get(i * 2..i * 2 + 2)?, 16).ok()? as f64 / 255.0;
+        *c = if v <= 0.03928 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        };
+    }
+    Some(0.2126 * chan[0] + 0.7152 * chan[1] + 0.0722 * chan[2])
+}
+
+/// WCAG contrast ratio. An unparseable colour scores 0, so callers treat it the
+/// same as "too close to read" and fall back.
+fn contrast(a: &str, b: &str) -> f64 {
+    let (Some(la), Some(lb)) = (luminance(a), luminance(b)) else {
+        return 0.0;
+    };
+    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// Ink that can be read ON `bg` — black or white, whichever wins.
+///
+/// Selection keeps the desktop's accent as its background because that is the
+/// one place a user expects to see it, so the FOREGROUND has to adapt. Pairing
+/// it with the page colour meant a pale accent gave near-white on near-white.
+fn readable_on(bg: &str) -> &'static str {
+    if contrast(bg, "#ffffff") >= contrast(bg, "#14120e") {
+        "#ffffff"
+    } else {
+        "#14120e"
+    }
+}
 
 /// Read `org.freedesktop.appearance` from the Settings portal.
 fn read_portal() -> anyhow::Result<Appearance> {
@@ -336,6 +397,142 @@ mod tests {
             css.contains("--accent: #e2a921"),
             "an unset accent must still resolve, or focus rings vanish"
         );
+    }
+
+    /// Every foreground/background pair the shell actually renders, checked
+    /// against WCAG AA in BOTH themes.
+    ///
+    /// This exists because the light theme has no user yet: this machine
+    /// reports dark, so launching the app cannot exercise it, and three
+    /// separate contrast bugs shipped in this feature precisely because a
+    /// value looked right in the theme someone happened to be looking at.
+    /// A ratio is checkable without eyes; "I looked at it" is not repeatable.
+    #[test]
+    fn every_rendered_pair_meets_aa_in_both_themes() {
+        /// Pick one colour out of a theme, so a pair is named once and checked
+        /// against both.
+        type Pick = fn(&Palette) -> &'static str;
+        /// (foreground, background, minimum ratio, what a reader calls it).
+        /// 4.5 is AA for body text; 3.0 is AA for large text and for UI
+        /// boundaries that only have to be locatable.
+        type Pair = (Pick, Pick, f64, &'static str);
+
+        let pairs: &[Pair] = &[
+            (|p| p.ink, |p| p.bg, 4.5, "body text on the page"),
+            (|p| p.ink, |p| p.panel, 4.5, "body text on a panel"),
+            (|p| p.dim, |p| p.bg, 4.5, "secondary text on the page"),
+            (|p| p.dim, |p| p.panel, 4.5, "secondary text on a panel"),
+            (|p| p.gold_text, |p| p.bg, 4.5, "gold as text on the page"),
+            (|p| p.gold_text, |p| p.panel, 4.5, "gold as text on a panel"),
+            (|p| p.ok, |p| p.panel, 4.5, "success text"),
+            (|p| p.danger, |p| p.bg, 4.5, "error text on the page"),
+            (|_| ON_GOLD, |p| p.gold, 4.5, "text on a gold button"),
+            (|p| p.edge, |p| p.bg, 1.2, "a border against the page"),
+            (|p| p.faint, |p| p.bg, 3.0, "the faintest text we render"),
+        ];
+
+        let mut failures = Vec::new();
+        for (dark, p) in [(true, &DARK), (false, &LIGHT)] {
+            for (fg, bg, min, what) in pairs {
+                let ratio = contrast(fg(p), bg(p));
+                if ratio < *min {
+                    failures.push(format!(
+                        "dark={dark}: {what} — {} on {} is {ratio:.2}:1, needs {min}",
+                        fg(p),
+                        bg(p)
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "contrast failures:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn contrast_matches_the_wcag_reference_points() {
+        // Black on white is the definitional 21:1; a colour against itself is
+        // 1:1. Anything unparseable scores 0 so callers treat it as illegible
+        // rather than trusting it.
+        assert!((contrast("#000000", "#ffffff") - 21.0).abs() < 0.01);
+        assert!((contrast("#abcdef", "#abcdef") - 1.0).abs() < 0.001);
+        assert_eq!(contrast("not-a-colour", "#ffffff"), 0.0);
+        assert_eq!(contrast("#fff", "#ffffff"), 0.0, "short hex is not parsed");
+    }
+
+    #[test]
+    fn a_low_contrast_accent_is_refused_where_it_has_to_be_seen() {
+        // Plasma will derive an accent from the wallpaper, so it can land
+        // anywhere. A pale accent on the light theme used to give a focus ring
+        // at roughly 1.2:1 — a keyboard user losing the caret entirely.
+        let pale = Appearance {
+            dark: false,
+            accent: Some("#f6e13c".to_string()),
+        }
+        .css_root();
+        assert!(
+            pale.contains("--accent: #8a6410"),
+            "an accent that vanishes against the page falls back to gold: {pale}"
+        );
+        assert!(
+            pale.contains("outline: 2px solid #8a6410"),
+            "the focus ring must be visible"
+        );
+
+        // A dark accent on the dark theme is the mirror case.
+        let murky = Appearance {
+            dark: true,
+            accent: Some("#2d1b4e".to_string()),
+        }
+        .css_root();
+        assert!(murky.contains("--accent: #e2a921"), "{murky}");
+
+        // One with real contrast is kept.
+        let good = Appearance {
+            dark: true,
+            accent: Some("#315bef".to_string()),
+        }
+        .css_root();
+        assert!(good.contains("--accent: #315bef"));
+    }
+
+    #[test]
+    fn selection_keeps_the_accent_and_picks_ink_that_can_be_read_on_it() {
+        // Selection is the one place the desktop's colour should win outright,
+        // so the FOREGROUND adapts instead. Pairing it with the page colour
+        // gave near-white on near-white for a pale accent.
+        let pale = Appearance {
+            dark: false,
+            accent: Some("#f6e13c".to_string()),
+        }
+        .css_root();
+        assert!(
+            pale.contains("::selection { background: #f6e13c; color: #14120e"),
+            "pale accent needs dark ink: {pale}"
+        );
+        let deep = Appearance {
+            dark: true,
+            accent: Some("#2d1b4e".to_string()),
+        }
+        .css_root();
+        assert!(
+            deep.contains("::selection { background: #2d1b4e; color: #ffffff"),
+            "deep accent needs light ink: {deep}"
+        );
+    }
+
+    #[test]
+    fn success_is_readable_on_the_light_theme_too() {
+        // #7fb069 is 2.5:1 on paper, under AA for the small text it labels.
+        let light = Appearance {
+            dark: false,
+            accent: None,
+        }
+        .css_root();
+        assert!(light.contains("--ok: #3d6b28"), "{light}");
+        assert!(contrast("#3d6b28", "#ffffff") >= 4.5);
     }
 
     #[test]
