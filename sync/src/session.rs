@@ -43,7 +43,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::frame::{
     err_code, read_frame, read_payload, write_frame, write_payload, BlockIds, BlockLanded, Frame,
     Hello, ProtoError, PutBlock, Role, Segment, SegmentLanded, WantSegment, MAX_BLOCK_BYTES,
-    MAX_BLOCK_IDS_PER_FRAME, MAX_SEGMENT_CHUNK, MIN_SEGMENT_CHUNK, PROTO_VERSION,
+    MAX_BLOCK_IDS_PER_FRAME, MAX_OFFERED_BLOCK_IDS, MAX_SEGMENT_CHUNK, MIN_SEGMENT_CHUNK,
+    PROTO_VERSION,
 };
 use crate::sink::SyncSink;
 use crate::source::SyncSource;
@@ -275,7 +276,23 @@ where
                 }
                 heads = Some(h);
             }
-            Frame::HaveBlocks(b) => offered_blocks.extend(b.ids),
+            Frame::HaveBlocks(b) => {
+                // The per-frame cap bounds one allocation, not a peer that
+                // never stops offering. Checked BEFORE extending, so the
+                // ceiling is what the receiver holds rather than that plus one
+                // more frame.
+                if offered_blocks.len() + b.ids.len() > MAX_OFFERED_BLOCK_IDS {
+                    return refuse(
+                        &mut writer,
+                        err_code::UNEXPECTED,
+                        format!(
+                            "the offer exceeds {MAX_OFFERED_BLOCK_IDS} block ids in one session"
+                        ),
+                    )
+                    .await;
+                }
+                offered_blocks.extend(b.ids);
+            }
             Frame::Done => break,
             Frame::Error(e) => bail!("peer refused the session: {} ({})", e.message, e.code),
             other => {

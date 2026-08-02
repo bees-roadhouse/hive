@@ -30,7 +30,7 @@ use hive_node::dns::{allowed_names, plan, CloudflareZone, DesiredRecord, RecordT
 use hive_node::{DnsPublisher, NodeConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const ZONE: &str = "bierlysmith.com";
+const ZONE: &str = "example.com";
 const PORT: u16 = 7847;
 const TTL: u32 = 60;
 
@@ -144,24 +144,24 @@ async fn a_publish_writes_the_srv_and_the_addresses_and_nothing_else() {
     assert_eq!(
         report.upserted,
         vec![
-            "_hive._tcp.bierlysmith.com",
-            "public.hive.bierlysmith.com",
-            "lan.hive.bierlysmith.com",
+            "_hive._tcp.example.com",
+            "public.hive.example.com",
+            "lan.hive.example.com",
         ],
         "SRV first, then one record per class in D35's class order"
     );
     assert!(report.unchanged.is_empty());
 
     assert_eq!(
-        zone.values("_hive._tcp.bierlysmith.com", RecordType::Srv),
+        zone.values("_hive._tcp.example.com", RecordType::Srv),
         vec![
-            "10 10 7847 lan.hive.bierlysmith.com",
-            "10 10 7847 public.hive.bierlysmith.com",
+            "10 10 7847 lan.hive.example.com",
+            "10 10 7847 public.hive.example.com",
         ],
         "both classes are candidates; the dialer races them (D35)"
     );
     assert_eq!(
-        zone.values("public.hive.bierlysmith.com", RecordType::A),
+        zone.values("public.hive.example.com", RecordType::A),
         vec!["203.0.113.10"]
     );
 
@@ -207,14 +207,14 @@ async fn a_moved_address_rewrites_only_the_record_that_moved() {
         ])
         .await
         .unwrap();
-    assert_eq!(report.upserted, vec!["lan.hive.bierlysmith.com"]);
+    assert_eq!(report.upserted, vec!["lan.hive.example.com"]);
     assert_eq!(
         report.unchanged,
-        vec!["_hive._tcp.bierlysmith.com", "public.hive.bierlysmith.com"],
+        vec!["_hive._tcp.example.com", "public.hive.example.com"],
         "the SRV names classes, not addresses, so it does not churn"
     );
     assert_eq!(
-        zone.values("lan.hive.bierlysmith.com", RecordType::A),
+        zone.values("lan.hive.example.com", RecordType::A),
         vec!["192.168.1.99"]
     );
 }
@@ -236,8 +236,8 @@ async fn a_class_that_disappears_leaves_the_srv() {
         .await
         .unwrap();
     assert_eq!(
-        zone.values("_hive._tcp.bierlysmith.com", RecordType::Srv),
-        vec!["10 10 7847 public.hive.bierlysmith.com"]
+        zone.values("_hive._tcp.example.com", RecordType::Srv),
+        vec!["10 10 7847 public.hive.example.com"]
     );
 }
 
@@ -248,10 +248,10 @@ async fn a_class_that_disappears_leaves_the_srv() {
 async fn a_name_outside_the_hive_set_is_refused_before_any_request() {
     let zone = MockZone::default();
     for hostile in [
-        "bierlysmith.com",
-        "mail.bierlysmith.com",
+        "example.com",
+        "mail.example.com",
         "_hive._tcp.evil.com",
-        "www.bierlysmith.com",
+        "www.example.com",
     ] {
         let err = publisher(&zone)
             .publish_records(&[DesiredRecord {
@@ -529,7 +529,7 @@ async fn the_cloudflare_rail_creates_updates_and_then_stays_quiet() {
     );
     assert!(
         api.contents().contains(&(
-            "public.hive.bierlysmith.com".to_string(),
+            "public.hive.example.com".to_string(),
             "A".to_string(),
             "203.0.113.10".to_string()
         )),
@@ -567,7 +567,7 @@ async fn the_cloudflare_rail_creates_updates_and_then_stays_quiet() {
         api.writes()
     );
     assert!(api.contents().contains(&(
-        "public.hive.bierlysmith.com".to_string(),
+        "public.hive.example.com".to_string(),
         "A".to_string(),
         "203.0.113.11".to_string()
     )));
@@ -613,7 +613,7 @@ fn a_node_toml_dns_block_builds_the_publisher_it_describes() {
         r#"
         [dns]
         provider = "cloudflare"
-        zone = "bierlysmith.com"
+        zone = "example.com"
 
         [dns.cloudflare]
         zone_id = "zone-1"

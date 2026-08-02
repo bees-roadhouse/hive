@@ -199,6 +199,21 @@ pub fn list_devices(data_dir: &Path) -> Result<Vec<String>> {
 /// Length and hash come from ONE read, so they always describe the same bytes
 /// — a tail that grows mid-enumeration yields a shorter-but-consistent
 /// description, never a length from one instant and a hash from another.
+///
+/// Both describe the WHOLE-FRAME PREFIX, not the raw file. A tail caught
+/// mid-append ends inside a frame, and those trailing bytes are not something
+/// the writer can be held to — the receiving side cuts them on landing
+/// (`hive_sync`'s vault does this explicitly), so a raw description would be a
+/// promise no honest peer could ever reproduce. Describing the same prefix on
+/// both sides is what keeps the session's completeness check an equivocation
+/// detector rather than a race detector: it used to compare this raw hash
+/// against the receiver's trimmed one and call a benign mid-append snapshot
+/// "the bytes on the two sides diverge", which wedged the transfer on every
+/// retry.
+///
+/// A segment whose walk fails outright is described raw, exactly as before:
+/// that is real corruption rather than a torn tail, and it belongs to the
+/// integrity machinery downstream, not to an enumerator.
 pub fn list_segments(data_dir: &Path, device: &str) -> Result<Vec<SegmentInfo>> {
     if !device_id_ok(device) {
         bail!("invalid device id {device:?}");
@@ -209,12 +224,16 @@ pub fn list_segments(data_dir: &Path, device: &str) -> Result<Vec<SegmentInfo>> 
     for (i, (start_seq, path)) in paths.into_iter().enumerate() {
         let bytes =
             std::fs::read(&path).with_context(|| format!("reading segment {}", path.display()))?;
+        let described = match walk_segment(&bytes) {
+            Ok(walk) => &bytes[..walk.whole_end as usize],
+            Err(_) => &bytes[..],
+        };
         out.push(SegmentInfo {
             device: device.to_string(),
             start_seq,
-            len: bytes.len() as u64,
+            len: described.len() as u64,
             sealed: i != last,
-            file_hash: *blake3::hash(&bytes).as_bytes(),
+            file_hash: *blake3::hash(described).as_bytes(),
         });
     }
     Ok(out)

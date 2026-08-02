@@ -516,18 +516,18 @@ mod tests {
 
     #[test]
     fn the_name_set_is_the_srv_plus_the_nodes_own_addresses() {
-        let names = allowed_names("bierlysmith.com");
+        let names = allowed_names("example.com");
         assert_eq!(
             names.iter().cloned().collect::<Vec<_>>(),
             vec![
-                "_hive._tcp.bierlysmith.com",
-                "lan.hive.bierlysmith.com",
-                "public.hive.bierlysmith.com",
-                "tailnet.hive.bierlysmith.com",
-                "zerotier.hive.bierlysmith.com",
+                "_hive._tcp.example.com",
+                "lan.hive.example.com",
+                "public.hive.example.com",
+                "tailnet.hive.example.com",
+                "zerotier.hive.example.com",
             ]
         );
-        for hostile in ["bierlysmith.com", "www.bierlysmith.com", "mail"] {
+        for hostile in ["example.com", "www.example.com", "mail"] {
             assert!(!names.contains(hostile), "{hostile} is not ours to write");
         }
     }
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn every_class_becomes_an_srv_target_and_its_own_address_record() {
         let records = plan(
-            "bierlysmith.com",
+            "example.com",
             7847,
             60,
             &[
@@ -545,22 +545,22 @@ mod tests {
         );
         assert_eq!(records.len(), 3);
 
-        assert_eq!(records[0].name, "_hive._tcp.bierlysmith.com");
+        assert_eq!(records[0].name, "_hive._tcp.example.com");
         assert_eq!(records[0].rtype, RecordType::Srv);
         assert_eq!(
             records[0].values,
             vec![
-                "10 10 7847 public.hive.bierlysmith.com",
-                "10 10 7847 tailnet.hive.bierlysmith.com",
+                "10 10 7847 public.hive.example.com",
+                "10 10 7847 tailnet.hive.example.com",
             ],
             "multiple targets are the point: the dialer races them"
         );
 
-        assert_eq!(records[1].name, "public.hive.bierlysmith.com");
+        assert_eq!(records[1].name, "public.hive.example.com");
         assert_eq!(records[1].rtype, RecordType::A);
         assert_eq!(records[1].values, vec!["203.0.113.10"]);
 
-        assert_eq!(records[2].name, "tailnet.hive.bierlysmith.com");
+        assert_eq!(records[2].name, "tailnet.hive.example.com");
         assert_eq!(records[2].rtype, RecordType::Aaaa, "v6 goes in AAAA");
     }
 
@@ -569,7 +569,7 @@ mod tests {
     #[test]
     fn a_plan_is_a_function_of_the_config_not_of_iteration_order() {
         let a = plan(
-            "bierlysmith.com",
+            "example.com",
             7847,
             60,
             &[
@@ -578,7 +578,7 @@ mod tests {
             ],
         );
         let b = plan(
-            "bierlysmith.com",
+            "example.com",
             7847,
             60,
             &[
@@ -591,13 +591,13 @@ mod tests {
 
     #[test]
     fn a_node_that_does_not_know_where_it_lives_publishes_nothing() {
-        assert!(plan("bierlysmith.com", 7847, 60, &[]).is_empty());
+        assert!(plan("example.com", 7847, 60, &[]).is_empty());
     }
 
     #[test]
     fn every_planned_name_is_inside_the_credential_scope() {
         let records = plan(
-            "bierlysmith.com",
+            "example.com",
             7847,
             60,
             &AddressClass::ALL
@@ -605,7 +605,7 @@ mod tests {
                 .map(|c| addr(*c, "203.0.113.10"))
                 .collect::<Vec<_>>(),
         );
-        let allowed = allowed_names("bierlysmith.com");
+        let allowed = allowed_names("example.com");
         for record in &records {
             assert!(allowed.contains(&record.name), "{} escaped", record.name);
         }
@@ -618,7 +618,7 @@ mod tests {
             r#"
             [dns]
             provider = "rfc2136"
-            zone = "bierlysmith.com"
+            zone = "example.com"
 
             [dns.rfc2136]
             server = "192.0.2.53:53"
@@ -632,13 +632,13 @@ mod tests {
         let err = DnsPublisher::from_config(&dns, Path::new("/srv/hive"), 7847).unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("rfc2136"), "{text}");
-        assert!(text.contains("_hive._tcp.bierlysmith.com"), "{text}");
+        assert!(text.contains("_hive._tcp.example.com"), "{text}");
     }
 
     #[test]
     fn provider_none_builds_no_publisher() {
         let dns = crate::config::NodeConfig::parse(
-            "[dns]\nprovider = \"none\"\nzone = \"bierlysmith.com\"\n",
+            "[dns]\nprovider = \"none\"\nzone = \"example.com\"\n",
         )
         .unwrap()
         .dns
@@ -656,7 +656,7 @@ mod tests {
             r#"
             [dns]
             provider = "cloudflare"
-            zone = "bierlysmith.com"
+            zone = "example.com"
 
             [dns.cloudflare]
             zone_id = "zone-1"

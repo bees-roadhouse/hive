@@ -50,7 +50,7 @@ use tokio::net::TcpStream;
 /// The one domain every scenario enrolls into. Created before the node boots
 /// (the seam does it): a node discovers its vault tree at open, so a domain
 /// that appears afterwards is one the running listener cannot serve.
-const DOMAIN: &str = "household/bierlysmith.com";
+const DOMAIN: &str = "household/example.com";
 
 /// Redeem `code` for `device`, from a fresh mTLS connection.
 ///
@@ -59,6 +59,10 @@ const DOMAIN: &str = "household/bierlysmith.com";
 /// The dialer pins NOTHING on this one connection — it has not been told the
 /// node's key yet, and the grant is what tells it ([`UnpinnedEnrollment`]).
 /// What authorizes it is the code.
+///
+/// The pin the handshake landed on is carried into `redeem` rather than
+/// discarded: accepting any server key is only safe because the grant is then
+/// checked against the key that actually answered.
 async fn redeem(
     addr: std::net::SocketAddr,
     identity: &hive_core::identity::DeviceIdentity,
@@ -67,11 +71,11 @@ async fn redeem(
 ) -> anyhow::Result<EnrollGrant> {
     let cert = DeviceCert::self_signed(identity)?;
     let connector = tls::connector(&cert, Arc::new(UnpinnedEnrollment))?;
-    let (stream, _node_pin) =
+    let (stream, node_pin) =
         tls::connect_pinned(&connector, TcpStream::connect(addr).await?).await?;
     let (mut reader, mut writer) = tokio::io::split(stream);
     let request = enroll::request(code, device, identity)?;
-    enroll::redeem(&mut reader, &mut writer, request).await
+    enroll::redeem(&mut reader, &mut writer, request, &node_pin).await
 }
 
 /// Open a session as a device the node has already pinned, pushing an empty
@@ -124,7 +128,7 @@ async fn a_device_enrolls_with_a_minted_code_and_comes_back_on_its_pin() {
     let grant = redeem(node.addr(), &laptop, "dev-laptop", &code)
         .await
         .expect("the first device enrolls");
-    assert_eq!(grant.domain, "bierlysmith.com");
+    assert_eq!(grant.domain, "example.com");
     assert_eq!(
         grant.node_ed25519_pk,
         node.node_key(),
@@ -145,7 +149,7 @@ async fn a_device_enrolls_with_a_minted_code_and_comes_back_on_its_pin() {
         node.addr(),
         &laptop,
         node.node_key(),
-        "bierlysmith.com",
+        "example.com",
         "dev-laptop",
     )
     .await
@@ -288,7 +292,7 @@ async fn a_revoked_device_cannot_reconnect_and_cannot_come_back() {
         node.addr(),
         &laptop,
         node.node_key(),
-        "bierlysmith.com",
+        "example.com",
         "dev-laptop",
     )
     .await
@@ -304,7 +308,7 @@ async fn a_revoked_device_cannot_reconnect_and_cannot_come_back() {
         node.addr(),
         &laptop,
         node.node_key(),
-        "bierlysmith.com",
+        "example.com",
         "dev-laptop",
     )
     .await
@@ -419,7 +423,7 @@ async fn the_control_epoch_never_regresses_across_a_reboot() {
         node.addr(),
         &laptop,
         node.node_key(),
-        "bierlysmith.com",
+        "example.com",
         "dev-laptop",
     )
     .await

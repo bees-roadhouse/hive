@@ -47,6 +47,27 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// The database file inside a domain's vault directory.
 pub const META_DB_FILE: &str = "node-meta.db";
 
+/// Seconds since the epoch, in the form every column here stores.
+///
+/// ONE converter, beside the columns it feeds, because there were three and
+/// they disagreed at exactly the edge that matters. The saturating version
+/// answered 0 for a clock at or before 1970, and `live_codes(0)` matches
+/// `expires_at > 0` — every code ever minted — so a node whose RTC had not
+/// been set yet reported an OPEN ENROLLMENT WINDOW indefinitely and its
+/// listener admitted any unpinned key. The comment on that version claimed
+/// precisely the opposite ("should refuse every code, and 0 does that").
+///
+/// So this REFUSES rather than clamps. A node that cannot say what time it is
+/// cannot decide whether a ten-minute credential has expired, and the safe
+/// answer to a question you cannot evaluate is to decline it.
+pub fn unix_seconds(at: std::time::SystemTime) -> Result<i64> {
+    let secs = at
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("a clock before 1970 cannot express an enrollment TTL")?
+        .as_secs();
+    i64::try_from(secs).context("a clock past year 292277026596")
+}
+
 /// Auth-audit rows kept per domain. Big enough that a real incident is still
 /// legible days later, small enough that an unauthenticated stranger holding a
 /// socket open cannot grow the file without bound (the alarms table has no
@@ -476,6 +497,54 @@ impl NodeMeta {
             )
             .with_context(|| format!("pinning device {device}"))?;
         Ok(())
+    }
+
+    /// Pin a device ONLY IF this domain still has no enrolled one, deciding and
+    /// writing inside a single transaction.
+    ///
+    /// `enroll::redeem` checks the same thing beforehand, and that check is
+    /// what produces a refusal an operator can read. This is the one that makes
+    /// it TRUE: the pre-check is a read, the pin is a later write, and two
+    /// redemptions of two DIFFERENT live codes run on their own blocking
+    /// threads. Each spends its own `enroll_codes` row, so the single-use
+    /// UPDATE cannot serialize them against each other — both would observe an
+    /// empty table and both would pin, leaving a domain with two devices
+    /// enrolled node-solo and no short-auth-string ever compared. That is the
+    /// state v1 refuses precisely because PR 4.14's ceremony does not ship.
+    ///
+    /// IMMEDIATE so the write lock is taken at BEGIN rather than at the INSERT:
+    /// a deferred transaction would let both readers in and turn the loser into
+    /// SQLITE_BUSY at commit, which is a refusal for the wrong reason.
+    pub fn pin_first_device(
+        &self,
+        device: &str,
+        ed25519_pk: &[u8; 32],
+        x25519_pk: &[u8; 32],
+    ) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("opening the enrollment transaction")?;
+        let taken: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM device_pins WHERE revoked_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .context("counting enrolled devices")?;
+        if taken > 0 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO device_pins (device, ed25519_pk, x25519_pk) VALUES (?1, ?2, ?3)
+             ON CONFLICT(device) DO UPDATE SET
+                 ed25519_pk = excluded.ed25519_pk,
+                 x25519_pk = excluded.x25519_pk",
+            params![device, &ed25519_pk[..], &x25519_pk[..]],
+        )
+        .with_context(|| format!("pinning device {device}"))?;
+        tx.commit().context("committing the enrollment")?;
+        Ok(true)
     }
 
     /// Tombstone a device. The row stays forever — a deleted revocation is a

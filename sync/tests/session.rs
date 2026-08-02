@@ -22,7 +22,7 @@ use hive_sync::frame::{
 use hive_sync::{push_session, receive_session, DirVault, SessionConfig, SyncSource};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-const DOMAIN: &str = "bierlysmith.com";
+const DOMAIN: &str = "example.com";
 
 /// A source with nothing in it — enough for every handshake case, and the
 /// base a hostile-answer source specialises.
@@ -151,7 +151,7 @@ async fn a_domain_mismatch_is_refused() {
     let (br, bw) = tokio::io::split(b);
     let (_dir, vault) = vault();
 
-    let pushing = cfg("bierlysmith.com", "dev-alpha");
+    let pushing = cfg("example.com", "dev-alpha");
     let receiving = cfg("someone-else.example", "node-1");
     let push = push_session(ar, aw, &EmptySource, &pushing);
     let recv = receive_session(br, bw, &vault, &receiving);

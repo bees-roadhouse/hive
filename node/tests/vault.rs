@@ -31,7 +31,7 @@ use hive_node::AlarmKind;
 use hive_sync::SyncSink;
 
 const TENANT: &str = "household";
-const DOMAIN: &str = "bierlysmith.com";
+const DOMAIN: &str = "example.com";
 
 /// The vault under test, in its own node root.
 fn vault() -> (tempfile::TempDir, SegmentVault) {
@@ -307,6 +307,76 @@ async fn bytes_that_vanish_and_return_different_are_caught_by_the_recorded_hash(
         .await
         .expect("a genuine restore is not an attack");
     assert_eq!(on_disk(&vault, "dev-alpha", 1), held);
+}
+
+/// The same substitution, but the forgery is SHORTER than what this node
+/// attested — which is the shape a truncating disk, a partial restore, or a
+/// hostile local process actually produces.
+///
+/// This is the case the length guard used to skip: `len >= row.len` was false,
+/// so the recorded-hash comparison never ran and `record_segment` quietly
+/// re-attested the shorter content. The node forgot it had ever vouched for
+/// the missing bytes and reported itself healthy.
+#[tokio::test]
+async fn a_forgery_shorter_than_what_was_attested_is_still_caught() {
+    let (_root, vault) = vault();
+    let held = segment_bytes("dev-alpha", 6, 0);
+    let forged = segment_bytes("dev-alpha", 2, 9);
+    assert!(
+        forged.len() < held.len(),
+        "the point of this test is a SHORTER forgery"
+    );
+    vault
+        .extend_segment("dev-alpha", 1, 0, held.clone())
+        .await
+        .unwrap();
+
+    std::fs::remove_file(oplog::segment_path(vault.dir(), "dev-alpha", 1)).unwrap();
+
+    let err = vault
+        .extend_segment("dev-alpha", 1, 0, forged)
+        .await
+        .expect_err("fewer bytes than we attested is still not the bytes we attested");
+    assert!(format!("{err:#}").contains("integrity alarm"), "{err:#}");
+    assert_eq!(vault.meta().alarms().unwrap().len(), 1);
+}
+
+/// `landed()` runs before a transfer, on whatever is on disk. It must not
+/// re-describe a tampered file into the very row it is about to be checked
+/// against — that made the divergence alarm unable to fire at all, because
+/// `after_write` then compared the new bytes to a hash taken from those same
+/// new bytes.
+#[tokio::test]
+async fn landed_refuses_to_re_attest_a_file_that_lost_what_was_vouched_for() {
+    let (_root, vault) = vault();
+    let held = segment_bytes("dev-alpha", 6, 0);
+    vault
+        .extend_segment("dev-alpha", 1, 0, held.clone())
+        .await
+        .unwrap();
+
+    // Someone with filesystem access on the blind node swaps the file for a
+    // shorter, structurally valid one. node-meta still remembers the real one.
+    let forged = segment_bytes("dev-alpha", 2, 9);
+    std::fs::write(oplog::segment_path(vault.dir(), "dev-alpha", 1), &forged).unwrap();
+
+    let err = vault
+        .landed("dev-alpha", 1)
+        .await
+        .expect_err("the session must not resume against bytes we never vouched for");
+    assert!(format!("{err:#}").contains("integrity alarm"), "{err:#}");
+    assert_eq!(
+        vault.meta().alarms().unwrap().len(),
+        1,
+        "the operator's alarms table is the whole detection surface"
+    );
+    // The attestation is intact: it was NOT overwritten by the tampered file.
+    let row = vault.meta().segment("dev-alpha", 1).unwrap().unwrap();
+    assert_eq!(
+        row.len,
+        held.len() as u64,
+        "the node still remembers what it vouched for"
+    );
 }
 
 /// A tail may extend, but only from where it ends. A write past the end is a
