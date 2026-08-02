@@ -38,6 +38,7 @@ use hive_shared::{
 use serde_json::Value;
 
 mod bridge_server;
+mod theme;
 
 /// Config key naming the human behind the hive — the owner display name. The
 /// onboarding identity step writes it; Settings edits it; it's the fallback
@@ -372,13 +373,23 @@ fn bridge_socket_enabled() -> bool {
     )
 }
 
-const BG: &str = "#14120e";
-const PANEL: &str = "#1a1712";
-const EDGE: &str = "#2c2818";
-const INK: &str = "#e8e2d4";
-const DIM: &str = "#9a927e";
-const FAINT: &str = "#6f684f";
-const GOLD: &str = "#e2a921";
+// The palette is INDIRECT on purpose. Every `style:` in this file
+// interpolates these, so pointing them at custom properties re-themes several
+// hundred call sites without touching one of them — and a theme change becomes
+// a stylesheet swap rather than a re-render of the world. The values live in
+// `theme.rs`, which is also where the OS gets its say.
+//
+// `GOLD` is the brand FILL (a button's background). `GOLD_TEXT` is gold ON the
+// current background, which has to be darker in the light theme or it fails
+// contrast. `ACCENT` is the DESKTOP's colour and belongs to chrome only.
+const BG: &str = "var(--bg)";
+const PANEL: &str = "var(--panel)";
+const EDGE: &str = "var(--edge)";
+const INK: &str = "var(--ink)";
+const DIM: &str = "var(--dim)";
+const FAINT: &str = "var(--faint)";
+const GOLD: &str = "var(--gold)";
+const ACCENT: &str = "var(--accent)";
 
 /// Scoped dark-theme styling for the Markdown-rendered journal bodies. Every
 /// rule is prefixed `.md-body` so it only touches rendered entry HTML, not the
@@ -390,27 +401,27 @@ const MD_CSS: &str = "\
 .md-body > *:last-child { margin-bottom: 0; } \
 .md-body p { margin: 0.5rem 0; } \
 .md-body h1, .md-body h2, .md-body h3, .md-body h4 { \
-  line-height: 1.3; margin: 0.9rem 0 0.4rem; font-weight: 700; color: #f0ead9; } \
+  line-height: 1.3; margin: 0.9rem 0 0.4rem; font-weight: 700; color: var(--ink); } \
 .md-body h1 { font-size: 1.3rem; } .md-body h2 { font-size: 1.15rem; } \
 .md-body h3 { font-size: 1.02rem; } .md-body h4 { font-size: 0.95rem; } \
-.md-body a { color: #e2a921; text-decoration: underline; } \
+.md-body a { color: var(--gold-text); text-decoration: underline; } \
 .md-body ul, .md-body ol { margin: 0.5rem 0; padding-left: 1.4rem; } \
 .md-body li { margin: 0.2rem 0; } \
 .md-body li input[type=checkbox] { margin-right: 0.4rem; vertical-align: middle; } \
-.md-body code { background: #14120e; border: 1px solid #2c2818; border-radius: 5px; \
+.md-body code { background: var(--bg); border: 1px solid var(--edge); border-radius: 5px; \
   padding: 0.05rem 0.3rem; font-size: 0.88em; } \
-.md-body pre { background: #14120e; border: 1px solid #2c2818; border-radius: 8px; \
+.md-body pre { background: var(--bg); border: 1px solid var(--edge); border-radius: 8px; \
   padding: 0.7rem 0.85rem; overflow-x: auto; margin: 0.6rem 0; } \
 .md-body pre code { background: none; border: none; padding: 0; } \
-.md-body blockquote { margin: 0.6rem 0; padding: 0.1rem 0.9rem; color: #9a927e; \
-  border-left: 3px solid #2c2818; } \
+.md-body blockquote { margin: 0.6rem 0; padding: 0.1rem 0.9rem; color: var(--dim); \
+  border-left: 3px solid var(--edge); } \
 .md-body table { border-collapse: collapse; margin: 0.6rem 0; display: block; \
   overflow-x: auto; } \
-.md-body th, .md-body td { border: 1px solid #2c2818; padding: 0.35rem 0.6rem; text-align: left; } \
-.md-body th { background: #1a1712; font-weight: 700; } \
+.md-body th, .md-body td { border: 1px solid var(--edge); padding: 0.35rem 0.6rem; text-align: left; } \
+.md-body th { background: var(--panel); font-weight: 700; } \
 .md-body img { max-width: 100%; border-radius: 6px; } \
-.md-body hr { border: none; border-top: 1px solid #2c2818; margin: 0.9rem 0; } \
-.md-body h1 { border-bottom: 1px solid #2c2818; padding-bottom: 0.2rem; }";
+.md-body hr { border: none; border-top: 1px solid var(--edge); margin: 0.9rem 0; } \
+.md-body h1 { border-bottom: 1px solid var(--edge); padding-bottom: 0.2rem; }";
 
 /// What the window is currently for. Boot picks the initial mode; the
 /// onboarding flow moves it to Journal IN PLACE (one process, no relaunch)
@@ -452,7 +463,13 @@ fn app() -> Element {
         Boot::Failed(reason) => Mode::Failed(reason),
     });
 
-    match mode() {
+    // The palette lives HERE, not in Shell: onboarding and the failure screen
+    // are separate roots, and a mode without :root resolves every var() to
+    // nothing — which renders as a default-white page, not as the fallback
+    // palette. Asked once, at mount; the portal is a blocking bus call.
+    let theme_css = use_hook(|| theme::Appearance::detect().css_root());
+
+    let body = match mode() {
         Mode::Journal(store) => rsx! {
             Shell { store }
         },
@@ -473,6 +490,11 @@ fn app() -> Element {
                 }
             }
         },
+    };
+
+    rsx! {
+        style { "{theme_css}" }
+        {body}
     }
 }
 
@@ -749,7 +771,7 @@ fn Onboarding(mode: Signal<Mode>, master: [u8; 32], dir: PathBuf) -> Element {
                                 span { style: "flex: 1;" }
                                 button {
                                     id: "onb-continue",
-                                    style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                                    style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
                                             padding: 0.6rem 1.5rem; font-weight: 700; font-size: 0.95rem; \
                                             cursor: pointer;",
                                     onclick: move |_| step.set(OnbStep::Choice),
@@ -801,7 +823,7 @@ fn Onboarding(mode: Signal<Mode>, master: [u8; 32], dir: PathBuf) -> Element {
                         }
                         if let Some(err) = fresh_err() {
                             div {
-                                style: "color: #e07a5f; font-size: 0.88rem; line-height: 1.55; margin-top: 0.9rem; \
+                                style: "color: var(--danger); font-size: 0.88rem; line-height: 1.55; margin-top: 0.9rem; \
                                         white-space: pre-wrap; overflow-wrap: anywhere;",
                                 "{err}"
                             }
@@ -847,7 +869,7 @@ fn Onboarding(mode: Signal<Mode>, master: [u8; 32], dir: PathBuf) -> Element {
                                 }
                                 button {
                                     id: "onb-import",
-                                    style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                                    style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
                                             padding: 0.6rem 1.5rem; font-weight: 700; font-size: 0.95rem; \
                                             cursor: pointer;",
                                     disabled: run_off,
@@ -890,7 +912,7 @@ fn Onboarding(mode: Signal<Mode>, master: [u8; 32], dir: PathBuf) -> Element {
                                     {summary_card(&summary)}
                                     button {
                                         id: "onb-open-journal",
-                                        style: "background: {GOLD}; color: #14120e; border: none; \
+                                        style: "background: {GOLD}; color: var(--bg); border: none; \
                                                 border-radius: 8px; padding: 0.7rem 1.6rem; font-weight: 700; \
                                                 font-size: 1rem; cursor: pointer; margin-top: 0.9rem;",
                                         onclick: open_journal,
@@ -913,7 +935,7 @@ fn import_error(err: &str) -> Element {
     rsx! {
         div {
             id: "onb-import-error",
-            style: "color: #e07a5f; font-size: 0.88rem; line-height: 1.55; margin-top: 0.9rem; \
+            style: "color: var(--danger); font-size: 0.88rem; line-height: 1.55; margin-top: 0.9rem; \
                     white-space: pre-wrap; overflow-wrap: anywhere;",
             "{err}"
         }
@@ -1231,11 +1253,17 @@ fn sidebar_row(
     } else {
         (DIM, "transparent", "500")
     };
+    // The selected row carries the DESKTOP's accent, not the brand gold. A
+    // rail marking "you are here" is chrome — the same job the desktop uses
+    // its accent for everywhere else — so this is where following it reads as
+    // belonging rather than as losing the palette.
+    let rail = if active { ACCENT } else { "transparent" };
     rsx! {
         button {
             id: s.nav_id(),
             style: "display: flex; align-items: center; gap: 0.6rem; width: 100%; text-align: left; \
                     padding: 0.5rem 0.6rem; margin-bottom: 0.15rem; border: none; border-radius: 8px; \
+                    border-left: 3px solid {rail}; \
                     background: {bg}; color: {fg}; font: inherit; font-size: 0.92rem; \
                     font-weight: {weight}; cursor: pointer;",
             onclick: move |_| {
@@ -1440,7 +1468,7 @@ fn JournalPane(store: ReadOnlySignal<Store>, active: Signal<String>) -> Element 
                     span { style: "flex: 1;" }
                     button {
                         id: "journal-append",
-                        style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                        style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
                                 padding: 0.5rem 1.2rem; font-weight: 700; font-size: 0.9rem; \
                                 cursor: pointer;",
                         onclick: move |_| append(),
@@ -1463,7 +1491,7 @@ fn JournalPane(store: ReadOnlySignal<Store>, active: Signal<String>) -> Element 
 
             if let Some(err) = status() {
                 div {
-                    style: "color: #e07a5f; font-size: 0.88rem; margin-bottom: 0.9rem;",
+                    style: "color: var(--danger); font-size: 0.88rem; margin-bottom: 0.9rem;",
                     "{err}"
                 }
             }
@@ -1497,7 +1525,7 @@ fn JournalPane(store: ReadOnlySignal<Store>, active: Signal<String>) -> Element 
 /// One segment button in the feed filter toggle.
 fn segmented_style(on: bool) -> String {
     let (fg, bg) = if on {
-        ("#14120e", GOLD)
+        ("var(--bg)", GOLD)
     } else {
         (DIM, "transparent")
     };
@@ -1636,7 +1664,7 @@ fn MailEmptyState(managing: Signal<bool>) -> Element {
             }
             button {
                 id: "mail-empty-add",
-                style: "margin-top: 1.4rem; background: {GOLD}; color: #14120e; border: none; \
+                style: "margin-top: 1.4rem; background: {GOLD}; color: var(--bg); border: none; \
                         border-radius: 10px; padding: 0.7rem 1.6rem; font: inherit; font-weight: 700; \
                         font-size: 0.95rem; cursor: pointer;",
                 onclick: move |_| managing.set(true),
@@ -1711,7 +1739,7 @@ fn MailSidebar(
             // New Message — opens the compose overlay with a blank seed.
             button {
                 id: "mail-compose-new",
-                style: "width: 100%; box-sizing: border-box; background: {GOLD}; color: #14120e; \
+                style: "width: 100%; box-sizing: border-box; background: {GOLD}; color: var(--bg); \
                         border: none; border-radius: 8px; padding: 0.5rem 0.8rem; font: inherit; \
                         font-weight: 700; font-size: 0.86rem; cursor: pointer; margin-bottom: 0.7rem;",
                 onclick: move |_| {
@@ -1811,7 +1839,7 @@ fn mail_account_group(
                     div { style: "color: {FAINT}; font-size: 0.78rem; padding: 0.2rem 0.4rem;", "…" }
                 },
                 Some(Err(e)) => rsx! {
-                    div { style: "color: #e07a5f; font-size: 0.76rem; padding: 0.2rem 0.4rem;", "{e}" }
+                    div { style: "color: var(--danger); font-size: 0.76rem; padding: 0.2rem 0.4rem;", "{e}" }
                 },
                 Some(Ok(boxes)) if boxes.is_empty() => rsx! {
                     div {
@@ -1861,7 +1889,7 @@ fn mail_mailbox_row(
             }
             if mbox.unread > 0 {
                 span {
-                    style: "font-size: 0.72rem; font-weight: 700; color: #14120e; background: {GOLD}; \
+                    style: "font-size: 0.72rem; font-weight: 700; color: var(--bg); background: {GOLD}; \
                             border-radius: 999px; padding: 0.05rem 0.42rem; min-width: 1rem; text-align: center;",
                     "{mbox.unread}"
                 }
@@ -2498,7 +2526,7 @@ fn MailActionBar(
                 if confirm_perm() {
                     button {
                         id: "mail-delete-perm-{message_id}",
-                        style: "background: #7a2e22; border: 1px solid #e07a5f; color: #ffe; \
+                        style: "background: #7a2e22; border: 1px solid var(--danger); color: #ffe; \
                                 border-radius: 8px; padding: 0.35rem 0.8rem; font: inherit; \
                                 font-size: 0.82rem; font-weight: 700; cursor: pointer;",
                         disabled: busy(),
@@ -2543,7 +2571,7 @@ fn MailActionBar(
                         {
                             let mjmap = mbox.jmap_id.clone();
                             let on = mailbox_ids.iter().any(|m| m == &mjmap);
-                            let (bg, fg, border) = if on { (GOLD, "#14120e", GOLD) } else { ("transparent", DIM, EDGE) };
+                            let (bg, fg, border) = if on { (GOLD, "var(--bg)", GOLD) } else { ("transparent", DIM, EDGE) };
                             rsx! {
                                 button {
                                     id: "mail-label-{message_id}-{mbox.id}",
@@ -2571,7 +2599,7 @@ fn MailActionBar(
             }
 
             if let Some(e) = err() {
-                div { style: "color: #e07a5f; font-size: 0.74rem; width: 100%;", "{e}" }
+                div { style: "color: var(--danger); font-size: 0.74rem; width: 100%;", "{e}" }
             }
         }
     }
@@ -2714,7 +2742,7 @@ fn mail_attachment_chip(store: ReadOnlySignal<Store>, att: MailAttachmentChip) -
                 span { style: "color: {FAINT}; flex: none;", "{size_label}" }
             }
             if let Some(e) = err() {
-                span { style: "color: #e07a5f; font-size: 0.72rem;", "{e}" }
+                span { style: "color: var(--danger); font-size: 0.72rem;", "{e}" }
             }
         }
     }
@@ -2987,7 +3015,7 @@ fn ComposeWindow(store: ReadOnlySignal<Store>, compose: Signal<Option<ComposeSee
                     button {
                         id: "compose-send",
                         disabled: sending || account_list.is_empty(),
-                        style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                        style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
                                 padding: 0.55rem 1.3rem; font-weight: 700; font-size: 0.9rem; \
                                 cursor: pointer; opacity: {send_opacity};",
                         onclick: submit,
@@ -3006,7 +3034,7 @@ fn ComposeWindow(store: ReadOnlySignal<Store>, compose: Signal<Option<ComposeSee
                 if let Some(e) = error() {
                     div {
                         id: "compose-error",
-                        style: "color: #e07a5f; font-size: 0.84rem; margin-top: 0.6rem;",
+                        style: "color: var(--danger); font-size: 0.84rem; margin-top: 0.6rem;",
                         "{e}"
                     }
                 }
@@ -3028,7 +3056,7 @@ fn compose_status(state: SendState) -> Element {
         SendState::Failed(reason) => rsx! {
             span {
                 id: "compose-failed",
-                style: "color: #e07a5f; font-size: 0.84rem;",
+                style: "color: var(--danger); font-size: 0.84rem;",
                 "Failed: {reason}"
             }
         },
@@ -3039,7 +3067,7 @@ fn compose_status(state: SendState) -> Element {
 /// rest read as muted pills.
 fn label_chip(label: &str) -> Element {
     let (bg, fg, border) = if label == "flagged" {
-        (GOLD, "#14120e", GOLD)
+        (GOLD, "var(--bg)", GOLD)
     } else {
         ("transparent", DIM, EDGE)
     };
@@ -3565,7 +3593,7 @@ fn MailAddAccount(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element
                 button {
                     id: "mail-add-submit",
                     disabled: busy(),
-                    style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                    style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
                             padding: 0.55rem 1.1rem; font-weight: 700; font-size: 0.88rem; \
                             cursor: pointer; opacity: {submit_opacity};",
                     onclick: submit,
@@ -3581,7 +3609,7 @@ fn MailAddAccount(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element
             if let Some(e) = error() {
                 div {
                     id: "mail-add-error",
-                    style: "color: #e07a5f; font-size: 0.84rem; margin-top: 0.6rem;",
+                    style: "color: var(--danger); font-size: 0.84rem; margin-top: 0.6rem;",
                     "{e}"
                 }
             }
@@ -3803,7 +3831,7 @@ fn mail_account_row(
                 if armed().as_deref() == Some(acct.id.as_str()) {
                     button {
                         id: "mail-account-delete-{acct.id}",
-                        style: "background: #e07a5f; color: #14120e; border: none; border-radius: 999px; \
+                        style: "background: var(--danger); color: var(--bg); border: none; border-radius: 999px; \
                                 padding: 0.35rem 0.8rem; font-weight: 700; font-size: 0.8rem; cursor: pointer;",
                         onclick: delete,
                         "Really delete"
@@ -3817,7 +3845,7 @@ fn mail_account_row(
                     }
                 } else {
                     button {
-                        style: "background: none; border: 1px solid #e07a5f; color: #e07a5f; \
+                        style: "background: none; border: 1px solid var(--danger); color: var(--danger); \
                                 border-radius: 999px; padding: 0.35rem 0.8rem; font: inherit; \
                                 font-size: 0.8rem; cursor: pointer;",
                         title: "Disconnect this mailbox and delete its local copy",
@@ -3884,7 +3912,7 @@ fn mail_account_row(
                         button {
                             id: "mail-edit-save-{acct.id}",
                             disabled: edit_busy(),
-                            style: "background: {GOLD}; color: #14120e; border: none; border-radius: 999px; \
+                            style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 999px; \
                                     padding: 0.4rem 0.9rem; font: inherit; font-weight: 700; \
                                     font-size: 0.82rem; cursor: pointer;",
                             onclick: save,
@@ -3918,13 +3946,13 @@ fn mail_account_row(
                 .filter(|_| acct.last_status.as_deref() == Some("error") || !acct.enabled)
             {
                 div {
-                    style: "color: #e07a5f; font-size: 0.78rem; margin-top: 0.5rem; overflow-wrap: anywhere;",
+                    style: "color: var(--danger); font-size: 0.78rem; margin-top: 0.5rem; overflow-wrap: anywhere;",
                     "Last error: {err}"
                 }
             }
             if let Some(e) = row_err() {
                 div {
-                    style: "color: #e07a5f; font-size: 0.78rem; margin-top: 0.5rem;",
+                    style: "color: var(--danger); font-size: 0.78rem; margin-top: 0.5rem;",
                     "{e}"
                 }
             }
@@ -3964,7 +3992,7 @@ fn account_status_line(a: &MailAccountAdminView) -> String {
 fn mail_pill_style(enabled: bool) -> String {
     if enabled {
         format!(
-            "background: {GOLD}; color: #14120e; border: none; border-radius: 999px; \
+            "background: {GOLD}; color: var(--bg); border: none; border-radius: 999px; \
              padding: 0.35rem 0.8rem; font-weight: 700; font-size: 0.8rem; cursor: pointer;"
         )
     } else {
@@ -4124,7 +4152,7 @@ fn CalendarPane(
                     }
                     button {
                         id: "cal-new",
-                        style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                        style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
                                 padding: 0.6rem 1.3rem; font-weight: 700; font-size: 0.9rem; cursor: pointer;",
                         onclick: move |_| create(),
                         "+ New event"
@@ -4132,7 +4160,7 @@ fn CalendarPane(
                 }
                 if let Some(e) = err() {
                     div {
-                        style: "color: #e07a5f; font-size: 0.85rem; margin-top: 0.6rem;",
+                        style: "color: var(--danger); font-size: 0.85rem; margin-top: 0.6rem;",
                         "{e}"
                     }
                 }
@@ -4493,7 +4521,7 @@ fn cal_view_seg(
 ) -> Element {
     let active = mine == current;
     let (bg, fg) = if active {
-        (GOLD.to_string(), "#14120e".to_string())
+        (GOLD.to_string(), "var(--bg)".to_string())
     } else {
         ("transparent".to_string(), INK.to_string())
     };
@@ -4944,7 +4972,7 @@ fn IdentitiesPane(
                     }
                     button {
                         id: "identity-create",
-                        style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                        style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
                                 padding: 0.6rem 1.3rem; font-weight: 700; font-size: 0.9rem; cursor: pointer;",
                         onclick: move |_| create(),
                         "Create"
@@ -4957,8 +4985,8 @@ fn IdentitiesPane(
             if let Some(e) = err() {
                 div {
                     id: "identity-error",
-                    style: "color: #e07a5f; font-size: 0.85rem; background: {PANEL}; \
-                            border: 1px solid #e07a5f; border-radius: 8px; padding: 0.6rem 0.8rem; \
+                    style: "color: var(--danger); font-size: 0.85rem; background: {PANEL}; \
+                            border: 1px solid var(--danger); border-radius: 8px; padding: 0.6rem 0.8rem; \
                             margin: 0 0 0.8rem;",
                     "{e}"
                 }
@@ -5241,7 +5269,7 @@ fn identity_row(
                                     button {
                                         id: "identity-claim-{person.slug}",
                                         disabled: busy() || owner_slug.is_empty(),
-                                        style: "background: {GOLD}; color: #14120e; border: none; \
+                                        style: "background: {GOLD}; color: var(--bg); border: none; \
                                                 border-radius: 999px; padding: 0.25rem 0.8rem; font: inherit; \
                                                 font-size: 0.74rem; font-weight: 700; cursor: pointer;",
                                         onclick: move |_| {
@@ -5425,7 +5453,7 @@ fn takeover_preview(
                 button {
                     id: "takeover-confirm",
                     disabled: busy() || owner_slug.is_empty(),
-                    style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                    style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
                             padding: 0.4rem 1rem; font: inherit; font-size: 0.82rem; \
                             font-weight: 700; cursor: pointer;",
                     onclick: move |_| {
@@ -6653,7 +6681,7 @@ fn ContactsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
                             }
                             button {
                                 id: "contact-create",
-                                style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                                style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
                                         padding: 0.5rem 0.9rem; font-weight: 700; font-size: 0.85rem; cursor: pointer;",
                                 onclick: move |_| create(),
                                 "Add"
@@ -6661,7 +6689,7 @@ fn ContactsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
                         }
                         if let Some(e) = err() {
                             div {
-                                style: "color: #e07a5f; font-size: 0.8rem; margin-top: 0.4rem;",
+                                style: "color: var(--danger); font-size: 0.8rem; margin-top: 0.4rem;",
                                 "{e}"
                             }
                         }
@@ -6734,7 +6762,7 @@ fn contact_filter_rail(
     let all_count = contacts.len();
     let row_style = |on: bool| {
         let (bg, fg) = if on {
-            (GOLD.to_string(), "#14120e".to_string())
+            (GOLD.to_string(), "var(--bg)".to_string())
         } else {
             ("transparent".to_string(), INK.to_string())
         };
@@ -6797,7 +6825,7 @@ fn group_rail_row(
         })
         .count();
     let (bg, fg) = if on {
-        (GOLD.to_string(), "#14120e".to_string())
+        (GOLD.to_string(), "var(--bg)".to_string())
     } else {
         ("transparent".to_string(), INK.to_string())
     };
@@ -6899,7 +6927,7 @@ fn contact_row(c: &CustomEntity, mut card_sel: Signal<Option<Selected>>) -> Elem
             span {
                 style: "display: inline-flex; align-items: center; justify-content: center; \
                         width: 2rem; height: 2rem; border-radius: 50%; background: {color}; \
-                        color: #f4eeda; font-size: 0.8rem; font-weight: 700; flex-shrink: 0;",
+                        color: var(--ink); font-size: 0.8rem; font-weight: 700; flex-shrink: 0;",
                 "{initials}"
             }
             span {
@@ -7036,7 +7064,7 @@ fn ContactCard(
                             span {
                                 style: "display: inline-flex; align-items: center; justify-content: center; \
                                         width: 5rem; height: 5rem; border-radius: 50%; background: {color}; \
-                                        color: #f4eeda; font-size: 1.8rem; font-weight: 700; margin-bottom: 0.7rem;",
+                                        color: var(--ink); font-size: 1.8rem; font-weight: 700; margin-bottom: 0.7rem;",
                                 "{initials}"
                             }
                             div {
@@ -7115,7 +7143,7 @@ fn ContactCard(
                         }
 
                         if let Some(e) = err() {
-                            div { style: "color: #e07a5f; font-size: 0.82rem; margin-bottom: 0.6rem;", "{e}" }
+                            div { style: "color: var(--danger); font-size: 0.82rem; margin-bottom: 0.6rem;", "{e}" }
                         }
 
                         // the reusable typed-field editor + journal backlinks
@@ -7601,11 +7629,11 @@ fn tasks_rail_row(
 ) -> Element {
     let mut on_select = on_select;
     let (bg, fg) = if active {
-        (GOLD, "#14120e")
+        (GOLD, "var(--bg)")
     } else {
         ("transparent", INK)
     };
-    let count_color = if active { "#14120e" } else { FAINT };
+    let count_color = if active { "var(--bg)" } else { FAINT };
     rsx! {
         button {
             id: "{id}",
@@ -7697,7 +7725,7 @@ fn tasks_quickadd(
                 id: "tasks-quickadd-due",
                 style: "background: {BG}; color: {DIM}; border: 1px solid {EDGE}; border-radius: 7px; \
                         padding: 0.3rem 0.4rem; font: inherit; font-size: 0.8rem; cursor: pointer; \
-                        color-scheme: dark;",
+                        ",
                 r#type: "date",
                 value: "{due}",
                 oninput: move |e| due.set(e.value()),
@@ -7714,7 +7742,7 @@ fn tasks_quickadd(
             }
             button {
                 id: "tasks-quickadd-submit",
-                style: "background: {GOLD}; color: #14120e; border: none; border-radius: 7px; \
+                style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 7px; \
                         padding: 0.4rem 0.9rem; font: inherit; font-weight: 700; font-size: 0.85rem; \
                         cursor: pointer;",
                 onclick: move |_| submit(),
@@ -7723,7 +7751,7 @@ fn tasks_quickadd(
             if let Some(e) = error() {
                 div {
                     id: "tasks-quickadd-error",
-                    style: "flex-basis: 100%; color: #e07a5f; font-size: 0.8rem; margin-top: 0.2rem;",
+                    style: "flex-basis: 100%; color: var(--danger); font-size: 0.8rem; margin-top: 0.2rem;",
                     "{e}"
                 }
             }
@@ -7751,7 +7779,7 @@ fn status_label(s: TaskStatus) -> &'static str {
 }
 
 /// A red-ish palette const for overdue accents (matches the app's error red).
-const OVERDUE: &str = "#e07a5f";
+const OVERDUE: &str = "var(--danger)";
 
 /// One checklist row: a tap-to-complete circle, the title (opens the detail
 /// view), a due chip, a priority flag, and a status chip for Doing/Blocked.
@@ -8347,7 +8375,7 @@ fn EntityDetail(
                             style: "display: flex; align-items: center; gap: 0.7rem; margin-top: 1.1rem;",
                             button {
                                 id: "detail-save",
-                                style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                                style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
                                         padding: 0.5rem 1.2rem; font-weight: 700; font-size: 0.9rem; cursor: pointer;",
                                 onclick: move |_| save(),
                                 "Save"
@@ -8360,12 +8388,12 @@ fn EntityDetail(
                                 span { style: "flex: 1;" }
                                 if confirm_delete() {
                                     span {
-                                        style: "font-size: 0.82rem; color: #e07a5f;",
+                                        style: "font-size: 0.82rem; color: var(--danger);",
                                         "Delete this event?"
                                     }
                                     button {
                                         id: "detail-delete",
-                                        style: "background: #e07a5f; color: #14120e; border: none; border-radius: 8px; \
+                                        style: "background: var(--danger); color: var(--bg); border: none; border-radius: 8px; \
                                                 padding: 0.5rem 1rem; font-weight: 700; font-size: 0.85rem; cursor: pointer;",
                                         onclick: move |_| delete(),
                                         "Really delete"
@@ -8381,7 +8409,7 @@ fn EntityDetail(
                                 } else {
                                     button {
                                         id: "detail-delete-arm",
-                                        style: "background: none; border: 1px solid #e07a5f; color: #e07a5f; \
+                                        style: "background: none; border: 1px solid var(--danger); color: var(--danger); \
                                                 border-radius: 8px; padding: 0.5rem 1rem; font: inherit; font-weight: 700; \
                                                 font-size: 0.85rem; cursor: pointer;",
                                         onclick: move |_| confirm_delete.set(true),
@@ -9180,7 +9208,7 @@ fn SettingsPane(store: ReadOnlySignal<Store>, refresh: Signal<u32>) -> Element {
                 style: "display: flex; align-items: center; gap: 0.8rem; margin-top: 0.4rem;",
                 button {
                     id: "settings-save",
-                    style: "background: {GOLD}; color: #14120e; border: none; border-radius: 8px; \
+                    style: "background: {GOLD}; color: var(--bg); border: none; border-radius: 8px; \
                             padding: 0.6rem 1.5rem; font-weight: 700; font-size: 0.92rem; cursor: pointer;",
                     onclick: move |_| save(),
                     "Save settings"
@@ -9308,14 +9336,14 @@ fn reembed_status(state: &ReembedState) -> Element {
         ReembedState::Latched => rsx! {
             span {
                 id: "settings-reembed-latched",
-                style: "font-size: 0.85rem; color: #e07a5f;",
+                style: "font-size: 0.85rem; color: var(--danger);",
                 "Paused: the model is unavailable, so search stays on keywords."
             }
         },
         ReembedState::Failed(err) => rsx! {
             span {
                 id: "settings-reembed-error",
-                style: "font-size: 0.85rem; color: #e07a5f;",
+                style: "font-size: 0.85rem; color: var(--danger);",
                 "Re-embed failed: {err}"
             }
         },

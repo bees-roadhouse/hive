@@ -21,6 +21,24 @@ finish-args:
   # null display then segfaults in libX11 (verified via coredumpctl).
   - --socket=wayland
   - --socket=x11
+  # ...and X11 is the backend we actually run on, deliberately.
+  #
+  # GTK3 does not implement xdg-decoration, so under Wayland it always draws
+  # its OWN titlebar from the runtime's theme. tao gives it a plain GtkWindow
+  # with no GtkHeaderBar, so what you get is Adwaita LIGHT window buttons
+  # bolted to a dark app — on KDE, on GNOME, on anything, because the theme
+  # comes from inside the sandbox where the host's is invisible.
+  #
+  # On X11 the window manager owns the decoration instead, so KWin draws it
+  # with whatever the user actually chose (verified against WhiteSurDark: the
+  # traffic-light buttons land on the left and match the rest of the desktop),
+  # and minimise/maximise/close are the WM's own controls rather than widgets
+  # the toolkit has to wire up.
+  #
+  # The cost is XWayland: no per-monitor fractional scaling. That is the right
+  # trade while dioxus 0.6 needs libxdo's X connection anyway — revisit when
+  # the desktop layer stops opening one.
+  - --env=GDK_BACKEND=x11
   # --device=dri is for the WebKit GL surface (graphics), NOT GPU compute. The
   # embedder's native ONNX engine runs on CPU inside the sandbox: ort-CUDA/ROCm
   # need the CUDA/ROCm COMPUTE runtime, which the GNOME runtime doesn't ship and
