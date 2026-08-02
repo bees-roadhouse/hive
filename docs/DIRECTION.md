@@ -953,3 +953,176 @@ New, numbered continuing from v2:
     device's cutoff the earliest hub receipt across nodes, or per-hub until epoch
     merge — and does a lagging node's acceptance window need a bound? Its own
     decision record, due with the first second-node deployment.
+
+# Hive Direction v2.2: Perception — PROPOSED, not adopted
+
+Status: PROPOSED 2026-08-02. **Nothing in this section is decided.** It amends
+nothing until ratified; D16-D36 stand unchanged either way. Written against
+main at 8a1d2bc from a verified read of the embedding seam, the index, the
+blockstore, and the journal write path; the reasoning, the storage shape, and
+the unverified list live in [MULTIMODAL-IDENTITY.md](./MULTIMODAL-IDENTITY.md),
+and the staged program is the wishlist Phase 8 in
+[PLAN-v2.1.md](./PLAN-v2.1.md). Four decisions (D37-D40) covering: vector
+spaces beyond text, where biometric templates live, what an identification is
+allowed to be, and how an AI is allowed to edit your content. D40 is the one
+that is not really about perception at all, and is the one worth adopting
+first.
+
+D37. **Embedding spaces are plural and named; prose stays on BGE.** The
+retrieval substrate gains a registry of named *spaces*, each with its own
+model, dimension, embedder, and set of `ref_kind`s. `text` is the existing
+384-dim `bge-small-en-v1.5` space and it does not move. Images embed into a
+CLIP-family space (SigLIP-base preferred, CLIP ViT-B/32 the fallback, decided
+by spike) under their own `ref_kind`, and a text query reaches them by being
+encoded with that model's *text tower* at query time — the `embed_query()`
+asymmetry the trait already carries. The rejected alternative is moving the
+corpus onto a CLIP-family text encoder: those towers cap at 64-77 tokens
+against hive's 450-token chunking, and they are caption encoders, not
+retrieval encoders. In a journal app prose is the substrate; trading its
+retrieval quality for the image half is trading the product for a feature.
+
+Three implementation facts are part of the decision, because getting them
+wrong relitigates it later. **The index is already plural** —
+`SqliteIndex.anns` is a per-model `HashMap` with per-model dimension, and the
+384-dim and 256-dim structures coexist today — so this is not new
+architecture, it is a third key plus a registry replacing the single
+`Arc<dyn Embedder>`. **Each space gets its own `ref_kind`**, because
+`embeddings` keys on `(ref_kind, ref_id, chunk_idx)` with `model` outside the
+key; that dodges a schema change and a FOLD_VERSION bump entirely, and adding
+`model` to the primary key — the honest shape — rides an already-scheduled
+bump rather than minting one. **Cross-space fusion is by reciprocal rank, not
+score.** CLIP cosines and BGE cosines are not commensurable and the current
+blend is a weighted sum; adding them under any fixed weight produces a ranking
+that drifts with corpus composition. Keeping the weighted blend inside the
+text space and fusing across spaces by rank also means a text-only query
+returns byte-identical results to today, so the golden retrieval fixture stays
+the parity oracle instead of becoming a thing that churns. The modality gap is
+load-bearing and states its own rule: the image space holds images only, image
+and text vectors never share an index, and no list is ever sorted by a raw
+cross-space score. Byte input arrives as a sibling trait, not a widened
+`embed()` — forcing `Option<&[u8]>` through a text signature would make every
+implementor lie — and the hash fallback gains a byte counterpart so
+`HIVE_EMBED=hash` keeps CI offline and deterministic. Local-caption-to-BGE is
+noted as a real third option, deferred rather than rejected: it cannot do
+image-to-image at all, but it costs nothing architecturally and lands under
+D40 as a derived layer. Ship at most one of the two at a time.
+
+D38. **Derived biometric templates are blobs — not records, not index rows.**
+Crypto-shreddability is the requirement, and it selects the storage. A print
+cannot be an op-log record: the log is immutable by construction (D18) and its
+segments are encrypted under per-segment keys, so destroying one print would
+mean destroying every record beside it. A print cannot live only as an index
+row: `index.db` is SQLCipher as one file under one key, a row delete is a
+delete rather than a shred, and a derived row returns on the next rebuild if
+its durable source survives. Only a blob carries a per-item content key whose
+destruction is provable, which is the mechanism D19 already ships and
+`core/tests/crypto_shred.rs` already proves through replay.
+
+The consequence the brief for this work under-specified: **the template vector
+itself is a blob**, not only the raw audio and imagery it came from. A
+192-float voiceprint is biometric data in its own right. So per contact, per
+modality: source captures are blobs, per-capture templates are blobs, the
+reference centroid is derived at load and never stored as a separate durable
+artifact (keeping the individual templates is what allows dropping one bad
+enrollment and re-deriving cleanly), and the `embeddings` row is a derived
+cache dropped on shred like any other vector row. Three riders. Blob
+production stops being mail-only, so a second producer needs its own table,
+refcount source, and redaction fold rule — real work, named now. **Biometric
+blobs use random-key put, never convergent**, by exactly D31's argument: a
+convergent key re-derives on re-ingestion of identical plaintext and would
+resurrect what a shred destroyed. And the wrapped key must survive an index
+rebuild, which today it does not — `blob_refs` sits in `DROP_DERIVED` while
+being fold-blind, so a FOLD_VERSION bump destroys every wrapped key with no
+op-log record able to rebuild it. That defect blocks this decision and
+independently endangers every mail attachment at PR 4.11; it is a prerequisite,
+not a footnote.
+
+D39. **An identification is a proposal, closed-set, and never written
+unconfirmed.** A voiceprint is a speaker embedding — a measurement, not a
+stamped identifier — and a match is a nearest-neighbour judgment with a
+confidence. Three rules follow and they are the decision.
+
+**Closed-set only.** hive never answers "who is this?"; it answers "is this one
+of the N contacts I enrolled?" No gallery beyond your own contacts, no
+external database, no import of anyone else's templates and no export of
+yours. This is an invariant, not an artifact of not having built the other
+thing. **Gate on similarity and margin, and keep `unknown` first-class.**
+Absolute cosine thresholds transfer badly across microphones, rooms, and
+lighting; the gap between the best and second-best contact is far more stable.
+A probe below either gate resolves to unknown, because a system that always
+names its best guess is a system that names strangers after your friends.
+Thresholds are per-contact, live in `config` records, and calibrate against
+the impostor set that comes free — everyone else already enrolled. **The match
+is not what gets recorded; the confirmation is.** A proposal above threshold
+surfaces in the UI with its score and materialises nothing. A human
+confirmation appends an ordinary record with provenance. This keeps
+probabilistic output out of an append-only log that a better model would later
+contradict, and it is what makes a nonzero false-match rate survivable.
+
+Rejected from the framing this design answers: adapting the *model* over time.
+Local fine-tuning of a speaker or face encoder is a different project with a
+worse failure mode, and it destroys the property that makes re-derivation
+work — a template derived under a locally-adapted model is incomparable with a
+stock-model one, forcing a full re-derive from source audio the user may
+deliberately have shredded. What improves is the reference set, the centroid,
+the calibrated threshold, and wholesale replacement of the stock model. Three
+of the four sharpenings survive; the fourth undermines the others.
+
+Two statements go to the threat model rather than being solved here. Trusted
+tier means the always-on box can read the household's faces and voices —
+delta 1 already says this about everything, and biometrics get no exemption,
+only an explicit sentence. And **consent here belongs to someone who is not
+the user**: a faceprint of a friend in a photograph is data about a person who
+never agreed to hive's threat model, cannot revoke it, and — unlike a
+password — cannot rotate a face after a breach. The answers are the closed-set
+rule, per-contact shred as a discoverable first-class action, and enrollment
+that is explicit rather than ambient. That is a mitigation, not a solution,
+and the document says so. Finally, and separately: these templates are memory
+aids and never credentials. Nothing in hive unlocks on a face.
+
+D40. **An AI correction is an appended layer; the capture is never
+overwritten.** The general rule for any AI edit of the user's own content —
+transcription cleanup, grammar, a generated caption — of which voice-to-journal
+is merely the first instance. A correction is a **new record referencing the
+original**, carrying the corrected text, the model id, the prompt version, and
+when it ran. The interface renders the corrected layer by default with a "view
+original" toggle; "revert" selects a different layer rather than deleting
+anything; the raw capture is immutable, as D18 already requires of everything
+else.
+
+Two details are part of the decision because implementation would otherwise
+discover them painfully. **Emergence runs over the corrected layer** — raw ASR
+produces "bracket task colon", not `[task: ...]`, so parsing the raw layer
+materialises nothing and parsing both double-materialises; the corrected layer
+is the one that means what the speaker meant. **Anchors bind to the layer they
+were computed against, never to "the current text".** `anchors` is
+`(entry_id, start, end)` over UTF-16 offsets into one specific body; a later,
+better correction is a new layer with different offsets, and a floating
+"latest" binding would silently corrupt every span in the entry each time a
+model improved. Append-only makes this easy rather than hard — the old layer
+still exists, so old anchors keep resolving — but only if the binding names
+its layer. Scope boundary: this governs AI corrections *to the user's own
+content*. AI-*authored* content (dreams, D26) already has its answer in the
+actor model and needs no correction layer to say who wrote it.
+
+This decision is doc-only, costs nothing, and is worth adopting ahead of the
+rest of this section: PR 3.6's dreaming and any future AI-touching surface all
+want the principle already settled.
+
+## Open questions (v2.2, proposed)
+
+Numbered continuing from v2.1's 16.
+
+17. Whether the `blob_refs` durability fix is "remove it from `DROP_DERIVED`"
+    (one line; it is not fold-owned, so its presence there is arguably the
+    defect) or "make the wrapped key durable in the log" (a frozen-format
+    change). Due before PR 4.11 regardless of this section's fate.
+18. Whether face identification is worth its second model (detect-and-align,
+    then embed) before voice has proven the pattern on one modality.
+19. Whether the ASR runtime is `ort` or a `whisper.cpp` binding — a second
+    model-cache story and a C dependency against an awkward encoder-decoder
+    loop. Its own spike.
+20. Whether source captures are retained by default at all. Re-derivability
+    requires keeping raw audio, and raw audio is a larger biometric liability
+    than the template derived from it; "keep everything so we can re-derive" is
+    not automatically the privacy-maximising choice.
