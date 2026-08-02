@@ -396,6 +396,95 @@ async fn artifacts_tools_and_identity_sync() {
     assert_eq!(missing["error"], "not found");
 }
 
+#[tokio::test]
+async fn artifacts_write_tools() {
+    let store = test_store().await;
+
+    // upsert: the row is keyed to the ACTING identity — there is no `actor`
+    // argument — and `enabled` defaults on.
+    let made = content_json(
+        &mcp::call_tool(
+            &store,
+            &ctx("pia"),
+            "artifacts_upsert",
+            &args(json!({
+                "kind": "skill", "name": "portainer",
+                "content": "# body v1", "description": "deploys stacks"
+            })),
+        )
+        .await,
+    );
+    assert_eq!(made["actor"], "pia");
+    assert_eq!(made["enabled"], true);
+    let id = made["id"].as_str().unwrap().to_string();
+
+    // Same (kind, name) refreshes in place: one row, same id, new content.
+    let again = content_json(
+        &mcp::call_tool(
+            &store,
+            &ctx("pia"),
+            "artifacts_upsert",
+            &args(json!({
+                "kind": "skill", "name": "portainer",
+                "content": "# body v2", "enabled": false
+            })),
+        )
+        .await,
+    );
+    assert_eq!(again["id"], id);
+    assert_eq!(again["content"], "# body v2");
+    let listed =
+        content_json(&mcp::call_tool(&store, &ctx("pia"), "artifacts_list", &Map::new()).await);
+    assert_eq!(listed["count"], 1, "upsert must not fork a second row");
+
+    // Disabling it takes it out of what the plugin syncs into .claude.
+    let synced = content_json(
+        &mcp::call_tool(&store, &ctx("pia"), "identity_artifacts_sync", &Map::new()).await,
+    );
+    assert_eq!(synced["count"], 0, "{synced}");
+
+    // A kind the plugin can't map to a path is refused rather than stored as a
+    // row that would silently never sync.
+    let bad = mcp::call_tool(
+        &store,
+        &ctx("pia"),
+        "artifacts_upsert",
+        &args(json!({"kind": "hook", "name": "x", "content": "y"})),
+    )
+    .await;
+    assert_eq!(bad["isError"], true);
+    assert!(
+        bad["content"][0]["text"].as_str().unwrap().contains("kind"),
+        "{bad}"
+    );
+
+    // remove is identity-scoped: another actor sees a miss, and the row lives.
+    let denied = content_json(
+        &mcp::call_tool(
+            &store,
+            &ctx("apis"),
+            "artifacts_remove",
+            &args(json!({"id": id})),
+        )
+        .await,
+    );
+    assert_eq!(denied["error"], "not found");
+    assert!(store.artifacts_get(&id).await.unwrap().is_some());
+
+    // The owner can delete it.
+    let removed = content_json(
+        &mcp::call_tool(
+            &store,
+            &ctx("pia"),
+            "artifacts_remove",
+            &args(json!({"id": id})),
+        )
+        .await,
+    );
+    assert_eq!(removed["removed"], true);
+    assert!(store.artifacts_get(&id).await.unwrap().is_none());
+}
+
 // ---- the JSON-RPC frame layer (moved into core by the PR 2.4 proxy flip) ----
 
 #[tokio::test]

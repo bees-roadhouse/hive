@@ -836,6 +836,34 @@ fn build_tools() -> Value {
     ));
     tools.push(json!(
         {
+            "name":"artifacts_upsert",
+            "description": "Create or replace one of the acting identity's Claude Code artifacts, keyed on (kind, name). `content` is the full markdown body (frontmatter included) that lands at skills/<name>/SKILL.md, agents/<name>.md, or commands/<name>.md. Only ENABLED artifacts reach the plugin via identity_artifacts_sync.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["skill", "agent", "command"]},
+                    "name": {"type": "string"},
+                    "content": {"type": "string"},
+                    "description": {"type": "string"},
+                    "enabled": {"type": "boolean"}
+                },
+                "required": ["kind", "name", "content"]
+            }
+        }
+    ));
+    tools.push(json!(
+        {
+            "name":"artifacts_remove",
+            "description": "DESTRUCTIVE. Delete one of the acting identity's Claude Code artifacts by id. Another identity's artifacts are not visible to this tool.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"]
+            }
+        }
+    ));
+    tools.push(json!(
+        {
             "name":"identity_artifacts_sync",
             "description": "The sync payload for an identity: its ENABLED artifacts only (what the Claude Code plugin pulls). Defaults to the acting identity; pass `actor` for another.",
             "inputSchema": {
@@ -1779,6 +1807,54 @@ async fn dispatch(
             match store.artifacts_get(id.unwrap()).await? {
                 Some(art) => Ok(ok_content(&art)),
                 None => Ok(ok_content(&json!({"error": "not found"}))),
+            }
+        }
+        // Writes are always scoped to the acting identity: an artifact is keyed
+        // on (actor, kind, name), so `actor` is taken from LocalCtx rather than
+        // the arguments — one identity can read another's artifacts (the sync
+        // surface below) but never author or delete them.
+        "artifacts_upsert" => {
+            let mut a = Args::new("artifacts_upsert", args);
+            let kind = a.req_str("kind");
+            let name = a.req_str("name");
+            let content = a.req_str("content");
+            let description = a.opt_str("description").unwrap_or("");
+            let enabled = a.opt_bool("enabled").unwrap_or(true);
+            a.finish()?;
+            let kind = kind.unwrap();
+            // The plugin maps kind -> path and silently skips anything else, so a
+            // typo would store a row that never syncs. Reject it at the door.
+            if !matches!(kind, "skill" | "agent" | "command") {
+                return Err(invalid_args(
+                    "artifacts_upsert",
+                    "kind must be one of: skill, agent, command",
+                ));
+            }
+            let art = store
+                .artifacts_upsert(
+                    actor,
+                    kind,
+                    name.unwrap(),
+                    content.unwrap(),
+                    description,
+                    enabled,
+                )
+                .await?;
+            Ok(ok_content(&art))
+        }
+        "artifacts_remove" => {
+            let mut a = Args::new("artifacts_remove", args);
+            let id = a.req_str("id");
+            a.finish()?;
+            let id = id.unwrap();
+            // Another identity's artifact reads as absent rather than forbidden —
+            // same shape as a genuine miss, so callers need one branch, not two.
+            match store.artifacts_get(id).await? {
+                Some(art) if art.actor == actor => {
+                    store.artifacts_remove(id).await?;
+                    Ok(ok_content(&json!({"removed": true, "id": id})))
+                }
+                _ => Ok(ok_content(&json!({"error": "not found"}))),
             }
         }
         // The plugin's sync surface: ENABLED artifacts only.
