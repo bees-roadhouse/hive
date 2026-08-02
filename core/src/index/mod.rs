@@ -63,16 +63,26 @@
 //     the MCP identity_* tools survived the teardown and D18 wants their
 //     writes as records).
 //   - Three RUNTIME tables join worker_status (store-written, fold-blind,
-//     excluded from the canonical dump; an index rebuild loses them, which is
-//     each one's documented trade):
+//     excluded from the canonical dump). Two of them a rebuild may lose,
+//     which is each one's documented trade; the third it must NOT, and the
+//     difference is whether the loss is recoverable:
 //       cc_credentials — the AES-GCM mail-credential vault (HIVE_CRED_KEY).
-//         Phase 3 replaces it with the OS keychain; mail is paused, so a
-//         rebuild losing vault rows means re-entering a password.
+//         Phase 3 replaces it with the OS keychain; a rebuild losing vault
+//         rows means re-entering a password. Recoverable, so it is dropped.
 //       outbox — the webhook/log work queue. Transient by nature.
 //       blob_refs — hash → serialized BlobRef for blockstore payloads
-//         (today: mail attachment bytes). Loses pointers on rebuild; the
-//         Phase 3 mail module re-fetches, and 1.7-imported blobs carry their
-//         refs in log records instead.
+//         (today: mail attachment bytes). NOT dropped, and not droppable:
+//         `ref` holds the only stored copy of each blob's wrapped content
+//         key, and no op-log record carries it, so losing a row IS a
+//         crypto-shred of those bytes (D19) — unrecoverable, not a trade.
+//         An earlier revision of this comment claimed two mitigations and
+//         both were wrong: the Phase 3 mail module cannot re-fetch, because
+//         mail_attachments_pending() keys off `blob_hash IS NULL` and replay
+//         repopulates blob_hash from the module.doc records; and 1.7-imported
+//         blobs do not carry refs in log records either — hive-import routes
+//         bytes through the same Store::mail_attachment_store_blob runtime
+//         path (importer/src/lib.rs), and its `alias` records carry only
+//         blob-hash re-keying. See DROP_DERIVED.
 //   - search_fts tokenizes with `porter unicode61`: parity with the Postgres
 //     `to_tsvector('english')` stemming the golden retrieval fixture was
 //     captured under (see fold/mod.rs v2 notes).
@@ -598,6 +608,17 @@ const DUMP_TABLES: &[(&str, &str)] = &[
 /// Everything `open` drops on a fold-version mismatch. Triggers and indexes
 /// go with their tables; sqlite_sequence rows (ann_keys AUTOINCREMENT) go
 /// with ann_keys.
+///
+/// `blob_refs` is deliberately NOT here, and must never be added: it is the
+/// only stored copy of every blob's wrapped content key, no op-log record
+/// carries that key, and destroying it is exactly what crypto-shred does on
+/// purpose (D19). Dropping it on a version bump would shred every attachment
+/// in the store while leaving `mail_attachments` rows looking healthy and the
+/// blocks on disk as undecryptable noise — and the pending-fetch drain would
+/// not notice, because it keys off `blob_hash IS NULL` and replay repopulates
+/// `blob_hash` from the module.doc records. The table is fold-blind and
+/// keyed by plaintext hash, so it has no schema dependency on the fold; if it
+/// ever needs a shape change, that is a real migration, not a drop.
 const DROP_DERIVED: &str = r#"
     DROP TABLE IF EXISTS search_fts;
     DROP TABLE IF EXISTS search;
@@ -626,7 +647,6 @@ const DROP_DERIVED: &str = r#"
     DROP TABLE IF EXISTS identities;
     DROP TABLE IF EXISTS cc_credentials;
     DROP TABLE IF EXISTS outbox;
-    DROP TABLE IF EXISTS blob_refs;
     DROP TABLE IF EXISTS worker_status;
     DROP TABLE IF EXISTS embeddings;
     DROP TABLE IF EXISTS ann_keys;
