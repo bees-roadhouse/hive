@@ -395,3 +395,76 @@ async fn artifacts_tools_and_identity_sync() {
     );
     assert_eq!(missing["error"], "not found");
 }
+
+// ---- the JSON-RPC frame layer (moved into core by the PR 2.4 proxy flip) ----
+
+#[tokio::test]
+async fn frame_layer_speaks_mcp_json_rpc() {
+    let store = test_store().await;
+    let ctx = ctx("nate");
+    let frame = |line: &'static str| mcp::handle_frame(&store, &ctx, line);
+
+    // initialize: a supported requested version echoes; an unknown one is
+    // countered with the latest we speak.
+    let reply = frame(
+        r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+    )
+    .await
+    .expect("requests get replies");
+    assert_eq!(reply["id"], json!(0));
+    assert_eq!(reply["result"]["protocolVersion"], "2025-06-18");
+    assert_eq!(reply["result"]["serverInfo"]["name"], "hive");
+    assert!(reply["result"]["instructions"]
+        .as_str()
+        .unwrap()
+        .contains("journal-first"));
+    let reply = frame(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}"#,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reply["result"]["protocolVersion"],
+        json!(mcp::LATEST_PROTOCOL_VERSION)
+    );
+
+    // Notifications and response frames produce no reply; ping answers {}.
+    assert!(
+        frame(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .await
+            .is_none()
+    );
+    assert!(frame(r#"{"jsonrpc":"2.0","id":9,"result":{}}"#)
+        .await
+        .is_none());
+    let reply = frame(r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#)
+        .await
+        .unwrap();
+    assert_eq!(reply["result"], json!({}));
+
+    // tools/call dispatches into the tool layer with the ctx actor pinned;
+    // a missing tool name is a transport-level -32602.
+    let reply = frame(
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"journal_append","arguments":{"body":"Framed entry."}}}"#,
+    )
+    .await
+    .unwrap();
+    let entry = content_json(&reply["result"]);
+    assert_eq!(entry["author"], "nate");
+    let reply = frame(r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{}}"#)
+        .await
+        .unwrap();
+    assert_eq!(reply["error"]["code"], json!(-32602));
+
+    // Transport errors: garbage → -32700 null id; a non-object → -32600;
+    // an unknown method → -32601 (we declare only tools).
+    let reply = frame("not json").await.unwrap();
+    assert_eq!(reply["error"]["code"], json!(-32700));
+    assert!(reply["id"].is_null());
+    let reply = frame("42").await.unwrap();
+    assert_eq!(reply["error"]["code"], json!(-32600));
+    let reply = frame(r#"{"jsonrpc":"2.0","id":5,"method":"resources/list"}"#)
+        .await
+        .unwrap();
+    assert_eq!(reply["error"]["code"], json!(-32601));
+}

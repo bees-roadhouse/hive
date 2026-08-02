@@ -8,18 +8,21 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-# Thin by design (D25): the MCP tool layer lives in hive-core and is
-# transport-free; this binary is stdio framing plus store bootstrap. No HTTP
-# stack of any kind — stdout is the protocol channel, stderr is the log.
-hive-core = { path = "../core" }
-hive-embed = { workspace = true }
+# Thin by design (D25, proxy mode): the bridge is a stdio ↔ unix-socket pump
+# with a handshake. No store, no keychain, no async runtime, no HTTP stack —
+# stdout is the protocol channel, stderr is the log. hive-shared carries the
+# socket wire contract (bridge_proto); protocol handling lives app-side in
+# hive-core. Keeping hive-core OUT of this list is deliberate: it is what
+# makes `cargo install --path bridge` a seconds-long build (no SQLCipher).
+hive-shared = { workspace = true }
 anyhow = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-# HIVE_MEMORY_KEY_HEX decoding (the keychain-free test/headless escape hatch).
-data-encoding = { workspace = true }
 
 [dev-dependencies]
+# The tests stand up an in-process socket host — a real Store served through
+# core's frame layer over a tokio UnixListener, exactly the app's shape — so
+# the binary is exercised end-to-end without a GUI.
+hive-core = { path = "../core" }
+hive-embed = { workspace = true }
+tokio = { workspace = true }
 tempfile = { workspace = true }

@@ -1,0 +1,48 @@
+[package]
+name = "hive-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The wire talks about the store's own artifacts, so the protocol crate links
+# the engine: `HeadsSnapshot`/`SegmentInfo` ARE the heads payload (PR 4.3 made
+# them serializable for exactly this), the keyless walker is what lets a
+# receiver land whole frames only, and `BlockStore` is the blocks half of the
+# store shape a vault mirrors verbatim.
+hive-core = { path = "../core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+# The same CBOR implementation the frozen record envelope uses — one encoder
+# in the tree, and control frames are the same shape of data.
+ciborium = { workspace = true }
+blake3 = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+# Lowercase-hex block ids in error messages (the blockstore's own filename
+# encoding, so an id in a log line greps against the disk).
+data-encoding = { workspace = true }
+
+# The mTLS carrier (PLAN-v2.1 PR 4.5): self-signed device certificates pinned
+# by SPKI. The device KEY comes from hive-core (`identity`); this crate only
+# carries it, which is why rustls/rcgen stop here and never reach the engine.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-webpki = { workspace = true }
+rcgen = { workspace = true }
+
+[dev-dependencies]
+# HOSTILE-DECODE over every frame (docs/TESTING-STRATEGY.md §2, §3.4): fixed
+# seeds, bounded cases, normal CI. The wire gets round-trips + proptests and
+# deliberately NOT byte goldens while it churns — compat fixtures are cut once,
+# at the v0.8.0 tag that carries proto v1.
+proptest = { workspace = true }
+tempfile = { workspace = true }
+# The loopback scenarios are smoke-tier: real device stores over the ONE-SEAM
+# domain helper, an in-memory duplex for the socket (AGENTS.md).
+hive-smoke-support = { path = "../smoke-support" }
+serde_json = { workspace = true }

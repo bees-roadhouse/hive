@@ -1,13 +1,17 @@
 // Mail archive: read paths on the index; write paths as records per the fold
 // contract — module.doc (account/mailbox/message/attachment upserts),
 // cursor.set (sync state), tombstone (JMAP destroys; soft delete in the
-// fold), redact (admin scrub). The sync daemon is PAUSED until the Phase 3
-// mail module, but every path compiles and is fold-tested.
+// fold), redact (admin scrub). The sync engine is LIVE: `mail_sync_tick`
+// (store/mail_sync.rs) drives jmap-sync over these paths and the app shell
+// spawns the driver at store open — mail came back early as core code, so
+// Phase 3's "mail module" PR shrinks to the wasm transport seam
+// (PLAN-v2.1).
 //
 // Command-layer responsibilities the fold refuses on purpose:
 //   - mail FTS membership (ingest mailboxes ∩ not junk): direct writes to the
-//     `search` table here (mail search rows do NOT rebuild from replay; the
-//     Phase 3 resync re-creates them);
+//     `search` table here (mail search rows do NOT rebuild from replay —
+//     pinned by the #[ignore]d test in core/tests/mail_store.rs until
+//     PR 4.10's post-fold FTS re-stamp closes the hole);
 //   - embeddings drops (via SqliteIndex so the ANN forgets too);
 //   - attachment BYTES: the blockstore, with blob_refs (runtime table)
 //     holding hash → serialized BlobRef. mail_attachments.blob_hash names

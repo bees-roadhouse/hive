@@ -11,6 +11,49 @@ fn memory_keysource_returns_its_fixed_key() {
     assert_eq!(ks.master_key().unwrap(), [9u8; 32]);
 }
 
+/// The shared master-key FILE format (PLAN-v2.1 PR 4.1 / TESTING-STRATEGY
+/// §0.4): 64 hex chars = one raw 32-byte master. The app's
+/// HIVE_MASTER_KEY_FILE seam, the node's FileKeySource test mode (PR 4.13),
+/// and the smoke helpers (PR 4.2) all consume this one parser — pinned here
+/// before they exist so the consumers cannot drift.
+#[test]
+fn master_key_hex_format_parses_strictly() {
+    // Canonical: 64 lowercase hex chars, trailing newline tolerated.
+    let hex = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    let key = keys::parse_master_key_hex(&format!("{hex}\n")).unwrap();
+    assert_eq!(&key[..4], &[0x00, 0x11, 0x22, 0x33]);
+    // Case-insensitive hex is the same key.
+    assert_eq!(
+        keys::parse_master_key_hex(&hex.to_ascii_uppercase()).unwrap(),
+        key
+    );
+
+    // Strict about everything else: wrong length, non-hex, empty.
+    assert!(keys::parse_master_key_hex(&hex[..62]).is_err());
+    assert!(keys::parse_master_key_hex(&format!("{hex}00")).is_err());
+    assert!(keys::parse_master_key_hex(&format!("zz{}", &hex[2..])).is_err());
+    assert!(keys::parse_master_key_hex("").is_err());
+}
+
+#[test]
+fn master_key_file_roundtrips_and_names_the_path_on_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("master.hex");
+    std::fs::write(&path, format!("{}\n", "7f".repeat(32))).unwrap();
+    assert_eq!(keys::read_master_key_file(&path).unwrap(), [0x7fu8; 32]);
+
+    // Errors carry the offending path (anyhow context) so a misconfigured
+    // HIVE_MASTER_KEY_FILE is diagnosable from the boot-failure screen.
+    std::fs::write(&path, "garbage").unwrap();
+    let err = format!("{:#}", keys::read_master_key_file(&path).unwrap_err());
+    assert!(err.contains("master.hex"), "{err}");
+    let err = format!(
+        "{:#}",
+        keys::read_master_key_file(&dir.path().join("absent.hex")).unwrap_err()
+    );
+    assert!(err.contains("absent.hex"), "{err}");
+}
+
 #[test]
 fn wrap_unwrap_roundtrip_and_tamper_resistance() {
     let master = [1u8; 32];

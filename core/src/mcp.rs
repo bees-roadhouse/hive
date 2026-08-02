@@ -1818,3 +1818,167 @@ async fn journal_append(store: &Store, ctx: &LocalCtx, args: &Map<String, Value>
             .await?,
     ))
 }
+
+// ---- JSON-RPC 2.0 frame layer (MCP framing over any line transport) ----
+//
+// One inbound line, at most one reply value. This logic lived in the
+// bridge's stdio loop through interim mode (PR 1.8); the PR 2.4 proxy flip
+// moved it here so the app's bridge socket, the bridge's tests, and any
+// future transport speak the identical protocol without owning it. Still
+// transport-free: strings and values in, values out — the caller does IO.
+
+/// One inbound frame → at most one reply. Notifications and client→server
+/// responses produce none (matching the SDK's stdio transport).
+pub async fn handle_frame(store: &Store, ctx: &LocalCtx, line: &str) -> Option<Value> {
+    let msg: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => {
+            return Some(error_response(
+                Value::Null,
+                -32700,
+                &format!("Parse error: {e}"),
+            ))
+        }
+    };
+    let Some(obj) = msg.as_object() else {
+        return Some(error_response(Value::Null, -32600, "Invalid Request"));
+    };
+    // A null id is treated like no id (MCP requires non-null request ids).
+    let id = obj.get("id").filter(|v| !v.is_null()).cloned();
+    let Some(method) = obj.get("method").and_then(Value::as_str) else {
+        if obj.contains_key("result") || obj.contains_key("error") {
+            return None; // a response frame; we never issue requests, ignore
+        }
+        return Some(error_response(
+            id.unwrap_or(Value::Null),
+            -32600,
+            "Invalid Request",
+        ));
+    };
+    let params = obj.get("params").and_then(Value::as_object);
+    match id {
+        None => None, // notification (notifications/initialized, …): no reply
+        Some(id) => Some(handle_request(store, ctx, id, method, params).await),
+    }
+}
+
+async fn handle_request(
+    store: &Store,
+    ctx: &LocalCtx,
+    id: Value,
+    method: &str,
+    params: Option<&Map<String, Value>>,
+) -> Value {
+    match method {
+        "initialize" => {
+            // Version negotiation per the MCP spec: echo a supported
+            // requested version, otherwise offer the latest we speak.
+            let requested = params
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(Value::as_str);
+            let version = requested
+                .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
+                .unwrap_or(LATEST_PROTOCOL_VERSION);
+            result_response(
+                id,
+                json!({
+                    "protocolVersion": version,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                    "instructions": instructions(),
+                }),
+            )
+        }
+        "ping" => result_response(id, json!({})),
+        "tools/list" => result_response(id, json!({"tools": tools_list()})),
+        "tools/call" => {
+            let Some(name) = params
+                .and_then(|p| p.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                return error_response(id, -32602, "Invalid params: missing tool name");
+            };
+            let args = params
+                .and_then(|p| p.get("arguments"))
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+            // Unknown tools and validation failures come back as isError
+            // content from dispatch — SDK parity, not transport errors.
+            result_response(id, call_tool(store, ctx, &name, &args).await)
+        }
+        other => error_response(id, -32601, &format!("Method not found: {other}")),
+    }
+}
+
+fn result_response(id: Value, result: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+fn error_response(id: Value, code: i64, message: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+/// Serve one bridge-socket connection: the hello/ack handshake
+/// (`hive_shared::bridge_proto`), then the newline-delimited frame loop.
+/// Generic over the IO halves so the app's unix-socket server and the
+/// bridge's test host drive the SAME code — only peer-credential checking
+/// and socket setup stay app-side. Frames are handled sequentially, so a
+/// client vanishing mid-call never cancels an in-flight store write. A
+/// malformed or version-mismatched hello drops the connection silently;
+/// the bridge reports "did not answer the hive handshake" on its side.
+pub async fn serve_bridge_connection<R, W>(
+    store: &Store,
+    fallback_actor: &str,
+    reader: R,
+    mut writer: W,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use hive_shared::bridge_proto;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let mut lines = reader.lines();
+    let Some(first) = lines.next_line().await? else {
+        return Ok(());
+    };
+    let Some(hello) = bridge_proto::parse_hello(first.trim()) else {
+        tracing::warn!("bridge connection sent no hello — dropping");
+        return Ok(());
+    };
+    if hello.proto != bridge_proto::BRIDGE_PROTO_VERSION {
+        tracing::warn!(
+            "bridge speaks protocol v{} but the app serves v{} — dropping (upgrade the older side)",
+            hello.proto,
+            bridge_proto::BRIDGE_PROTO_VERSION
+        );
+        return Ok(());
+    }
+    let ack = bridge_proto::ack_line(&store.data_dir().display().to_string());
+    writer.write_all(format!("{ack}\n").as_bytes()).await?;
+
+    // The hello's actor pins authorship for the whole connection (the
+    // bridge's --actor surface). Empty falls back to the host's default.
+    let actor = if hello.actor.trim().is_empty() {
+        fallback_actor.to_string()
+    } else {
+        hello.actor
+    };
+    let ctx = LocalCtx { actor };
+    tracing::info!("bridge connected — actor {}", ctx.actor);
+    while let Some(line) = lines.next_line().await? {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(reply) = handle_frame(store, &ctx, line).await {
+            let framed = serde_json::to_string(&reply).map_err(std::io::Error::other)?;
+            writer.write_all(format!("{framed}\n").as_bytes()).await?;
+        }
+    }
+    tracing::info!("bridge disconnected — actor {}", ctx.actor);
+    Ok(())
+}
