@@ -48,15 +48,33 @@ base64 = { workspace = true }
 # The bridge socket server (D25 proxy mode) logs through tracing like the
 # store's drivers do; dioxus's launch installs the subscriber.
 tracing = { workspace = true }
-# The XDG appearance portal (light/dark + accent). Already in the tree via
-# keyring's secret-service; named here because this crate calls it directly,
-# and it is the ONE way the app learns anything about the desktop.
-zbus = "4"
+[target.'cfg(windows)'.dependencies]
+# The bridge doorway's security descriptor (see app/src/bridge_server.rs).
+# A named pipe created with DEFAULT security is readable by Everyone and by
+# the anonymous account, so building an owner-only DACL is not hardening, it
+# is the thing that makes the Windows doorway as private as the unix one.
+# Already in the lock transitively; named here because this crate calls it.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(unix)'.dependencies]
 # Peer-credential check on the bridge socket (D25): same-euid clients only.
 # rustix over libc to match core's flock choice (core/src/store/core.rs).
 rustix = { version = "1.1", features = ["process"] }
+# The XDG appearance portal (light/dark + accent). Already in the tree via
+# keyring's secret-service; named here because this crate calls it directly,
+# and it is the ONE way the app learns anything about the desktop.
+#
+# Unix-only, deliberately: zbus 4.4's win32 transport does not compile against
+# the windows-sys in our lock (`WSAIoctl` is absent from Win32::Networking::
+# WinSock), and a D-Bus portal has no meaning on Windows anyway — the Windows
+# half of theme.rs reads the OS instead. Keeping it out of the Windows graph
+# is what lets hive-app build there at all.
+zbus = "4"
 
 [dev-dependencies]
 # The boot() master-key-file seam test writes a throwaway key file

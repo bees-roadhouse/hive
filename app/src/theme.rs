@@ -234,7 +234,21 @@ fn readable_on(bg: &str) -> &'static str {
     }
 }
 
+/// Windows has no XDG portal. Falling back to [`Appearance::default`] is the
+/// same answer this file already gives a Linux desktop whose portal is missing
+/// — the shipped look — so the app opens correctly rather than not at all.
+///
+/// The real Windows read (HKCU\...\Themes\Personalize\AppsUseLightTheme for
+/// light/dark, HKCU\Software\Microsoft\Windows\DWM\AccentColor for the accent)
+/// is a follow-up: it needs a registry dependency this crate does not yet
+/// carry, and the point of THIS change is that hive-app compiles on Windows.
+#[cfg(not(unix))]
+fn read_portal() -> anyhow::Result<Appearance> {
+    anyhow::bail!("no appearance portal on this platform")
+}
+
 /// Read `org.freedesktop.appearance` from the Settings portal.
+#[cfg(unix)]
 fn read_portal() -> anyhow::Result<Appearance> {
     use zbus::blocking::Connection;
 
@@ -260,6 +274,7 @@ fn read_portal() -> anyhow::Result<Appearance> {
 
 /// One key, or `None` — a portal that does not publish a key is not an error,
 /// it is a desktop with no opinion about it.
+#[cfg(unix)]
 fn read_one(proxy: &zbus::blocking::Proxy<'_>, key: &str) -> Option<zbus::zvariant::OwnedValue> {
     proxy
         .call::<_, _, zbus::zvariant::OwnedValue>("Read", &("org.freedesktop.appearance", key))
@@ -272,6 +287,7 @@ fn read_one(proxy: &zbus::blocking::Proxy<'_>, key: &str) -> Option<zbus::zvaria
 /// variant deep — and some implementations nest it twice. Downcasting the
 /// outer value directly therefore fails on a perfectly good answer, which is a
 /// silent fall back to defaults rather than an error anyone would notice.
+#[cfg(unix)]
 fn unwrap_variants(value: &zbus::zvariant::Value<'_>) -> Option<zbus::zvariant::Value<'static>> {
     let mut v = value.try_clone().ok()?.try_to_owned().ok()?.into();
     for _ in 0..3 {
@@ -286,6 +302,7 @@ fn unwrap_variants(value: &zbus::zvariant::Value<'_>) -> Option<zbus::zvariant::
 }
 
 /// The portal's `color-scheme`: 0 no preference, 1 dark, 2 light.
+#[cfg(unix)]
 fn scheme_u32(value: &zbus::zvariant::Value<'_>) -> Option<u32> {
     match unwrap_variants(value)? {
         zbus::zvariant::Value::U32(n) => Some(n),
@@ -294,6 +311,7 @@ fn scheme_u32(value: &zbus::zvariant::Value<'_>) -> Option<u32> {
 }
 
 /// The portal's accent is `(ddd)` — three 0.0..=1.0 doubles, NOT bytes.
+#[cfg(unix)]
 fn accent_hex(value: &zbus::zvariant::Value<'_>) -> Option<String> {
     let zbus::zvariant::Value::Structure(s) = unwrap_variants(value)? else {
         return None;
@@ -563,6 +581,10 @@ mod tests {
         assert!(light.contains("--gold-text: #8a6410"));
     }
 
+    // The portal payload tests speak zvariant, so they live where zbus does.
+    // The palette/contrast tests above are platform-neutral and still run
+    // everywhere — which is the half that guards what Windows actually uses.
+    #[cfg(unix)]
     #[test]
     fn a_hostile_accent_payload_is_declined_rather_than_rendered() {
         use zbus::zvariant::{Structure, Value};
@@ -579,6 +601,7 @@ mod tests {
         assert_eq!(accent_hex(&nan), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_variant_wrapped_answer_is_read_rather_than_silently_ignored() {
         use zbus::zvariant::{Structure, Value};
@@ -604,6 +627,7 @@ mod tests {
         assert_eq!(accent_hex(&wrapped_accent), Some("#0000ff".to_string()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_well_formed_accent_becomes_the_hex_the_stylesheet_wants() {
         use zbus::zvariant::{Structure, Value};
