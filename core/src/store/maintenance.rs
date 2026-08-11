@@ -152,7 +152,8 @@ mod tests {
 
     #[tokio::test]
     async fn orphaned_vectors_reaped_live_ones_kept() {
-        let store = Store::new(db::test_pool().await);
+        let test_db = db::test_pool().await;
+        let store = Store::new(test_db.pool.clone());
 
         // Live rows for every anchored kind + a custom type, each with a vector.
         seed_journal(&store, "j-live", NOW).await;
@@ -265,7 +266,8 @@ mod tests {
 
     #[tokio::test]
     async fn journal_window_sweep_reaps_beyond_newest_n() {
-        let store = Store::new(db::test_pool().await);
+        let test_db = db::test_pool().await;
+        let store = Store::new(test_db.pool.clone());
         // Five entries, j1 oldest … j5 newest; j1 chunked into two rows.
         for i in 1..=5 {
             seed_journal(
@@ -427,7 +429,8 @@ mod tests {
 
     #[tokio::test]
     async fn mail_ineligible_vectors_reaped_eligible_kept() {
-        let store = Store::new(db::test_pool().await);
+        let test_db = db::test_pool().await;
+        let store = Store::new(test_db.pool.clone());
         seed_mail_scenario(&store).await;
 
         let reaped = store.embeddings_reap(2).await.unwrap();
@@ -452,7 +455,8 @@ mod tests {
     /// fight forever (embed → reap → re-embed every cycle).
     #[tokio::test]
     async fn rows_matching_the_shared_eligibility_predicate_are_never_reaped() {
-        let store = Store::new(db::test_pool().await);
+        let test_db = db::test_pool().await;
+        let store = Store::new(test_db.pool.clone());
         seed_mail_scenario(&store).await;
 
         let sql = format!("SELECT m.id FROM mail_messages m WHERE {MAIL_EMBED_ELIGIBLE_SQL}");
@@ -471,7 +475,8 @@ mod tests {
 
     #[tokio::test]
     async fn mail_window_zero_or_negative_means_gate_closed() {
-        let store = Store::new(db::test_pool().await);
+        let test_db = db::test_pool().await;
+        let store = Store::new(test_db.pool.clone());
         seed_mail_scenario(&store).await;
         let reaped = store.embeddings_reap(0).await.unwrap();
         assert_eq!(

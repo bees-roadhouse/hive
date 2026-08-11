@@ -33,20 +33,21 @@ impl hive_embed::OnnxProvider for Mock384 {
     }
 }
 
-async fn test_setup() -> (sqlx::PgPool, Store) {
+async fn test_setup() -> (sqlx::PgPool, Store, hive_core::db::TestDb) {
     // Must beat the first embed call: the provider choice latches once per
     // process, and installing the mock first keeps the lazy default ort
     // engine (real model download) from ever wiring itself in.
     std::env::set_var("HIVE_EMBED", "transformers");
     hive_embed::set_onnx_provider(Box::new(Mock384));
-    let pool = hive_core::db::test_pool().await;
-    (pool.clone(), Store::new(pool))
+    let test_db = hive_core::db::test_pool().await;
+    let pool = test_db.pool.clone();
+    (pool.clone(), Store::new(pool), test_db)
 }
 
 #[tokio::test]
 async fn chunked_dual_write_skip_and_atomic_replace() {
     let _env = ENV_LOCK.lock().await;
-    let (pool, store) = test_setup().await;
+    let (pool, store, _test_db) = test_setup().await;
     assert_eq!(hive_embed::embed_dim(), 384, "mock must be vec_v-eligible");
 
     // A body several times the 450-token (1800-char) chunk target → the item
@@ -130,7 +131,7 @@ async fn chunked_dual_write_skip_and_atomic_replace() {
 #[tokio::test]
 async fn zero_budget_defers_items_to_the_next_call() {
     let _env = ENV_LOCK.lock().await;
-    let (pool, store) = test_setup().await;
+    let (pool, store, _test_db) = test_setup().await;
     std::env::set_var("HIVE_EMBED_STAGE_BUDGET_SECS", "0");
 
     sqlx::query(

@@ -19,9 +19,10 @@ fn hash_setup() {
     assert_eq!(hive_embed::embed_dim(), 256, "hash provider must be active");
 }
 
-async fn test_store() -> Store {
+async fn test_store() -> (Store, hive_api::db::TestDb) {
     hash_setup();
-    Store::new(hive_api::db::test_pool().await)
+    let test_db = hive_api::db::test_pool().await;
+    (Store::new(test_db.pool.clone()), test_db)
 }
 
 /// A deterministic vector whose cosine similarity to `q` is ~`sim`:
@@ -143,7 +144,7 @@ fn opts(viewer: Option<&str>, limit: usize) -> SemanticOptions {
 
 #[tokio::test]
 async fn brute_owner_filter_and_batched_mail_visibility() {
-    let store = test_store().await;
+    let (store, _test_db) = test_store().await;
     let q = hive_embed::embed_query(QUERY);
 
     insert_journal(&store, "jrnl_global", "maggie", None, "global note").await;
@@ -246,7 +247,7 @@ async fn brute_owner_filter_and_batched_mail_visibility() {
 
 #[tokio::test]
 async fn chunk_collapse_scores_parent_by_best_chunk() {
-    let store = test_store().await;
+    let (store, _test_db) = test_store().await;
     let q = hive_embed::embed_query(QUERY);
 
     insert_journal(&store, "jrnl_chunky", "nate", None, "long chunked entry").await;
@@ -293,7 +294,7 @@ async fn chunk_collapse_scores_parent_by_best_chunk() {
 
 #[tokio::test]
 async fn hydration_misses_drop_without_starving_results() {
-    let store = test_store().await;
+    let (store, _test_db) = test_store().await;
     let q = hive_embed::embed_query(QUERY);
 
     insert_journal(&store, "jrnl_real", "nate", None, "real entry body").await;
@@ -339,7 +340,7 @@ async fn hydration_misses_drop_without_starving_results() {
 
 #[tokio::test]
 async fn kind_weights_demote_mail_and_config_overrides() {
-    let store = test_store().await;
+    let (store, _test_db) = test_store().await;
     let q = hive_embed::embed_query(QUERY);
 
     insert_journal(&store, "jrnl_w", "nate", None, "journal about inspections").await;
@@ -396,7 +397,7 @@ async fn kind_weights_demote_mail_and_config_overrides() {
 
 #[tokio::test]
 async fn diversified_pool_guarantees_journal_under_mail_flood() {
-    let store = test_store().await;
+    let (store, _test_db) = test_store().await;
     let q = hive_embed::embed_query(QUERY);
 
     insert_mail_account(&store, "acct_f", "nate").await;

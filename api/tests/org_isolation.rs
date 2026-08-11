@@ -22,13 +22,13 @@ use uuid::Uuid;
 
 use hive_api::store::Store;
 
-async fn test_app() -> (Router, Store) {
+async fn test_app() -> (Router, Store, hive_api::db::TestDb) {
     std::env::set_var("HIVE_EMBED", "hash");
     // STRICT: no fallback scope, so an unscoped task reads nothing exactly as
     // the binary behaves. A test on the permissive pool would prove nothing.
-    let pool = hive_api::db::test_pool_strict().await;
-    let store = Store::new(pool);
-    (hive_api::routes::router(store.clone()), store)
+    let test_db = hive_api::db::test_pool_strict().await;
+    let store = Store::new(test_db.pool.clone());
+    (hive_api::routes::router(store.clone()), store, test_db)
 }
 
 async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Value, axum::http::HeaderMap) {
@@ -154,7 +154,7 @@ async fn journal_ids(app: &Router, cookie: &str) -> Vec<String> {
 /// THE test. Everything else in this file is a negative control on it.
 #[tokio::test]
 async fn a_member_of_one_org_cannot_read_or_insert_into_another() {
-    let (app, store) = test_app().await;
+    let (app, store, _test_db) = test_app().await;
     let alice = onboard(&app).await;
     let (beta, bob) = second_org(&store, &app).await;
 
@@ -195,7 +195,7 @@ async fn a_member_of_one_org_cannot_read_or_insert_into_another() {
 /// to poison — and the policy's WITH CHECK would reject it anyway.
 #[tokio::test]
 async fn a_forged_org_id_in_the_request_body_is_ignored() {
-    let (app, store) = test_app().await;
+    let (app, store, _test_db) = test_app().await;
     let alice = onboard(&app).await;
     let (beta, bob) = second_org(&store, &app).await;
     let default_org = store.orgs_default().await.expect("default org").id;
@@ -233,7 +233,7 @@ async fn a_forged_org_id_in_the_request_body_is_ignored() {
 /// that row is not there.
 #[tokio::test]
 async fn a_token_minted_in_one_org_cannot_reach_another() {
-    let (app, store) = test_app().await;
+    let (app, store, _test_db) = test_app().await;
     let alice = onboard(&app).await;
     let (_, bob) = second_org(&store, &app).await;
 
@@ -266,8 +266,8 @@ async fn a_token_minted_in_one_org_cannot_reach_another() {
 /// session variable leaked, this test would see it.
 #[tokio::test]
 async fn one_connection_serving_two_orgs_in_sequence_leaks_nothing() {
-    let pool = hive_core::db::test_pool_single_conn().await;
-    let store = Store::new(pool);
+    let test_db = hive_core::db::test_pool_single_conn().await;
+    let store = Store::new(test_db.pool.clone());
     let alpha = store.orgs_default().await.expect("default org").id;
     let beta = store.orgs_create("beta", "Beta").await.expect("org").id;
 
@@ -301,8 +301,8 @@ async fn one_connection_serving_two_orgs_in_sequence_leaks_nothing() {
 /// nothing and cannot write: `org_id` has no value to default to.
 #[tokio::test]
 async fn an_unscoped_task_reads_nothing_and_writes_nothing() {
-    let pool = hive_core::db::test_pool_strict().await;
-    let store = Store::new(pool);
+    let test_db = hive_core::db::test_pool_strict().await;
+    let store = Store::new(test_db.pool.clone());
     let alpha = store.orgs_default().await.expect("default org").id;
 
     let id = acting::scope(ActingScope::new(alpha, "alice".to_string(), true), async {
@@ -330,7 +330,8 @@ async fn an_unscoped_task_reads_nothing_and_writes_nothing() {
 /// so boot refuses them — this is that refusal, asserted.
 #[tokio::test]
 async fn the_serving_role_is_neither_superuser_nor_bypassrls() {
-    let pool = hive_core::db::test_pool_strict().await;
+    let test_db = hive_core::db::test_pool_strict().await;
+    let pool = test_db.pool.clone();
     let privileged: bool = hive_core::pgq::query_scalar::<bool>(
         "SELECT COALESCE((SELECT bool_or(rolsuper OR rolbypassrls) FROM pg_roles \
                           WHERE rolname = current_user), true)",
@@ -363,7 +364,8 @@ async fn the_serving_role_is_neither_superuser_nor_bypassrls() {
 #[tokio::test]
 async fn every_content_table_is_scoped_and_forced() {
     const TENANCY_PLANE: &[&str] = &["sessions", "api_tokens", "oauth_auth_codes", "memberships"];
-    let pool = hive_core::db::test_pool_strict().await;
+    let test_db = hive_core::db::test_pool_strict().await;
+    let pool = test_db.pool.clone();
     let admin = hive_core::db::test_admin_pool(&pool).await;
     let gaps: Vec<String> = hive_core::pgq::query_scalar::<String>(
         "SELECT c.relname::text FROM pg_class c \

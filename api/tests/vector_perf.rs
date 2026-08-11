@@ -63,9 +63,10 @@ fn ann_setup() {
     );
 }
 
-async fn test_store() -> Store {
+async fn test_store() -> (Store, hive_api::db::TestDb) {
     ann_setup();
-    Store::new(hive_api::db::test_pool().await)
+    let test_db = hive_api::db::test_pool().await;
+    (Store::new(test_db.pool.clone()), test_db)
 }
 
 /// Deterministic vector with cosine ~`sim` to `q` (component along q̂ plus an
@@ -185,7 +186,7 @@ fn opts(viewer: Option<&str>, limit: usize) -> SemanticOptions {
 
 #[tokio::test]
 async fn ann_owner_filter_and_chunk_collapse() {
-    let store = test_store().await;
+    let (store, _test_db) = test_store().await;
     let q = hive_embed::embed_query(QUERY);
 
     insert_journal(&store, "jrnl_global", "maggie", None, "global chunked note").await;
@@ -293,7 +294,7 @@ async fn ann_owner_filter_and_chunk_collapse() {
 
 #[tokio::test]
 async fn ann_double_probe_rescues_journal_from_mail_flood() {
-    let store = test_store().await;
+    let (store, _test_db) = test_store().await;
     let q = hive_embed::embed_query(QUERY);
 
     // limit 5 → stage1 pool 10 → chunk_k 40. 60 mail chunks all outscoring
@@ -537,7 +538,8 @@ async fn ann_perf_200k_hybrid_p95_owner_isolation_and_recall() {
     ann_setup();
 
     // Baseline: maggie's corpus WITHOUT nate's 200k rows.
-    let base_pool = hive_api::db::test_pool().await;
+    let base_db = hive_api::db::test_pool().await;
+    let base_pool = base_db.pool.clone();
     let base_store = Store::new(base_pool.clone());
     println!("[perf] building baseline schema (10k maggie mail + 1k journal)…");
     insert_mail_account(&base_store, "acct_maggie", "maggie").await;
@@ -558,7 +560,8 @@ async fn ann_perf_200k_hybrid_p95_owner_isolation_and_recall() {
     println!("[perf] maggie p95 baseline (nate rows absent): {p95_maggie_base:.1}ms");
 
     // Full corpus: 200k nate mail + 10k maggie mail + 1k journal.
-    let pool = hive_api::db::test_pool().await;
+    let full_db = hive_api::db::test_pool().await;
+    let pool = full_db.pool.clone();
     let store = Store::new(pool.clone());
     println!("[perf] building full schema (200k nate + 10k maggie mail + 1k journal)…");
     insert_mail_account(&store, "acct_nate", "nate").await;

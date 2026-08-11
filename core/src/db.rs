@@ -1379,24 +1379,90 @@ pub async fn init() -> Result<PgPool> {
     Ok(pool)
 }
 
+/// Drops the schema it names when it goes out of scope. Constructed the moment
+/// `CREATE SCHEMA` returns, so a helper that panics half-way through migrating
+/// still takes its schema with it.
+///
+/// `Drop` cannot await, and every test here runs on `#[tokio::test]`'s
+/// current-thread runtime, where `block_in_place` panics — so the DROP goes to
+/// its own thread with its own runtime and its own connection. It must not
+/// touch the test's pool: those sockets are registered with the test's runtime,
+/// and driving them from another thread would deadlock against the very thread
+/// this one is blocking. A private thread per guard rather than one shared
+/// teardown worker, so two tests finishing at once do not queue behind each
+/// other.
+struct SchemaGuard {
+    schema: String,
+    url: String,
+}
+
+impl Drop for SchemaGuard {
+    fn drop(&mut self) {
+        let (schema, url) = (self.schema.clone(), self.url.clone());
+        let done = std::thread::spawn(move || -> Result<()> {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("teardown runtime")?;
+            rt.block_on(async move {
+                let conn = PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&url)
+                    .await
+                    .context("teardown connect")?;
+                // CASCADE because the schema holds every table the migrate
+                // path built, plus their indexes, policies and default ACLs.
+                // The test's own connections are idle by now and hold no
+                // locks, so this does not wait on them.
+                let dropped = sqlx::raw_sql(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+                    .execute(&conn)
+                    .await
+                    .with_context(|| format!("dropping test schema {schema}"));
+                conn.close().await;
+                dropped.map(|_| ())
+            })
+        })
+        .join();
+        // Never panic here. A failed teardown leaks exactly one schema; a panic
+        // while already unwinding a failed test aborts the process and buries
+        // the real failure. Say it loudly on stderr instead.
+        match done {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("test schema teardown failed: {e:#}"),
+            Err(_) => eprintln!("test schema teardown thread panicked"),
+        }
+    }
+}
+
+/// A test database: one throwaway schema, the pool bound to it, and the
+/// teardown that drops the schema. Holding all three in ONE value is the point
+/// — the schema lives exactly as long as the test that owns it, and a test that
+/// panics still cleans up, because unwinding runs `Drop`.
+///
+/// Keep it bound for the whole test (`let (app, store, _test_db) = …`). A
+/// helper that builds a `Store` or a `Router` has to hand this back with them:
+/// dropping it inside the helper drops the schema out from under what it
+/// returned, and the next query fails with `relation "…" does not exist`.
+#[must_use = "dropping the TestDb drops the schema — bind it for the whole test"]
+pub struct TestDb {
+    pub pool: PgPool,
+    guard: SchemaGuard,
+}
+
+impl TestDb {
+    /// The schema this database lives in — `current_schema()` for every
+    /// connection in [`TestDb::pool`].
+    pub fn schema(&self) -> &str {
+        &self.guard.schema
+    }
+}
+
 /// Build a fresh, uniquely-named schema, migrate it, and hand back a pool on
 /// it as the unprivileged serving role. Each test gets full isolation against
 /// one shared Postgres (DATABASE_URL or the local dev default). Public (not
 /// cfg(test)) so integration tests can use it; never called from the binaries.
-async fn test_pool_with(fallback: Option<ActingScope>, max_connections: u32) -> PgPool {
-    let url = database_url();
-    let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
-
-    let boot = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&url)
-        .await
-        .expect("connect admin");
-    sqlx::raw_sql(&format!("CREATE SCHEMA \"{schema}\""))
-        .execute(&boot)
-        .await
-        .expect("create schema");
-    boot.close().await;
+async fn test_pool_with(fallback: Option<ActingScope>, max_connections: u32) -> TestDb {
+    let (schema, guard, base) = create_test_schema().await;
 
     // Pin every connection in the pool to the test schema via the libpq
     // `options` startup parameter — cleaner than an after_connect hook.
@@ -1404,7 +1470,7 @@ async fn test_pool_with(fallback: Option<ActingScope>, max_connections: u32) -> 
     // pgvector) resolve inside test schemas; the test schema is first, so all
     // created objects (including sqlx's per-schema _sqlx_migrations) land in it.
     let search_path = || [("search_path", format!("{schema},public"))];
-    let base: PgConnectOptions = url.parse().expect("parse DATABASE_URL");
+    let url = guard.url.clone();
     let admin = PgPoolOptions::new()
         .max_connections(2)
         .connect_with(base.options(search_path()))
@@ -1431,7 +1497,32 @@ async fn test_pool_with(fallback: Option<ActingScope>, max_connections: u32) -> 
         .await
         .expect("connect app pool");
     assert_rls_applies(&pool).await.expect("rls applies");
-    pool
+    TestDb { pool, guard }
+}
+
+/// `CREATE SCHEMA` + the guard that will drop it. Split out so the guard exists
+/// before anything that can panic (migrate, role provisioning) runs against it.
+async fn create_test_schema() -> (String, SchemaGuard, PgConnectOptions) {
+    let url = database_url();
+    let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
+
+    let boot = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect admin");
+    sqlx::raw_sql(&format!("CREATE SCHEMA \"{schema}\""))
+        .execute(&boot)
+        .await
+        .expect("create schema");
+    boot.close().await;
+
+    let base: PgConnectOptions = url.parse().expect("parse DATABASE_URL");
+    let guard = SchemaGuard {
+        schema: schema.clone(),
+        url,
+    };
+    (schema, guard, base)
 }
 
 /// The general test pool. A task with NO acting scope falls back to the default
@@ -1441,22 +1532,36 @@ async fn test_pool_with(fallback: Option<ActingScope>, max_connections: u32) -> 
 /// That fallback exists ONLY here. `init()` calls `open_app`, which hardcodes
 /// `None`, so in the binary a request that fails to establish a scope reads
 /// nothing. Anything asserting on isolation must use [`test_pool_strict`].
-pub async fn test_pool() -> PgPool {
+pub async fn test_pool() -> TestDb {
     test_pool_with(Some(ActingScope::new(DEFAULT_ORG_ID, "tests", true)), 5).await
 }
 
 /// No fallback scope: an unscoped task sees nothing, exactly as the binary
 /// behaves. Use for anything that asserts on isolation, so the assertion is
 /// about the policy and not about a helper.
-pub async fn test_pool_strict() -> PgPool {
+pub async fn test_pool_strict() -> TestDb {
     test_pool_with(None, 5).await
 }
 
 /// [`test_pool_strict`] with a single connection, so every statement in a test
 /// provably rides the SAME physical connection. This is what turns "a pooled
 /// connection is reused across two orgs" from a hope into a test.
-pub async fn test_pool_single_conn() -> PgPool {
+pub async fn test_pool_single_conn() -> TestDb {
     test_pool_with(None, 1).await
+}
+
+/// An empty schema and an OWNER-role pool on it, with [`migrate`] NOT run — for
+/// the migration tests, which lay down an old-shape table by hand and then
+/// migrate over it. Same schema-per-test isolation and the same teardown as the
+/// migrated helpers above.
+pub async fn test_pool_unmigrated() -> TestDb {
+    let (schema, guard, base) = create_test_schema().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect_with(base.options([("search_path", format!("{schema},public"))]))
+        .await
+        .expect("connect pool");
+    TestDb { pool, guard }
 }
 
 /// Test helper: an owner-role pool on the SAME schema as `pool`, for the

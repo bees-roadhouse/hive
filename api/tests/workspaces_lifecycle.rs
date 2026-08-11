@@ -8,14 +8,14 @@ use axum::Router;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-async fn test_app() -> (Router, hive_api::store::Store) {
+async fn test_app() -> (Router, hive_api::store::Store, hive_api::db::TestDb) {
     // Hash embedder: deterministic + offline (set before any embed call; the
     // provider choice is latched once per process).
     std::env::set_var("HIVE_EMBED", "hash");
     // Isolated Postgres schema per test (uses DATABASE_URL / local dev default).
-    let pool = hive_api::db::test_pool().await;
-    let store = hive_api::store::Store::new(pool);
-    (hive_api::routes::router(store.clone()), store)
+    let test_db = hive_api::db::test_pool().await;
+    let store = hive_api::store::Store::new(test_db.pool.clone());
+    (hive_api::routes::router(store.clone()), store, test_db)
 }
 
 async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Value, axum::http::HeaderMap) {
@@ -145,7 +145,7 @@ async fn count(store: &hive_api::store::Store, sql: &str, bind: &str) -> i64 {
 
 #[tokio::test]
 async fn delete_cascades_transcript_and_links_but_keeps_journal_mirrors() {
-    let (app, store) = test_app().await;
+    let (app, store, _test_db) = test_app().await;
     let admin = onboard(&app).await;
     let maggie = member(&app, &admin, "Maggie", "maggie@example.com").await;
     let ws = create_conversation(&app, &maggie, "sweep me").await;
@@ -237,7 +237,7 @@ async fn delete_cascades_transcript_and_links_but_keeps_journal_mirrors() {
 
 #[tokio::test]
 async fn delete_is_owner_or_admin_gated() {
-    let (app, _store) = test_app().await;
+    let (app, _store, _test_db) = test_app().await;
     let admin = onboard(&app).await;
     let maggie = member(&app, &admin, "Maggie", "maggie@example.com").await;
     let bob = member(&app, &admin, "Bob", "bob@example.com").await;
