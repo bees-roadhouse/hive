@@ -94,8 +94,8 @@ fn tools_list_matches_the_teardown() {
         "entity_create",
         "entity_update",
         "entity_delete",
-        "artifacts_list",
-        "artifacts_get",
+        "identity_artifacts_list",
+        "identity_artifacts_get",
         "identity_artifacts_sync",
     ] {
         assert!(names.contains(&want), "missing tool {want}");
@@ -336,21 +336,22 @@ async fn inbox_dashboard_and_status_tools_run_unscoped() {
 async fn artifacts_tools_and_identity_sync() {
     let store = test_store().await;
     store
-        .artifacts_upsert("pia", "skill", "journal", "body-v1", "j", true)
+        .identity_artifacts_upsert("pia", "skill", "journal", "body-v1", "j", true)
         .await
         .unwrap();
     store
-        .artifacts_upsert("pia", "agent", "scout", "body", "s", false)
+        .identity_artifacts_upsert("pia", "agent", "scout", "body", "s", false)
         .await
         .unwrap();
     store
-        .artifacts_upsert("apis", "skill", "elsewhere", "body", "", true)
+        .identity_artifacts_upsert("apis", "skill", "elsewhere", "body", "", true)
         .await
         .unwrap();
 
-    // artifacts_list: ALL of the acting identity's artifacts (incl. disabled).
-    let listed =
-        content_json(&mcp::call_tool(&store, &ctx("pia"), "artifacts_list", &Map::new()).await);
+    // identity_artifacts_list: ALL of the acting identity's artifacts (incl. disabled).
+    let listed = content_json(
+        &mcp::call_tool(&store, &ctx("pia"), "identity_artifacts_list", &Map::new()).await,
+    );
     assert_eq!(listed["count"], 2);
 
     // identity_artifacts_sync: ENABLED only; defaults to the acting identity,
@@ -372,13 +373,13 @@ async fn artifacts_tools_and_identity_sync() {
     assert_eq!(other["count"], 1);
     assert_eq!(other["artifacts"][0]["name"], "elsewhere");
 
-    // artifacts_get by id (no identity gate; missing ids answer not found).
+    // identity_artifacts_get by id (no identity gate; missing ids answer not found).
     let id = listed["artifacts"][0]["id"].as_str().unwrap();
     let got = content_json(
         &mcp::call_tool(
             &store,
             &ctx("apis"),
-            "artifacts_get",
+            "identity_artifacts_get",
             &args(json!({"id": id})),
         )
         .await,
@@ -388,7 +389,7 @@ async fn artifacts_tools_and_identity_sync() {
         &mcp::call_tool(
             &store,
             &ctx("pia"),
-            "artifacts_get",
+            "identity_artifacts_get",
             &args(json!({"id": "art_missing"})),
         )
         .await,
@@ -406,7 +407,7 @@ async fn artifacts_write_tools() {
         &mcp::call_tool(
             &store,
             &ctx("pia"),
-            "artifacts_upsert",
+            "identity_artifacts_upsert",
             &args(json!({
                 "kind": "skill", "name": "portainer",
                 "content": "# body v1", "description": "deploys stacks"
@@ -423,7 +424,7 @@ async fn artifacts_write_tools() {
         &mcp::call_tool(
             &store,
             &ctx("pia"),
-            "artifacts_upsert",
+            "identity_artifacts_upsert",
             &args(json!({
                 "kind": "skill", "name": "portainer",
                 "content": "# body v2", "enabled": false
@@ -433,8 +434,9 @@ async fn artifacts_write_tools() {
     );
     assert_eq!(again["id"], id);
     assert_eq!(again["content"], "# body v2");
-    let listed =
-        content_json(&mcp::call_tool(&store, &ctx("pia"), "artifacts_list", &Map::new()).await);
+    let listed = content_json(
+        &mcp::call_tool(&store, &ctx("pia"), "identity_artifacts_list", &Map::new()).await,
+    );
     assert_eq!(listed["count"], 1, "upsert must not fork a second row");
 
     // Disabling it takes it out of what the plugin syncs into .claude.
@@ -448,7 +450,7 @@ async fn artifacts_write_tools() {
     let bad = mcp::call_tool(
         &store,
         &ctx("pia"),
-        "artifacts_upsert",
+        "identity_artifacts_upsert",
         &args(json!({"kind": "hook", "name": "x", "content": "y"})),
     )
     .await;
@@ -463,26 +465,26 @@ async fn artifacts_write_tools() {
         &mcp::call_tool(
             &store,
             &ctx("apis"),
-            "artifacts_remove",
+            "identity_artifacts_remove",
             &args(json!({"id": id})),
         )
         .await,
     );
     assert_eq!(denied["error"], "not found");
-    assert!(store.artifacts_get(&id).await.unwrap().is_some());
+    assert!(store.identity_artifacts_get(&id).await.unwrap().is_some());
 
     // The owner can delete it.
     let removed = content_json(
         &mcp::call_tool(
             &store,
             &ctx("pia"),
-            "artifacts_remove",
+            "identity_artifacts_remove",
             &args(json!({"id": id})),
         )
         .await,
     );
     assert_eq!(removed["removed"], true);
-    assert!(store.artifacts_get(&id).await.unwrap().is_none());
+    assert!(store.identity_artifacts_get(&id).await.unwrap().is_none());
 }
 
 // ---- the JSON-RPC frame layer (moved into core by the PR 2.4 proxy flip) ----

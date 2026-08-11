@@ -348,6 +348,48 @@ const SCHEMA: &str = r#"
     -- (people.slug), NOT the per-user memory namespace.
     -- Skills are modeled as a single SKILL.md `content` for v1 — multi-file
     -- skills (scripts, references) are out of scope for now.
+    -- ===== Orgs (PLACEHOLDER — the orgs/memberships/RLS workstream owns this) =====
+    -- Here only so `artifacts` can carry its org_id FK and RLS policy in their
+    -- final shape from the start. Expect this block to be replaced wholesale by
+    -- the real orgs + memberships + users reshape.
+    CREATE TABLE IF NOT EXISTS orgs (
+      id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      slug       TEXT NOT NULL UNIQUE,
+      name       TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    -- ===== Artifacts: stored FILES =====
+    -- Photos, scans, PDFs, audio, mail attachments. The row is the artifact;
+    -- its bytes are content-addressed on disk at
+    -- <data_root>/artifacts/<org_id>/<hh>/<sha256> (core/src/artifact_storage.rs),
+    -- object storage later behind the same driver trait.
+    --
+    -- NOT the Claude Code skills/agents/commands surface — that is
+    -- `identity_artifacts`, right below.
+    --
+    -- Dedup is (org_id, sha256) on the BYTES, one row per upload: filename,
+    -- created_by, and created_at are per-upload facts, and derived artifacts
+    -- (OCR text, captions, transcriptions, thumbnails — docs/ARTIFACTS.md
+    -- Part 3) reference a parent artifact id, so two uploads of the same scan
+    -- must stay two artifacts rather than fusing their derivation trees.
+    -- THIS `id` IS THAT SEAM: a derived-artifacts table references artifacts(id)
+    -- ON DELETE CASCADE and carries its own model/author/confidence columns.
+    -- Nothing derived is produced here.
+    CREATE TABLE IF NOT EXISTS artifacts (
+      id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      org_id     UUID NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+      sha256     TEXT NOT NULL,
+      mime       TEXT NOT NULL,
+      bytes      BIGINT NOT NULL,
+      filename   TEXT,
+      created_by TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS artifacts_org ON artifacts (org_id, created_at DESC);
+    -- The delete-time refcount ("any row left in this org holding these bytes?").
+    CREATE INDEX IF NOT EXISTS artifacts_org_sha ON artifacts (org_id, sha256);
+
     CREATE TABLE IF NOT EXISTS identity_artifacts (
       id          TEXT PRIMARY KEY,
       actor       TEXT NOT NULL,
@@ -682,6 +724,29 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         // Attachment bytes arrive pre-compressed (images, PDFs, zips):
         // skipping TOAST compression on the BYTEA saves CPU on both sides.
         "ALTER TABLE blobs ALTER COLUMN data SET STORAGE EXTERNAL",
+        // Row-level security on artifacts. FORCE, because the API role owns the
+        // tables and an owner bypasses its own policies without it; WITH CHECK
+        // as well as USING, or a caller could INSERT into an org it cannot read.
+        // `CREATE POLICY` has no IF NOT EXISTS, hence the probe.
+        //
+        // The policy reads `hive.acting_org`, set per transaction by
+        // Store::org_tx today and per request by the auth middleware once the
+        // orgs workstream lands. Note that RLS is only as good as the role: a
+        // superuser or BYPASSRLS role defeats it entirely, and the local dev
+        // role is currently both.
+        "ALTER TABLE artifacts ENABLE ROW LEVEL SECURITY",
+        "ALTER TABLE artifacts FORCE ROW LEVEL SECURITY",
+        "DO $$ BEGIN \
+           IF NOT EXISTS ( \
+             SELECT 1 FROM pg_policies \
+             WHERE schemaname = current_schema() AND tablename = 'artifacts' \
+               AND policyname = 'artifacts_org' \
+           ) THEN \
+             CREATE POLICY artifacts_org ON artifacts \
+               USING      (org_id = current_setting('hive.acting_org')::uuid) \
+               WITH CHECK (org_id = current_setting('hive.acting_org')::uuid); \
+           END IF; \
+         END $$",
     ] {
         sqlx::raw_sql(ddl).execute(pool).await?;
     }

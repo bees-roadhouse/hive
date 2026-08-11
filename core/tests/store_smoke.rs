@@ -413,11 +413,11 @@ async fn recall_filters_kinds_in_search_and_unknown_kinds_drop() {
 async fn artifact_upsert_is_idempotent_by_actor_kind_name() {
     let store = test_store().await;
     let a = store
-        .artifacts_upsert("pia", "skill", "journal", "v1", "first", true)
+        .identity_artifacts_upsert("pia", "skill", "journal", "v1", "first", true)
         .await
         .unwrap();
     let b = store
-        .artifacts_upsert("pia", "skill", "journal", "v2", "second", false)
+        .identity_artifacts_upsert("pia", "skill", "journal", "v2", "second", false)
         .await
         .unwrap();
 
@@ -429,31 +429,31 @@ async fn artifact_upsert_is_idempotent_by_actor_kind_name() {
     assert!(!b.enabled);
 
     // Exactly one row for that key.
-    assert_eq!(store.artifacts_list("pia").await.unwrap().len(), 1);
+    assert_eq!(store.identity_artifacts_list("pia").await.unwrap().len(), 1);
 }
 
 #[tokio::test]
 async fn artifact_sync_excludes_disabled_and_other_actors() {
     let store = test_store().await;
     store
-        .artifacts_upsert("pia", "skill", "on", "x", "", true)
+        .identity_artifacts_upsert("pia", "skill", "on", "x", "", true)
         .await
         .unwrap();
     store
-        .artifacts_upsert("pia", "agent", "off", "x", "", false)
+        .identity_artifacts_upsert("pia", "agent", "off", "x", "", false)
         .await
         .unwrap();
     store
-        .artifacts_upsert("apis", "skill", "other", "x", "", true)
+        .identity_artifacts_upsert("apis", "skill", "other", "x", "", true)
         .await
         .unwrap();
 
-    let synced = store.artifacts_for_actor("pia").await.unwrap();
+    let synced = store.identity_artifacts_for_actor("pia").await.unwrap();
     assert_eq!(synced.len(), 1, "only pia's ENABLED artifacts");
     assert_eq!(synced[0].name, "on");
 
     // Management listing still sees the disabled one.
-    assert_eq!(store.artifacts_list("pia").await.unwrap().len(), 2);
+    assert_eq!(store.identity_artifacts_list("pia").await.unwrap().len(), 2);
 }
 
 /// identity_create mints an authorable actor through the normal fold (survives

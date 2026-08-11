@@ -14,6 +14,9 @@ packages/*/dist/
 data/*.db
 data/*.db-shm
 data/*.db-wal
+# Artifact bytes: the default data root is ./data, so a local dev upload lands
+# here (core/src/artifact_storage.rs).
+data/artifacts/
 *.tsbuildinfo
 
 # Claude Desktop bundle build output (scripts/build-mcpb.sh)

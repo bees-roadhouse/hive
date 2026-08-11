@@ -17,6 +17,7 @@ pub mod auth;
 pub mod conversations;
 pub mod custom;
 pub mod entities;
+pub mod identity_artifacts;
 pub mod journal;
 pub mod mail;
 pub mod mcp;
@@ -43,6 +44,7 @@ pub fn router(store: Store) -> Router {
         .merge(oauth::router())
         .merge(admin::router())
         .merge(artifacts::router())
+        .merge(identity_artifacts::router())
         .merge(workspaces::router())
         .merge(mcp::router())
         .merge(stream::router())

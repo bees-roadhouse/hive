@@ -818,14 +818,14 @@ fn build_tools() -> Value {
     ));
     tools.push(json!(
         {
-            "name":"artifacts_list",
+            "name":"identity_artifacts_list",
             "description": "List the acting identity's Claude Code artifacts (skills, agents, slash-commands), including disabled ones",
             "inputSchema": {"type": "object", "properties": {}}
         }
     ));
     tools.push(json!(
         {
-            "name":"artifacts_get",
+            "name":"identity_artifacts_get",
             "description": "Get one Claude Code artifact by id",
             "inputSchema": {
                 "type": "object",
@@ -836,7 +836,7 @@ fn build_tools() -> Value {
     ));
     tools.push(json!(
         {
-            "name":"artifacts_upsert",
+            "name":"identity_artifacts_upsert",
             "description": "Create or replace one of the acting identity's Claude Code artifacts, keyed on (kind, name). `content` is the full markdown body (frontmatter included) that lands at skills/<name>/SKILL.md, agents/<name>.md, or commands/<name>.md. Only ENABLED artifacts reach the plugin via identity_artifacts_sync.",
             "inputSchema": {
                 "type": "object",
@@ -853,7 +853,7 @@ fn build_tools() -> Value {
     ));
     tools.push(json!(
         {
-            "name":"artifacts_remove",
+            "name":"identity_artifacts_remove",
             "description": "DESTRUCTIVE. Delete one of the acting identity's Claude Code artifacts by id. Another identity's artifacts are not visible to this tool.",
             "inputSchema": {
                 "type": "object",
@@ -1792,19 +1792,19 @@ async fn dispatch(
         }
         // Claude Code artifacts for the authenticated identity (its own skills /
         // agents / commands) — same keying as the REST sync endpoint.
-        "artifacts_list" => {
-            let a = Args::new("artifacts_list", args);
+        "identity_artifacts_list" => {
+            let a = Args::new("identity_artifacts_list", args);
             a.finish()?;
-            let items = store.artifacts_list(actor).await?;
+            let items = store.identity_artifacts_list(actor).await?;
             Ok(ok_content(
                 &json!({"count": items.len(), "artifacts": items}),
             ))
         }
-        "artifacts_get" => {
-            let mut a = Args::new("artifacts_get", args);
+        "identity_artifacts_get" => {
+            let mut a = Args::new("identity_artifacts_get", args);
             let id = a.req_str("id");
             a.finish()?;
-            match store.artifacts_get(id.unwrap()).await? {
+            match store.identity_artifacts_get(id.unwrap()).await? {
                 Some(art) => Ok(ok_content(&art)),
                 None => Ok(ok_content(&json!({"error": "not found"}))),
             }
@@ -1813,8 +1813,8 @@ async fn dispatch(
         // on (actor, kind, name), so `actor` is taken from LocalCtx rather than
         // the arguments — one identity can read another's artifacts (the sync
         // surface below) but never author or delete them.
-        "artifacts_upsert" => {
-            let mut a = Args::new("artifacts_upsert", args);
+        "identity_artifacts_upsert" => {
+            let mut a = Args::new("identity_artifacts_upsert", args);
             let kind = a.req_str("kind");
             let name = a.req_str("name");
             let content = a.req_str("content");
@@ -1826,12 +1826,12 @@ async fn dispatch(
             // typo would store a row that never syncs. Reject it at the door.
             if !matches!(kind, "skill" | "agent" | "command") {
                 return Err(invalid_args(
-                    "artifacts_upsert",
+                    "identity_artifacts_upsert",
                     "kind must be one of: skill, agent, command",
                 ));
             }
             let art = store
-                .artifacts_upsert(
+                .identity_artifacts_upsert(
                     actor,
                     kind,
                     name.unwrap(),
@@ -1842,16 +1842,16 @@ async fn dispatch(
                 .await?;
             Ok(ok_content(&art))
         }
-        "artifacts_remove" => {
-            let mut a = Args::new("artifacts_remove", args);
+        "identity_artifacts_remove" => {
+            let mut a = Args::new("identity_artifacts_remove", args);
             let id = a.req_str("id");
             a.finish()?;
             let id = id.unwrap();
             // Another identity's artifact reads as absent rather than forbidden —
             // same shape as a genuine miss, so callers need one branch, not two.
-            match store.artifacts_get(id).await? {
+            match store.identity_artifacts_get(id).await? {
                 Some(art) if art.actor == actor => {
-                    store.artifacts_remove(id).await?;
+                    store.identity_artifacts_remove(id).await?;
                     Ok(ok_content(&json!({"removed": true, "id": id})))
                 }
                 _ => Ok(ok_content(&json!({"error": "not found"}))),
@@ -1863,7 +1863,7 @@ async fn dispatch(
             let target = a.opt_str("actor").map(String::from);
             a.finish()?;
             let items = store
-                .artifacts_for_actor(target.as_deref().unwrap_or(actor))
+                .identity_artifacts_for_actor(target.as_deref().unwrap_or(actor))
                 .await?;
             Ok(ok_content(
                 &json!({"count": items.len(), "artifacts": items}),

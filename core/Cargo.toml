@@ -34,5 +34,7 @@ rss = { workspace = true }
 # Misc
 nanoid = { workspace = true }
 uuid = { workspace = true }
+# Object-safe async storage driver trait (artifact_storage.rs).
+async-trait = { workspace = true }
 # Credential vault: reversible encryption of per-user Claude Code tokens at rest.
 aes-gcm = "0.10"

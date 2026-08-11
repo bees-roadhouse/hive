@@ -42,6 +42,9 @@ dotenvy = { workspace = true }
 async-stream = "0.3"
 futures = "0.3"
 urlencoding = "2.1"
+# ReaderStream: an AsyncRead from the artifact storage driver becomes a
+# streaming response body without buffering the object.
+tokio-util = { version = "0.7", features = ["io"] }
 
 [dev-dependencies]
 tempfile = "3"

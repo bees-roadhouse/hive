@@ -2,6 +2,7 @@
 // helpers) extracted from the api crate so worker/mail — and later the desktop
 // shell — depend on the data layer without the HTTP surface.
 
+pub mod artifact_storage;
 pub mod auth;
 pub mod db;
 pub mod pgq;
