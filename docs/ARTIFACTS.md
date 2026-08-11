@@ -72,6 +72,36 @@ already exists. What is new is dispatch on it.
 Unknown types must be storable. An artifact whose type has no pipeline is a
 normal artifact that simply has nothing derived from it, never a rejected one.
 
+## Part 2a — bytes stream, references sync (D43)
+
+An artifact's BYTES are not replicated eagerly. The log record carries a
+`BlobRef` — the reference plus the wrapped content key — never the payload, so
+a client can know an artifact exists, its mime, its size, and its manifest hash
+while holding none of it. That separation is already in the frozen format; what
+this note adds is the policy on top.
+
+| tier | contents |
+|---|---|
+| eager | op-log, index, embeddings, derived text |
+| eager | thumbnails and small renditions |
+| on demand | original bytes, streamed and LRU-cached to a user-set ceiling |
+
+**A thumbnail is a derived artifact like any other**, produced by the same
+pipeline as a caption or an OCR pass, indexed nowhere, and crypto-shredded with
+its parent. It is in the eager tier for one reason: without it a photo grid is
+empty on a plane, and a photo product whose grid is empty offline is not a
+photo product.
+
+Streaming works through a blind cache because content addressing is over
+CIPHERTEXT — a cache serves blocks it cannot read, and the client verifies them
+by hash. Two households holding the same photo produce different ciphertext,
+because the content key is a PRF of the plaintext hash under a master-derived
+subkey, so nothing about who holds what leaks to whoever runs the cache.
+
+The fetch chain is main device, then blind cache if the user enabled one, then
+unavailable and say so. Caching everything on every device is not a cache; for
+a household's whole photographic history it is a copy.
+
 ## Part 3 — derived text is one kind with several producers
 
 OCR, speech-to-text, and image captioning are the same shape: **text derived
