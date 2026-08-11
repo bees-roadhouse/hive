@@ -1,0 +1,29 @@
+# Single browser origin for the hive: serve the static SPA, proxy the API.
+# `handle` blocks are mutually exclusive and ordered, so the SPA's try_files
+# fallback can't swallow /api or /mcp (a plain matcher + try_files would, since
+# the try_files rewrite runs before reverse_proxy).
+:8080 {
+	encode gzip
+
+	# API + SSE stream. flush_interval -1 disables buffering so /api/stream
+	# pushes each SSE frame to the browser live.
+	handle /api/* {
+		reverse_proxy hive-api:8787 {
+			flush_interval -1
+		}
+	}
+
+	# MCP (Streamable HTTP) endpoint.
+	handle /mcp {
+		reverse_proxy hive-api:8787 {
+			flush_interval -1
+		}
+	}
+
+	# Everything else is the Solid SPA; unknown paths fall back to index.html.
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

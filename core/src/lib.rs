@@ -1,19 +1,11 @@
-// hive-core: the single-user data core (PR 1.6 cutover shape). The append-only
-// op log (oplog) is the source of truth; the SQLCipher SQLite index (index) is
-// its rebuildable projection, maintained by the fold; the blockstore holds
-// payload bytes; keys holds master-key custody and identity holds the
-// per-device transport keypair (PLAN-v2.1 PR 4.5) that the mTLS carrier,
-// control signing, and sharing all reuse. The store layer rides ONE writer
-// thread that owns all of it (store/core.rs) behind the unchanged async
-// Store surface, and mcp is the tool layer the desktop shell (Phase 2) and
-// the stdio bridge (PR 1.8) drive directly. Postgres left at the cutover;
-// the PR 1.7 importer reads old instances with its own Postgres client.
+// hive-core: the store layer (Postgres store, schema/migrations, pgq query
+// helpers) extracted from the api crate so worker/mail — and later the desktop
+// shell — depend on the data layer without the HTTP surface.
 
-pub mod blockstore;
-pub mod fold;
-pub mod identity;
-pub mod index;
-pub mod keys;
-pub mod mcp;
-pub mod oplog;
+pub mod auth;
+pub mod db;
+pub mod pgq;
 pub mod store;
+
+mod visibility;
+pub use visibility::Visibility;

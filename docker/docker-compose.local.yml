@@ -1,0 +1,56 @@
+# Local hive stack for podman/docker compose.
+#   podman compose -f docker/docker-compose.local.yml up -d --build
+# Browser:  http://localhost:8080   ·   API: http://localhost:8787/api/healthz
+name: hive
+
+services:
+  hive-api:
+    build:
+      context: ..
+      dockerfile: docker/Containerfile
+      target: runtime
+    command: ["node", "--experimental-strip-types", "packages/api/src/server.ts"]
+    environment:
+      PORT: "8787"
+      HIVE_DB: /data/hive.db
+      HIVE_EMBED: hash
+    volumes:
+      - hive-data:/data
+    ports:
+      - "8787:8787"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8787/api/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
+  hive-worker:
+    build:
+      context: ..
+      dockerfile: docker/Containerfile
+      target: runtime
+    command: ["node", "--experimental-strip-types", "packages/worker/src/index.ts"]
+    environment:
+      HIVE_DB: /data/hive.db
+      HIVE_EMBED: hash
+      HIVE_WORKER_TICK: "30"
+    volumes:
+      - hive-data:/data
+    depends_on:
+      hive-api:
+        condition: service_healthy
+
+  hive-web:
+    build:
+      context: ..
+      dockerfile: docker/Containerfile
+      target: web
+    ports:
+      - "8080:8080"
+    depends_on:
+      hive-api:
+        condition: service_healthy
+
+volumes:
+  hive-data:

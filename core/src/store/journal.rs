@@ -1,162 +1,114 @@
-// Journal append/list/get + anchors + bracket-token refs. Parity port of
-// store.ts `journal`, `anchorsFor`/`refsFor`, `materialiseAnchor`,
-// `parseBracketTokens`, `journalWriters`.
-//
-// The cutover shape (D18): journal_append is ONE logical write = ONE record
-// batch. The command layer parses emergence here — bracket tokens, anchor
-// materialisation, mention fan-out — and pre-computes EVERYTHING into the
-// journal.append payload (anchors, emerged entity-creates, inbox rows), with
-// links and side-effect updates (decision supersedes) as separate records in
-// the same batch. The fold applies it all in one SQLite transaction: the
-// atomicity the Postgres path never had. Find-or-create consults the pending
-// batch as well as the index, so two [topic: X] tokens in one entry emerge
-// one topic.
+// Journal append/list/get + anchors + bracket-token refs + visibleJournal ACL.
+// Parity port of store.ts `journal`, `anchorsFor`/`refsFor`, `materialiseAnchor`,
+// `parseBracketTokens`, `journalWriters`, `visibleJournal`, `visibleEntryIds`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
 use hive_shared::{
-    parse_mentions, slugify, ActorKind, Anchor, AnchorFields, AnchorKind, DecisionStatus,
+    parse_mentions, slugify, snip, ActorKind, Anchor, AnchorFields, AnchorKind, DecisionStatus,
     EntityKind, InboxReason, JournalEntry, JournalEntryView, JournalRef, JournalWriter, NewAnchor,
-    NewJournalEntry, Person, Priority, ResolvedAnchor, TaskStatus, ACTORS,
+    NewJournalEntry, NewShare, Priority, ResolvedAnchor, ShareScope, TaskStatus, ACTORS,
 };
-use rusqlite::OptionalExtension;
-use serde_json::{json, Value as Json};
+use serde_json::json;
+use sqlx::Row;
 
-use super::{json_vec, new_id, now_iso, Core, Draft, Store};
+use crate::Visibility;
 
-/// The in-flight state of one journal_append: everything emerging from the
-/// entry, accumulated before the single commit.
-struct Emergence {
-    /// Pre-materialized entity.create payloads (the `emerged` array).
-    emerged: Vec<Json>,
-    /// Pre-computed inbox fan-out rows (the `inbox` array).
-    inbox: Vec<Json>,
-    /// link.add / entity.update records that ride the same batch.
-    extra: Vec<Draft>,
-    /// Anchor rows (the `anchors` array).
-    anchors: Vec<Json>,
-    /// Pending find-or-create results, keyed by slug (or composite), so a
-    /// second token in the same entry reuses the first's id.
-    topics: HashMap<String, (String, String)>, // slug -> (id, name)
-    projects: HashMap<String, (String, String)>, // slug -> (id, name)
-    phases: HashMap<(String, String), String>,   // (project id, lower name) -> id
-    people: HashMap<String, Person>,             // slug -> person
-    phase_next_pos: HashMap<String, i64>,        // project id -> next position
-    contacts: HashMap<String, (String, String)>, // contact slug -> (instance id, name)
-    /// Memoized contact `type_id` for this batch: `None` until the first
-    /// [contact:] token ensures the type. Its ensure-payloads (type + fields)
-    /// are pushed into `emerged` at most once, ahead of any instance.
-    contact_type_id: Option<String>,
-}
-
-impl Emergence {
-    fn new() -> Self {
-        Emergence {
-            emerged: Vec::new(),
-            inbox: Vec::new(),
-            extra: Vec::new(),
-            anchors: Vec::new(),
-            topics: HashMap::new(),
-            projects: HashMap::new(),
-            phases: HashMap::new(),
-            people: HashMap::new(),
-            phase_next_pos: HashMap::new(),
-            contacts: HashMap::new(),
-            contact_type_id: None,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn add_inbox(
-        &mut self,
-        recipient: &str,
-        from: &str,
-        reason: InboxReason,
-        ref_kind: &str,
-        ref_id: &str,
-        entry_id: Option<&str>,
-        snippet: &str,
-    ) {
-        if recipient == from {
-            return; // don't notify yourself (inbox_add parity)
-        }
-        self.inbox.push(super::inbox::inbox_payload_item(
-            recipient,
-            from,
-            reason,
-            ref_kind,
-            ref_id,
-            entry_id,
-            snippet,
-            &now_iso(),
-        ));
-    }
-}
+use super::decisions::DecisionCreate;
+use super::events::EventCreate;
+use super::tasks::TaskCreate;
+use super::{json_vec, new_id, now_iso, placeholders_or_never, to_json, Store};
 
 impl Store {
     pub async fn journal_list(&self, limit: i64, offset: i64) -> Result<Vec<JournalEntryView>> {
-        self.run(move |core| {
-            let entries: Vec<JournalEntry> = {
-                let mut stmt = core
-                    .conn()
-                    .prepare("SELECT * FROM journal ORDER BY created_at DESC LIMIT ?1 OFFSET ?2")?;
-                let rows = stmt.query_map(rusqlite::params![limit, offset], row_to_entry)?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            entries.into_iter().map(|e| entry_view(core, e)).collect()
-        })
-        .await
+        let rows =
+            crate::pgq::query("SELECT * FROM journal ORDER BY created_at DESC LIMIT ? OFFSET ?")
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(self.db())
+                .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let entry = row_to_entry(row)?;
+            out.push(self.entry_view(entry).await?);
+        }
+        Ok(out)
     }
 
-    /// Like `journal_list`, but only entries authored by `author` (the
-    /// people.slug). Newest-first, paginated the same way — the app's
-    /// Identities filter uses it to show one identity's journal without
-    /// dropping entries: filtering a client-side page would silently hide
-    /// rows past the limit, so the WHERE runs in SQL on the derived index.
-    pub async fn journal_list_by_author(
+    pub async fn journal_get(
         &self,
-        author: &str,
-        limit: i64,
-        offset: i64,
-    ) -> Result<Vec<JournalEntryView>> {
-        let author = author.to_string();
-        self.run(move |core| {
-            let entries: Vec<JournalEntry> = {
-                let mut stmt = core.conn().prepare(
-                    "SELECT * FROM journal WHERE author = ?1 \
-                     ORDER BY created_at DESC LIMIT ?2 OFFSET ?3",
-                )?;
-                let rows =
-                    stmt.query_map(rusqlite::params![author, limit, offset], row_to_entry)?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            entries.into_iter().map(|e| entry_view(core, e)).collect()
-        })
-        .await
+        entry_id: &str,
+        vis: &Visibility,
+    ) -> Result<Option<JournalEntryView>> {
+        let row = crate::pgq::query("SELECT * FROM journal WHERE id = ?")
+            .bind(entry_id)
+            .fetch_optional(self.db())
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        // Namespace gate: non-admins get an entry only if it's global, in their
+        // own namespace, or explicitly shared/@mentioned to them. Hidden as 404.
+        if let Visibility::Namespace(u) = vis {
+            let scope: Option<String> = row.try_get("user_scope")?;
+            let own_or_global = scope.as_deref().map(|s| s == u).unwrap_or(true);
+            if !own_or_global {
+                let visible = self.visible_entry_ids(vis).await?.unwrap_or_default();
+                if !visible.contains(entry_id) {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(self.entry_view(row_to_entry(&row)?).await?))
     }
 
-    pub async fn journal_get(&self, entry_id: &str) -> Result<Option<JournalEntryView>> {
-        let entry_id = entry_id.to_string();
-        self.run(move |core| {
-            let entry = core
-                .conn()
-                .query_row(
-                    "SELECT * FROM journal WHERE id = ?1",
-                    rusqlite::params![entry_id],
-                    row_to_entry,
-                )
-                .optional()?;
-            entry.map(|e| entry_view(core, e)).transpose()
-        })
-        .await
+    /// Admin bulk-reassignment of journal namespace ownership. Filters (ANDed,
+    /// all optional) pick the entries: `match_unscoped` = currently global,
+    /// `from_user` = currently owned by that user, `author` = written by that
+    /// actor. `to` is the new owner (None = make global). Returns rows changed.
+    /// With no filters it reassigns every entry (admin-only, deliberate).
+    pub async fn journal_reassign_scope(
+        &self,
+        match_unscoped: bool,
+        from_user: Option<&str>,
+        author: Option<&str>,
+        to: Option<&str>,
+    ) -> Result<u64> {
+        let mut clauses: Vec<String> = Vec::new();
+        if match_unscoped {
+            clauses.push("user_scope IS NULL".to_string());
+        }
+        if from_user.is_some() {
+            clauses.push("user_scope = ?".to_string());
+        }
+        if author.is_some() {
+            clauses.push("author = ?".to_string());
+        }
+        let where_ = if clauses.is_empty() {
+            "TRUE".to_string()
+        } else {
+            clauses.join(" AND ")
+        };
+        let sql = format!("UPDATE journal SET user_scope = ? WHERE {where_}");
+        let mut q = crate::pgq::query(&sql).bind(to);
+        if let Some(u) = from_user {
+            q = q.bind(u);
+        }
+        if let Some(a) = author {
+            q = q.bind(a);
+        }
+        Ok(q.execute(self.db()).await?.rows_affected())
     }
 
     /// The one write path. Persist immutable prose, then materialise each anchored
     /// span into a structured entity and fan out inbox notifications. Also parses
     /// inline [person:], [topic:], [project:], [phase:], [task:] tokens to
-    /// emerge/link entities and feed inboxes. One record batch, one fold
-    /// transaction.
+    /// emerge/link entities and feed inboxes.
+    ///
+    /// Node wraps this in a SQLite transaction; here the steps run sequentially on
+    /// the pool because emit/inbox/ensure helpers are pool-level (a wrapping write
+    /// transaction would deadlock against them under WAL's single-writer rule).
     pub async fn journal_append(
         &self,
         input: NewJournalEntry,
@@ -167,880 +119,988 @@ impl Store {
             .map(String::from)
             .or_else(|| input.author.clone())
             .ok_or_else(|| anyhow!("author required"))?;
-        let user_scope = user_scope.map(String::from);
-        let author_for_emit = author.clone();
+        let mentions = parse_mentions(&input.body);
 
-        let view = self
-            .run(move |core| {
-                let mentions = parse_mentions(&input.body);
-                let entry = JournalEntry {
-                    id: new_id("jrnl"),
-                    author: author.clone(),
-                    body: input.body.clone(),
-                    tags: input.tags.clone().unwrap_or_default(),
-                    mentions: mentions.clone(),
-                    user_scope: user_scope.clone(),
-                    created_at: now_iso(),
-                };
-
-                let mut em = Emergence::new();
-                let mut assigned: HashSet<String> = HashSet::new();
-                for a in input.anchors.as_deref().unwrap_or_default() {
-                    materialise_anchor(core, &entry, a, &author, &mut assigned, &mut em)?;
+        // Mail-scope guard — the benign-exfiltration-loop fix (DIRECTION.md
+        // "Risks and tar pits"; open question 1 decided: downgrade-not-refuse).
+        // The sanctioned dreaming pattern has agents summarize what they read
+        // into journal prose, and a global (user_scope = NULL) entry is
+        // visible to everyone — so an agent journaling a mail summary would
+        // publish private correspondence globally. When a non-human author
+        // writes a GLOBAL entry that cites mail ("[mail:" token), downgrade
+        // it to the author's owner namespace and tag it 'scoped-by-policy' so
+        // the rewrite is visible, never silent. A non-human author with no
+        // owner has no scope to land in → refuse. Human-authored global mail
+        // references pass untouched; authors with no people row are treated
+        // as non-human (fail closed — only mail-citing global writes hit this).
+        let mut tags = input.tags.clone().unwrap_or_default();
+        let mut user_scope = user_scope.map(String::from);
+        if user_scope.is_none() && input.body.contains("[mail:") {
+            let person = self.people_get(&author).await?;
+            let human = person.as_ref().is_some_and(|p| p.kind == ActorKind::Human);
+            if !human {
+                match person.and_then(|p| p.owner) {
+                    Some(owner) => {
+                        if !tags.iter().any(|t| t == "scoped-by-policy") {
+                            tags.push("scoped-by-policy".to_string());
+                        }
+                        user_scope = Some(owner);
+                    }
+                    None => return Err(anyhow!("mail-derived memory needs an owner scope")),
                 }
-                parse_bracket_tokens_into(core, &entry, &author, &mut assigned, &mut em)?;
+            }
+        }
 
-                // Anyone @mentioned but not already pulled into an anchor gets a
-                // plain "mention" inbox item — humans and AIs alike.
-                for m in &mentions {
-                    if !assigned.contains(m) {
-                        em.add_inbox(
-                            m,
-                            &author,
+        let entry = JournalEntry {
+            id: new_id("jrnl"),
+            author: author.clone(),
+            body: input.body.clone(),
+            tags,
+            mentions: mentions.clone(),
+            user_scope,
+            created_at: now_iso(),
+        };
+        // Namespace owner: the human the writing principal acts for (None = a
+        // system/worker write → global/continuous history).
+        crate::pgq::query(
+            "INSERT INTO journal (id, author, body, tags, mentions, user_scope, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&entry.id)
+        .bind(&entry.author)
+        .bind(&entry.body)
+        .bind(to_json(&entry.tags))
+        .bind(to_json(&entry.mentions))
+        .bind(&entry.user_scope)
+        .bind(&entry.created_at)
+        .execute(self.db())
+        .await?;
+        self.index_entity(
+            "journal",
+            &entry.id,
+            &format!("{author}: {}", snip(&input.body, 50)),
+            &input.body,
+            &entry.tags,
+        )
+        .await?;
+
+        let mut assigned: HashSet<String> = HashSet::new();
+        for a in input.anchors.as_deref().unwrap_or_default() {
+            self.materialise_anchor(&entry, a, &author, &mut assigned)
+                .await?;
+        }
+
+        // Parse bracket tokens: emerge/link entities, fan to inboxes.
+        self.parse_bracket_tokens(&entry, &author, &mut assigned)
+            .await?;
+
+        // Anyone @mentioned but not already pulled into an anchor gets a plain
+        // "mention" inbox item — humans and AIs alike.
+        for m in &mentions {
+            if !assigned.contains(m) {
+                self.inbox_add(
+                    m,
+                    &author,
+                    InboxReason::Mention,
+                    EntityKind::Journal.as_str(),
+                    &entry.id,
+                    Some(&entry.id),
+                    &input.body,
+                )
+                .await?;
+            }
+        }
+
+        // Auto-share: every @mentioned actor gets an entry-level share so the
+        // entry is visible in their scoped journal view.
+        for m in &mentions {
+            if m != &author {
+                self.shares_create(NewShare {
+                    scope: ShareScope::Entry,
+                    ref_: entry.id.clone(),
+                    viewer: m.clone(),
+                })
+                .await?;
+            }
+        }
+
+        self.emit(
+            "journal.created",
+            &author,
+            json!({"id": entry.id, "anchors": input.anchors.as_ref().map_or(0, Vec::len)}),
+        )
+        .await?;
+        self.entry_view(entry).await
+    }
+
+    async fn materialise_anchor(
+        &self,
+        entry: &JournalEntry,
+        a: &NewAnchor,
+        author: &str,
+        assigned: &mut HashSet<String>,
+    ) -> Result<()> {
+        let text = js_slice_utf16(&entry.body, a.start, a.end)
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            return Ok(());
+        }
+        let f: AnchorFields = a.fields.clone().unwrap_or_default();
+        let span_mentions = parse_mentions(&text);
+        // Auto-assign to the entry author when no explicit assignees and no @mentions in the span.
+        let raw_assignees = f.assignees.clone().unwrap_or_else(|| {
+            if span_mentions.is_empty() {
+                vec![author.to_string()]
+            } else {
+                span_mentions
+            }
+        });
+        let assignees: Vec<String> = raw_assignees
+            .iter()
+            .filter(|x| x.as_str() != author)
+            .cloned()
+            .collect();
+        let assignees_for_task = if raw_assignees.is_empty() {
+            vec![author.to_string()]
+        } else {
+            raw_assignees.clone()
+        };
+        let title_src = f.title.clone().unwrap_or_else(|| {
+            text.split(['.', '\n'])
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        });
+        let title = js_slice_utf16(&title_src, 0, 120).trim().to_string();
+
+        let (ref_id, reason, ref_kind) = match a.kind {
+            AnchorKind::Task => {
+                let t = self
+                    .tasks_create(
+                        TaskCreate {
+                            title,
+                            body: text.clone(),
+                            status: f
+                                .status
+                                .as_deref()
+                                .map(TaskStatus::from_str_lossy)
+                                .unwrap_or(TaskStatus::Todo),
+                            priority: f.priority.unwrap_or(Priority::Normal),
+                            tags: f.tags.clone().unwrap_or_default(),
+                            assignees: assignees_for_task.clone(),
+                            project: f.project.clone().flatten(),
+                            origin_entry_id: Some(entry.id.clone()),
+                            anchor_text: Some(text.clone()),
+                            ..TaskCreate::default()
+                        },
+                        author,
+                    )
+                    .await?;
+                (t.id, InboxReason::Assignment, EntityKind::Task)
+            }
+            AnchorKind::Decision => {
+                let d = self
+                    .decisions_create(
+                        DecisionCreate {
+                            title,
+                            context: f.context.clone().unwrap_or_default(),
+                            decision: f.decision.clone().unwrap_or_else(|| text.clone()),
+                            consequences: f.consequences.clone().unwrap_or_default(),
+                            status: f
+                                .status
+                                .as_deref()
+                                .map(DecisionStatus::from_str_lossy)
+                                .unwrap_or(DecisionStatus::Proposed),
+                            tags: f.tags.clone().unwrap_or_default(),
+                            assignees: assignees.clone(),
+                            project: f.project.clone().flatten(),
+                            supersedes: f.supersedes.clone().flatten(),
+                            origin_entry_id: Some(entry.id.clone()),
+                            anchor_text: Some(text.clone()),
+                        },
+                        author,
+                    )
+                    .await?;
+                (d.id, InboxReason::Decision, EntityKind::Decision)
+            }
+            AnchorKind::Event => {
+                let e = self
+                    .events_create(
+                        EventCreate {
+                            title,
+                            body: text.clone(),
+                            at: f.at.clone().flatten(),
+                            tags: f.tags.clone().unwrap_or_default(),
+                            assignees: assignees.clone(),
+                            origin_entry_id: Some(entry.id.clone()),
+                            anchor_text: Some(text.clone()),
+                        },
+                        author,
+                    )
+                    .await?;
+                (e.id, InboxReason::Event, EntityKind::Event)
+            }
+        };
+
+        crate::pgq::query(
+            r#"INSERT INTO anchors (id, entry_id, start, "end", text, kind, ref_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(new_id("anc"))
+        .bind(&entry.id)
+        .bind(a.start)
+        .bind(a.end)
+        .bind(&text)
+        .bind(a.kind.as_str())
+        .bind(&ref_id)
+        .bind(now_iso())
+        .execute(self.db())
+        .await?;
+        self.links_create(
+            EntityKind::Journal.as_str(),
+            &entry.id,
+            ref_kind.as_str(),
+            &ref_id,
+            "anchors",
+        )
+        .await?;
+
+        // For inbox delivery use the full assignee list (including author when auto-assigned).
+        let recipients = if a.kind == AnchorKind::Task {
+            &assignees_for_task
+        } else {
+            &assignees
+        };
+        for who in recipients {
+            assigned.insert(who.clone());
+            self.inbox_add(
+                who,
+                author,
+                reason,
+                ref_kind.as_str(),
+                &ref_id,
+                Some(&entry.id),
+                &text,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Parse [person:], [topic:], [project:], [phase:], [task:] tokens from an
+    /// entry body. Find-or-create each entity, create a links row, and fan to
+    /// inboxes where relevant. Context tracking: if the entry mentions a
+    /// [project:] and/or [phase:], any [task:] that emerges is related to it.
+    async fn parse_bracket_tokens(
+        &self,
+        entry: &JournalEntry,
+        author: &str,
+        assigned: &mut HashSet<String>,
+    ) -> Result<()> {
+        let tokens = scan_tokens(&entry.body);
+
+        // First pass: collect context (project + phase referenced in this entry).
+        let mut ctx_project: Option<String> = None;
+        let mut ctx_phase: Option<String> = None;
+        for t in &tokens {
+            match t.kind {
+                "project" => {
+                    let p = self.projects_ensure(&t.name).await?;
+                    ctx_project = Some(p.id);
+                }
+                "phase" => {
+                    if let Some(pid) = &ctx_project {
+                        let ph = self.phases_ensure(pid, &t.name).await?;
+                        ctx_phase = Some(ph.id);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Second pass: process all tokens.
+        for t in &tokens {
+            match t.kind {
+                "person" => {
+                    // Resolve against ACTORS first (known actors), then ensure as a people row.
+                    let slug = slugify(&t.name);
+                    let actor_match = ACTORS
+                        .iter()
+                        .find(|(n, _)| *n == slug || slugify(n) == slug);
+                    let person = match actor_match {
+                        Some((n, k)) => self.people_ensure(&capitalize(n), *k).await?,
+                        None => self.people_ensure(&t.name, ActorKind::Human).await?,
+                    };
+                    self.links_create(
+                        EntityKind::Journal.as_str(),
+                        &entry.id,
+                        EntityKind::Person.as_str(),
+                        &person.id,
+                        "mentions",
+                    )
+                    .await?;
+                    // Fan to inbox if this person is a known actor (same as @mention).
+                    if let Some((n, _)) = actor_match {
+                        assigned.insert((*n).to_string());
+                        self.inbox_add(
+                            n,
+                            author,
                             InboxReason::Mention,
                             EntityKind::Journal.as_str(),
                             &entry.id,
                             Some(&entry.id),
-                            &input.body,
-                        );
+                            &entry.body,
+                        )
+                        .await?;
                     }
                 }
-
-                let payload = json!({
-                    "id": entry.id,
-                    "author": entry.author,
-                    "body": entry.body,
-                    "tags": entry.tags,
-                    "mentions": entry.mentions,
-                    "user_scope": entry.user_scope,
-                    "created_at": entry.created_at,
-                    "anchors": em.anchors,
-                    "emerged": em.emerged,
-                    "inbox": em.inbox,
-                });
-                let mut batch = vec![Draft::new(
-                    crate::oplog::kind::JOURNAL_APPEND,
-                    &author,
-                    &entry.created_at,
-                    payload,
-                )];
-                batch.extend(em.extra);
-                core.commit(batch)?;
-
-                entry_view(core, entry)
-            })
-            .await?;
-
-        self.emit(
-            "journal.created",
-            &author_for_emit,
-            json!({"id": view.entry.id, "anchors": view.anchors.len()}),
-        )
-        .await?;
-        Ok(view)
+                "topic" => {
+                    let topic = self.topics_ensure(&t.name).await?;
+                    self.links_create(
+                        EntityKind::Journal.as_str(),
+                        &entry.id,
+                        EntityKind::Topic.as_str(),
+                        &topic.id,
+                        "tagged",
+                    )
+                    .await?;
+                }
+                "project" => {
+                    let proj = self.projects_ensure(&t.name).await?;
+                    self.links_create(
+                        EntityKind::Journal.as_str(),
+                        &entry.id,
+                        EntityKind::Project.as_str(),
+                        &proj.id,
+                        "about",
+                    )
+                    .await?;
+                }
+                "phase" => {
+                    if let Some(pid) = &ctx_project {
+                        let ph = self.phases_ensure(pid, &t.name).await?;
+                        self.links_create(
+                            EntityKind::Journal.as_str(),
+                            &entry.id,
+                            EntityKind::Phase.as_str(),
+                            &ph.id,
+                            "about",
+                        )
+                        .await?;
+                    }
+                }
+                "task" => {
+                    // Emerge a task anchored to this entry, auto-assigned to the author.
+                    let task = self
+                        .tasks_create(
+                            TaskCreate {
+                                title: t.name.clone(),
+                                body: String::new(),
+                                assignees: vec![author.to_string()],
+                                project: ctx_project.clone(),
+                                phase: ctx_phase.clone(),
+                                origin_entry_id: Some(entry.id.clone()),
+                                anchor_text: Some(t.name.clone()),
+                                ..TaskCreate::default()
+                            },
+                            author,
+                        )
+                        .await?;
+                    self.links_create(
+                        EntityKind::Journal.as_str(),
+                        &entry.id,
+                        EntityKind::Task.as_str(),
+                        &task.id,
+                        "anchors",
+                    )
+                    .await?;
+                    // author is assigned; inbox_add silently skips self-notification.
+                    self.inbox_add(
+                        author,
+                        author,
+                        InboxReason::Assignment,
+                        EntityKind::Task.as_str(),
+                        &task.id,
+                        Some(&entry.id),
+                        &t.name,
+                    )
+                    .await?;
+                }
+                "mail" => {
+                    // [mail:<id>] cites an archived message: a links row only —
+                    // no entity emerges, no anchor (anchors stay journal spans;
+                    // a task cites the ENTRY, never the email), no inbox fan.
+                    // Write-time scope gate: you can only cite mail whose owner
+                    // matches the entry's effective scope (its user_scope, or
+                    // the author's namespace for global entries) — a token
+                    // naming someone else's mail simply doesn't link (D9:
+                    // owner-only, no piercing).
+                    let token = t.name.trim();
+                    let effective_scope = entry
+                        .user_scope
+                        .clone()
+                        .unwrap_or_else(|| author.to_string());
+                    let visible: Option<String> = crate::pgq::query_scalar::<String>(
+                        "SELECT id FROM mail_messages \
+                         WHERE id = ? AND user_scope = ? AND deleted_at IS NULL",
+                    )
+                    .bind(token)
+                    .bind(&effective_scope)
+                    .fetch_optional(self.db())
+                    .await?;
+                    if let Some(mail_id) = visible {
+                        self.links_create(
+                            EntityKind::Journal.as_str(),
+                            &entry.id,
+                            EntityKind::Mail.as_str(),
+                            &mail_id,
+                            "cites",
+                        )
+                        .await?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Anchors for an entry, each with its resolved entity (Node `anchorsFor`).
     pub async fn anchors_for(&self, entry_id: &str) -> Result<Vec<ResolvedAnchor>> {
-        let entry_id = entry_id.to_string();
-        self.run(move |core| anchors_for_conn(core, &entry_id))
-            .await
+        let rows = crate::pgq::query(
+            r#"SELECT id, entry_id, start, "end", text, kind, ref_id, created_at FROM anchors WHERE entry_id = ? ORDER BY start"#,
+        )
+        .bind(entry_id)
+        .fetch_all(self.db())
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let kind_str: String = r.try_get("kind")?;
+            let ref_id: String = r.try_get("ref_id")?;
+            let anchor = Anchor {
+                id: r.try_get("id")?,
+                entry_id: r.try_get("entry_id")?,
+                start: r.try_get("start")?,
+                end: r.try_get("end")?,
+                text: r.try_get("text")?,
+                kind: AnchorKind::parse(&kind_str).unwrap_or(AnchorKind::Task),
+                ref_id: ref_id.clone(),
+                created_at: r.try_get("created_at")?,
+            };
+            let entity = self.entity_by_id(&kind_str, &ref_id).await?;
+            out.push(ResolvedAnchor { anchor, entity });
+        }
+        Ok(out)
+    }
+
+    /// Node `entityById` — Task | Decision | EventItem | null as JSON.
+    async fn entity_by_id(&self, kind: &str, ref_id: &str) -> Result<serde_json::Value> {
+        Ok(match kind {
+            "task" => self
+                .tasks_get(ref_id)
+                .await?
+                .map(serde_json::to_value)
+                .transpose()?
+                .unwrap_or(serde_json::Value::Null),
+            "decision" => self
+                .decisions_get(ref_id)
+                .await?
+                .map(serde_json::to_value)
+                .transpose()?
+                .unwrap_or(serde_json::Value::Null),
+            "event" => self
+                .events_get(ref_id)
+                .await?
+                .map(serde_json::to_value)
+                .transpose()?
+                .unwrap_or(serde_json::Value::Null),
+            _ => serde_json::Value::Null,
+        })
     }
 
     /// Resolve bracket tokens in a body string against the DB at read time
     /// (Node `refsFor`).
     pub async fn refs_for(&self, body: &str) -> Result<Vec<JournalRef>> {
-        let body = body.to_string();
-        self.run(move |core| refs_for_conn(core, &body)).await
-    }
-
-    /// Every journal author, with their people row when one exists (Node
-    /// `journalWriters`, unscoped — single user sees all writers).
-    pub async fn journal_writers(&self) -> Result<Vec<JournalWriter>> {
-        self.run(|core| {
-            let slugs: Vec<String> = {
-                let mut stmt = core.conn().prepare("SELECT DISTINCT author FROM journal")?;
-                let rows = stmt.query_map([], |r| r.get(0))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            let mut result = Vec::with_capacity(slugs.len());
-            for slug in &slugs {
-                match super::people::person_get(core.conn(), slug)? {
-                    Some(p) => result.push(JournalWriter {
-                        slug: p.slug,
-                        name: p.name,
-                        kind: p.kind,
-                        owner: p.owner,
-                    }),
-                    // Author may not be in the people table — return a minimal record.
-                    None => result.push(JournalWriter {
-                        slug: slug.clone(),
-                        name: slug.clone(),
-                        kind: ActorKind::Human,
-                        owner: None,
-                    }),
-                }
-            }
-            result.sort_by(|a, b| a.slug.cmp(&b.slug));
-            Ok(result)
-        })
-        .await
-    }
-}
-
-// ── emergence (command layer; everything lands in the Emergence acc) ────────
-
-fn materialise_anchor(
-    core: &Core,
-    entry: &JournalEntry,
-    a: &NewAnchor,
-    author: &str,
-    assigned: &mut HashSet<String>,
-    em: &mut Emergence,
-) -> Result<()> {
-    let text = js_slice_utf16(&entry.body, a.start, a.end)
-        .trim()
-        .to_string();
-    if text.is_empty() {
-        return Ok(());
-    }
-    let f: AnchorFields = a.fields.clone().unwrap_or_default();
-    let span_mentions = parse_mentions(&text);
-    // Auto-assign to the entry author when no explicit assignees and no @mentions in the span.
-    let raw_assignees = f.assignees.clone().unwrap_or_else(|| {
-        if span_mentions.is_empty() {
-            vec![author.to_string()]
-        } else {
-            span_mentions
-        }
-    });
-    let assignees: Vec<String> = raw_assignees
-        .iter()
-        .filter(|x| x.as_str() != author)
-        .cloned()
-        .collect();
-    let assignees_for_task = if raw_assignees.is_empty() {
-        vec![author.to_string()]
-    } else {
-        raw_assignees.clone()
-    };
-    let title_src = f.title.clone().unwrap_or_else(|| {
-        text.split(['.', '\n'])
-            .next()
-            .unwrap_or_default()
-            .to_string()
-    });
-    let title = js_slice_utf16(&title_src, 0, 120).trim().to_string();
-
-    let (ref_id, reason, ref_kind) = match a.kind {
-        AnchorKind::Task => {
-            let project = resolve_project_value(core, em, f.project.clone().flatten())?;
-            let ts = now_iso();
-            let t = hive_shared::Task {
-                id: new_id("task"),
-                title,
-                body: text.clone(),
-                status: f
-                    .status
-                    .as_deref()
-                    .map(TaskStatus::from_str_lossy)
-                    .unwrap_or(TaskStatus::Todo),
-                priority: f.priority.unwrap_or(Priority::Normal),
-                tags: f.tags.clone().unwrap_or_default(),
-                assignees: assignees_for_task.clone(),
-                project,
-                phase: None,
-                due: None,
-                origin_entry_id: Some(entry.id.clone()),
-                anchor_text: Some(text.clone()),
-                created_at: ts.clone(),
-                updated_at: ts,
-            };
-            em.emerged.push(super::tasks::task_create_payload(&t));
-            (t.id, InboxReason::Assignment, EntityKind::Task)
-        }
-        AnchorKind::Decision => {
-            let project = resolve_project_value(core, em, f.project.clone().flatten())?;
-            let ts = now_iso();
-            let d = hive_shared::Decision {
-                id: new_id("dec"),
-                title,
-                context: f.context.clone().unwrap_or_default(),
-                decision: f.decision.clone().unwrap_or_else(|| text.clone()),
-                consequences: f.consequences.clone().unwrap_or_default(),
-                status: f
-                    .status
-                    .as_deref()
-                    .map(DecisionStatus::from_str_lossy)
-                    .unwrap_or(DecisionStatus::Proposed),
-                tags: f.tags.clone().unwrap_or_default(),
-                assignees: assignees.clone(),
-                project,
-                supersedes: f.supersedes.clone().flatten(),
-                origin_entry_id: Some(entry.id.clone()),
-                anchor_text: Some(text.clone()),
-                created_at: ts.clone(),
-                updated_at: ts,
-            };
-            em.emerged
-                .push(super::decisions::decision_create_payload(&d));
-            // Supersedes side effect: prior decision flips + link, same batch.
-            if let Some(supersedes) = &d.supersedes {
-                if let Some(prior) = super::decisions::decision_get(core, supersedes)? {
-                    let ts2 = now_iso();
-                    em.extra.push(Draft::new(
-                        crate::oplog::kind::ENTITY_UPDATE,
-                        author,
-                        &ts2,
-                        json!({"kind": "decision", "id": prior.id, "fields": {
-                            "status": "superseded", "updated_at": ts2,
-                        }}),
-                    ));
-                    em.extra.push(super::links::link_draft(
-                        EntityKind::Decision.as_str(),
-                        &d.id,
-                        EntityKind::Decision.as_str(),
-                        &prior.id,
-                        "supersedes",
-                        &ts2,
-                    ));
-                }
-            }
-            (d.id, InboxReason::Decision, EntityKind::Decision)
-        }
-        AnchorKind::Event => {
-            let e = hive_shared::EventItem {
-                id: new_id("evt"),
-                title,
-                body: text.clone(),
-                at: f.at.clone().flatten(),
-                tags: f.tags.clone().unwrap_or_default(),
-                assignees: assignees.clone(),
-                origin_entry_id: Some(entry.id.clone()),
-                anchor_text: Some(text.clone()),
-                created_at: now_iso(),
-            };
-            em.emerged.push(super::events::event_create_payload(&e));
-            (e.id, InboxReason::Event, EntityKind::Event)
-        }
-    };
-
-    em.anchors.push(json!({
-        "id": new_id("anc"),
-        "start": a.start, "end": a.end, "text": text,
-        "kind": a.kind.as_str(), "ref_id": ref_id,
-        "created_at": now_iso(),
-    }));
-    em.extra.push(super::links::link_draft(
-        EntityKind::Journal.as_str(),
-        &entry.id,
-        ref_kind.as_str(),
-        &ref_id,
-        "anchors",
-        &now_iso(),
-    ));
-
-    // For inbox delivery use the full assignee list (including author when auto-assigned).
-    let recipients = if a.kind == AnchorKind::Task {
-        &assignees_for_task
-    } else {
-        &assignees
-    };
-    for who in recipients {
-        assigned.insert(who.clone());
-        em.add_inbox(
-            who,
-            author,
-            reason,
-            ref_kind.as_str(),
-            &ref_id,
-            Some(&entry.id),
-            &text,
-        );
-    }
-    Ok(())
-}
-
-/// Anchor `fields.project`: a known project id passes through; anything else
-/// find-or-creates by name (batch-aware).
-fn resolve_project_value(
-    core: &Core,
-    em: &mut Emergence,
-    project: Option<String>,
-) -> Result<Option<String>> {
-    let Some(project) = project else {
-        return Ok(None);
-    };
-    if super::projects::project_get(core.conn(), &project)?.is_some()
-        || em.projects.values().any(|(id, _)| *id == project)
-    {
-        return Ok(Some(project));
-    }
-    let (id, _name) = ensure_project(core, em, &project)?;
-    Ok(Some(id))
-}
-
-/// Batch-aware find-or-create: pending map → index → mint into `emerged`.
-fn ensure_project(core: &Core, em: &mut Emergence, name: &str) -> Result<(String, String)> {
-    let slug = slugify(name);
-    if let Some(hit) = em.projects.get(&slug) {
-        return Ok(hit.clone());
-    }
-    if let Some(p) = super::projects::project_by_slug(core.conn(), &slug)? {
-        let hit = (p.id.clone(), p.name.clone());
-        em.projects.insert(slug, hit.clone());
-        return Ok(hit);
-    }
-    let id = new_id("proj");
-    let ts = now_iso();
-    em.emerged
-        .push(json!({"kind": "project", "id": id, "fields": {
-            "name": name, "slug": slug, "created_at": ts,
-        }}));
-    let hit = (id, name.to_string());
-    em.projects.insert(slug, hit.clone());
-    Ok(hit)
-}
-
-fn ensure_topic(core: &Core, em: &mut Emergence, name: &str) -> Result<(String, String)> {
-    let slug = slugify(name);
-    if let Some(hit) = em.topics.get(&slug) {
-        return Ok(hit.clone());
-    }
-    if let Some(t) = super::topics::topic_by_slug(core.conn(), &slug)? {
-        let hit = (t.id.clone(), t.name.clone());
-        em.topics.insert(slug, hit.clone());
-        return Ok(hit);
-    }
-    let id = new_id("top");
-    let ts = now_iso();
-    em.emerged
-        .push(json!({"kind": "topic", "id": id, "fields": {
-            "name": name, "slug": slug, "created_at": ts,
-        }}));
-    let hit = (id, name.to_string());
-    em.topics.insert(slug, hit.clone());
-    Ok(hit)
-}
-
-fn ensure_phase(core: &Core, em: &mut Emergence, project_id: &str, name: &str) -> Result<String> {
-    let key = (project_id.to_string(), name.to_lowercase());
-    if let Some(id) = em.phases.get(&key) {
-        return Ok(id.clone());
-    }
-    let existing: Option<String> = core
-        .conn()
-        .query_row(
-            "SELECT id FROM phases WHERE project = ?1 AND LOWER(name) = LOWER(?2)",
-            rusqlite::params![project_id, name],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if let Some(id) = existing {
-        em.phases.insert(key, id.clone());
-        return Ok(id);
-    }
-    let pos = match em.phase_next_pos.get(project_id) {
-        Some(p) => *p,
-        None => core.conn().query_row(
-            "SELECT COALESCE(MAX(position)+1, 0) FROM phases WHERE project = ?1",
-            rusqlite::params![project_id],
-            |r| r.get(0),
-        )?,
-    };
-    em.phase_next_pos.insert(project_id.to_string(), pos + 1);
-    let id = new_id("ph");
-    let ts = now_iso();
-    em.emerged
-        .push(json!({"kind": "phase", "id": id, "fields": {
-            "project": project_id, "name": name, "position": pos, "created_at": ts,
-        }}));
-    em.phases.insert(key, id.clone());
-    Ok(id)
-}
-
-fn ensure_person(core: &Core, em: &mut Emergence, name: &str, kind: ActorKind) -> Result<Person> {
-    let slug = slugify(name);
-    if let Some(p) = em.people.get(&slug) {
-        return Ok(p.clone());
-    }
-    if let Some(p) = super::people::person_by_slug(core.conn(), &slug)? {
-        em.people.insert(slug, p.clone());
-        return Ok(p);
-    }
-    let p = Person {
-        id: new_id("per"),
-        name: name.to_string(),
-        slug: slug.clone(),
-        kind,
-        owner: None,
-        bio: None,
-        role: None,
-        created_at: now_iso(),
-    };
-    em.emerged
-        .push(json!({"kind": "person", "id": p.id, "fields": {
-            "slug": p.slug, "name": p.name, "kind": p.kind.as_str(),
-            "owner": null, "bio": null, "role": null, "created_at": p.created_at,
-        }}));
-    em.people.insert(slug, p.clone());
-    Ok(p)
-}
-
-/// Batch-aware find-or-create of a CONTACT CARD (a custom entity of the
-/// built-in `contact` type). Mirrors `ensure_person`, but the entity lives in
-/// the `entities` table under the contact type: so it first ensures the
-/// contact type exists (pushing its type + field entity.create payloads into
-/// `emerged` at most once per batch, ahead of any instance — the emerged
-/// array applies in order), then reuses a pending/indexed instance by slug or
-/// mints a fresh one. Returns (instance id, display name). No fold change:
-/// every payload is an existing entity.create shape (custom-slug routing).
-fn ensure_contact(
-    core: &Core,
-    entry: &JournalEntry,
-    em: &mut Emergence,
-    name: &str,
-) -> Result<(String, String)> {
-    let slug = slugify(name);
-    if let Some(hit) = em.contacts.get(&slug) {
-        return Ok(hit.clone());
-    }
-    // Ensure the contact type (once per batch). When it already exists in the
-    // index, `contact_type_ensure_payloads` returns no payloads and its id.
-    let type_id = match &em.contact_type_id {
-        Some(id) => id.clone(),
-        None => {
-            let (type_id, payloads) = super::contacts::contact_type_ensure_payloads(core)?;
-            for p in payloads {
-                em.emerged.push(p);
-            }
-            em.contact_type_id = Some(type_id.clone());
-            type_id
-        }
-    };
-    // Reuse an existing card whose title slugifies to the same handle. Scan in
-    // Rust (household scale) so slugify parity holds exactly (the entity title
-    // is free text; there is no stored slug column on instances).
-    let existing: Option<(String, String)> = {
-        let mut stmt = core
-            .conn()
-            .prepare("SELECT id, title FROM entities WHERE type_id = ?1")?;
-        let rows = stmt.query_map(rusqlite::params![type_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
-        let mut found = None;
-        for row in rows {
-            let (id, title) = row?;
-            if slugify(&title) == slug {
-                found = Some((id, title));
-                break;
-            }
-        }
-        found
-    };
-    if let Some(hit) = existing {
-        em.contacts.insert(slug, hit.clone());
-        return Ok(hit);
-    }
-    // Mint a new card. The emerged payload is exactly a custom-instance
-    // entity.create (entities columns): empty `fields`, title = display name,
-    // origin_entry_id stamped to the entry that named them.
-    let id = new_id("ent");
-    let ts = now_iso();
-    em.emerged.push(
-        json!({"kind": super::contacts::CONTACT_TYPE_SLUG, "id": id, "fields": {
-            "type_id": type_id, "title": name,
-            "fields": "{}",
-            "user_scope": entry.user_scope, "origin_entry_id": entry.id,
-            "created_by": entry.author, "created_at": ts, "updated_at": ts,
-        }}),
-    );
-    let hit = (id, name.to_string());
-    em.contacts.insert(slug, hit.clone());
-    Ok(hit)
-}
-
-/// Parse [person:], [topic:], [project:], [phase:], [task:], [contact:]
-/// tokens from an entry body. Find-or-create each entity, add a links record,
-/// and fan to inboxes where relevant. Context tracking: if the entry mentions
-/// a [project:] and/or [phase:], any [task:] that emerges is related to it.
-fn parse_bracket_tokens_into(
-    core: &Core,
-    entry: &JournalEntry,
-    author: &str,
-    assigned: &mut HashSet<String>,
-    em: &mut Emergence,
-) -> Result<()> {
-    let tokens = scan_tokens(&entry.body);
-
-    // First pass: collect context (project + phase referenced in this entry).
-    let mut ctx_project: Option<String> = None;
-    let mut ctx_phase: Option<String> = None;
-    for t in &tokens {
-        match t.kind {
-            "project" => {
-                let (id, _) = ensure_project(core, em, &t.name)?;
-                ctx_project = Some(id);
-            }
-            "phase" => {
-                if let Some(pid) = &ctx_project {
-                    let id = ensure_phase(core, em, pid, &t.name)?;
-                    ctx_phase = Some(id);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Second pass: process all tokens.
-    for t in &tokens {
-        match t.kind {
-            "person" => {
-                // Resolve against ACTORS first (known actors), then ensure as a people row.
-                let slug = slugify(&t.name);
-                let actor_match = ACTORS
-                    .iter()
-                    .find(|(n, _)| *n == slug || slugify(n) == slug);
-                let person = match actor_match {
-                    Some((n, k)) => ensure_person(core, em, &capitalize(n), *k)?,
-                    None => ensure_person(core, em, &t.name, ActorKind::Human)?,
-                };
-                em.extra.push(super::links::link_draft(
-                    EntityKind::Journal.as_str(),
-                    &entry.id,
-                    EntityKind::Person.as_str(),
-                    &person.id,
-                    "mentions",
-                    &now_iso(),
-                ));
-                // Fan to inbox if this person is a known actor (same as @mention).
-                if let Some((n, _)) = actor_match {
-                    assigned.insert((*n).to_string());
-                    em.add_inbox(
-                        n,
-                        author,
-                        InboxReason::Mention,
-                        EntityKind::Journal.as_str(),
-                        &entry.id,
-                        Some(&entry.id),
-                        &entry.body,
-                    );
-                }
-            }
-            "contact" => {
-                // Find-or-create the contact CARD and link the entry to it, so
-                // the card's "Related in your journal" surfaces this entry. The
-                // target_kind is the custom contact slug (links carry kinds as
-                // plain strings). No inbox fan: a contact is a record of a
-                // person, not necessarily an actor who reads inboxes.
-                let (contact_id, _) = ensure_contact(core, entry, em, &t.name)?;
-                em.extra.push(super::links::link_draft(
-                    EntityKind::Journal.as_str(),
-                    &entry.id,
-                    super::contacts::CONTACT_TYPE_SLUG,
-                    &contact_id,
-                    "mentions",
-                    &now_iso(),
-                ));
-            }
-            "topic" => {
-                let (topic_id, _) = ensure_topic(core, em, &t.name)?;
-                em.extra.push(super::links::link_draft(
-                    EntityKind::Journal.as_str(),
-                    &entry.id,
-                    EntityKind::Topic.as_str(),
-                    &topic_id,
-                    "tagged",
-                    &now_iso(),
-                ));
-            }
-            "project" => {
-                let (proj_id, _) = ensure_project(core, em, &t.name)?;
-                em.extra.push(super::links::link_draft(
-                    EntityKind::Journal.as_str(),
-                    &entry.id,
-                    EntityKind::Project.as_str(),
-                    &proj_id,
-                    "about",
-                    &now_iso(),
-                ));
-            }
-            "phase" => {
-                if let Some(pid) = &ctx_project {
-                    let ph_id = ensure_phase(core, em, pid, &t.name)?;
-                    em.extra.push(super::links::link_draft(
-                        EntityKind::Journal.as_str(),
-                        &entry.id,
-                        EntityKind::Phase.as_str(),
-                        &ph_id,
-                        "about",
-                        &now_iso(),
-                    ));
-                }
-            }
-            "task" => {
-                // Emerge a task anchored to this entry, auto-assigned to the author.
-                let ts = now_iso();
-                let task = hive_shared::Task {
-                    id: new_id("task"),
-                    title: t.name.clone(),
-                    body: String::new(),
-                    status: TaskStatus::Todo,
-                    priority: Priority::Normal,
-                    tags: Vec::new(),
-                    assignees: vec![author.to_string()],
-                    project: ctx_project.clone(),
-                    phase: ctx_phase.clone(),
-                    due: None,
-                    origin_entry_id: Some(entry.id.clone()),
-                    anchor_text: Some(t.name.clone()),
-                    created_at: ts.clone(),
-                    updated_at: ts,
-                };
-                em.emerged.push(super::tasks::task_create_payload(&task));
-                em.extra.push(super::links::link_draft(
-                    EntityKind::Journal.as_str(),
-                    &entry.id,
-                    EntityKind::Task.as_str(),
-                    &task.id,
-                    "anchors",
-                    &now_iso(),
-                ));
-                // author is assigned; add_inbox silently skips self-notification.
-                em.add_inbox(
-                    author,
-                    author,
-                    InboxReason::Assignment,
-                    EntityKind::Task.as_str(),
-                    &task.id,
-                    Some(&entry.id),
-                    &t.name,
-                );
-            }
-            "mail" => {
-                // [mail:<id>] cites an archived message: a links record only —
-                // no entity emerges, no anchor (anchors stay journal spans;
-                // a task cites the ENTRY, never the email), no inbox fan.
-                // Write-time scope gate: you can only cite mail whose owner
-                // matches the entry's effective scope (its user_scope, or
-                // the author's namespace for global entries) — a token
-                // naming someone else's mail simply doesn't link (D9:
-                // owner-only, no piercing).
-                let token = t.name.trim();
-                let effective_scope = entry
-                    .user_scope
-                    .clone()
-                    .unwrap_or_else(|| author.to_string());
-                let visible: Option<String> = core
-                    .conn()
-                    .query_row(
-                        "SELECT id FROM mail_messages \
-                         WHERE id = ?1 AND user_scope = ?2 AND deleted_at IS NULL",
-                        rusqlite::params![token, effective_scope],
-                        |r| r.get(0),
+        let mut refs = Vec::new();
+        for t in scan_tokens(body) {
+            let start = utf16_len(&body[..t.start_byte]);
+            let end = utf16_len(&body[..t.end_byte]);
+            let resolved: Option<(String, String, String)> = match t.kind {
+                "person" => self
+                    .people_by_slug(&slugify(&t.name))
+                    .await?
+                    .map(|p| (p.id, p.slug, p.name)),
+                "topic" => self
+                    .topics_by_slug(&slugify(&t.name))
+                    .await?
+                    .map(|x| (x.id, x.slug, x.name)),
+                "project" => self
+                    .projects_by_slug(&slugify(&t.name))
+                    .await?
+                    .map(|x| (x.id, x.slug, x.name)),
+                "phase" => {
+                    // phase resolution without a project context: find by name across all phases
+                    let row = crate::pgq::query(
+                        "SELECT * FROM phases WHERE LOWER(name) = LOWER(?) LIMIT 1",
                     )
-                    .optional()?;
-                if let Some(mail_id) = visible {
-                    em.extra.push(super::links::link_draft(
-                        EntityKind::Journal.as_str(),
-                        &entry.id,
-                        EntityKind::Mail.as_str(),
-                        &mail_id,
-                        "cites",
-                        &now_iso(),
-                    ));
+                    .bind(&t.name)
+                    .fetch_optional(self.db())
+                    .await?;
+                    match row {
+                        Some(r) => {
+                            let name: String = r.try_get("name")?;
+                            Some((r.try_get("id")?, slugify(&name), name))
+                        }
+                        None => None,
+                    }
+                }
+                // mail — id-addressed; the chip renders the subject. Live
+                // rows only (tombstoned/redacted mail resolves to nothing and
+                // the raw token stays visible — honest about a dead citation).
+                "mail" => {
+                    let row = crate::pgq::query(
+                        "SELECT id, subject FROM mail_messages WHERE id = ? AND deleted_at IS NULL",
+                    )
+                    .bind(t.name.trim())
+                    .fetch_optional(self.db())
+                    .await?;
+                    match row {
+                        Some(r) => {
+                            let id: String = r.try_get("id")?;
+                            let subject: String = r.try_get("subject")?;
+                            let name = if subject.trim().is_empty() {
+                                "(no subject)".to_string()
+                            } else {
+                                subject
+                            };
+                            Some((id.clone(), id, name))
+                        }
+                        None => None,
+                    }
+                }
+                // task — find the most recent task with matching title
+                _ => {
+                    let row = crate::pgq::query(
+                        "SELECT id, title FROM tasks WHERE LOWER(title) = LOWER(?) ORDER BY created_at DESC LIMIT 1",
+                    )
+                    .bind(&t.name)
+                    .fetch_optional(self.db())
+                    .await?;
+                    match row {
+                        Some(r) => {
+                            let title: String = r.try_get("title")?;
+                            Some((r.try_get("id")?, slugify(&title), title))
+                        }
+                        None => None,
+                    }
+                }
+            };
+            if let Some((id, slug, name)) = resolved {
+                // TOKEN_KINDS is a subset of EntityKind strings, so this never
+                // skips today; parse keeps it fail-closed if they ever drift.
+                if let Some(kind) = EntityKind::parse(t.kind) {
+                    refs.push(JournalRef {
+                        kind,
+                        id,
+                        slug,
+                        name,
+                        start,
+                        end,
+                    });
                 }
             }
-            _ => {}
         }
+        Ok(refs)
     }
-    Ok(())
-}
 
-// ── read-side composition ────────────────────────────────────────────────────
-
-pub(crate) fn anchors_for_conn(core: &Core, entry_id: &str) -> Result<Vec<ResolvedAnchor>> {
-    struct Raw {
-        anchor: Anchor,
-        kind_str: String,
-        ref_id: String,
+    async fn entry_view(&self, entry: JournalEntry) -> Result<JournalEntryView> {
+        Ok(JournalEntryView {
+            anchors: self.anchors_for(&entry.id).await?,
+            refs: self.refs_for(&entry.body).await?,
+            entry,
+        })
     }
-    let raws: Vec<Raw> = {
-        let mut stmt = core.conn().prepare(
-            r#"SELECT id, entry_id, start, "end", text, kind, ref_id, created_at FROM anchors WHERE entry_id = ?1 ORDER BY start"#,
-        )?;
-        let rows = stmt.query_map(rusqlite::params![entry_id], |r| {
-            let kind_str: String = r.get("kind")?;
-            let ref_id: String = r.get("ref_id")?;
-            Ok(Raw {
-                anchor: Anchor {
-                    id: r.get("id")?,
-                    entry_id: r.get("entry_id")?,
-                    start: r.get("start")?,
-                    end: r.get("end")?,
-                    text: r.get("text")?,
-                    kind: AnchorKind::parse(&kind_str).unwrap_or(AnchorKind::Task),
-                    ref_id: ref_id.clone(),
-                    created_at: r.get("created_at")?,
-                },
-                kind_str,
-                ref_id,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    let mut out = Vec::with_capacity(raws.len());
-    for raw in raws {
-        let entity = entity_by_id(core, &raw.kind_str, &raw.ref_id)?;
-        out.push(ResolvedAnchor {
-            anchor: raw.anchor,
-            entity,
-        });
-    }
-    Ok(out)
-}
 
-/// Node `entityById` — Task | Decision | EventItem | null as JSON.
-fn entity_by_id(core: &Core, kind: &str, ref_id: &str) -> Result<Json> {
-    let conn = core.conn();
-    Ok(match kind {
-        "task" => conn
-            .query_row(
-                "SELECT * FROM tasks WHERE id = ?1",
-                rusqlite::params![ref_id],
-                super::tasks::row_to_task,
-            )
-            .optional()?
-            .map(serde_json::to_value)
-            .transpose()?
-            .unwrap_or(Json::Null),
-        "decision" => conn
-            .query_row(
-                "SELECT * FROM decisions WHERE id = ?1",
-                rusqlite::params![ref_id],
-                super::decisions::row_to_decision,
-            )
-            .optional()?
-            .map(serde_json::to_value)
-            .transpose()?
-            .unwrap_or(Json::Null),
-        "event" => conn
-            .query_row(
-                "SELECT * FROM events WHERE id = ?1",
-                rusqlite::params![ref_id],
-                super::events::row_to_event,
-            )
-            .optional()?
-            .map(serde_json::to_value)
-            .transpose()?
-            .unwrap_or(Json::Null),
-        _ => Json::Null,
-    })
-}
-
-pub(crate) fn refs_for_conn(core: &Core, body: &str) -> Result<Vec<JournalRef>> {
-    let conn = core.conn();
-    let mut refs = Vec::new();
-    for t in scan_tokens(body) {
-        let start = utf16_len(&body[..t.start_byte]);
-        let end = utf16_len(&body[..t.end_byte]);
-        let resolved: Option<(String, String, String)> = match t.kind {
-            "person" => super::people::person_by_slug(conn, &slugify(&t.name))?
-                .map(|p| (p.id, p.slug, p.name)),
-            "topic" => super::topics::topic_by_slug(conn, &slugify(&t.name))?
-                .map(|x| (x.id, x.slug, x.name)),
-            "project" => super::projects::project_by_slug(conn, &slugify(&t.name))?
-                .map(|x| (x.id, x.slug, x.name)),
-            "phase" => {
-                // phase resolution without a project context: find by name across all phases
-                conn.query_row(
-                    "SELECT id, name FROM phases WHERE LOWER(name) = LOWER(?1) LIMIT 1",
-                    rusqlite::params![t.name],
-                    |r| {
-                        let id: String = r.get(0)?;
-                        let name: String = r.get(1)?;
-                        Ok((id, slugify(&name), name))
-                    },
-                )
-                .optional()?
+    /// Authors whose journal streams a viewer can see by ownership/relationship:
+    /// themselves, AIs they own, AIs that linked or @mentioned them.
+    async fn viewer_base_authors(&self, viewer: &str) -> Result<Vec<String>> {
+        let mut authors: Vec<String> = vec![viewer.to_string()];
+        let push = |list: Vec<String>, authors: &mut Vec<String>| {
+            for a in list {
+                if !authors.contains(&a) {
+                    authors.push(a);
+                }
             }
-            // mail — id-addressed; the chip renders the subject. Live
-            // rows only (tombstoned/redacted mail resolves to nothing and
-            // the raw token stays visible — honest about a dead citation).
-            "mail" => conn
-                .query_row(
-                    "SELECT id, subject FROM mail_messages WHERE id = ?1 AND deleted_at IS NULL",
-                    rusqlite::params![t.name.trim()],
-                    |r| {
-                        let id: String = r.get(0)?;
-                        let subject: String = r.get(1)?;
-                        Ok((id, subject))
-                    },
-                )
-                .optional()?
-                .map(|(id, subject)| {
-                    let name = if subject.trim().is_empty() {
-                        "(no subject)".to_string()
-                    } else {
-                        subject
-                    };
-                    (id.clone(), id, name)
-                }),
-            // contact — a custom-slug card, not a closed EntityKind. Its
-            // backlinks surface in the detail view via links_for_entity, so
-            // read-time ref resolution is intentionally a no-op here (skip the
-            // task-title fallthrough below, which would mis-resolve).
-            "contact" => None,
-            // task — find the most recent task with matching title
-            _ => conn
-                .query_row(
-                    "SELECT id, title FROM tasks WHERE LOWER(title) = LOWER(?1) ORDER BY created_at DESC LIMIT 1",
-                    rusqlite::params![t.name],
-                    |r| {
-                        let id: String = r.get(0)?;
-                        let title: String = r.get(1)?;
-                        Ok((id, slugify(&title), title))
-                    },
-                )
-                .optional()?,
         };
-        if let Some((id, slug, name)) = resolved {
-            // Most TOKEN_KINDS map onto a closed EntityKind; `contact` does
-            // not (it is a custom slug, resolved to None above and never
-            // reaching here). parse keeps this fail-closed if they ever drift.
-            if let Some(kind) = EntityKind::parse(t.kind) {
-                refs.push(JournalRef {
-                    kind,
-                    id,
-                    slug,
-                    name,
-                    start,
-                    end,
-                });
+
+        let owned: Vec<String> =
+            crate::pgq::query_scalar("SELECT slug FROM people WHERE kind='ai' AND owner=?")
+                .bind(viewer)
+                .fetch_all(self.db())
+                .await?;
+        push(owned, &mut authors);
+
+        // AI authors that have written inside this user's namespace belong to
+        // this user's memory view even if the AI person row predates ownership.
+        let namespace_ai_authors: Vec<String> = crate::pgq::query_scalar(
+            "SELECT DISTINCT j.author FROM journal j \
+             WHERE j.user_scope = ? \
+               AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')",
+        )
+        .bind(viewer)
+        .fetch_all(self.db())
+        .await?;
+        push(namespace_ai_authors, &mut authors);
+
+        // AI authors that referenced viewer via links (target_kind='person', target_id=viewer).
+        let linked: Vec<String> = crate::pgq::query_scalar(
+            "SELECT DISTINCT j.author FROM journal j \
+             JOIN links l ON l.source_kind='journal' AND l.source_id=j.id \
+             WHERE l.target_kind='person' AND l.target_id=? \
+               AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')",
+        )
+        .bind(viewer)
+        .fetch_all(self.db())
+        .await?;
+        push(linked, &mut authors);
+
+        // AI authors that @mentioned viewer in any entry.
+        let mentioned: Vec<String> = crate::pgq::query_scalar(
+            "SELECT DISTINCT j.author FROM journal j \
+             WHERE j.mentions LIKE ? \
+               AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')",
+        )
+        .bind(mention_like(viewer))
+        .fetch_all(self.db())
+        .await?;
+        push(mentioned, &mut authors);
+        Ok(authors)
+    }
+
+    /// Journal entries visible to a principal, optionally filtered to specific
+    /// writers (Node `visibleJournal`, now per-user-namespace). Admins see every
+    /// entry; everyone else sees global + own-namespace entries surfaced by the
+    /// author/share/mention ACL.
+    pub async fn visible_journal(
+        &self,
+        vis: &Visibility,
+        writers: Option<&[String]>,
+        scope: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<JournalEntryView>> {
+        let viewer = match vis {
+            Visibility::All => return self.journal_all(writers, scope, limit, offset).await,
+            Visibility::Namespace(u) => u.clone(),
+        };
+        let viewer = viewer.as_str();
+        // Base authors (self + owned/related AIs) are NAMESPACE-GATED.
+        let mut base_authors = self.viewer_base_authors(viewer).await?;
+        // Journal-scope shares grant a whole author stream and PIERCE the
+        // namespace (explicit "open my journal to you").
+        let mut shared_authors: Vec<String> =
+            crate::pgq::query_scalar("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
+                .bind(viewer)
+                .fetch_all(self.db())
+                .await?;
+        // Entry shares + @mentions are explicit per-entry grants that PIERCE.
+        let shared_entry_ids: Vec<String> =
+            crate::pgq::query_scalar("SELECT ref FROM shares WHERE scope='entry' AND viewer=?")
+                .bind(viewer)
+                .fetch_all(self.db())
+                .await?;
+        let mentioned_ids: Vec<String> =
+            crate::pgq::query_scalar("SELECT id FROM journal WHERE mentions LIKE ?")
+                .bind(mention_like(viewer))
+                .fetch_all(self.db())
+                .await?;
+        let mut extra_ids: Vec<String> = Vec::new();
+        for id in shared_entry_ids.into_iter().chain(mentioned_ids) {
+            if !extra_ids.contains(&id) {
+                extra_ids.push(id);
             }
         }
+
+        // Optional writers filter: intersect with both author lists.
+        let writers = writers.filter(|w| !w.is_empty());
+        if let Some(w) = writers {
+            base_authors.retain(|a| w.contains(a));
+            shared_authors.retain(|a| w.contains(a));
+        }
+
+        let base_ph = placeholders_or_never(base_authors.len());
+        let shared_ph = placeholders_or_never(shared_authors.len());
+        let extra_ph = placeholders_or_never(extra_ids.len());
+        let writers_filter = match writers {
+            Some(w) => format!("AND j.author IN ({})", placeholders_or_never(w.len())),
+            None => String::new(),
+        };
+        // Namespace gate applies to the base-author branch ONLY; shared streams,
+        // entry shares, and @mentions pierce it. The optional `scope` filter only
+        // NARROWS this already-permitted set (it never widens visibility): it is
+        // ANDed onto the whole WHERE.
+        let scope_filter = scope_clause(scope);
+        let sql = format!(
+            "SELECT j.* FROM journal j WHERE (\
+               (j.author IN ({base_ph}) AND (j.user_scope IS NULL OR j.user_scope = ?)) \
+               OR j.author IN ({shared_ph}) \
+               OR (j.id IN ({extra_ph}) {writers_filter})\
+             ){scope_filter} \
+             ORDER BY j.created_at DESC LIMIT ? OFFSET ?"
+        );
+        let mut q = crate::pgq::query(&sql);
+        for a in &base_authors {
+            q = q.bind(a);
+        }
+        q = q.bind(viewer);
+        for a in &shared_authors {
+            q = q.bind(a);
+        }
+        for id in &extra_ids {
+            q = q.bind(id);
+        }
+        if let Some(w) = writers {
+            for x in w {
+                q = q.bind(x);
+            }
+        }
+        q = bind_scope(q, scope);
+        let rows = q.bind(limit).bind(offset).fetch_all(self.db()).await?;
+        self.hydrate_entries(&rows).await
     }
-    Ok(refs)
+
+    /// Admin path: every entry, optionally filtered to writers, no namespace gate.
+    /// The optional `scope` filter lets an admin pivot the feed to a single
+    /// namespace (or the global/continuous stream).
+    async fn journal_all(
+        &self,
+        writers: Option<&[String]>,
+        scope: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<JournalEntryView>> {
+        let writers = writers.filter(|w| !w.is_empty());
+        let scope_filter = scope_clause(scope);
+        let sql = match writers {
+            Some(w) => format!(
+                "SELECT j.* FROM journal j WHERE j.author IN ({}){scope_filter} \
+                 ORDER BY j.created_at DESC LIMIT ? OFFSET ?",
+                placeholders_or_never(w.len())
+            ),
+            None => format!(
+                "SELECT j.* FROM journal j WHERE TRUE{scope_filter} \
+                 ORDER BY j.created_at DESC LIMIT ? OFFSET ?"
+            ),
+        };
+        let mut q = crate::pgq::query(&sql);
+        if let Some(w) = writers {
+            for x in w {
+                q = q.bind(x);
+            }
+        }
+        q = bind_scope(q, scope);
+        let rows = q.bind(limit).bind(offset).fetch_all(self.db()).await?;
+        self.hydrate_entries(&rows).await
+    }
+
+    async fn hydrate_entries(
+        &self,
+        rows: &[sqlx::postgres::PgRow],
+    ) -> Result<Vec<JournalEntryView>> {
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let entry = row_to_entry(row)?;
+            // Parity with Node: visibleJournal calls refsFor(r.id) — the entry ID,
+            // not the body — so refs always resolve empty on this path.
+            let refs = self.refs_for(&entry.id).await?;
+            out.push(JournalEntryView {
+                anchors: self.anchors_for(&entry.id).await?,
+                refs,
+                entry,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Writers visible to a principal: their own + related AIs (Node
+    /// `journalWriters`). Admins get every author.
+    pub async fn journal_writers(&self, vis: &Visibility) -> Result<Vec<JournalWriter>> {
+        let viewer = match vis {
+            Visibility::All => {
+                return self.all_writers().await;
+            }
+            Visibility::Namespace(u) => u.clone(),
+        };
+        let viewer = viewer.as_str();
+        let mut slugs = self.viewer_base_authors(viewer).await?;
+        let journal_shared: Vec<String> =
+            crate::pgq::query_scalar("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
+                .bind(viewer)
+                .fetch_all(self.db())
+                .await?;
+        for a in journal_shared {
+            if !slugs.contains(&a) {
+                slugs.push(a);
+            }
+        }
+
+        let mut result = Vec::with_capacity(slugs.len());
+        for slug in &slugs {
+            match self.people_get(slug).await? {
+                Some(p) => result.push(JournalWriter {
+                    slug: p.slug,
+                    name: p.name,
+                    kind: p.kind,
+                    owner: p.owner,
+                }),
+                // Viewer may not be in the people table yet — return a minimal record.
+                None => result.push(JournalWriter {
+                    slug: slug.clone(),
+                    name: slug.clone(),
+                    kind: ActorKind::Human,
+                    owner: None,
+                }),
+            }
+        }
+        result.sort_by(|a, b| a.slug.cmp(&b.slug));
+        Ok(result)
+    }
+
+    /// Admin path: every journal author as a writer.
+    async fn all_writers(&self) -> Result<Vec<JournalWriter>> {
+        let slugs: Vec<String> = crate::pgq::query_scalar("SELECT DISTINCT author FROM journal")
+            .fetch_all(self.db())
+            .await?;
+        let mut result = Vec::with_capacity(slugs.len());
+        for slug in &slugs {
+            match self.people_get(slug).await? {
+                Some(p) => result.push(JournalWriter {
+                    slug: p.slug,
+                    name: p.name,
+                    kind: p.kind,
+                    owner: p.owner,
+                }),
+                None => result.push(JournalWriter {
+                    slug: slug.clone(),
+                    name: slug.clone(),
+                    kind: ActorKind::Human,
+                    owner: None,
+                }),
+            }
+        }
+        result.sort_by(|a, b| a.slug.cmp(&b.slug));
+        Ok(result)
+    }
+
+    /// Journal entry ids visible to a principal — the permission boundary every
+    /// read (feed, search, entity reads) filters through (Node `visibleEntryIds`,
+    /// now per-user-namespace). Returns `None` for an admin (sees everything — no
+    /// id filter). For a non-admin the candidate set (author streams + shares +
+    /// @mentions) is hard-gated to the principal's namespace: only entries that
+    /// are global (`user_scope IS NULL`) or owned by their namespace user.
+    pub async fn visible_entry_ids(&self, vis: &Visibility) -> Result<Option<HashSet<String>>> {
+        let Visibility::Namespace(viewer) = vis else {
+            return Ok(None);
+        };
+        let viewer = viewer.as_str();
+        let base_authors = self.viewer_base_authors(viewer).await?;
+        let shared_authors: Vec<String> =
+            crate::pgq::query_scalar("SELECT ref FROM shares WHERE scope='journal' AND viewer=?")
+                .bind(viewer)
+                .fetch_all(self.db())
+                .await?;
+
+        let mut ids: HashSet<String> = HashSet::new();
+        // Explicit entry shares + @mentions pierce the namespace (a deliberate
+        // "relates to you" signal across users).
+        let shared: Vec<String> =
+            crate::pgq::query_scalar("SELECT ref FROM shares WHERE scope='entry' AND viewer=?")
+                .bind(viewer)
+                .fetch_all(self.db())
+                .await?;
+        ids.extend(shared);
+        let mentioned: Vec<String> =
+            crate::pgq::query_scalar("SELECT id FROM journal WHERE mentions LIKE ?")
+                .bind(mention_like(viewer))
+                .fetch_all(self.db())
+                .await?;
+        ids.extend(mentioned);
+
+        // Base author streams are namespace-gated: global or own-namespace only.
+        if !base_authors.is_empty() {
+            let sql = format!(
+                "SELECT id FROM journal WHERE author IN ({}) \
+                 AND (user_scope IS NULL OR user_scope = ?)",
+                placeholders_or_never(base_authors.len())
+            );
+            let mut q = crate::pgq::query_scalar::<String>(&sql);
+            for a in &base_authors {
+                q = q.bind(a);
+            }
+            q = q.bind(viewer);
+            ids.extend(q.fetch_all(self.db()).await?);
+        }
+
+        // Journal-scope-shared author streams pierce the namespace.
+        if !shared_authors.is_empty() {
+            let sql = format!(
+                "SELECT id FROM journal WHERE author IN ({})",
+                placeholders_or_never(shared_authors.len())
+            );
+            let mut q = crate::pgq::query_scalar::<String>(&sql);
+            for a in &shared_authors {
+                q = q.bind(a);
+            }
+            ids.extend(q.fetch_all(self.db()).await?);
+        }
+
+        Ok(Some(ids))
+    }
 }
 
-pub(crate) fn entry_view(core: &Core, entry: JournalEntry) -> Result<JournalEntryView> {
-    Ok(JournalEntryView {
-        anchors: anchors_for_conn(core, &entry.id)?,
-        refs: refs_for_conn(core, &entry.body)?,
-        entry,
-    })
-}
-
-pub(crate) fn row_to_entry(r: &rusqlite::Row) -> rusqlite::Result<JournalEntry> {
+fn row_to_entry(r: &sqlx::postgres::PgRow) -> Result<JournalEntry> {
     Ok(JournalEntry {
-        id: r.get("id")?,
-        author: r.get("author")?,
-        body: r.get("body")?,
-        tags: json_vec(r.get::<_, String>("tags")?.as_str()),
-        mentions: json_vec(r.get::<_, String>("mentions")?.as_str()),
-        user_scope: r.get("user_scope")?,
-        created_at: r.get("created_at")?,
+        id: r.try_get("id")?,
+        author: r.try_get("author")?,
+        body: r.try_get("body")?,
+        tags: json_vec(r.try_get::<String, _>("tags")?.as_str()),
+        mentions: json_vec(r.try_get::<String, _>("mentions")?.as_str()),
+        user_scope: r.try_get("user_scope")?,
+        created_at: r.try_get("created_at")?,
     })
+}
+
+/// `%"viewer"%` — Node's LIKE probe into the mentions JSON column.
+fn mention_like(viewer: &str) -> String {
+    format!("%\"{viewer}\"%")
+}
+
+/// Sentinel scope value meaning "the global / continuous (un-owned) stream"
+/// — i.e. `user_scope IS NULL`. Any other `Some(slug)` matches that exact owner.
+pub const GLOBAL_SCOPE: &str = "__global__";
+
+/// SQL fragment ANDed onto the feed query for the optional namespace filter.
+/// `None` → no extra clause; `Some(GLOBAL_SCOPE)` → only un-owned (global)
+/// entries; `Some(slug)` → only entries owned by `slug`. This only ever NARROWS
+/// the already-permitted set.
+fn scope_clause(scope: Option<&str>) -> &'static str {
+    match scope {
+        None => "",
+        Some(GLOBAL_SCOPE) => " AND j.user_scope IS NULL",
+        Some(_) => " AND j.user_scope = ?",
+    }
+}
+
+/// Bind the placeholder used by `scope_clause` (a no-op unless `scope` is a
+/// concrete owner slug).
+fn bind_scope<'q>(
+    q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    scope: Option<&'q str>,
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    match scope {
+        Some(s) if s != GLOBAL_SCOPE => q.bind(s),
+        _ => q,
+    }
 }
 
 fn capitalize(s: &str) -> String {
@@ -1080,13 +1140,10 @@ struct BracketToken {
     end_byte: usize,
 }
 
-const TOKEN_KINDS: &[&str] = &[
-    "person", "contact", "topic", "project", "phase", "task", "mail",
-];
+const TOKEN_KINDS: &[&str] = &["person", "topic", "project", "phase", "task", "mail"];
 
-/// Node TOKEN_RE, plus the Rust-side `mail` (id-addressed) and `contact`
-/// (contact-card, Phase 3) additions:
-/// /\[(person|contact|topic|project|phase|task|mail):([^\]]+)\]/g
+/// Node TOKEN_RE, plus the Rust-side `mail` addition (id-addressed):
+/// /\[(person|topic|project|phase|task|mail):([^\]]+)\]/g
 fn scan_tokens(body: &str) -> Vec<BracketToken> {
     let bytes = body.as_bytes();
     let mut out = Vec::new();
