@@ -20,6 +20,11 @@ pub struct AuthCodeGrant {
     pub scope: String,
     /// Requested access-token lifetime (seconds); None → server default.
     pub token_ttl_secs: Option<i64>,
+    /// The org the granting human was acting in at consent. Carried on the
+    /// code so `/oauth/token` — which is unauthenticated by construction —
+    /// mints a token pinned to that org and no other. Set by the column
+    /// default at INSERT, read back at redemption.
+    pub org_id: Option<uuid::Uuid>,
 }
 
 pub enum RedeemOutcome {
@@ -178,6 +183,7 @@ impl Store {
             granted_by: row.try_get("granted_by")?,
             scope: row.try_get("scope")?,
             token_ttl_secs: row.try_get("token_ttl_secs")?,
+            org_id: row.try_get("org_id")?,
         }))
     }
 }

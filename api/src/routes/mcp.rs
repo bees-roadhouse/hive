@@ -372,6 +372,10 @@ mod tests {
             principal: Some("token"),
             role: Some(hive_shared::UserRole::Admin),
             namespace_user: Some("nate".to_string()),
+            // These tests call `entry` directly rather than through the
+            // middleware, so they name the org the way a real token's row
+            // would: the default one, which is where onboarding put everything.
+            org: Some(crate::db::DEFAULT_ORG_ID),
             session_cookie: None,
         }
     }
@@ -383,6 +387,7 @@ mod tests {
             principal: Some("token"),
             role: None,
             namespace_user: Some(actor.to_string()),
+            org: Some(crate::db::DEFAULT_ORG_ID),
             session_cookie: None,
         }
     }

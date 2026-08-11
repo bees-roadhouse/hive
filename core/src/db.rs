@@ -9,11 +9,13 @@
 // endpoint (api/src/legacy_import.rs reads the uploaded .db; this store writes
 // it through the normal insert path).
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use hive_shared::APP_VERSION;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
+use uuid::Uuid;
 
+use crate::acting::{self, ActingScope};
 use crate::store::now_iso;
 
 /// Resolve the Postgres connection string from `DATABASE_URL`. Falls back to a
@@ -23,10 +25,104 @@ pub fn database_url() -> String {
         .unwrap_or_else(|_| "postgres://hive:hive@localhost:5432/hive".to_string())
 }
 
-pub async fn open(url: &str) -> Result<PgPool> {
+/// The org an existing single-tenant install is folded into, and the org the
+/// first-run wizard puts the first admin in. Fixed rather than random so a
+/// migrated install lands somewhere nameable and tests can assert on it; org
+/// ids are addresses, never secrets — membership is what grants access.
+pub const DEFAULT_ORG_ID: Uuid = Uuid::from_u128(1);
+pub const DEFAULT_ORG_SLUG: &str = "default";
+
+/// The unprivileged role the API serves requests as. It owns nothing and has
+/// neither SUPERUSER nor BYPASSRLS, because either one silently turns every
+/// policy below into a comment.
+pub const APP_ROLE: &str = "hive_app";
+
+/// Open a pool WITHOUT the acting-org stamping — the owner/admin connection
+/// used for DDL at boot. Never hand this to request-serving code: it is the
+/// table owner, and only `FORCE ROW LEVEL SECURITY` stands between it and
+/// every row in every org.
+pub async fn open_admin(url: &str) -> Result<PgPool> {
+    let pool = PgPoolOptions::new().max_connections(4).connect(url).await?;
+    Ok(pool)
+}
+
+/// Stamp the current task's acting scope onto a connection. Runs at the two
+/// (and only two) points a connection can enter user code: `after_connect` for
+/// a freshly dialled one, `before_acquire` for one coming back off the idle
+/// queue. Both fire inside the acquiring task, so both see that task's scope.
+///
+/// No scope means empty strings, which make the policy predicate NULL: reads
+/// see nothing and writes trip `org_id NOT NULL`. Deny, not bypass.
+async fn stamp_scope(
+    conn: &mut sqlx::PgConnection,
+    fallback: Option<&ActingScope>,
+) -> Result<(), sqlx::Error> {
+    let scope = acting::current().or_else(|| fallback.cloned());
+    let (org, user, admin) = match &scope {
+        Some(s) => (
+            s.org.to_string(),
+            s.user.clone(),
+            if s.admin { "on" } else { "off" }.to_string(),
+        ),
+        None => (String::new(), String::new(), "off".to_string()),
+    };
+    sqlx::query(
+        "SELECT set_config('hive.acting_org', $1, false), \
+                set_config('hive.acting_user', $2, false), \
+                set_config('hive.acting_admin', $3, false)",
+    )
+    .bind(org)
+    .bind(user)
+    .bind(admin)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// The request-serving pool: connects as [`APP_ROLE`] and re-stamps the acting
+/// scope on every checkout, so a connection can never carry one request's org
+/// into another's. The `after_release` clear is belt to that braces — even if
+/// it never ran, the next checkout overwrites the value before any statement.
+pub async fn open_app(opts: PgConnectOptions) -> Result<PgPool> {
+    open_app_inner(opts, None, 16).await
+}
+
+async fn open_app_inner(
+    opts: PgConnectOptions,
+    fallback: Option<ActingScope>,
+    max_connections: u32,
+) -> Result<PgPool> {
+    let for_connect = fallback.clone();
     let pool = PgPoolOptions::new()
-        .max_connections(16)
-        .connect(url)
+        .max_connections(max_connections)
+        // Leave min_connections at 0: a connection opened by the background
+        // filler would run `after_connect` outside any request task. It would
+        // be stamped empty (harmless), but keeping the filler off means every
+        // connection in this pool was dialled by a task that had a scope.
+        .after_connect(move |conn, _meta| {
+            let fb = for_connect.clone();
+            Box::pin(async move { stamp_scope(conn, fb.as_ref()).await })
+        })
+        .before_acquire(move |conn, _meta| {
+            let fb = fallback.clone();
+            Box::pin(async move {
+                stamp_scope(conn, fb.as_ref()).await?;
+                Ok(true)
+            })
+        })
+        .after_release(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query(
+                    "SELECT set_config('hive.acting_org', '', false), \
+                            set_config('hive.acting_user', '', false), \
+                            set_config('hive.acting_admin', 'off', false)",
+                )
+                .execute(conn)
+                .await?;
+                Ok(true)
+            })
+        })
+        .connect_with(opts)
         .await?;
     Ok(pool)
 }
@@ -620,6 +716,485 @@ const SCHEMA_SEARCH: &str = r#"
     CREATE INDEX IF NOT EXISTS mail_attachments_blob ON mail_attachments (blob_hash);
 "#;
 
+/// The tenancy plane. Deliberately NOT row-level-secured: resolving a session
+/// cookie to a user, and a user to an org, has to happen before an acting org
+/// exists. These four tables are the only ones a request may touch unscoped,
+/// and none of them holds content.
+///
+/// `user_identities` follows `docs/SELF-HOST.md`: `UNIQUE (issuer, subject)` so
+/// a provider account maps to exactly one local identity, and `user_id` is NOT
+/// unique so one identity may hold many providers. Email is nowhere in it —
+/// email is a display attribute, never a join key.
+const SCHEMA_ORGS: &str = r#"
+    CREATE TABLE IF NOT EXISTS orgs (
+      id         UUID PRIMARY KEY,
+      slug       TEXT NOT NULL UNIQUE,
+      name       TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+
+    -- users.id is the house `usr_<nanoid>` TEXT id, so this column is TEXT
+    -- rather than the uuid the design note sketched; org_id stays UUID because
+    -- the RLS predicate casts it.
+    CREATE TABLE IF NOT EXISTS memberships (
+      user_id    TEXT NOT NULL,
+      org_id     UUID NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+      role       TEXT NOT NULL DEFAULT 'member',
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, org_id)
+    );
+    CREATE INDEX IF NOT EXISTS memberships_org ON memberships (org_id);
+
+    CREATE TABLE IF NOT EXISTS user_identities (
+      id         TEXT PRIMARY KEY,
+      user_id    TEXT NOT NULL,
+      issuer     TEXT NOT NULL,
+      subject    TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE (issuer, subject)
+    );
+    CREATE INDEX IF NOT EXISTS user_identities_user ON user_identities (user_id);
+"#;
+
+/// Every content table. Each one gets `org_id`, a foreign key to `orgs`, an
+/// index, and the policy pair below. Adding a content table means adding it
+/// here — nothing else in the tree filters by org, so an omission is a hole.
+const ORG_TABLES: &[&str] = &[
+    "journal",
+    "anchors",
+    "projects",
+    "topics",
+    "phases",
+    "tasks",
+    "decisions",
+    "events",
+    "inbox",
+    "links",
+    "wire",
+    "sources",
+    "outbox",
+    "embeddings",
+    "people",
+    "shares",
+    "profile",
+    "identities",
+    "identity_artifacts",
+    "cc_sessions",
+    "cc_messages",
+    "cc_credentials",
+    "search",
+    "entity_types",
+    "entity_fields",
+    "entities",
+    "mail_accounts",
+    "mail_mailboxes",
+    "mail_messages",
+    "mail_attachments",
+];
+
+/// Content tables carrying a per-user namespace column. The namespace used to
+/// be enforced by `Visibility` filters composed into every query in the store
+/// layer — the ACL-ordering surface D16 named. It is a policy predicate now,
+/// so there is no query left to compose it into wrong.
+const USER_SCOPE_TABLES: &[(&str, &str)] = &[
+    ("journal", "user_scope"),
+    ("entities", "user_scope"),
+    ("mail_messages", "user_scope"),
+    ("cc_sessions", "owner"),
+    ("cc_credentials", "owner"),
+    ("mail_accounts", "owner"),
+];
+
+/// Unique constraints that have to be per-org or two orgs cannot both have a
+/// person called `nate`. Rebuilt as `(org_id, …)`; the queries that read them
+/// are unchanged because RLS already narrows the lookup to one org.
+const ORG_UNIQUE_REBUILDS: &[(&str, &str, &str)] = &[
+    ("people", "people_slug_key", "slug"),
+    ("projects", "projects_name_key", "name"),
+    ("topics", "topics_slug_key", "slug"),
+    ("entity_types", "entity_types_slug_key", "slug"),
+    (
+        "identities",
+        "identities_platform_platform_id_key",
+        "platform, platform_id",
+    ),
+    (
+        "identity_artifacts",
+        "identity_artifacts_actor_kind_name_key",
+        "actor, kind, name",
+    ),
+    (
+        "mail_accounts",
+        "mail_accounts_owner_address_key",
+        "owner, address",
+    ),
+    ("shares", "shares_uniq", "scope, ref, viewer"),
+];
+
+const ACTING_ORG: &str = "nullif(current_setting('hive.acting_org', true), '')::uuid";
+const ACTING_USER: &str = "nullif(current_setting('hive.acting_user', true), '')";
+const ACTING_ADMIN: &str = "current_setting('hive.acting_admin', true) = 'on'";
+
+/// `org_id = acting_org`, and inside the org, the row's namespace owner is
+/// either nobody (shared), you, or you are an admin. One predicate, applied by
+/// the database to every statement, with no ordering to get wrong.
+fn org_predicate(table: &str) -> String {
+    let org = format!("org_id = {ACTING_ORG}");
+    match USER_SCOPE_TABLES.iter().find(|(t, _)| *t == table) {
+        Some((_, col)) => {
+            format!("({org} AND ({col} IS NULL OR {col} = {ACTING_USER} OR {ACTING_ADMIN}))")
+        }
+        None => format!("({org})"),
+    }
+}
+
+/// The journal's READ predicate widens the namespace by explicit grant: an
+/// entry shared to you, an author whose journal is shared to you, or an entry
+/// that @mentions you. That was `visible_entry_ids` in the store layer — a set
+/// of ids computed in Rust and then ANDed into every query by hand, which is
+/// exactly the ordering surface D16 named. It is a predicate now.
+///
+/// The WRITE predicate does NOT widen. Someone sharing their journal with you
+/// lets you read it; it does not let you write into their namespace. Splitting
+/// USING from WITH CHECK is what makes that expressible at all.
+fn journal_read_predicate() -> String {
+    let base = org_predicate("journal");
+    format!(
+        "({base} OR (org_id = {ACTING_ORG} AND ( \
+            EXISTS (SELECT 1 FROM shares s WHERE s.org_id = journal.org_id \
+                    AND s.viewer = {ACTING_USER} \
+                    AND ((s.scope = 'entry' AND s.ref = journal.id) \
+                      OR (s.scope = 'journal' AND s.ref = journal.author))) \
+            OR journal.mentions LIKE '%\"' || {ACTING_USER} || '\"%' \
+         )))"
+    )
+}
+
+/// Add `org_id` everywhere, fold pre-org rows into the default org, and turn
+/// RLS on. Idempotent, and runs after the inline base DDL because it has to
+/// reference tables that DDL creates (sqlx migrations run before it).
+async fn apply_org_scoping(pool: &PgPool) -> Result<()> {
+    sqlx::raw_sql(SCHEMA_ORGS).execute(pool).await?;
+
+    crate::pgq::query(
+        "INSERT INTO orgs (id, slug, name) VALUES (?, ?, ?) ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(DEFAULT_ORG_ID)
+    .bind(DEFAULT_ORG_SLUG)
+    .bind("Default")
+    .execute(pool)
+    .await?;
+
+    // The credential, not the request, decides the acting org: a session and a
+    // token each pin exactly one. Nothing reads an org from a header or a body.
+    for ddl in [
+        "ALTER TABLE sessions         ADD COLUMN IF NOT EXISTS org_id UUID",
+        "ALTER TABLE api_tokens       ADD COLUMN IF NOT EXISTS org_id UUID",
+        "ALTER TABLE oauth_auth_codes ADD COLUMN IF NOT EXISTS org_id UUID",
+    ] {
+        sqlx::raw_sql(ddl).execute(pool).await?;
+    }
+    for table in ["sessions", "api_tokens", "oauth_auth_codes"] {
+        sqlx::raw_sql(&format!(
+            "UPDATE {table} SET org_id = '{DEFAULT_ORG_ID}'::uuid WHERE org_id IS NULL"
+        ))
+        .execute(pool)
+        .await?;
+    }
+    // A token and an auth code are minted inside a request that already has an
+    // acting org, so the default carries it across without a query change —
+    // and, more to the point, without a place to pass the WRONG one.
+    for table in ["api_tokens", "oauth_auth_codes"] {
+        sqlx::raw_sql(&format!(
+            "ALTER TABLE {table} ALTER COLUMN org_id \
+             SET DEFAULT nullif(current_setting('hive.acting_org', true), '')::uuid"
+        ))
+        .execute(pool)
+        .await?;
+    }
+
+    // Pass one: the column, everywhere. A policy may reference another table
+    // (the journal's read predicate joins `shares`), so every `org_id` has to
+    // exist before any policy is written.
+    for table in ORG_TABLES {
+        let stmts = [
+            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS org_id UUID"),
+            format!("UPDATE {table} SET org_id = '{DEFAULT_ORG_ID}'::uuid WHERE org_id IS NULL"),
+            // The default is what keeps ~180 hand-written INSERTs correct
+            // without editing (and forgetting) any of them: omit org_id and
+            // the row lands in the acting org, or fails NOT NULL if there
+            // isn't one.
+            format!(
+                "ALTER TABLE {table} ALTER COLUMN org_id \
+                 SET DEFAULT nullif(current_setting('hive.acting_org', true), '')::uuid"
+            ),
+            format!("ALTER TABLE {table} ALTER COLUMN org_id SET NOT NULL"),
+            format!("CREATE INDEX IF NOT EXISTS {table}_org ON {table} (org_id)"),
+        ];
+        for sql in stmts {
+            sqlx::raw_sql(&sql)
+                .execute(pool)
+                .await
+                .with_context(|| format!("org-scoping {table}: {sql}"))?;
+        }
+        // The FK is added separately: a pre-existing one makes ADD CONSTRAINT
+        // fail, and Postgres has no ADD CONSTRAINT IF NOT EXISTS.
+        let fk = format!("{table}_org_fk");
+        sqlx::raw_sql(&format!(
+            "DO $$ BEGIN \
+               IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '{fk}') THEN \
+                 ALTER TABLE {table} ADD CONSTRAINT {fk} FOREIGN KEY (org_id) REFERENCES orgs(id); \
+               END IF; \
+             END $$"
+        ))
+        .execute(pool)
+        .await
+        .with_context(|| format!("org FK on {table}"))?;
+    }
+
+    // Pass two: the policies.
+    for table in ORG_TABLES {
+        let write = org_predicate(table);
+        let read = if *table == "journal" {
+            journal_read_predicate()
+        } else {
+            write.clone()
+        };
+        for sql in [
+            format!("ALTER TABLE {table} ENABLE ROW LEVEL SECURITY"),
+            // Without FORCE, the owner — which is whoever ran this DDL —
+            // sails past every policy.
+            format!("ALTER TABLE {table} FORCE ROW LEVEL SECURITY"),
+            format!("DROP POLICY IF EXISTS {table}_org ON {table}"),
+            // WITH CHECK as well as USING: USING filters reads, and without
+            // WITH CHECK a caller can INSERT into an org it cannot read.
+            format!("CREATE POLICY {table}_org ON {table} USING {read} WITH CHECK {write}"),
+        ] {
+            sqlx::raw_sql(&sql)
+                .execute(pool)
+                .await
+                .with_context(|| format!("org policy on {table}: {sql}"))?;
+        }
+    }
+
+    for (table, index, cols) in ORG_UNIQUE_REBUILDS {
+        for sql in [
+            format!("ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {index}"),
+            format!("DROP INDEX IF EXISTS {index}"),
+            format!(
+                "CREATE UNIQUE INDEX IF NOT EXISTS {table}_org_uniq ON {table} (org_id, {cols})"
+            ),
+        ] {
+            sqlx::raw_sql(&sql)
+                .execute(pool)
+                .await
+                .with_context(|| format!("per-org uniqueness on {table}: {sql}"))?;
+        }
+    }
+    // cc_sessions' capture-dedup index is partial, so it is rebuilt on its own.
+    for sql in [
+        "DROP INDEX IF EXISTS cc_sessions_captured_ext",
+        "CREATE UNIQUE INDEX IF NOT EXISTS cc_sessions_captured_ext ON cc_sessions \
+         (org_id, runtime, claude_session_id) WHERE origin = 'captured'",
+    ] {
+        sqlx::raw_sql(sql).execute(pool).await?;
+    }
+    // `profile` is keyed on an actor slug, which is only unique inside an org
+    // now — so its PRIMARY KEY has to move too, or two orgs cannot both have a
+    // person called `nate`.
+    sqlx::raw_sql(
+        "DO $$ BEGIN \
+           IF EXISTS (SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid \
+                      WHERE i.indrelid = 'profile'::regclass AND i.indisprimary \
+                        AND i.indnatts = 1) THEN \
+             ALTER TABLE profile DROP CONSTRAINT profile_pkey; \
+             ALTER TABLE profile ADD PRIMARY KEY (org_id, actor); \
+           END IF; \
+         END $$",
+    )
+    .execute(pool)
+    .await
+    .context("per-org profile key")?;
+
+    // Every existing login joins the default org, so an upgraded install keeps
+    // working the moment it boots.
+    crate::pgq::query(
+        "INSERT INTO memberships (user_id, org_id, role, created_at) \
+         SELECT u.id, ?, CASE WHEN u.role = 'admin' THEN 'admin' ELSE 'member' END, ? \
+         FROM users u ON CONFLICT (user_id, org_id) DO NOTHING",
+    )
+    .bind(DEFAULT_ORG_ID)
+    .bind(now_iso())
+    .execute(pool)
+    .await?;
+
+    grant_app_role(pool).await
+}
+
+/// The serving role's password, derived rather than stored.
+///
+/// Deriving it from `DATABASE_URL` has three properties worth the oddity: it is
+/// identical on every instance sharing the database (so two API processes never
+/// fight over it), it needs no storage (so there is no file or row to leak it
+/// from), and it is never weaker than what it protects — anyone who can guess
+/// `DATABASE_URL` already holds the owner's credentials and does not need this
+/// one. `HIVE_APP_DATABASE_URL` opts out for operators who provision the role
+/// themselves.
+fn app_password(url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(format!("hive-app-role-v1:{url}").as_bytes()))
+}
+
+/// Idempotent, concurrency-safe `CREATE ROLE`. Roles are cluster-wide, so two
+/// instances (or two parallel tests) boot against the same row in `pg_authid`;
+/// every write here is guarded by a check so the steady state is zero writes
+/// and a genuine race is `duplicate_object`, which is the outcome we wanted.
+async fn ensure_app_role(pool: &PgPool, password: &str) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    // Roles are cluster-wide. Guards make each write conditional, but two boots
+    // can still evaluate the guard and write in the same instant, which
+    // Postgres reports as "tuple concurrently updated". An advisory lock makes
+    // the whole check-then-write atomic across processes; it releases at
+    // commit, so a crashed boot cannot wedge the next one.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('hive:app-role'))")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::raw_sql(&format!(
+        "DO $$ BEGIN \
+           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{APP_ROLE}') THEN \
+             BEGIN \
+               CREATE ROLE {APP_ROLE} LOGIN PASSWORD '{password}'; \
+             EXCEPTION WHEN duplicate_object THEN NULL; \
+             END; \
+           END IF; \
+           IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{APP_ROLE}' \
+                      AND (rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole \
+                           OR NOT rolcanlogin)) THEN \
+             ALTER ROLE {APP_ROLE} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS; \
+           END IF; \
+         END $$"
+    ))
+    .execute(&mut *tx)
+    .await
+    .context(
+        "creating the unprivileged API role (the DATABASE_URL role needs CREATEROLE, or set \
+         HIVE_APP_DATABASE_URL to a role you provisioned yourself)",
+    )?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Give [`APP_ROLE`] exactly DML on the current schema — never ownership, never
+/// DDL. Re-run every boot so a table added since the last one is covered.
+async fn grant_app_role(pool: &PgPool) -> Result<()> {
+    ensure_app_role(pool, &app_password(&database_url())).await?;
+    let schema: String = crate::pgq::query_scalar::<String>("SELECT current_schema()")
+        .fetch_one(pool)
+        .await?;
+    // `public` is shared by every schema on the cluster, so the grant on it is
+    // conditional: an unconditional one is a write to a row two parallel boots
+    // both want, and Postgres answers that with "tuple concurrently updated".
+    sqlx::raw_sql(&format!(
+        "DO $$ BEGIN \
+           IF NOT has_schema_privilege('{APP_ROLE}', 'public', 'USAGE') THEN \
+             GRANT USAGE ON SCHEMA public TO {APP_ROLE}; \
+           END IF; \
+         END $$"
+    ))
+    .execute(pool)
+    .await
+    .with_context(|| format!("granting {APP_ROLE} usage on public"))?;
+    for sql in [
+        format!("GRANT USAGE ON SCHEMA \"{schema}\" TO {APP_ROLE}"),
+        format!(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA \"{schema}\" TO {APP_ROLE}"
+        ),
+        format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA \"{schema}\" TO {APP_ROLE}"),
+        format!(
+            "ALTER DEFAULT PRIVILEGES IN SCHEMA \"{schema}\" \
+             GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {APP_ROLE}"
+        ),
+    ] {
+        sqlx::raw_sql(&sql)
+            .execute(pool)
+            .await
+            .with_context(|| format!("granting {APP_ROLE}: {sql}"))?;
+    }
+    Ok(())
+}
+
+/// Connect options for the serving role. Nothing is rotated and nothing is
+/// written in the steady state, so two instances booting at once do not fight.
+/// `HIVE_APP_DATABASE_URL` opts out entirely for deployments that provision the
+/// role themselves.
+async fn app_connect_options(admin: &PgPool, url: &str) -> Result<PgConnectOptions> {
+    if let Ok(explicit) = std::env::var("HIVE_APP_DATABASE_URL") {
+        if !explicit.trim().is_empty() {
+            return Ok(explicit.parse::<PgConnectOptions>()?);
+        }
+    }
+    let password = app_password(url);
+    ensure_app_role(admin, &password).await?;
+    Ok(url
+        .parse::<PgConnectOptions>()?
+        .username(APP_ROLE)
+        .password(&password))
+}
+
+/// Open the serving pool, healing a role whose password predates this scheme.
+/// The heal is triggered by a failed connection rather than by inspecting
+/// `pg_authid` (superuser-only) and writes the same deterministic value every
+/// instance would, so a concurrent heal is a no-op rather than a fight.
+async fn connect_app(admin: &PgPool, opts: PgConnectOptions, url: &str) -> Result<PgPool> {
+    match open_app(opts.clone()).await {
+        Ok(pool) => Ok(pool),
+        Err(e) if is_auth_failure(&e) => {
+            let mut tx = admin.begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtext('hive:app-role'))")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::raw_sql(&format!(
+                "ALTER ROLE {APP_ROLE} WITH PASSWORD '{}'",
+                app_password(url)
+            ))
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            open_app(opts).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn is_auth_failure(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<sqlx::Error>(),
+        Some(sqlx::Error::Database(db)) if db.code().as_deref() == Some("28P01")
+    )
+}
+
+/// Refuse to serve as a role that outranks the policies. A superuser or a
+/// BYPASSRLS role reads every org's rows and no policy fires, so this is a
+/// hard stop rather than a warning. Unknown answers count as privileged.
+pub async fn assert_rls_applies(pool: &PgPool) -> Result<()> {
+    let role: String = crate::pgq::query_scalar::<String>("SELECT current_user::text")
+        .fetch_one(pool)
+        .await?;
+    let privileged: bool = crate::pgq::query_scalar::<bool>(
+        "SELECT COALESCE((SELECT bool_or(rolsuper OR rolbypassrls) FROM pg_roles \
+                          WHERE rolname = current_user), true)",
+    )
+    .fetch_one(pool)
+    .await?;
+    anyhow::ensure!(
+        !privileged,
+        "the API is connecting as {role}, which is SUPERUSER or BYPASSRLS — row-level security \
+         does not apply to it and every org would be readable. Point HIVE_APP_DATABASE_URL at an \
+         unprivileged role."
+    );
+    Ok(())
+}
+
 pub async fn migrate(pool: &PgPool) -> Result<()> {
     // sqlx-managed reshape migrations run FIRST, before the inline base DDL
     // below (hybrid convention — see core/migrations/0001_baseline_marker.sql).
@@ -686,6 +1261,11 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         sqlx::raw_sql(ddl).execute(pool).await?;
     }
 
+    // Tenancy last: it adds a column to every table the DDL above creates, so
+    // it cannot be a sqlx migration (those run first, against a DB where the
+    // base tables may not exist yet).
+    apply_org_scoping(pool).await?;
+
     // Onboarding gate: stamp the app version once; a fresh DB needs the wizard,
     // an existing DB is treated as already set up.
     let has_version: Option<String> =
@@ -719,44 +1299,113 @@ async fn set_config(pool: &PgPool, key: &str, value: &str) -> Result<()> {
 }
 
 /// Open + migrate in one call (the boot path for both api and worker).
+///
+/// Two connections, two roles: DDL runs as the owner, and the pool handed back
+/// for serving requests is the unprivileged one the policies actually apply to.
 pub async fn init() -> Result<PgPool> {
     let url = database_url();
-    let pool = open(&url).await?;
-    migrate(&pool).await?;
+    let admin = open_admin(&url).await?;
+    migrate(&admin).await?;
+    let opts = app_connect_options(&admin, &url).await?;
+    let pool = connect_app(&admin, opts, &url).await?;
+    admin.close().await;
+
+    assert_rls_applies(&pool).await?;
     Ok(pool)
 }
 
-/// Test helper: a pool pinned to a fresh, uniquely-named schema, migrated and
-/// ready. Each test gets full isolation against one shared Postgres (DATABASE_URL
-/// or the local dev default). Public (not cfg(test)) so integration tests can
-/// use it; never called from the running binaries.
-pub async fn test_pool() -> PgPool {
+/// Build a fresh, uniquely-named schema, migrate it, and hand back a pool on
+/// it as the unprivileged serving role. Each test gets full isolation against
+/// one shared Postgres (DATABASE_URL or the local dev default). Public (not
+/// cfg(test)) so integration tests can use it; never called from the binaries.
+async fn test_pool_with(fallback: Option<ActingScope>, max_connections: u32) -> PgPool {
     let url = database_url();
     let schema = format!("t_{}", uuid::Uuid::new_v4().simple());
 
-    let admin = PgPoolOptions::new()
+    let boot = PgPoolOptions::new()
         .max_connections(1)
         .connect(&url)
         .await
         .expect("connect admin");
     sqlx::raw_sql(&format!("CREATE SCHEMA \"{schema}\""))
-        .execute(&admin)
+        .execute(&boot)
         .await
         .expect("create schema");
-    admin.close().await;
+    boot.close().await;
 
     // Pin every connection in the pool to the test schema via the libpq
     // `options` startup parameter — cleaner than an after_connect hook.
     // `public` stays on the path so extension types installed there (e.g.
     // pgvector) resolve inside test schemas; the test schema is first, so all
     // created objects (including sqlx's per-schema _sqlx_migrations) land in it.
-    let opts: PgConnectOptions = url.parse().expect("parse DATABASE_URL");
-    let opts = opts.options([("search_path", format!("{schema},public"))]);
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect_with(opts)
+    let search_path = || [("search_path", format!("{schema},public"))];
+    let base: PgConnectOptions = url.parse().expect("parse DATABASE_URL");
+    let admin = PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(base.options(search_path()))
         .await
-        .expect("connect pool");
-    migrate(&pool).await.expect("migrate");
+        .expect("connect admin pool");
+    migrate(&admin).await.expect("migrate");
+    let opts = app_connect_options(&admin, url.as_str())
+        .await
+        .expect("provision app role")
+        .options(search_path());
+    // One connect-and-heal on the shared role before the real pool opens, so a
+    // stale password from an earlier scheme is fixed once rather than by every
+    // parallel test at once.
+    connect_app(&admin, opts.clone(), url.as_str())
+        .await
+        .expect("app role usable")
+        .close()
+        .await;
+    admin.close().await;
+
+    // Tests run against the same unprivileged, scope-stamping pool the binary
+    // serves from — a test against a superuser pool would prove nothing.
+    let pool = open_app_inner(opts, fallback, max_connections)
+        .await
+        .expect("connect app pool");
+    assert_rls_applies(&pool).await.expect("rls applies");
     pool
+}
+
+/// The general test pool. A task with NO acting scope falls back to the default
+/// org, so store-level tests (which never pass through the auth middleware, and
+/// so never open a scope) keep exercising real SQL.
+///
+/// That fallback exists ONLY here. `init()` calls `open_app`, which hardcodes
+/// `None`, so in the binary a request that fails to establish a scope reads
+/// nothing. Anything asserting on isolation must use [`test_pool_strict`].
+pub async fn test_pool() -> PgPool {
+    test_pool_with(Some(ActingScope::new(DEFAULT_ORG_ID, "tests", true)), 5).await
+}
+
+/// No fallback scope: an unscoped task sees nothing, exactly as the binary
+/// behaves. Use for anything that asserts on isolation, so the assertion is
+/// about the policy and not about a helper.
+pub async fn test_pool_strict() -> PgPool {
+    test_pool_with(None, 5).await
+}
+
+/// [`test_pool_strict`] with a single connection, so every statement in a test
+/// provably rides the SAME physical connection. This is what turns "a pooled
+/// connection is reused across two orgs" from a hope into a test.
+pub async fn test_pool_single_conn() -> PgPool {
+    test_pool_with(None, 1).await
+}
+
+/// Test helper: an owner-role pool on the SAME schema as `pool`, for the
+/// setup a test has to do from outside any org (seeding a second org, reading
+/// across orgs to check a leak did not happen).
+pub async fn test_admin_pool(pool: &PgPool) -> PgPool {
+    let schema: String = crate::pgq::query_scalar::<String>("SELECT current_schema()")
+        .fetch_one(pool)
+        .await
+        .expect("current schema");
+    let base: PgConnectOptions = database_url().parse().expect("parse DATABASE_URL");
+    PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(base.options([("search_path", format!("{schema},public"))]))
+        .await
+        .expect("connect admin pool")
 }

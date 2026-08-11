@@ -1126,8 +1126,10 @@ version = "0.7.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
+ "async-stream",
  "base64 0.22.1",
  "chrono",
+ "futures-core",
  "hex",
  "hive-embed",
  "hive-shared",

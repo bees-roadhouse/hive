@@ -34,7 +34,7 @@ impl Store {
         let row = crate::pgq::query(&format!(
             "INSERT INTO identity_artifacts (id, actor, kind, name, content, description, enabled, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT (actor, kind, name) DO UPDATE SET \
+             ON CONFLICT (org_id, actor, kind, name) DO UPDATE SET \
                content = excluded.content, \
                description = excluded.description, \
                enabled = excluded.enabled, \

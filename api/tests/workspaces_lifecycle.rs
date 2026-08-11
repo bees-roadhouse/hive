@@ -243,13 +243,16 @@ async fn delete_is_owner_or_admin_gated() {
     let bob = member(&app, &admin, "Bob", "bob@example.com").await;
     let ws = create_conversation(&app, &maggie, "not yours, bob").await;
 
-    // A non-owner member cannot delete it.
+    // A non-owner member cannot delete it — 404, not 403. The namespace is a
+    // row-level-security predicate now, so a row in someone else's namespace
+    // is not visible to be refused. That also stops the refusal from
+    // confirming the row exists.
     let (status, _, _) = send(
         &app,
         delete_req(&format!("/api/workspaces/{ws}"), Some(&bob)),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _, _) = send(&app, get(&format!("/api/workspaces/{ws}"), Some(&maggie))).await;
     assert_eq!(status, StatusCode::OK, "still there after forbidden delete");
 

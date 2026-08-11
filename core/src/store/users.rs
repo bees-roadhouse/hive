@@ -104,6 +104,19 @@ impl Store {
         .bind(&user.created_at)
         .execute(self.db())
         .await?;
+        // An admin adds people to THEIR org, never to one they name. The org
+        // is read from the same session variable every row default reads, so
+        // there is no field to forge — and no scope means no membership,
+        // because `org_id` is NOT NULL and there is nothing to default to.
+        self.memberships_add_acting(
+            &user.id,
+            if user.role == UserRole::Admin {
+                "admin"
+            } else {
+                "member"
+            },
+        )
+        .await?;
         self.emit(
             "user.created",
             by,
@@ -157,6 +170,12 @@ impl Store {
 
     /// Create the first admin + name the instance, mark setup complete, and
     /// return a session so the wizard logs the admin straight in.
+    ///
+    /// First run is the one place a request legitimately has no acting org yet
+    /// — there is no session to read one off. So it opens one explicitly, for
+    /// the default org, and everything it writes (`people`, `wire`) lands
+    /// there. This is a bootstrap, not a bypass: the scope is the default org
+    /// by name, not "whatever org the caller asked for".
     pub async fn onboarding_complete(
         &self,
         instance_name: &str,
@@ -164,30 +183,36 @@ impl Store {
         admin_email: &str,
         password: &str,
     ) -> Result<(SafeUser, String)> {
-        let admin = self
-            .users_create(
-                NewUser {
-                    name: admin_name.to_string(),
-                    email: admin_email.to_string(),
-                    password: password.to_string(),
-                    role: Some(UserRole::Admin),
-                    actor: Some(admin_name.to_string()),
-                    kind: Some(ActorKind::Human),
-                },
-                "onboarding",
+        let org = self.orgs_default().await?;
+        let scope = crate::ActingScope::new(org.id, admin_name.to_string(), true);
+        crate::acting::scope(scope, async move {
+            let admin = self
+                .users_create(
+                    NewUser {
+                        name: admin_name.to_string(),
+                        email: admin_email.to_string(),
+                        password: password.to_string(),
+                        role: Some(UserRole::Admin),
+                        actor: Some(admin_name.to_string()),
+                        kind: Some(ActorKind::Human),
+                    },
+                    "onboarding",
+                )
+                .await?;
+            self.memberships_add(&admin.id, org.id, "admin").await?;
+            self.config_set("instance.name", instance_name).await?;
+            self.config_set("app.version", APP_VERSION).await?;
+            self.config_set("onboarding.completed", "true").await?;
+            let session = self.sessions_create(&admin.id, org.id).await?;
+            self.emit(
+                "onboarding.completed",
+                &admin.actor.clone(),
+                json!({"instance": instance_name, "org": org.slug}),
             )
             .await?;
-        self.config_set("instance.name", instance_name).await?;
-        self.config_set("app.version", APP_VERSION).await?;
-        self.config_set("onboarding.completed", "true").await?;
-        let session = self.sessions_create(&admin.id).await?;
-        self.emit(
-            "onboarding.completed",
-            &admin.actor.clone(),
-            json!({"instance": instance_name}),
-        )
-        .await?;
-        Ok((admin, session))
+            Ok((admin, session))
+        })
+        .await
     }
 }
 

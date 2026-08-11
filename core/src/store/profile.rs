@@ -54,7 +54,7 @@ impl Store {
         crate::pgq::query(
             "INSERT INTO profile (actor, kind, display_name, body, source, derived_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(actor) DO UPDATE SET kind=excluded.kind, display_name=excluded.display_name, \
+             ON CONFLICT (org_id, actor) DO UPDATE SET kind=excluded.kind, display_name=excluded.display_name, \
                body=excluded.body, source=excluded.source, derived_at=excluded.derived_at, updated_at=excluded.updated_at",
         )
         .bind(&next.actor)

@@ -63,11 +63,11 @@ struct ListQuery {
 
 async fn list(
     State(s): State<Store>,
-    Extension(ctx): Extension<AuthCtx>,
+    Extension(_ctx): Extension<AuthCtx>,
     Query(q): Query<ListQuery>,
 ) -> ApiResult {
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
-    Ok(Json(s.workspace_list(&ctx.visibility(), limit).await?).into_response())
+    Ok(Json(s.workspace_list(limit).await?).into_response())
 }
 
 async fn create(
@@ -137,10 +137,10 @@ async fn create(
 
 async fn get_one(
     State(s): State<Store>,
-    Extension(ctx): Extension<AuthCtx>,
+    Extension(_ctx): Extension<AuthCtx>,
     Path(id): Path<String>,
 ) -> ApiResult {
-    match s.workspace_get(&ctx.visibility(), &id).await? {
+    match s.workspace_get(&id).await? {
         Some(ws) => Ok(Json(ws).into_response()),
         None => Ok(not_found()),
     }
@@ -154,11 +154,11 @@ struct TranscriptQuery {
 
 async fn transcript(
     State(s): State<Store>,
-    Extension(ctx): Extension<AuthCtx>,
+    Extension(_ctx): Extension<AuthCtx>,
     Path(id): Path<String>,
     Query(q): Query<TranscriptQuery>,
 ) -> ApiResult {
-    if s.workspace_get(&ctx.visibility(), &id).await?.is_none() {
+    if s.workspace_get(&id).await?.is_none() {
         return Ok(not_found());
     }
     let msgs = s
@@ -212,7 +212,7 @@ async fn send_input(
     Path(id): Path<String>,
     Json(body): Json<InputBody>,
 ) -> ApiResult {
-    if s.workspace_get(&ctx.visibility(), &id).await?.is_none() {
+    if s.workspace_get(&id).await?.is_none() {
         return Ok(not_found());
     }
     let msg = s
@@ -233,10 +233,10 @@ async fn send_input(
 
 async fn archive(
     State(s): State<Store>,
-    Extension(ctx): Extension<AuthCtx>,
+    Extension(_ctx): Extension<AuthCtx>,
     Path(id): Path<String>,
 ) -> ApiResult {
-    if s.workspace_get(&ctx.visibility(), &id).await?.is_none() {
+    if s.workspace_get(&id).await?.is_none() {
         return Ok(not_found());
     }
     s.workspace_archive(&id).await?;
