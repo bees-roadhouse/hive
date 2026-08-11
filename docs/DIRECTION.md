@@ -1260,3 +1260,53 @@ canonical ids never do.
 A reserved-name list and a policy on brand impersonation are due before the
 relay is public. A free public namespace attracts exactly that, and it is far
 cheaper to decide with no users than with some.
+
+**D44 addressing amendment, same day.** The path-routing half of D44 is
+withdrawn: addressing is `<id>.relay.example` by SUBDOMAIN, routed on SNI.
+
+D44 chose paths partly to keep instance ids out of Certificate Transparency.
+That reasoning does not survive contact with D41 and D42's requirement that the
+relay be blind, because the two are simply incompatible when the client is a
+browser. Routing on a path means reading the HTTP request line, which is inside
+TLS, which means the relay terminates and can read every journal entry, every
+message, and every photo passing through it. A browser cannot send a routing
+hint outside the encrypted channel, so there is no clever way around this.
+
+Blindness wins, and the CT cost is accepted: what leaks is that an opaque
+`nanoid` exists, not who owns it or what is in it. Weighed against the relay
+operator reading all traffic, that is plainly the smaller price.
+
+Mechanically, SNI arrives in the ClientHello in the clear, so the relay routes
+without decrypting. The relay therefore needs NO certificate for those names
+... the instances hold their own, obtained by ACME DNS-01 delegation against
+the relay's zone. An instance must generate its own key; a relay that ever
+holds an instance's private key can machine-in-the-middle later, and the
+promise evaporates.
+
+Implementation is `frp` in HTTPS proxy mode with `subdomainHost`, not a
+reverse proxy in front of a tunnel daemon. frp reads the ClientHello for SNI
+and splices; the tunnel and the routing are one component. Traefik TCP
+passthrough was evaluated and dropped: a TCP router points at exactly one
+service, so per-instance routing needs a router per instance, making every
+connect and disconnect a config rebuild with no published scaling data. And
+Traefik cannot hand a backend the SNI it matched ... "Pass SNI in PROXY
+Protocol Version 2 as PP2_TYPE_AUTHORITY" (traefik#8827) has been an open
+proposal since 2022 ... so the single-listener alternative does not exist.
+
+Two frp defaults are wrong for hosting strangers and must be set explicitly:
+`transport.bandwidthLimitMode` defaults to `client`, which lets the tenant
+enforce its own limit, and `maxPortsPerClient` defaults to unlimited.
+Authorization belongs in frp's `NewProxy` server-plugin hook.
+
+Two consequences that shipped with the choice. Cloudflare Tunnel and any
+CDN-terminated path are disqualified outright ... they decrypt at the edge, so
+the trusted party becomes a third party the user never chose. And the UniFi
+model of a single central sign-in over a proxied session is not available: the
+relay cannot render what it cannot read, so it serves a directory that links
+outward and each instance authenticates its own users. Credentials never touch
+the relay, which is a better property than the one being given up.
+
+Unresolved, and it governs the operational risk rather than the design: whether
+the relay is invite-only or open. Blind hosting under one's own domain means
+abuse cannot be detected, only reported ... so the relay should live on a
+dedicated domain rather than one carrying mail its reputation depends on.
