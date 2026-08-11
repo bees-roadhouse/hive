@@ -8,8 +8,18 @@
 # it appears in one file and not the other.
 #
 # Prerequisite: a hive-api listening on $TARGET (default 127.0.0.1:7979).
+# From a cold machine:
 #
-#   ./run.sh
+#   podman run -d --name hive-relay-pg -e POSTGRES_USER=hive \
+#     -e POSTGRES_PASSWORD=hive -e POSTGRES_DB=hive -p 55432:5432 \
+#     docker.io/pgvector/pgvector:pg17
+#   cargo build -p hive-api -p hive-relay
+#   DATABASE_URL=postgres://hive:hive@localhost:55432/hive PORT=7981 \
+#     HIVE_EMBED=hash ./target/debug/hive-api &
+#   TARGET=127.0.0.1:7981 ./relay/demo/run.sh
+#
+# `*.localtest.me` resolves to 127.0.0.1 from public DNS, so the demo needs no
+# hosts-file edit to exercise a real subdomain.
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
