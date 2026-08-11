@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::{new_id, now_iso, Store};
-use crate::Visibility;
 
 const SESSION_COLS: &str =
     "id, owner, created_by, title, workdir, claude_session_id, runtime, status, \
@@ -175,13 +174,6 @@ fn workspaces_root() -> String {
     })
 }
 
-fn visible(vis: &Visibility, owner: &str) -> bool {
-    match vis {
-        Visibility::All => true,
-        Visibility::Namespace(v) => v == owner,
-    }
-}
-
 pub fn normalize_runtime(runtime: Option<&str>) -> String {
     match runtime.unwrap_or("claude_code").trim() {
         "" | "claude" | "claude_code" => "claude_code".to_string(),
@@ -277,34 +269,20 @@ impl Store {
         Ok(row.map(SessionRow::into_view))
     }
 
-    /// Get by id, gated by the caller's namespace visibility.
-    pub async fn workspace_get(&self, vis: &Visibility, id: &str) -> Result<Option<CcSession>> {
-        Ok(self
-            .workspace_get_internal(id)
-            .await?
-            .filter(|s| visible(vis, &s.owner)))
+    /// Get by id. No visibility argument: `cc_sessions` is behind a policy
+    /// keyed on `org_id` and `owner`, so a row outside the caller's namespace
+    /// is not filtered out here — it never arrives.
+    pub async fn workspace_get(&self, id: &str) -> Result<Option<CcSession>> {
+        self.workspace_get_internal(id).await
     }
 
-    pub async fn workspace_list(&self, vis: &Visibility, limit: i64) -> Result<Vec<CcSession>> {
-        let rows = match vis {
-            Visibility::All => {
-                crate::pgq::query_as::<SessionRow>(&format!(
-                    "SELECT {SESSION_COLS} FROM cc_sessions ORDER BY created_at DESC LIMIT ?"
-                ))
-                .bind(limit)
-                .fetch_all(self.db())
-                .await?
-            }
-            Visibility::Namespace(viewer) => {
-                crate::pgq::query_as::<SessionRow>(&format!(
-                    "SELECT {SESSION_COLS} FROM cc_sessions WHERE owner = ? ORDER BY created_at DESC LIMIT ?"
-                ))
-                .bind(viewer)
-                .bind(limit)
-                .fetch_all(self.db())
-                .await?
-            }
-        };
+    pub async fn workspace_list(&self, limit: i64) -> Result<Vec<CcSession>> {
+        let rows = crate::pgq::query_as::<SessionRow>(&format!(
+            "SELECT {SESSION_COLS} FROM cc_sessions ORDER BY created_at DESC LIMIT ?"
+        ))
+        .bind(limit)
+        .fetch_all(self.db())
+        .await?;
         Ok(rows.into_iter().map(SessionRow::into_view).collect())
     }
 

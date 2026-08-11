@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod authz;
 pub mod error;
 pub mod legacy_import;
 pub mod mcp;

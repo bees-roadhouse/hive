@@ -97,10 +97,10 @@ async fn append(
 
 async fn get_one(
     State(s): State<Store>,
-    Extension(ctx): Extension<AuthCtx>,
+    Extension(_ctx): Extension<AuthCtx>,
     Path(id): Path<String>,
 ) -> ApiResult {
-    match s.journal_get(&id, &ctx.visibility()).await? {
+    match s.journal_get(&id).await? {
         Some(e) => Ok(Json(e).into_response()),
         None => Ok(not_found()),
     }

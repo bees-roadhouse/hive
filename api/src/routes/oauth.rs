@@ -386,6 +386,9 @@ async fn consent_grant(
             granted_by: owner,
             scope,
             token_ttl_secs: clamp_token_ttl(body.token_ttl_secs),
+            // Ignored on write — the column default stamps the acting org, so
+            // consent cannot grant into an org the human is not acting in.
+            org_id: None,
         })
         .await?;
     let state = body.state.unwrap_or_default();
@@ -452,15 +455,25 @@ async fn token(State(s): State<Store>, form: Result<Form<TokenForm>, FormRejecti
         Some(secs) => Some(secs.clamp(OAUTH_TOKEN_TTL_MIN_SECS, OAUTH_TOKEN_TTL_MAX_SECS)),
         None => Some(OAUTH_TOKEN_TTL_SECS),
     };
-    let (token, _record) = s
-        .tokens_create_oauth(
+    // This endpoint is unauthenticated by construction (the client presents a
+    // code, not a session), so the acting org comes off the code — stamped
+    // when the human consented. The minted token inherits it via the column
+    // default and can never act anywhere else.
+    let Some(org) = grant.org_id else {
+        return Ok(err(StatusCode::BAD_REQUEST, "invalid_grant"));
+    };
+    let scope = hive_core::ActingScope::new(org, grant.granted_by.clone(), false);
+    let (token, _record) = hive_core::acting::scope(scope, async {
+        s.tokens_create_oauth(
             &grant.ai_actor,
             &grant.client_id,
             &grant.granted_by,
             &grant.scope,
             grant.token_ttl_secs,
         )
-        .await?;
+        .await
+    })
+    .await?;
     let mut body = json!({
         "access_token": token,
         "token_type": "Bearer",
@@ -654,16 +667,43 @@ async fn oidc_sign_in(
     let id_token = exchange_code(cfg, &disco.token_endpoint, code).await?;
     let claims = verify_id_token(cfg, &disco.jwks_uri, &id_token, nonce).await?;
     let email = claims.email.to_lowercase();
-    let mut user = s.users_by_email(&email).await?.map(|(u, _hash)| u);
+
+    // NEVER LINK ON EMAIL (docs/SELF-HOST.md). The recovered v0.6 code did:
+    // `users_by_email(&email)` handed the matching local account to whoever
+    // arrived with that address in an id_token, which is the classic takeover
+    // — register the victim's address at a trusted IdP and let the match do
+    // the rest. `email_verified` would not have helped: it is an assertion by
+    // a provider we do not control.
+    //
+    // The join key is `(issuer, subject)`, unique in `user_identities`. A
+    // provider account maps to exactly one local identity; adding a SECOND
+    // provider to an identity means signing in with the first, which is a
+    // different flow and not this one.
+    let existing = s.identity_user(&claims.issuer, &claims.subject).await?;
+    let mut user = match &existing {
+        Some(uid) => s.users_by_id(uid).await?,
+        None => None,
+    };
     if user.is_none() {
         let domain = email.split('@').nth(1).unwrap_or("").to_string();
         if !cfg.allowed_domains.contains(&domain) {
             return Ok(html_error(
-                "No hive account for this email, and its domain isn't allowed.",
+                "No hive account for this identity, and its domain isn't allowed.",
             ));
         }
-        let safe = s
-            .users_create(
+        // A local account already using this address is NOT this person until
+        // they prove it by signing in with it and linking. Refusing is the
+        // whole point; silently adopting it is the vulnerability.
+        if s.users_by_email(&email).await?.is_some() {
+            return Ok(html_error(
+                "An account already exists for that email address. Sign in with your password \
+                 first, then link this provider.",
+            ));
+        }
+        let org = s.orgs_default().await?;
+        let scope = hive_core::ActingScope::new(org.id, "oidc".to_string(), false);
+        let safe = hive_core::acting::scope(scope, async {
+            s.users_create(
                 NewUser {
                     name: claims.name.clone().unwrap_or_else(|| email.clone()),
                     email: email.clone(),
@@ -674,13 +714,20 @@ async fn oidc_sign_in(
                 },
                 "oidc",
             )
+            .await
+        })
+        .await?;
+        s.identity_link(&safe.id, &claims.issuer, &claims.subject)
             .await?;
         user = s.users_by_id(&safe.id).await?;
     }
     let Some(user) = user else {
         return Ok(html_error("Could not provision an account."));
     };
-    let session = s.sessions_create(&user.id).await?;
+    let Some(membership) = s.memberships_for(&user.id).await?.into_iter().next() else {
+        return Ok(html_error("That account is not a member of any org."));
+    };
+    let session = s.sessions_create(&user.id, membership.org.id).await?;
     let back = cookie_value(headers, OIDC_RETURN_COOKIE)
         .and_then(|v| safe_return_to(&v))
         .unwrap_or_else(|| "/".to_string());
@@ -721,6 +768,11 @@ async fn exchange_code(cfg: &OidcConfig, token_endpoint: &str, code: &str) -> An
 }
 
 struct IdClaims {
+    /// Issuer-scoped subject. THE join key — the only claim that identifies
+    /// the account rather than describing it.
+    issuer: String,
+    subject: String,
+    /// A display attribute. Never a key. See `oidc_sign_in`.
     email: String,
     name: Option<String>,
 }
@@ -799,7 +851,17 @@ async fn verify_id_token(
         .get("email")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("no email in id_token"))?;
+    // `sub` is required by OIDC core and is what the account IS. A token
+    // without one cannot be linked to anything, so refuse it rather than fall
+    // back to email.
+    let subject = payload
+        .get("sub")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("no sub in id_token"))?;
     Ok(IdClaims {
+        issuer: cfg.issuer.clone(),
+        subject: subject.to_string(),
         email: email.to_string(),
         name: payload
             .get("name")

@@ -96,21 +96,21 @@ struct PendingQuery {
 /// oldest first. Visibility-gated (owner sees own; admins see all).
 async fn pending(
     State(s): State<Store>,
-    Extension(ctx): Extension<AuthCtx>,
+    Extension(_ctx): Extension<AuthCtx>,
     Query(q): Query<PendingQuery>,
 ) -> ApiResult {
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
-    Ok(Json(s.conversations_pending(&ctx.visibility(), limit).await?).into_response())
+    Ok(Json(s.conversations_pending(limit).await?).into_response())
 }
 
 /// A conversation + its transcript flattened to plain text (what the
 /// reflector consumes). Hidden as 404 outside the viewer's namespace.
 async fn get_one(
     State(s): State<Store>,
-    Extension(ctx): Extension<AuthCtx>,
+    Extension(_ctx): Extension<AuthCtx>,
     Path(id): Path<String>,
 ) -> ApiResult {
-    match s.conversation_get_flat(&ctx.visibility(), &id).await? {
+    match s.conversation_get_flat(&id).await? {
         Some(view) => Ok(Json(view).into_response()),
         None => Ok(not_found()),
     }

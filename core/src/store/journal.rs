@@ -36,11 +36,10 @@ impl Store {
         Ok(out)
     }
 
-    pub async fn journal_get(
-        &self,
-        entry_id: &str,
-        vis: &Visibility,
-    ) -> Result<Option<JournalEntryView>> {
+    /// One entry, or None. The namespace gate that used to live here — global,
+    /// or own, or shared, or @mentioned — is the journal policy's USING clause
+    /// now, so an entry the caller may not read simply does not come back.
+    pub async fn journal_get(&self, entry_id: &str) -> Result<Option<JournalEntryView>> {
         let row = crate::pgq::query("SELECT * FROM journal WHERE id = ?")
             .bind(entry_id)
             .fetch_optional(self.db())
@@ -48,18 +47,6 @@ impl Store {
         let Some(row) = row else {
             return Ok(None);
         };
-        // Namespace gate: non-admins get an entry only if it's global, in their
-        // own namespace, or explicitly shared/@mentioned to them. Hidden as 404.
-        if let Visibility::Namespace(u) = vis {
-            let scope: Option<String> = row.try_get("user_scope")?;
-            let own_or_global = scope.as_deref().map(|s| s == u).unwrap_or(true);
-            if !own_or_global {
-                let visible = self.visible_entry_ids(vis).await?.unwrap_or_default();
-                if !visible.contains(entry_id) {
-                    return Ok(None);
-                }
-            }
-        }
         Ok(Some(self.entry_view(row_to_entry(&row)?).await?))
     }
 

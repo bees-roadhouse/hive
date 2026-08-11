@@ -15,7 +15,6 @@ use axum::response::{IntoResponse, Json};
 use axum::routing::get;
 use axum::{Extension, Router};
 use serde_json::json;
-use tokio::sync::broadcast::error::RecvError;
 
 use crate::error::ApiResult;
 use crate::middleware::AuthCtx;
@@ -33,27 +32,31 @@ async fn stream(State(s): State<Store>, Extension(ctx): Extension<AuthCtx>) -> A
         )
             .into_response());
     }
+    // The bus is one in-process channel for every org, and the response body is
+    // polled long after this handler's acting scope is gone — so the org is
+    // captured here and the subscription filters on it. Without an org there is
+    // nothing to subscribe to.
+    let Some(org) = ctx.org else {
+        return Ok((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "no_acting_org"})),
+        )
+            .into_response());
+    };
 
-    let mut rx = s.subscribe();
+    let rx = s.subscribe(org);
     let events = async_stream::stream! {
         yield Ok::<Event, Infallible>(Event::default().comment("connected"));
-        loop {
-            match rx.recv().await {
-                Ok(ev) => {
-                    // Node's BusEvent shape: {kind, actor, payload, at} — `at`,
-                    // not created_at, and no id.
-                    let data = json!({
-                        "kind": ev.kind,
-                        "actor": ev.actor,
-                        "payload": ev.payload,
-                        "at": ev.created_at,
-                    });
-                    yield Ok(Event::default().data(data.to_string()));
-                }
-                // A slow consumer that missed events just keeps going.
-                Err(RecvError::Lagged(_)) => continue,
-                Err(RecvError::Closed) => break,
-            }
+        for await ev in rx {
+            // Node's BusEvent shape: {kind, actor, payload, at} — `at`,
+            // not created_at, and no id.
+            let data = json!({
+                "kind": ev.kind,
+                "actor": ev.actor,
+                "payload": ev.payload,
+                "at": ev.created_at,
+            });
+            yield Ok(Event::default().data(data.to_string()));
         }
     };
 

@@ -24,7 +24,6 @@ use hive_shared::{
 use serde_json::{json, Value};
 
 use super::{new_id, now_iso, Store};
-use crate::Visibility;
 
 const CONV_COLS: &str = "id, owner, created_by, title, runtime, origin, status, \
     claude_session_id, summary, reflected_at, created_at, updated_at, last_activity_at";
@@ -89,13 +88,6 @@ impl FlatMsgRow {
             content,
             created_at: self.created_at,
         }
-    }
-}
-
-fn visible(vis: &Visibility, owner: &str) -> bool {
-    match vis {
-        Visibility::All => true,
-        Visibility::Namespace(v) => v == owner,
     }
 }
 
@@ -176,7 +168,7 @@ impl Store {
              (id, owner, created_by, title, workdir, claude_session_id, runtime, origin, \
               status, usage, meta, summary, created_at, updated_at) \
              VALUES (?, ?, ?, ?, '', ?, ?, 'captured', 'captured', '{{}}', ?, ?, ?, ?) \
-             ON CONFLICT (runtime, claude_session_id) WHERE origin = 'captured' DO UPDATE SET \
+             ON CONFLICT (org_id, runtime, claude_session_id) WHERE origin = 'captured' DO UPDATE SET \
                title = CASE WHEN excluded.title = '' THEN cc_sessions.title ELSE excluded.title END, \
                summary = CASE WHEN excluded.summary = '' THEN cc_sessions.summary ELSE excluded.summary END, \
                updated_at = excluded.updated_at \
@@ -288,51 +280,26 @@ impl Store {
     /// The reflection queue: captured conversations not yet reflected, oldest
     /// first so reflection drains the backlog in order. Namespace viewers see
     /// their own; admins see all.
-    pub async fn conversations_pending(
-        &self,
-        vis: &Visibility,
-        limit: i64,
-    ) -> Result<Vec<Conversation>> {
-        let rows = match vis {
-            Visibility::All => {
-                crate::pgq::query_as::<ConvRow>(&format!(
-                    "SELECT {CONV_COLS} FROM cc_sessions \
-                     WHERE origin = 'captured' AND reflected_at IS NULL \
-                     ORDER BY created_at ASC LIMIT ?"
-                ))
-                .bind(limit)
-                .fetch_all(self.db())
-                .await?
-            }
-            Visibility::Namespace(viewer) => {
-                crate::pgq::query_as::<ConvRow>(&format!(
-                    "SELECT {CONV_COLS} FROM cc_sessions \
-                     WHERE origin = 'captured' AND reflected_at IS NULL AND owner = ? \
-                     ORDER BY created_at ASC LIMIT ?"
-                ))
-                .bind(viewer)
-                .bind(limit)
-                .fetch_all(self.db())
-                .await?
-            }
-        };
+    pub async fn conversations_pending(&self, limit: i64) -> Result<Vec<Conversation>> {
+        let rows = crate::pgq::query_as::<ConvRow>(&format!(
+            "SELECT {CONV_COLS} FROM cc_sessions \
+             WHERE origin = 'captured' AND reflected_at IS NULL \
+             ORDER BY created_at ASC LIMIT ?"
+        ))
+        .bind(limit)
+        .fetch_all(self.db())
+        .await?;
         Ok(rows.into_iter().map(ConvRow::into_view).collect())
     }
 
     /// A captured conversation + its transcript with content flattened to
-    /// plain text (the reflector consumes content as a string). Visibility-
-    /// gated (owner-or-admin); hidden rows answer None (a 404 upstream).
-    pub async fn conversation_get_flat(
-        &self,
-        vis: &Visibility,
-        id: &str,
-    ) -> Result<Option<ConversationView>> {
+    /// plain text (the reflector consumes content as a string). A row outside
+    /// the caller's namespace answers None because the policy hid it, not
+    /// because this function checked.
+    pub async fn conversation_get_flat(&self, id: &str) -> Result<Option<ConversationView>> {
         let Some(conversation) = self.conversation_get_captured(id).await? else {
             return Ok(None);
         };
-        if !visible(vis, &conversation.owner) {
-            return Ok(None);
-        }
         let rows = crate::pgq::query_as::<FlatMsgRow>(
             "SELECT id, seq, role, kind, content, created_at FROM cc_messages \
              WHERE session_id = ? ORDER BY seq ASC",

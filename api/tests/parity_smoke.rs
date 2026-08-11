@@ -237,6 +237,9 @@ const OIDC_TEST_JWK_N: &str = "pVBO3-ABsn3cL8nJ9UQXz6wpvH0zPuZuQwoF3k4t2_p3u0ab5
 #[derive(Serialize)]
 struct FakeOidcClaims<'a> {
     iss: &'a str,
+    /// The join key. An id_token without one identifies nobody, and the
+    /// callback refuses it rather than falling back to email.
+    sub: &'a str,
     aud: &'a str,
     exp: i64,
     nonce: &'a str,
@@ -286,6 +289,7 @@ async fn fake_oidc_provider() -> String {
                     header.kid = Some("hive-test".to_string());
                     let claims = FakeOidcClaims {
                         iss: &issuer,
+                        sub: "oidc-subject-0001",
                         aud: "hive-client",
                         exp: chrono::Utc::now().timestamp() + 600,
                         nonce: code,

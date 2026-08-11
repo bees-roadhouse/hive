@@ -87,6 +87,10 @@ async fn onboarding_complete(State(s): State<Store>, body: Json<OnboardingPayloa
 struct LoginBody {
     email: Option<String>,
     password: Option<String>,
+    /// Which of the caller's orgs this session acts in. Omitted → their first
+    /// membership. Switching orgs is logging in again, by design: a session
+    /// carries ONE org and nothing mutates it afterwards.
+    org: Option<String>,
 }
 
 async fn login(State(s): State<Store>, Json(body): Json<LoginBody>) -> ApiResult {
@@ -99,7 +103,18 @@ async fn login(State(s): State<Store>, Json(body): Json<LoginBody>) -> ApiResult
     let Some(user) = s.users_authenticate(&email, &password).await? else {
         return Ok(err(StatusCode::UNAUTHORIZED, "invalid credentials"));
     };
-    let session = s.sessions_create(&user.id).await?;
+    // Membership is checked once, here, to decide whether the acting org may
+    // be set at all. RLS enforces it on every statement afterwards without the
+    // application re-deriving anything.
+    let memberships = s.memberships_for(&user.id).await?;
+    let chosen = match body.org.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
+        Some(slug) => memberships.iter().find(|m| m.org.slug == slug),
+        None => memberships.first(),
+    };
+    let Some(membership) = chosen else {
+        return Ok(err(StatusCode::FORBIDDEN, "not a member of that org"));
+    };
+    let session = s.sessions_create(&user.id, membership.org.id).await?;
     let safe = hive_shared::SafeUser {
         id: user.id,
         actor: user.actor,
@@ -107,7 +122,11 @@ async fn login(State(s): State<Store>, Json(body): Json<LoginBody>) -> ApiResult
         name: user.name,
         role: user.role,
     };
-    let mut res = Json(json!({ "user": safe })).into_response();
+    let mut res = Json(json!({
+        "user": safe,
+        "org": {"slug": membership.org.slug, "name": membership.org.name, "role": membership.role},
+    }))
+    .into_response();
     res.headers_mut()
         .insert(header::SET_COOKIE, session_cookie_header(&session));
     Ok(res)

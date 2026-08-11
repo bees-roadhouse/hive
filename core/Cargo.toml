@@ -31,6 +31,11 @@ hex = { workspace = true }
 # Feeds (pollSources runs api-side too; the worker reuses it)
 rss = { workspace = true }
 
+# The SSE bus: one broadcast channel serves every org, so `subscribe` filters
+# it down to the caller's before anything leaves the process.
+async-stream = "0.3"
+futures-core = "0.3"
+
 # Misc
 nanoid = { workspace = true }
 uuid = { workspace = true }

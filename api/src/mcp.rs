@@ -1362,16 +1362,14 @@ async fn dispatch(
             let limit = a.opt_int("limit", Some(1), Some(500));
             a.finish()?;
             Ok(ok_content(
-                &store
-                    .workspace_list(&ctx.visibility(), limit.unwrap_or(50))
-                    .await?,
+                &store.workspace_list(limit.unwrap_or(50)).await?,
             ))
         }
         "workspace_get" => {
             let mut a = Args::new("workspace_get", args);
             let id = a.req_str("id");
             a.finish()?;
-            match store.workspace_get(&ctx.visibility(), id.unwrap()).await? {
+            match store.workspace_get(id.unwrap()).await? {
                 Some(ws) => Ok(ok_content(&ws)),
                 None => Ok(ok_content(&json!({"error": "not found"}))),
             }
@@ -1383,7 +1381,7 @@ async fn dispatch(
             let limit = a.opt_int("limit", Some(1), Some(5000));
             a.finish()?;
             let id = id.unwrap();
-            if store.workspace_get(&ctx.visibility(), id).await?.is_none() {
+            if store.workspace_get(id).await?.is_none() {
                 return Ok(ok_content(&json!({"error": "not found"})));
             }
             Ok(ok_content(
@@ -1407,7 +1405,7 @@ async fn dispatch(
             let mut a = Args::new("journal_get", args);
             let id = a.req_str("id");
             a.finish()?;
-            match store.journal_get(id.unwrap(), &ctx.visibility()).await? {
+            match store.journal_get(id.unwrap()).await? {
                 Some(e) => Ok(ok_content(&e)),
                 None => Ok(ok_content(&json!({"error": "not found"}))),
             }
@@ -2027,19 +2025,14 @@ async fn dispatch(
             let limit = a.opt_int("limit", Some(1), Some(200));
             a.finish()?;
             Ok(ok_content(
-                &store
-                    .conversations_pending(&ctx.visibility(), limit.unwrap_or(50))
-                    .await?,
+                &store.conversations_pending(limit.unwrap_or(50)).await?,
             ))
         }
         "conversation_get" => {
             let mut a = Args::new("conversation_get", args);
             let id = a.req_str("id");
             a.finish()?;
-            match store
-                .conversation_get_flat(&ctx.visibility(), id.unwrap())
-                .await?
-            {
+            match store.conversation_get_flat(id.unwrap()).await? {
                 Some(view) => Ok(ok_content(&view)),
                 None => Ok(ok_content(&json!({"error": "not found"}))),
             }

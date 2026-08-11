@@ -28,6 +28,7 @@ pub mod links;
 pub mod mail;
 pub mod maintenance;
 pub mod oauth;
+pub mod orgs;
 pub mod outbox;
 pub mod people;
 pub mod phases;
@@ -55,10 +56,21 @@ pub fn now_iso() -> String {
         .to_string()
 }
 
+/// A wire event plus the org it happened in. The bus is one in-process
+/// broadcast channel shared by every connected client, and a broadcast channel
+/// has no policies — so the org rides along and `subscribe` filters on it.
+/// Without this the SSE stream would hand every org's mutations to every
+/// listener, which is a leak RLS cannot see.
+#[derive(Clone, Debug)]
+pub struct ScopedEvent {
+    pub org: Option<uuid::Uuid>,
+    pub event: WireEvent,
+}
+
 #[derive(Clone)]
 pub struct Store {
     db: PgPool,
-    bus: broadcast::Sender<WireEvent>,
+    bus: broadcast::Sender<ScopedEvent>,
 }
 
 impl Store {
@@ -71,9 +83,21 @@ impl Store {
         &self.db
     }
 
-    /// Subscribe to live wire events (the SSE stream's feed).
-    pub fn subscribe(&self) -> broadcast::Receiver<WireEvent> {
-        self.bus.subscribe()
+    /// Subscribe to live wire events for one org (the SSE stream's feed).
+    /// Events from any other org are dropped before the caller sees them.
+    pub fn subscribe(&self, org: uuid::Uuid) -> impl futures_core::Stream<Item = WireEvent> {
+        let mut rx = self.bus.subscribe();
+        async_stream::stream! {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) if ev.org == Some(org) => yield ev.event,
+                    Ok(_) => continue,
+                    // A slow consumer that missed events just keeps going.
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
     }
 
     /// Append a wire event and fan it out to SSE subscribers (store.emit + bus.publish).
@@ -101,7 +125,10 @@ impl Store {
         .execute(&self.db)
         .await?;
         // A lagging/absent subscriber must never fail the mutation path.
-        let _ = self.bus.send(ev.clone());
+        let _ = self.bus.send(ScopedEvent {
+            org: crate::acting::current().map(|s| s.org),
+            event: ev.clone(),
+        });
         Ok(ev)
     }
 

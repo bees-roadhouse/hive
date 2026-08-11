@@ -410,7 +410,11 @@ async fn conversations_are_namespace_scoped() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "foreign message write");
+    // 404, not 403. The namespace is a row-level-security predicate now, so a
+    // conversation in someone else's namespace is not visible to be refused —
+    // it is not there. That also closes the existence oracle a 403 opened: the
+    // GET above already hid as 404, and the write now agrees with it.
+    assert_eq!(status, StatusCode::NOT_FOUND, "foreign message write");
     let (status, _, _) = send(
         &app,
         post_json(
@@ -420,7 +424,7 @@ async fn conversations_are_namespace_scoped() {
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "foreign reflect");
+    assert_eq!(status, StatusCode::NOT_FOUND, "foreign reflect");
 
     // A capture key is not a bearer credential: re-upserting someone else's
     // (runtime, external_id) is forbidden, not a silent join.

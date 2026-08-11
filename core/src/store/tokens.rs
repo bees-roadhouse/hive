@@ -19,6 +19,14 @@ use super::{new_id, now_iso, Store};
 const TOKEN_COLS: &str =
     "id, actor, label, created_by, created_at, last_used_at, kind, client_id, granted_by, expires_at, scope";
 
+/// What a bearer token authenticates as. The `org` is the acting-org pin:
+/// one org per credential, decided at mint time and never rewritten.
+pub struct ResolvedToken {
+    pub actor: String,
+    pub namespace_user: String,
+    pub org: Option<uuid::Uuid>,
+}
+
 impl Store {
     pub async fn tokens_list(&self) -> Result<Vec<ApiToken>> {
         let rows = crate::pgq::query(&format!(
@@ -151,14 +159,18 @@ impl Store {
     }
 
     /// Resolve a bearer token to its actor (and stamp last_used), honoring
-    /// expiry (NULL = legacy non-expiring; past expiry → reject + reap).
-    /// Resolve a bearer token to `(actor, namespace_user)`. The namespace user is
-    /// the human the token acts for — `granted_by` for OAuth tokens, else
-    /// `created_by` — which keys per-user memory visibility (an AI sees the
-    /// namespace of whoever granted its token).
-    pub async fn tokens_resolve(&self, token: &str) -> Result<Option<(String, String)>> {
+    /// expiry (NULL = legacy non-expiring; past expiry → reject + reap). The
+    /// namespace user is the human the token acts for — `granted_by` for OAuth
+    /// tokens, else `created_by` — which keys per-user memory visibility (an AI
+    /// sees the namespace of whoever granted its token).
+    ///
+    /// `org` is the one org this token may ever act in, fixed when it was
+    /// minted. An agent authenticates into one org per session and cannot
+    /// switch: nothing writes this column after the INSERT.
+    pub async fn tokens_resolve(&self, token: &str) -> Result<Option<ResolvedToken>> {
         let row = crate::pgq::query(
-            "SELECT id, actor, granted_by, created_by, expires_at FROM api_tokens WHERE token_hash = ?",
+            "SELECT id, actor, granted_by, created_by, org_id, expires_at \
+             FROM api_tokens WHERE token_hash = ?",
         )
         .bind(token_hash(token))
         .fetch_optional(self.db())
@@ -171,6 +183,7 @@ impl Store {
         let granted_by: Option<String> = row.try_get("granted_by")?;
         let created_by: String = row.try_get("created_by")?;
         let namespace_user = granted_by.unwrap_or(created_by);
+        let org: Option<uuid::Uuid> = row.try_get("org_id")?;
         let expires_at: Option<String> = row.try_get("expires_at")?;
         if let Some(exp) = expires_at {
             let expired = chrono::DateTime::parse_from_rfc3339(&exp)
@@ -189,7 +202,11 @@ impl Store {
             .bind(&id)
             .execute(self.db())
             .await?;
-        Ok(Some((actor, namespace_user)))
+        Ok(Some(ResolvedToken {
+            actor,
+            namespace_user,
+            org,
+        }))
     }
 
     pub async fn tokens_remove(&self, token_id: &str) -> Result<bool> {
