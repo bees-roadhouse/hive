@@ -1126,3 +1126,137 @@ Numbered continuing from v2.1's 16.
     requires keeping raw audio, and raw audio is a larger biometric liability
     than the template derived from it; "keep everything so we can re-derive" is
     not automatically the privacy-maximising choice.
+
+# Hive Direction v2.2: The Relay Amendment
+
+Status: adopted 2026-08-10. Amends — does not supersede — v2.1 (D29-D36) and
+v2 (D16-D28). Decisions here start at D41. D37-D40 (perception) are untouched.
+D17, D18, D19, and D20 remain explicitly untouched, and no frozen format
+changes anywhere in this amendment: the segment format, the envelope, the
+blockstore derivations, and the wrap format are all unchanged.
+
+Written against `docs/SELF-HOST.md` and `docs/ARTIFACTS.md`. Three of v2.1's
+"deliberate rejections" are reopened here, which that document requires be a
+new decision record rather than a quiet drift: iroh, third-party relays, and
+the single-user posture. Each is reopened for a stated reason.
+
+D41. **The relay is a transport, it is blind, and it is how a self-hoster is
+reachable.** A person who wants their own data from a coffee shop must not have
+to own a domain, forward a port, or run a reverse proxy. Both the node and the
+client dial OUTBOUND to a relay; the relay pairs them by instance id and
+forwards. It holds no key and terminates nothing it can read.
+
+This reopens v2.1's rejection of iroh, specifically because the reason given
+there has expired. D29 rejected it thus: "not iroh, not QUIC: **the stable URL
+removes NAT traversal (iroh's core value)**". That assumed the node has a
+stable reachable URL — which IS the port forwarding and the domain this
+decision exists to eliminate. Remove the stable URL and NAT traversal is the
+core problem again, so iroh's core value returns with it. The framing layer was
+deliberately built generic over byte streams "so QUIC or iroh can slot
+underneath later"; this is later.
+
+The operational argument is decisive. A hand-rolled forwarding relay carries
+every byte of every session, forever, on the relay operator's bill.
+Hole-punching with a direct-path upgrade carries the handshake and then gets
+out of the way. For a relay offered free to other households, that is the
+difference between a cost that scales with total traffic and one that scales
+with connection count.
+
+**A forwarding relay is NOT the "third-party blind relay" v2.1 deferred.** That
+deferral reads: "the node pins keys first-hand at enrollment — third-party
+blind relays are the phase that needs exported statements." The distinction is
+vouching. A relay that only forwards vouches for nothing and needs no
+verification surface, because client and node already pinned each other at
+enrollment and D35's rule holds unchanged: addressing is never authentication.
+A relay that STORES does need it, and that is D42.
+
+D42. **Two tiers, chosen by who operates the machine. Storing for others is
+optional and always blind.** v2.1 shipped the blind tier and only that. This
+splits by role instead:
+
+* **A node its own user operates is TRUSTED.** It holds keys, folds, and reads.
+  Authorization is membership and a `WHERE` clause. Blindness there protects
+  the operator from themselves, and costs cryptographic authorization, key
+  distribution, and a revocation model that cannot actually revoke — it can
+  only stop granting access to future records. This amends D16 (single user, no
+  accounts) and the blind-only half of D29, and shrinks D33 to grouping,
+  quotas, and membership.
+* **A node operated for OTHER people is BLIND, without exception.** The
+  `SegmentVault` v2.1 built is exactly this and is not replaced: verbatim
+  ciphertext in store shape, no key, no fold. Whoever runs it must not be able
+  to read what it holds.
+
+Storage for others is opt-in on both sides — the operator decides whether to
+offer it and at what quota, the user decides whether to use it. Even blind
+storage is a copy of a life somewhere else, and some people will decline.
+
+The blind cache is what makes streaming survive an offline main device (D43),
+and it is a SEPARATE service from the relay of D41. Conflating them would be a
+mistake: one is a connection broker that holds nothing, the other is a store
+that holds everything and reads none of it.
+
+Two properties already bound what a blind cache can do. The op-log blake3 chain
+means it **cannot forge or alter** — a client verifies what it is served
+regardless of who served it, missing records appear as seq gaps, and staleness
+is detectable because a client knows its own head. Its entire power is
+withholding, which is denial of service. And because the content key is a PRF
+of the plaintext hash under a MASTER-derived subkey (D19/D20), two households
+holding the same photo produce different ciphertext: cross-user dedup is
+impossible by construction, so hosting cannot leak who holds what.
+
+The costs that are not technical must be decided before the relay is public:
+storage that grows forever on the operator's bill, and content that cannot be
+moderated because it cannot be read. "We cannot look" is a position to take
+deliberately.
+
+D43. **Artifact bytes stream; the log carries references, not payloads.** A
+client holds the whole op-log and index — every artifact's existence, mime,
+size, manifest hash, and wrapped content key — while holding none of the bytes.
+This is not new machinery: log records already carry a `BlobRef` rather than a
+payload, and content addressing is over CIPHERTEXT precisely so "sync can
+verify and dedup transfers without ever seeing plaintext."
+
+Three sync tiers:
+
+| tier | contents | why |
+|---|---|---|
+| eager | op-log, index, embeddings, derived text | text, small, and it is what search needs |
+| eager | thumbnails and small renditions | bounded; without them a photo grid is empty on a plane |
+| on demand | original artifact bytes | the bulk. Streamed, LRU-cached against a user-set ceiling |
+
+A **thumbnail is a first-class derived artifact**, not a special case: same
+pipeline as the captions, OCR, and transcripts of `docs/ARTIFACTS.md`, so it
+inherits re-derivation on model change and is crypto-shredded with its parent.
+
+The fetch chain is main device, then blind cache if the user enabled one, then
+unavailable-and-say-so. An offline-cache-everything client would put every
+photo on every device, which for a product holding a household's whole
+photographic history is not a cache, it is a copy.
+
+D44. **An instance has a permanent id and an optional mutable alias; the pinned
+key is what identifies it.** Addressing is `relay.example/<id>` by path, not a
+subdomain. One name, one certificate, and — the reason that is easy to miss —
+per-instance certificates publish their names in Certificate Transparency, so
+`<id>.relay.example` would make every instance id public the moment it was
+issued. The relay reads only the outer path and forwards the inner stream
+blind.
+
+The canonical id is house format (`nanoid`, not a GUID — the tree already reads
+`prefix_<nanoid>` everywhere) and is never recycled. An alias is a mutable
+pointer, optional and releasable, and **recycling one is safe** because D35's
+rule applies unchanged: a client pins the instance key at enrollment, so a
+client aimed at a re-assigned alias fails the pin and refuses rather than
+talking to a stranger. Without key pinning an alias would be a hijack primitive
+and would have to be permanent.
+
+Reclaim is possession of the instance key, or a recovery code in the same
+`BASE32_NOPAD` alphabet as the enrollment and recovery codes — the tree's rule
+of ONE way to write a secret a human retypes. Stated plainly because it is easy
+to design around and hard to undo: **any reclaim path is an attack path**, so
+the recovery code is the security boundary for id ownership and deserves
+master-key handling. Abandoned aliases expire and return to the pool; abandoned
+canonical ids never do.
+
+A reserved-name list and a policy on brand impersonation are due before the
+relay is public. A free public namespace attracts exactly that, and it is far
+cheaper to decide with no users than with some.
