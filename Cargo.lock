@@ -1163,6 +1163,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "hive-relay"
+version = "0.7.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "nanoid",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "hive-shared"
 version = "0.7.0"
 dependencies = [
