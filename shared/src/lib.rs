@@ -147,6 +147,32 @@ pub struct JournalWriter {
     pub owner: Option<String>,
 }
 
+// ---- artifacts (stored files: photos, scans, PDFs, audio, attachments) ----
+
+/// One stored file. `sha256` is the content address its bytes live at and
+/// `bytes` is their length; the row is the artifact, the bytes are its content
+/// (hive-core's `artifact_storage` holds those).
+///
+/// This `id` is the seam derived artifacts hang off: OCR text, captions,
+/// transcriptions, and thumbnails are separate rows that reference a parent
+/// artifact id (docs/ARTIFACTS.md Part 3). Nothing derived is produced here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Artifact {
+    pub id: String,
+    /// Owning org. Every read and write is RLS-scoped on it.
+    pub org_id: String,
+    /// Lowercase hex sha256 of the bytes.
+    pub sha256: String,
+    pub mime: String,
+    pub bytes: i64,
+    /// Original upload name, for display and download only — never a path.
+    pub filename: Option<String>,
+    /// The acting identity that uploaded it.
+    pub created_by: Option<String>,
+    pub created_at: String,
+}
+
 // ---- identity artifacts (Claude Code skills / agents / commands) ----
 
 /// A Claude Code artifact (skill, agent, or slash-command) stored per AI

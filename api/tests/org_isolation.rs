@@ -394,7 +394,11 @@ async fn every_content_table_is_scoped_and_forced() {
     .fetch_one(&admin)
     .await
     .expect("scoped count");
-    assert_eq!(scoped, 30, "content tables under a forced org policy");
+    // 30 at the orgs workstream, +1 for `artifacts` (the file-artifacts
+    // workstream, integrated separately). Bump this deliberately when a content
+    // table is ADDED; a drop means one silently lost `org_id`, which is the
+    // whole reason this counts rather than trusting the gap sweep above.
+    assert_eq!(scoped, 31, "content tables under a forced org policy");
 }
 
 // ---- helpers that talk to the store directly ----

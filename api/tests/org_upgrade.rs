@@ -178,5 +178,8 @@ async fn the_tenancy_migration_is_idempotent() {
     .fetch_one(&admin)
     .await
     .expect("policies");
-    assert_eq!(policies, 30, "one policy per content table, not three");
+    // 30 at the orgs workstream, +1 for `artifacts`. The number is not the
+    // point ... running the migration three times must not triple it, which is
+    // what a CREATE POLICY without a DROP-if-exists would do.
+    assert_eq!(policies, 31, "one policy per content table, not three");
 }

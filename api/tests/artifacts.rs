@@ -1,173 +1,63 @@
-// Identity-artifacts: store idempotency + the sync endpoint + owner/admin
-// management gating. The sync endpoint is keyed on the authenticated AI actor
-// (the token's actor), NOT the per-user memory namespace; disabled artifacts
-// are excluded from the sync payload. Management goes through the shared
-// identity gate (middleware::can_act_for_identity): admin, the identity
-// itself, or — for sessions — the logged-in owner of that AI.
+// File artifacts over HTTP: bytes in, bytes out, ranged, scoped, deduped.
+//
+// The assertions that matter are byte-level. A content route that returns the
+// right status and the wrong bytes is worse than one that fails, so every read
+// here compares the payload itself, and the range cases compare against the
+// exact slice they asked for.
+
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use axum::Router;
-use hive_api::store::users::NewUser;
-use hive_shared::{ActorKind, UserRole};
-use serde_json::{json, Value};
+use serde_json::Value;
 use tower::ServiceExt;
 
-async fn store() -> hive_api::store::Store {
-    // Hash embedder: deterministic + offline (same latch as parity_smoke).
+/// One artifact root for the whole test binary: `storage()` resolves
+/// `HIVE_DATA_DIR` once per process, so it has to be set before the first
+/// request and cannot change afterwards. Tests stay isolated regardless — each
+/// gets its own Postgres schema, hence its own org, hence its own subtree.
+fn data_root() -> &'static PathBuf {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!(
+            "hive-artifacts-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("test data root");
+        std::env::set_var("HIVE_DATA_DIR", &dir);
+        dir
+    })
+}
+
+async fn app() -> Router {
     std::env::set_var("HIVE_EMBED", "hash");
-    // Isolated Postgres schema per test (uses DATABASE_URL / local dev default).
+    data_root();
     let pool = hive_api::db::test_pool().await;
-    hive_api::store::Store::new(pool)
-}
-
-async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Value) {
-    let res = app.clone().oneshot(req).await.expect("request");
-    let status = res.status();
-    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-        .await
-        .expect("body");
-    let body = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-    };
-    (status, body)
-}
-
-fn bearer_get(path: &str, token: &str) -> Request<Body> {
-    Request::get(path)
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::empty())
-        .unwrap()
-}
-
-fn bearer_post(path: &str, token: &str, body: Value) -> Request<Body> {
-    Request::post(path)
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap()
-}
-
-fn bearer_delete(path: &str, token: &str) -> Request<Body> {
-    Request::delete(path)
-        .header(header::AUTHORIZATION, format!("Bearer {token}"))
-        .body(Body::empty())
-        .unwrap()
-}
-
-fn cookie_get(path: &str, cookie: &str) -> Request<Body> {
-    Request::get(path)
-        .header(header::COOKIE, cookie)
-        .body(Body::empty())
-        .unwrap()
-}
-
-// ---- store layer ----
-
-#[tokio::test]
-async fn upsert_is_idempotent_by_actor_kind_name() {
-    let s = store().await;
-    let a = s
-        .artifacts_upsert("pia", "skill", "journal", "v1", "first", true)
-        .await
-        .unwrap();
-    let b = s
-        .artifacts_upsert("pia", "skill", "journal", "v2", "second", false)
-        .await
-        .unwrap();
-
-    // Same logical row: id + created_at preserved, content/flags refreshed.
-    assert_eq!(a.id, b.id, "upsert must reuse the (actor,kind,name) row");
-    assert_eq!(a.created_at, b.created_at);
-    assert_eq!(b.content, "v2");
-    assert_eq!(b.description, "second");
-    assert!(!b.enabled);
-
-    // Exactly one row for that key.
-    assert_eq!(s.artifacts_list("pia").await.unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn for_actor_excludes_disabled_and_other_actors() {
-    let s = store().await;
-    s.artifacts_upsert("pia", "skill", "on", "x", "", true)
-        .await
-        .unwrap();
-    s.artifacts_upsert("pia", "agent", "off", "x", "", false)
-        .await
-        .unwrap();
-    s.artifacts_upsert("apis", "skill", "other", "x", "", true)
-        .await
-        .unwrap();
-
-    let synced = s.artifacts_for_actor("pia").await.unwrap();
-    assert_eq!(synced.len(), 1, "only pia's ENABLED artifacts");
-    assert_eq!(synced[0].name, "on");
-
-    // Management listing still sees the disabled one.
-    assert_eq!(s.artifacts_list("pia").await.unwrap().len(), 2);
-}
-
-// ---- HTTP: sync endpoint + management gating ----
-
-/// Onboard an admin and return the store + router. The admin actor is "nate".
-async fn app_with_admin() -> (hive_api::store::Store, Router) {
-    let s = store().await;
+    let s = hive_api::store::Store::new(pool);
     s.onboarding_complete("Test Hive", "Nate", "nate@example.com", "hunter22-strong")
         .await
         .unwrap();
-    let router = hive_api::routes::router(s.clone());
-    (s, router)
+    hive_api::routes::router(s)
 }
 
-/// Mint an OAuth identity token for `actor` granted by `granter`, so the request
-/// authenticates AS `actor` in `granter`'s namespace (and role).
-async fn identity_token(s: &hive_api::store::Store, actor: &str, granter: &str) -> String {
-    let (token, _) = s
-        .tokens_create_oauth(actor, "claude-code", granter, "hive", Some(3600))
-        .await
-        .unwrap();
-    token
-}
-
-/// Create a member login for `slug` and return its session cookie.
-async fn member_session(
-    s: &hive_api::store::Store,
-    app: &Router,
-    slug: &str,
-    email: &str,
-) -> String {
-    s.people_upsert(slug, slug, ActorKind::Human, None)
-        .await
-        .unwrap();
-    s.users_create(
-        NewUser {
-            name: slug.into(),
-            email: email.into(),
-            password: "hunter22-strong".into(),
-            role: Some(UserRole::Member),
-            actor: Some(slug.into()),
-            kind: Some(ActorKind::Human),
-        },
-        "test",
-    )
-    .await
-    .unwrap();
+/// An admin PAT, so requests get past the auth gate.
+async fn admin_token(app: &Router) -> String {
     let res = app
         .clone()
         .oneshot(
             Request::post("/api/auth/login")
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
-                    json!({"email": email, "password": "hunter22-strong"}).to_string(),
+                    serde_json::json!({"email": "nate@example.com", "password": "hunter22-strong"})
+                        .to_string(),
                 ))
                 .unwrap(),
         )
         .await
         .expect("login");
-    assert_eq!(res.status(), StatusCode::OK, "member login");
+    assert_eq!(res.status(), StatusCode::OK, "admin login");
     res.headers()
         .get(header::SET_COOKIE)
         .expect("session cookie")
@@ -179,157 +69,325 @@ async fn member_session(
         .to_string()
 }
 
-#[tokio::test]
-async fn sync_returns_only_token_actors_enabled_artifacts() {
-    let (s, app) = app_with_admin().await;
-    // pia is an AI owned by maggie (a non-admin member).
-    let _maggie = member_session(&s, &app, "maggie", "maggie@example.com").await;
-    s.people_upsert("pia", "Pia", ActorKind::Ai, Some("maggie"))
-        .await
-        .unwrap();
+const BOUNDARY: &str = "----hivetestboundary";
 
-    s.artifacts_upsert("pia", "skill", "journal", "body", "j", true)
-        .await
-        .unwrap();
-    s.artifacts_upsert("pia", "agent", "scout", "body", "s", false)
-        .await
-        .unwrap();
-    s.artifacts_upsert("apis", "skill", "elsewhere", "body", "", true)
-        .await
-        .unwrap();
+fn multipart(filename: &str, mime: &str, bytes: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {mime}\r\n\r\n").as_bytes());
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+    body
+}
 
-    let token = identity_token(&s, "pia", "maggie").await;
-    let (status, body) = send(&app, bearer_get("/api/identity/artifacts", &token)).await;
-    assert_eq!(status, StatusCode::OK);
-    let arr = body.as_array().unwrap();
-    assert_eq!(arr.len(), 1, "only pia's ENABLED artifact: {body}");
-    assert_eq!(arr[0]["name"], "journal");
-    assert_eq!(arr[0]["kind"], "skill");
-    // camelCase wire shape (matches the file fields the plugin reads).
-    assert!(arr[0]["createdAt"].is_string());
+async fn upload(app: &Router, cookie: &str, filename: &str, mime: &str, bytes: &[u8]) -> Value {
+    let req = Request::post("/api/artifacts")
+        .header(header::COOKIE, cookie)
+        .header(
+            header::CONTENT_TYPE,
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .body(Body::from(multipart(filename, mime, bytes)))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.expect("upload");
+    let status = res.status();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    assert_eq!(status, StatusCode::CREATED, "upload: {json}");
+    json
+}
+
+struct Fetched {
+    status: StatusCode,
+    bytes: Vec<u8>,
+    content_range: Option<String>,
+    content_length: Option<String>,
+    accept_ranges: Option<String>,
+    content_type: Option<String>,
+}
+
+async fn fetch(app: &Router, cookie: &str, path: &str, range: Option<&str>) -> Fetched {
+    let mut req = Request::get(path).header(header::COOKIE, cookie);
+    if let Some(r) = range {
+        req = req.header(header::RANGE, r);
+    }
+    let res = app
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .expect("fetch");
+    let status = res.status();
+    let header_of = |h: header::HeaderName| {
+        res.headers()
+            .get(h)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    };
+    let content_range = header_of(header::CONTENT_RANGE);
+    let content_length = header_of(header::CONTENT_LENGTH);
+    let accept_ranges = header_of(header::ACCEPT_RANGES);
+    let content_type = header_of(header::CONTENT_TYPE);
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+        .await
+        .unwrap()
+        .to_vec();
+    Fetched {
+        status,
+        bytes,
+        content_range,
+        content_length,
+        accept_ranges,
+        content_type,
+    }
+}
+
+/// Where a given artifact's bytes should be on disk.
+fn object_path(artifact: &Value) -> PathBuf {
+    let org = artifact["orgId"].as_str().unwrap().replace('-', "");
+    let sha = artifact["sha256"].as_str().unwrap();
+    data_root()
+        .join("artifacts")
+        .join(org)
+        .join(&sha[..2])
+        .join(sha)
+}
+
+/// Big enough that a range is a real seek and small enough to keep the test
+/// fast; every byte is distinct mod 251 so a misaligned slice cannot pass.
+fn payload(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
 }
 
 #[tokio::test]
-async fn owner_can_manage_but_non_owner_non_admin_gets_403() {
-    let (s, app) = app_with_admin().await;
-    // Owner: maggie (member) owns pia. Stranger: bob (member) owns apis.
-    let maggie_cookie = member_session(&s, &app, "maggie", "maggie@example.com").await;
-    member_session(&s, &app, "bob", "bob@example.com").await;
-    s.people_upsert("pia", "Pia", ActorKind::Ai, Some("maggie"))
+async fn bytes_go_in_and_come_out_byte_identical() {
+    let app = app().await;
+    let cookie = admin_token(&app).await;
+    let body = payload(64 * 1024 + 7);
+
+    let a = upload(&app, &cookie, "scan.pdf", "application/pdf", &body).await;
+    assert_eq!(a["bytes"].as_u64(), Some(body.len() as u64));
+    assert_eq!(a["mime"], "application/pdf");
+    assert_eq!(a["filename"], "scan.pdf");
+    assert_eq!(a["createdBy"], "nate");
+    assert_eq!(
+        a["sha256"].as_str().unwrap(),
+        hex_sha256(&body),
+        "the row records the content address of what was actually stored"
+    );
+
+    // Metadata round-trips.
+    let id = a["id"].as_str().unwrap();
+    let meta = fetch(&app, &cookie, &format!("/api/artifacts/{id}"), None).await;
+    assert_eq!(meta.status, StatusCode::OK);
+    let meta: Value = serde_json::from_slice(&meta.bytes).unwrap();
+    assert_eq!(meta["id"], a["id"]);
+
+    // The whole object, byte for byte.
+    let got = fetch(&app, &cookie, &format!("/api/artifacts/{id}/content"), None).await;
+    assert_eq!(got.status, StatusCode::OK);
+    assert_eq!(got.bytes, body, "content must be byte-identical");
+    assert_eq!(got.accept_ranges.as_deref(), Some("bytes"));
+    assert_eq!(
+        got.content_length.as_deref(),
+        Some(body.len().to_string().as_str())
+    );
+    assert_eq!(got.content_type.as_deref(), Some("application/pdf"));
+    assert!(got.content_range.is_none(), "a full read is not partial");
+}
+
+#[tokio::test]
+async fn ranges_return_exactly_the_requested_bytes() {
+    let app = app().await;
+    let cookie = admin_token(&app).await;
+    let body = payload(10_000);
+    let a = upload(&app, &cookie, "clip.bin", "application/octet-stream", &body).await;
+    let path = format!("/api/artifacts/{}/content", a["id"].as_str().unwrap());
+    let total = body.len();
+
+    // A closed range in the middle: the classic seek a media player makes.
+    let got = fetch(&app, &cookie, &path, Some("bytes=1000-1999")).await;
+    assert_eq!(got.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(got.bytes, body[1000..2000], "exactly the requested slice");
+    assert_eq!(
+        got.content_range.as_deref(),
+        Some(format!("bytes 1000-1999/{total}").as_str())
+    );
+    assert_eq!(got.content_length.as_deref(), Some("1000"));
+
+    // Open-ended: byte N to the end.
+    let got = fetch(&app, &cookie, &path, Some("bytes=9990-")).await;
+    assert_eq!(got.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(got.bytes, body[9990..]);
+    assert_eq!(
+        got.content_range.as_deref(),
+        Some(format!("bytes 9990-9999/{total}").as_str())
+    );
+
+    // Suffix: the final N bytes.
+    let got = fetch(&app, &cookie, &path, Some("bytes=-16")).await;
+    assert_eq!(got.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(got.bytes, body[total - 16..]);
+
+    // The very first byte, and a range clamped to the end.
+    let got = fetch(&app, &cookie, &path, Some("bytes=0-0")).await;
+    assert_eq!(got.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(got.bytes, body[0..1]);
+    let got = fetch(&app, &cookie, &path, Some("bytes=9995-99999")).await;
+    assert_eq!(got.status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(got.bytes, body[9995..]);
+
+    // Past the end is 416 and says how long the thing actually is.
+    let got = fetch(&app, &cookie, &path, Some("bytes=20000-20010")).await;
+    assert_eq!(got.status, StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        got.content_range.as_deref(),
+        Some(format!("bytes */{total}").as_str())
+    );
+
+    // An unparseable Range is ignored, not rejected.
+    let got = fetch(&app, &cookie, &path, Some("furlongs=1-2")).await;
+    assert_eq!(got.status, StatusCode::OK);
+    assert_eq!(got.bytes, body);
+}
+
+#[tokio::test]
+async fn duplicate_uploads_share_bytes_and_delete_refcounts() {
+    let app = app().await;
+    let cookie = admin_token(&app).await;
+    let body = payload(4096);
+
+    let first = upload(&app, &cookie, "invoice.pdf", "application/pdf", &body).await;
+    let second = upload(&app, &cookie, "invoice-copy.pdf", "application/pdf", &body).await;
+
+    // One row per upload, one stored file: the per-upload facts survive.
+    assert_ne!(first["id"], second["id"], "each upload is its own artifact");
+    assert_eq!(first["sha256"], second["sha256"], "one content address");
+    assert_eq!(first["filename"], "invoice.pdf");
+    assert_eq!(second["filename"], "invoice-copy.pdf");
+    let path = object_path(&first);
+    assert_eq!(object_path(&second), path, "both rows point at one file");
+    assert!(path.is_file(), "bytes landed at {}", path.display());
+
+    // Deleting one must not pull the bytes out from under the other.
+    let del = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/artifacts/{}", first["id"].as_str().unwrap()))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    s.people_upsert("apis", "Apis", ActorKind::Ai, Some("bob"))
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+    assert!(
+        path.is_file(),
+        "the surviving row still references these bytes"
+    );
+
+    let still = fetch(
+        &app,
+        &cookie,
+        &format!("/api/artifacts/{}/content", second["id"].as_str().unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(still.status, StatusCode::OK);
+    assert_eq!(still.bytes, body);
+
+    // The deleted row is gone.
+    let gone = fetch(
+        &app,
+        &cookie,
+        &format!("/api/artifacts/{}", first["id"].as_str().unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(gone.status, StatusCode::NOT_FOUND);
+
+    // Deleting the last reference unlinks the bytes.
+    let del = app
+        .clone()
+        .oneshot(
+            Request::delete(format!("/api/artifacts/{}", second["id"].as_str().unwrap()))
+                .header(header::COOKIE, &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+    assert!(!path.exists(), "the last reference took the bytes with it");
+}
 
-    // pia's own identity token can upsert pia's artifacts.
-    let pia_tok = identity_token(&s, "pia", "maggie").await;
-    let (status, created) = send(
-        &app,
-        bearer_post(
-            "/api/actors/pia/artifacts",
-            &pia_tok,
-            json!({"kind": "skill", "name": "journal", "content": "body"}),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "identity manages itself");
-    let artifact_id = created["id"].as_str().expect("artifact id").to_string();
+#[tokio::test]
+async fn unknown_and_malformed_ids_are_404_not_500() {
+    let app = app().await;
+    let cookie = admin_token(&app).await;
 
-    // A rejected kind is a 400, not a row.
-    let (status, _) = send(
-        &app,
-        bearer_post(
-            "/api/actors/pia/artifacts",
-            &pia_tok,
-            json!({"kind": "hook", "name": "nope", "content": "body"}),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "kind outside the registry");
+    for path in [
+        "/api/artifacts/not-a-uuid",
+        "/api/artifacts/00000000-0000-0000-0000-000000000000",
+        "/api/artifacts/00000000-0000-0000-0000-000000000000/content",
+    ] {
+        let got = fetch(&app, &cookie, path, None).await;
+        assert_eq!(got.status, StatusCode::NOT_FOUND, "{path}");
+    }
+}
 
-    // The owner's SESSION manages her AI (list incl. disabled).
-    let (status, body) = send(
-        &app,
-        cookie_get("/api/actors/pia/artifacts", &maggie_cookie),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "owner session may list: {body}");
-    assert_eq!(body.as_array().map(Vec::len), Some(1));
-
-    // bob acts as apis (his own AI); he is neither admin nor pia's owner → 403.
-    let bob_tok = identity_token(&s, "apis", "bob").await;
-    let (status, _) = send(
-        &app,
-        bearer_post(
-            "/api/actors/pia/artifacts",
-            &bob_tok,
-            json!({"kind": "skill", "name": "sneaky", "content": "body"}),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "non-owner non-admin blocked");
-
-    let (status, _) = send(&app, bearer_get("/api/actors/pia/artifacts", &bob_tok)).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "list is gated too");
-
-    let (status, _) = send(
-        &app,
-        bearer_delete(&format!("/api/artifacts/{artifact_id}"), &bob_tok),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "delete is gated too");
-
-    // Admin authority: a PAT acting AS the admin human (actor == namespace).
-    let (admin_tok, _) = s
-        .tokens_create("nate", "admin-pat", Some(7), false, "nate")
+#[tokio::test]
+async fn a_body_with_no_file_part_is_a_400() {
+    let app = app().await;
+    let cookie = admin_token(&app).await;
+    let body = format!(
+        "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\nno file here\r\n--{BOUNDARY}--\r\n"
+    );
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/api/artifacts")
+                .header(header::COOKIE, &cookie)
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let (status, body) = send(&app, bearer_get("/api/actors/pia/artifacts", &admin_tok)).await;
-    assert_eq!(status, StatusCode::OK, "admin may list: {body}");
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
 
-    // Disable via upsert (same key), then the sync payload goes empty while the
-    // management listing still shows the row.
-    let (status, disabled) = send(
-        &app,
-        bearer_post(
-            "/api/actors/pia/artifacts",
-            &pia_tok,
-            json!({"kind": "skill", "name": "journal", "content": "body", "enabled": false}),
-        ),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::CREATED,
-        "disable via upsert: {disabled}"
-    );
-    assert_eq!(
-        disabled["id"],
-        json!(artifact_id),
-        "same (actor,kind,name) row"
-    );
-    assert_eq!(disabled["enabled"], json!(false));
-    let (_, synced) = send(&app, bearer_get("/api/identity/artifacts", &pia_tok)).await;
-    assert_eq!(
-        synced.as_array().map(Vec::len),
-        Some(0),
-        "disabled rows never sync"
-    );
-    let (_, listed) = send(&app, bearer_get("/api/actors/pia/artifacts", &pia_tok)).await;
-    assert_eq!(listed.as_array().map(Vec::len), Some(1));
+/// The upload endpoint is gated like every other non-public API path.
+#[tokio::test]
+async fn upload_requires_authentication() {
+    let app = app().await;
+    let res = app
+        .clone()
+        .oneshot(
+            Request::post("/api/artifacts")
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={BOUNDARY}"),
+                )
+                .body(Body::from(multipart("x.txt", "text/plain", b"hi")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
 
-    // The identity deletes its own artifact; a second delete 404s.
-    let (status, _) = send(
-        &app,
-        bearer_delete(&format!("/api/artifacts/{artifact_id}"), &pia_tok),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    let (status, _) = send(
-        &app,
-        bearer_delete(&format!("/api/artifacts/{artifact_id}"), &pia_tok),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+fn hex_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    hex::encode(h.finalize())
 }

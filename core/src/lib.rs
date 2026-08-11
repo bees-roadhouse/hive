@@ -3,6 +3,7 @@
 // shell — depend on the data layer without the HTTP surface.
 
 pub mod acting;
+pub mod artifact_storage;
 pub mod auth;
 pub mod db;
 pub mod pgq;
