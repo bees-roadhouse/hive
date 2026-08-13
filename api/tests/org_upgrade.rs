@@ -92,7 +92,8 @@ async fn seed_v0_6(admin: &PgPool) {
 async fn a_pre_org_database_backfills_into_the_default_org() {
     // Start from a migrated schema, rewind it, seed it, then migrate again —
     // which is exactly what booting this code over a v0.6 database does.
-    let pool = db::test_pool_strict().await;
+    let test_db = db::test_pool_strict().await;
+    let pool = test_db.pool.clone();
     let admin = db::test_admin_pool(&pool).await;
     rewind_to_v0_6(&admin).await;
     seed_v0_6(&admin).await;
@@ -161,7 +162,8 @@ async fn a_pre_org_database_backfills_into_the_default_org() {
 /// Migrating twice must be a no-op, because that is what every restart is.
 #[tokio::test]
 async fn the_tenancy_migration_is_idempotent() {
-    let pool = db::test_pool_strict().await;
+    let test_db = db::test_pool_strict().await;
+    let pool = test_db.pool.clone();
     let admin = db::test_admin_pool(&pool).await;
     for _ in 0..3 {
         db::migrate(&admin).await.expect("re-migrate");

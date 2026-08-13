@@ -1400,9 +1400,9 @@ mod tests {
     use super::*;
     use crate::db;
 
-    async fn seeded_store() -> Store {
-        let pool = db::test_pool().await;
-        let store = Store::new(pool);
+    async fn seeded_store() -> (Store, db::TestDb) {
+        let test_db = db::test_pool().await;
+        let store = Store::new(test_db.pool.clone());
         let now = "2026-07-05T00:00:00Z";
 
         crate::pgq::query(
@@ -1487,12 +1487,12 @@ mod tests {
         .await
         .unwrap();
 
-        store
+        (store, test_db)
     }
 
     #[tokio::test]
     async fn mail_queries_are_viewer_gated() {
-        let store = seeded_store().await;
+        let (store, _test_db) = seeded_store().await;
 
         let alice_accounts = store.mail_accounts_list(Some("alice")).await.unwrap();
         assert_eq!(alice_accounts.len(), 1);
@@ -1536,8 +1536,8 @@ mod tests {
         // Same constant every test uses; set_var is process-global but
         // idempotent here.
         std::env::set_var("HIVE_CRED_KEY", "mail-store-test-key");
-        let pool = db::test_pool().await;
-        let store = Store::new(pool);
+        let test_db = db::test_pool().await;
+        let store = Store::new(test_db.pool.clone());
 
         let view = store
             .mail_account_create(
@@ -1674,7 +1674,7 @@ mod tests {
 
     #[tokio::test]
     async fn mailbox_ingest_toggle_gates_retrieval() {
-        let store = seeded_store().await;
+        let (store, _test_db) = seeded_store().await;
         // Give alice's message mailbox membership + a search row, as the
         // sink would have.
         crate::pgq::query(
@@ -1778,7 +1778,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_batch_is_idempotent_and_metadata_only_on_replay() {
-        let store = seeded_store().await;
+        let (store, _test_db) = seeded_store().await;
         crate::pgq::query("UPDATE mail_mailboxes SET ingest = TRUE WHERE id = 'mbox-alice-inbox'")
             .execute(store.db())
             .await
@@ -1850,7 +1850,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_gates_junk_and_non_ingest_mailboxes() {
-        let store = seeded_store().await;
+        let (store, _test_db) = seeded_store().await;
         crate::pgq::query("UPDATE mail_mailboxes SET ingest = TRUE WHERE id = 'mbox-alice-inbox'")
             .execute(store.db())
             .await
@@ -1890,7 +1890,7 @@ mod tests {
 
     #[tokio::test]
     async fn tombstone_removes_retrieval_in_the_same_batch_and_stays_dead() {
-        let store = seeded_store().await;
+        let (store, _test_db) = seeded_store().await;
         crate::pgq::query("UPDATE mail_mailboxes SET ingest = TRUE WHERE id = 'mbox-alice-inbox'")
             .execute(store.db())
             .await
@@ -1949,7 +1949,7 @@ mod tests {
 
     #[tokio::test]
     async fn mail_token_links_gate_by_scope_and_resolve_subjects() {
-        let store = seeded_store().await;
+        let (store, _test_db) = seeded_store().await;
         // seeded: msg-alice-1 (user_scope 'alice', subject "Quarterly bees").
 
         // Alice-scoped entry citing alice's mail → a 'cites' link + a subject chip.
@@ -2017,8 +2017,8 @@ mod tests {
     #[tokio::test]
     async fn backoff_disables_after_eight_failures() {
         std::env::set_var("HIVE_CRED_KEY", "mail-store-test-key");
-        let pool = db::test_pool().await;
-        let store = Store::new(pool);
+        let test_db = db::test_pool().await;
+        let store = Store::new(test_db.pool.clone());
         let view = store
             .mail_account_create(
                 "alice",
@@ -2053,7 +2053,7 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_writes_attachment_metadata_idempotently() {
-        let store = seeded_store().await;
+        let (store, _test_db) = seeded_store().await;
         crate::pgq::query("UPDATE mail_mailboxes SET ingest = TRUE WHERE id = 'mbox-alice-inbox'")
             .execute(store.db())
             .await
@@ -2094,7 +2094,7 @@ mod tests {
 
     #[tokio::test]
     async fn attachments_pending_excludes_skipped_stored_and_deleted() {
-        let store = seeded_store().await;
+        let (store, _test_db) = seeded_store().await;
         crate::pgq::query("UPDATE mail_mailboxes SET ingest = TRUE WHERE id = 'mbox-alice-inbox'")
             .execute(store.db())
             .await
@@ -2154,7 +2154,7 @@ mod tests {
 
     #[tokio::test]
     async fn attachment_store_blob_dedups_by_hash() {
-        let store = seeded_store().await;
+        let (store, _test_db) = seeded_store().await;
         let now = "2026-07-09T00:00:00.000Z";
         for (att, blob) in [("att-d1", "b1"), ("att-d2", "b2")] {
             crate::pgq::query(
@@ -2210,7 +2210,7 @@ mod tests {
     /// must not resurrect body, subject, search, or attachment rows.
     #[tokio::test]
     async fn redact_scrubs_everything_and_replay_cannot_resurrect() {
-        let store = seeded_store().await;
+        let (store, _test_db) = seeded_store().await;
         crate::pgq::query("UPDATE mail_mailboxes SET ingest = TRUE WHERE id = 'mbox-alice-inbox'")
             .execute(store.db())
             .await
@@ -2350,7 +2350,7 @@ mod tests {
 
     #[tokio::test]
     async fn blob_gc_deletes_only_unreferenced_aged_blobs() {
-        let store = seeded_store().await;
+        let (store, _test_db) = seeded_store().await;
         let old = "2020-01-01T00:00:00.000Z";
         let fresh = (chrono::Utc::now())
             .format("%Y-%m-%dT%H:%M:%S%.3fZ")

@@ -13,12 +13,12 @@ use hive_shared::{ActorKind, UserRole};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-async fn store() -> hive_api::store::Store {
+async fn store() -> (hive_api::store::Store, hive_api::db::TestDb) {
     // Hash embedder: deterministic + offline (same latch as parity_smoke).
     std::env::set_var("HIVE_EMBED", "hash");
     // Isolated Postgres schema per test (uses DATABASE_URL / local dev default).
-    let pool = hive_api::db::test_pool().await;
-    hive_api::store::Store::new(pool)
+    let test_db = hive_api::db::test_pool().await;
+    (hive_api::store::Store::new(test_db.pool.clone()), test_db)
 }
 
 async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Value) {
@@ -68,7 +68,7 @@ fn cookie_get(path: &str, cookie: &str) -> Request<Body> {
 
 #[tokio::test]
 async fn upsert_is_idempotent_by_actor_kind_name() {
-    let s = store().await;
+    let (s, _test_db) = store().await;
     let a = s
         .identity_artifacts_upsert("pia", "skill", "journal", "v1", "first", true)
         .await
@@ -91,7 +91,7 @@ async fn upsert_is_idempotent_by_actor_kind_name() {
 
 #[tokio::test]
 async fn for_actor_excludes_disabled_and_other_actors() {
-    let s = store().await;
+    let (s, _test_db) = store().await;
     s.identity_artifacts_upsert("pia", "skill", "on", "x", "", true)
         .await
         .unwrap();
@@ -113,13 +113,15 @@ async fn for_actor_excludes_disabled_and_other_actors() {
 // ---- HTTP: sync endpoint + management gating ----
 
 /// Onboard an admin and return the store + router. The admin actor is "nate".
-async fn app_with_admin() -> (hive_api::store::Store, Router) {
-    let s = store().await;
+/// The `TestDb` comes back with them: dropping it here would drop the schema
+/// out from under the router this returns.
+async fn app_with_admin() -> (hive_api::store::Store, Router, hive_api::db::TestDb) {
+    let (s, test_db) = store().await;
     s.onboarding_complete("Test Hive", "Nate", "nate@example.com", "hunter22-strong")
         .await
         .unwrap();
     let router = hive_api::routes::router(s.clone());
-    (s, router)
+    (s, router, test_db)
 }
 
 /// Mint an OAuth identity token for `actor` granted by `granter`, so the request
@@ -181,7 +183,7 @@ async fn member_session(
 
 #[tokio::test]
 async fn sync_returns_only_token_actors_enabled_artifacts() {
-    let (s, app) = app_with_admin().await;
+    let (s, app, _test_db) = app_with_admin().await;
     // pia is an AI owned by maggie (a non-admin member).
     let _maggie = member_session(&s, &app, "maggie", "maggie@example.com").await;
     s.people_upsert("pia", "Pia", ActorKind::Ai, Some("maggie"))
@@ -211,7 +213,7 @@ async fn sync_returns_only_token_actors_enabled_artifacts() {
 
 #[tokio::test]
 async fn owner_can_manage_but_non_owner_non_admin_gets_403() {
-    let (s, app) = app_with_admin().await;
+    let (s, app, _test_db) = app_with_admin().await;
     // Owner: maggie (member) owns pia. Stranger: bob (member) owns apis.
     let maggie_cookie = member_session(&s, &app, "maggie", "maggie@example.com").await;
     member_session(&s, &app, "bob", "bob@example.com").await;

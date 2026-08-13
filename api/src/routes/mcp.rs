@@ -325,15 +325,15 @@ fn v4_issue(expected: &str, path: &[&str], received: Option<&Value>) -> String {
 mod tests {
     use super::*;
 
-    async fn test_store() -> (Store, ()) {
+    async fn test_store() -> (Store, crate::db::TestDb) {
         std::env::set_var("HIVE_EMBED", "hash");
-        let pool = crate::db::test_pool().await;
-        let store = Store::new(pool);
+        let test_db = crate::db::test_pool().await;
+        let store = Store::new(test_db.pool.clone());
         store
             .onboarding_complete("test", "nate", "nate@example.com", "Password123!")
             .await
             .expect("onboarding");
-        (store, ())
+        (store, test_db)
     }
 
     fn req(method: &str, params: Value, id: i64) -> Value {
@@ -407,7 +407,7 @@ mod tests {
 
     #[tokio::test]
     async fn initialize_negotiates_protocol_version() {
-        let (store, _dir) = test_store().await;
+        let (store, _test_db) = test_store().await;
         let res = handle_request(
             &store,
             &authed(),
@@ -464,7 +464,7 @@ mod tests {
 
     #[tokio::test]
     async fn tools_list_matches_node_surface() {
-        let (store, _dir) = test_store().await;
+        let (store, _test_db) = test_store().await;
         let res = handle_request(&store, &authed(), &req("tools/list", json!({}), 1)).await;
         let tools = res["result"]["tools"].as_array().expect("tools array");
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -553,7 +553,7 @@ mod tests {
 
     #[tokio::test]
     async fn tools_call_results_and_errors() {
-        let (store, _dir) = test_store().await;
+        let (store, _test_db) = test_store().await;
 
         // Authorship pins to the token actor even if the client tries to spoof.
         let res = handle_request(
@@ -650,7 +650,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbox_tools_are_viewer_gated() {
-        let (store, _dir) = test_store().await;
+        let (store, _test_db) = test_store().await;
         let item = store
             .inbox_add(
                 "nate",
@@ -757,7 +757,7 @@ mod tests {
 
     #[tokio::test]
     async fn http_layer_parity() {
-        let (store, _dir) = test_store().await;
+        let (store, _test_db) = test_store().await;
 
         // Unauthenticated → 401 + RFC 9728 pointer (Node's raw-server shape).
         let res = post(&store, AuthCtx::default(), req("tools/list", json!({}), 1)).await;

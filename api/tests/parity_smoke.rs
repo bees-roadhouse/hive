@@ -39,14 +39,14 @@ fn reset_auth_env() {
     }
 }
 
-async fn test_app() -> (Router, hive_api::store::Store) {
+async fn test_app() -> (Router, hive_api::store::Store, hive_api::db::TestDb) {
     // Hash embedder: deterministic + offline (set before any embed call; the
     // provider choice is latched once per process).
     std::env::set_var("HIVE_EMBED", "hash");
     // Isolated Postgres schema per test (uses DATABASE_URL / local dev default).
-    let pool = hive_api::db::test_pool().await;
-    let store = hive_api::store::Store::new(pool);
-    (hive_api::routes::router(store.clone()), store)
+    let test_db = hive_api::db::test_pool().await;
+    let store = hive_api::store::Store::new(test_db.pool.clone());
+    (hive_api::routes::router(store.clone()), store, test_db)
 }
 
 async fn backfill_embeddings(store: &hive_api::store::Store) {
@@ -348,7 +348,7 @@ async fn onboard(app: &Router) -> String {
 async fn onboarding_gate_then_full_flow() {
     let _guard = env_guard().await;
     reset_auth_env();
-    let (app, store) = test_app().await;
+    let (app, store, _test_db) = test_app().await;
 
     // Fresh DB: healthz is public, everything else is locked behind onboarding.
     let (status, body, _) = send(&app, get("/api/healthz", None)).await;
@@ -654,7 +654,7 @@ async fn onboarding_gate_then_full_flow() {
 async fn rest_inbox_routes_are_viewer_gated() {
     let _guard = env_guard().await;
     reset_auth_env();
-    let (app, store) = test_app().await;
+    let (app, store, _test_db) = test_app().await;
     let admin = onboard(&app).await; // nate, admin
 
     // A member with a login (maggie) and an AI she owns (pia).
@@ -825,7 +825,7 @@ async fn oidc_callback_provisions_allowed_user_and_sets_session() {
     );
     std::env::set_var("OIDC_ALLOWED_DOMAINS", "example.com");
 
-    let (app, _dir) = test_app().await;
+    let (app, _dir, _test_db) = test_app().await;
     let _admin_cookie = onboard(&app).await;
 
     let (status, body, _) = send(&app, get("/api/auth/config", None)).await;
@@ -913,7 +913,7 @@ async fn local_auth_can_be_disabled_globally() {
     reset_auth_env();
     std::env::set_var("HIVE_LOCAL_AUTH_ENABLED", "false");
 
-    let (app, _store) = test_app().await;
+    let (app, _store, _test_db) = test_app().await;
     let cookie = onboard(&app).await;
 
     let (status, body, _) = send(&app, get("/api/auth/config", None)).await;
@@ -941,7 +941,7 @@ async fn local_auth_can_be_disabled_globally() {
 async fn oauth_mcp_flow_issues_long_and_never_tokens() {
     let _guard = env_guard().await;
     reset_auth_env();
-    let (app, _store) = test_app().await;
+    let (app, _store, _test_db) = test_app().await;
     let cookie = onboard(&app).await;
 
     let (status, _, _) = send(
@@ -1068,7 +1068,7 @@ async fn oauth_mcp_flow_issues_long_and_never_tokens() {
 async fn viewer_acl_scopes_journal() {
     let _guard = env_guard().await;
     reset_auth_env();
-    let (app, _dir) = test_app().await;
+    let (app, _dir, _test_db) = test_app().await;
     let cookie = onboard(&app).await;
 
     // Two more humans: maggie gets a login; bob is just a person.
@@ -1177,7 +1177,7 @@ async fn viewer_acl_scopes_journal() {
 async fn semantic_scope_runs_before_truncation_and_recall_filters_kinds_in_search() {
     let _guard = env_guard().await;
     reset_auth_env();
-    let (app, store) = test_app().await;
+    let (app, store, _test_db) = test_app().await;
     let cookie = onboard(&app).await;
 
     // maggie: a second, non-admin login.
@@ -1332,7 +1332,7 @@ async fn semantic_scope_runs_before_truncation_and_recall_filters_kinds_in_searc
 async fn ai_token_memory_is_namespaced_and_mention_shared() {
     let _guard = env_guard().await;
     reset_auth_env();
-    let (app, _dir) = test_app().await;
+    let (app, _dir, _test_db) = test_app().await;
     let cookie = onboard(&app).await;
 
     // Maggie has her own user namespace.
@@ -1609,7 +1609,7 @@ async fn ai_token_memory_is_namespaced_and_mention_shared() {
 async fn spa_paths_are_not_gated() {
     let _guard = env_guard().await;
     reset_auth_env();
-    let (app, _dir) = test_app().await;
+    let (app, _dir, _test_db) = test_app().await;
     // Without onboarding, non-API paths must not 401/403 (the SPA has to load
     // so the wizard can run). Dist isn't present in tests → plain 404.
     let (status, _, _) = send(&app, get("/login", None)).await;
@@ -1633,7 +1633,7 @@ fn delete_req(path: &str, cookie: Option<&str>) -> Request<Body> {
 async fn custom_entity_types_full_flow() {
     let _guard = env_guard().await;
     reset_auth_env();
-    let (app, _store) = test_app().await;
+    let (app, _store, _test_db) = test_app().await;
     let cookie = onboard(&app).await;
 
     // A member login for the non-admin side of every gate.
@@ -2014,7 +2014,7 @@ async fn mcp_call(app: &Router, token: &str, name: &str, arguments: Value) -> Va
 async fn custom_entities_over_mcp() {
     let _guard = env_guard().await;
     reset_auth_env();
-    let (app, _store) = test_app().await;
+    let (app, _store, _test_db) = test_app().await;
     let cookie = onboard(&app).await;
 
     // nate token = admin-capable principal; pia token = AI in nate's

@@ -11,13 +11,13 @@ use axum::Router;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-async fn test_app() -> (Router, hive_api::store::Store) {
+async fn test_app() -> (Router, hive_api::store::Store, hive_api::db::TestDb) {
     // Hash embedder: deterministic + offline (latched once per process).
     std::env::set_var("HIVE_EMBED", "hash");
     // Isolated Postgres schema per test (uses DATABASE_URL / local dev default).
-    let pool = hive_api::db::test_pool().await;
-    let store = hive_api::store::Store::new(pool);
-    (hive_api::routes::router(store.clone()), store)
+    let test_db = hive_api::db::test_pool().await;
+    let store = hive_api::store::Store::new(test_db.pool.clone());
+    (hive_api::routes::router(store.clone()), store, test_db)
 }
 
 async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Value, axum::http::HeaderMap) {
@@ -129,7 +129,7 @@ fn turn(role: &str, text: &str) -> Value {
 
 #[tokio::test]
 async fn capture_upsert_is_idempotent_by_runtime_and_external_id() {
-    let (app, _store) = test_app().await;
+    let (app, _store, _test_db) = test_app().await;
     let cookie = onboard(&app).await;
 
     let id = capture(&app, &cookie, "sess-uuid-1", "local hack").await;
@@ -185,7 +185,7 @@ async fn capture_upsert_is_idempotent_by_runtime_and_external_id() {
 
 #[tokio::test]
 async fn replace_swaps_the_full_transcript() {
-    let (app, _store) = test_app().await;
+    let (app, _store, _test_db) = test_app().await;
     let cookie = onboard(&app).await;
     let id = capture(&app, &cookie, "sess-replace", "").await;
 
@@ -258,7 +258,7 @@ async fn replace_swaps_the_full_transcript() {
 
 #[tokio::test]
 async fn runner_cannot_claim_captured_sessions() {
-    let (app, _store) = test_app().await;
+    let (app, _store, _test_db) = test_app().await;
     let cookie = onboard(&app).await;
 
     // A hosted workspace is what the runner claims: status 'provisioning'.
@@ -296,7 +296,7 @@ async fn runner_cannot_claim_captured_sessions() {
 
 #[tokio::test]
 async fn pending_reflected_flow_and_message_requeue() {
-    let (app, _store) = test_app().await;
+    let (app, _store, _test_db) = test_app().await;
     let cookie = onboard(&app).await;
     let id = capture(&app, &cookie, "sess-reflect", "to reflect").await;
     let (_, _, _) = send(
@@ -366,7 +366,7 @@ async fn pending_reflected_flow_and_message_requeue() {
 
 #[tokio::test]
 async fn conversations_are_namespace_scoped() {
-    let (app, _store) = test_app().await;
+    let (app, _store, _test_db) = test_app().await;
     let admin = onboard(&app).await;
     let maggie = member(&app, &admin, "Maggie", "maggie@example.com").await;
     let bob = member(&app, &admin, "Bob", "bob@example.com").await;
@@ -456,7 +456,7 @@ async fn conversations_are_namespace_scoped() {
 
 #[tokio::test]
 async fn mcp_capture_tools_flow() {
-    let (app, _store) = test_app().await;
+    let (app, _store, _test_db) = test_app().await;
     let cookie = onboard(&app).await;
     // The Hive plugin's shape: token actor = pia (AI), namespace = nate.
     let (status, minted, _) = send(
@@ -562,8 +562,8 @@ async fn journal_guard_downgrades_ai_mail_summaries() {
     use hive_shared::{ActorKind, NewJournalEntry};
 
     std::env::set_var("HIVE_EMBED", "hash");
-    let pool = hive_api::db::test_pool().await;
-    let store = Store::new(pool);
+    let test_db = hive_api::db::test_pool().await;
+    let store = Store::new(test_db.pool.clone());
 
     store
         .people_upsert("nate", "Nate", ActorKind::Human, None)

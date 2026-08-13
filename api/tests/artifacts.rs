@@ -31,15 +31,15 @@ fn data_root() -> &'static PathBuf {
     })
 }
 
-async fn app() -> Router {
+async fn app() -> (Router, hive_api::db::TestDb) {
     std::env::set_var("HIVE_EMBED", "hash");
     data_root();
-    let pool = hive_api::db::test_pool().await;
-    let s = hive_api::store::Store::new(pool);
+    let test_db = hive_api::db::test_pool().await;
+    let s = hive_api::store::Store::new(test_db.pool.clone());
     s.onboarding_complete("Test Hive", "Nate", "nate@example.com", "hunter22-strong")
         .await
         .unwrap();
-    hive_api::routes::router(s)
+    (hive_api::routes::router(s), test_db)
 }
 
 /// An admin PAT, so requests get past the auth gate.
@@ -166,7 +166,7 @@ fn payload(len: usize) -> Vec<u8> {
 
 #[tokio::test]
 async fn bytes_go_in_and_come_out_byte_identical() {
-    let app = app().await;
+    let (app, _test_db) = app().await;
     let cookie = admin_token(&app).await;
     let body = payload(64 * 1024 + 7);
 
@@ -203,7 +203,7 @@ async fn bytes_go_in_and_come_out_byte_identical() {
 
 #[tokio::test]
 async fn ranges_return_exactly_the_requested_bytes() {
-    let app = app().await;
+    let (app, _test_db) = app().await;
     let cookie = admin_token(&app).await;
     let body = payload(10_000);
     let a = upload(&app, &cookie, "clip.bin", "application/octet-stream", &body).await;
@@ -258,7 +258,7 @@ async fn ranges_return_exactly_the_requested_bytes() {
 
 #[tokio::test]
 async fn duplicate_uploads_share_bytes_and_delete_refcounts() {
-    let app = app().await;
+    let (app, _test_db) = app().await;
     let cookie = admin_token(&app).await;
     let body = payload(4096);
 
@@ -328,7 +328,7 @@ async fn duplicate_uploads_share_bytes_and_delete_refcounts() {
 
 #[tokio::test]
 async fn unknown_and_malformed_ids_are_404_not_500() {
-    let app = app().await;
+    let (app, _test_db) = app().await;
     let cookie = admin_token(&app).await;
 
     for path in [
@@ -343,7 +343,7 @@ async fn unknown_and_malformed_ids_are_404_not_500() {
 
 #[tokio::test]
 async fn a_body_with_no_file_part_is_a_400() {
-    let app = app().await;
+    let (app, _test_db) = app().await;
     let cookie = admin_token(&app).await;
     let body = format!(
         "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\nno file here\r\n--{BOUNDARY}--\r\n"
@@ -368,7 +368,7 @@ async fn a_body_with_no_file_part_is_a_400() {
 /// The upload endpoint is gated like every other non-public API path.
 #[tokio::test]
 async fn upload_requires_authentication() {
-    let app = app().await;
+    let (app, _test_db) = app().await;
     let res = app
         .clone()
         .oneshot(
