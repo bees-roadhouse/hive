@@ -1399,37 +1399,42 @@ struct SchemaGuard {
 impl Drop for SchemaGuard {
     fn drop(&mut self) {
         let (schema, url) = (self.schema.clone(), self.url.clone());
-        let done = std::thread::spawn(move || -> Result<()> {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("teardown runtime")?;
-            rt.block_on(async move {
-                let conn = PgPoolOptions::new()
-                    .max_connections(1)
-                    .connect(&url)
-                    .await
-                    .context("teardown connect")?;
-                // CASCADE because the schema holds every table the migrate
-                // path built, plus their indexes, policies and default ACLs.
-                // The test's own connections are idle by now and hold no
-                // locks, so this does not wait on them.
-                let dropped = sqlx::raw_sql(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
-                    .execute(&conn)
-                    .await
-                    .with_context(|| format!("dropping test schema {schema}"));
-                conn.close().await;
-                dropped.map(|_| ())
-            })
-        })
-        .join();
+        // `Builder::spawn` rather than `thread::spawn`, which PANICS when the
+        // OS refuses a thread — and nothing in this function may panic (below).
+        let spawned = std::thread::Builder::new()
+            .name("test-schema-teardown".to_string())
+            .spawn(move || -> Result<()> {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("teardown runtime")?;
+                rt.block_on(async move {
+                    let conn = PgPoolOptions::new()
+                        .max_connections(1)
+                        .connect(&url)
+                        .await
+                        .context("teardown connect")?;
+                    // CASCADE because the schema holds every table the migrate
+                    // path built, plus their indexes, policies and default
+                    // ACLs. The test's own connections are idle by now and
+                    // hold no locks, so this does not wait on them.
+                    let dropped =
+                        sqlx::raw_sql(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+                            .execute(&conn)
+                            .await
+                            .with_context(|| format!("dropping test schema {schema}"));
+                    conn.close().await;
+                    dropped.map(|_| ())
+                })
+            });
         // Never panic here. A failed teardown leaks exactly one schema; a panic
         // while already unwinding a failed test aborts the process and buries
         // the real failure. Say it loudly on stderr instead.
-        match done {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => eprintln!("test schema teardown failed: {e:#}"),
-            Err(_) => eprintln!("test schema teardown thread panicked"),
+        match spawned.map(|handle| handle.join()) {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(e))) => eprintln!("test schema teardown failed: {e:#}"),
+            Ok(Err(_)) => eprintln!("test schema teardown thread panicked"),
+            Err(e) => eprintln!("test schema teardown thread not spawned: {e}"),
         }
     }
 }
