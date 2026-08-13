@@ -1,0 +1,9 @@
+# Test corpora are compared BYTE for byte, so git must not rewrite their line
+# endings on checkout. Without this, every fixture arrives CRLF on Windows
+# while the parser under test emits LF, and `jmap-sync --test quote_corpus`
+# fails locally while passing on Linux CI ... the worst shape of failure,
+# because it looks like a real regression to whoever is on Windows.
+jmap-sync/tests/** -text
+
+# Shell scripts must stay LF or they will not execute in a container.
+*.sh text eol=lf

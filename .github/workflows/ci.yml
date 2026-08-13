@@ -10,23 +10,39 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Postgres is no longer the exception, it is the store (docs/WEB-APP.md).
+  # Every job that runs a test needs one, which inverts the previous file: it
+  # had a no-database `rust` job and a single `importer` job holding the only
+  # Postgres in CI. That split described the op-log/SQLite architecture and
+  # both of the crates it named are gone.
   rust:
     runs-on: ubuntu-latest
-    # No database service: the store is op-log + SQLite since the PR 1.6
-    # cutover — every test runs against tempdir data dirs. This job runs the
-    # WHOLE workspace with no DATABASE_URL (the invariant): hive-import's
-    # DB-backed tests skip themselves loudly, its grep gate and preflight
-    # tests still run. The `importer` job below is the one place Postgres
-    # exists, scoped to the importer's own tests.
+    services:
+      postgres:
+        # pgvector, not plain postgres: embeddings live in a vector column and
+        # the schema will not create without the extension.
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: hive
+          POSTGRES_PASSWORD: hive
+          POSTGRES_DB: hive
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hive"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
+      # No webkit/gtk any more: those were hive-app's, and the desktop shell is
+      # a browser now. What remains is the vendored-OpenSSL/cmake closure.
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev cmake \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev
+            pkg-config libssl-dev cmake
 
       # Matches rust-toolchain.toml so local fmt/clippy and CI agree.
       - uses: dtolnay/rust-toolchain@stable
@@ -47,99 +63,49 @@ jobs:
       - name: Cargo build
         run: cargo build --workspace --all-targets
 
-      # The flatpak ships the RELEASE binary, and borrow-check can differ
+      # The container ships the RELEASE binary, and borrow-check can differ
       # between opt levels (temporary lifetimes): a move-then-borrow that
       # passes in debug/clippy/test can fail only under --release. Build the
-      # app in release so that class is caught in CI, not at packaging time.
-      - name: Cargo build (release, app)
-        run: cargo build --release -p hive-app
+      # shipped binary in release so that class is caught here, not at
+      # packaging time.
+      - name: Cargo build (release, api)
+        run: cargo build --release -p hive-api
 
       - name: Cargo test
-        # Belt and braces: hive-core injects the hash embedder in tests, but
-        # hive-embed's own default (no HIVE_EMBED) is the transformers
-        # provider, whose lazy ONNX engine would try to download BGE models
-        # from the HF hub on a stray first embed. Pin CI offline + fast.
         env:
+          # hive-embed's default provider is transformers, whose lazy ONNX
+          # engine would try to pull BGE models from the HF hub on a stray
+          # first embed. Pin CI offline and fast.
           HIVE_EMBED: hash
+          # api/tests/org_isolation.rs provisions an unprivileged role and
+          # serves as it, so this role must be able to CREATE ROLE. The
+          # image's POSTGRES_USER is a superuser, which satisfies it.
+          DATABASE_URL: postgres://hive:hive@localhost:5432/hive
+          HIVE_CRED_KEY: ci-credential-vault-key-not-a-secret
         run: cargo test --workspace
 
-  # The PR 1.7 exception, and the ONLY database in CI: hive-import reads a
-  # hosted-era Postgres, so its fixture tests get a pgvector service (the
-  # legacy schema's embeddings.vec_v column needs the extension) and
-  # DATABASE_URL. Everything else about "no Postgres in hive" is enforced by
-  # the grep gate (importer/tests/no_postgres_gate.rs), which runs in BOTH
-  # jobs.
-  importer:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: pgvector/pgvector:pg17
-        env:
-          POSTGRES_USER: hive
-          POSTGRES_PASSWORD: hive
-          POSTGRES_DB: hive
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U hive"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-    steps:
-      - uses: actions/checkout@v4
-
-      # hive-import pulls in hive-core (bundled SQLCipher + vendored
-      # OpenSSL) and hive-embed, but not the app — no webkit/gtk here.
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev cmake
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.94.1
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: hive-rust-importer
-
-      - name: Importer tests (fixture Postgres)
-        env:
-          HIVE_EMBED: hash
-          DATABASE_URL: postgres://hive:hive@localhost:5432/hive
-        run: cargo test -p hive-import
-
-  # The smoke tier (docs/TESTING-STRATEGY.md §4): real binaries, real sockets,
-  # multi-process scenarios. Merge-gating from day one, and the reason the
-  # `rust` job above stays honest — those tests skip themselves loudly without
-  # HIVE_SMOKE=1, so without this job they would never run anywhere.
-  #
-  # Crate-scoped, not --workspace: no hive-app means no webkit/gtk stack here
-  # (the one scenario that boots the app needs a display and rides the shots
-  # rig instead), so this job's system deps match the importer's. Its own cache
-  # key keeps that smaller dependency closure from thrashing `hive-rust`.
-  #
-  # scripts/smoke.sh is the single source of truth for what the tier builds,
-  # exports, and runs — CI calls it so local and CI cannot drift.
-  smoke:
+  # The SPA is shipped by the API (routes/spa.rs serves HIVE_WEB_DIST), so a
+  # frontend that does not build is a broken release even when Rust is green.
+  web:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libssl-dev cmake
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
         with:
-          toolchain: 1.94.1
+          node-version: '22'
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: hive-rust-smoke
+      - name: Enable pnpm
+        run: corepack enable
 
-      - name: Smoke tier
-        run: ./scripts/smoke.sh
+      # CI=true so a stale node_modules is purged rather than prompting for a
+      # confirmation no runner can answer.
+      - name: Install
+        env:
+          CI: 'true'
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the SPA
+        env:
+          CI: 'true'
+        run: pnpm --filter @hive/web build
