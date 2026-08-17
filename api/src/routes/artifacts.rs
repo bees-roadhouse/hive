@@ -30,7 +30,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Router};
-use hive_core::artifact_storage::storage;
+use hive_core::artifact_storage::{storage, TooLarge};
 use serde::Deserialize;
 use tokio_util::io::ReaderStream;
 use uuid::Uuid;
@@ -51,8 +51,13 @@ pub fn router() -> Router<Store> {
             post(upload)
                 // The payload streams to disk chunk by chunk and is never held
                 // in memory, so axum's 2 MiB default is the wrong shape of
-                // limit here — the ceiling that matters is disk, and a byte
-                // quota belongs with org quotas rather than the body layer.
+                // limit here. The ceiling that matters is disk, and it is
+                // enforced per chunk against the running total by the storage
+                // driver ($HIVE_MAX_ARTIFACT_BYTES, 512 MiB by default) — a
+                // body-layer limit would reject on a header an attacker writes
+                // and would answer a rejected stream with the wrong status.
+                // This is a per-upload cap and nothing more: there is no
+                // per-org byte budget in this tree.
                 .layer(DefaultBodyLimit::disable())
                 .get(list),
         )
@@ -87,7 +92,19 @@ async fn upload(
 
         let mut write = storage().begin(org).await?;
         while let Some(chunk) = field.chunk().await? {
-            write.write(&chunk).await?;
+            if let Err(e) = write.write(&chunk).await {
+                let Some(TooLarge { limit }) = e.downcast_ref::<TooLarge>().copied() else {
+                    return Err(e.into());
+                };
+                // Answered the moment the running total crosses the ceiling:
+                // the rest of the body is never read, and the partial file goes
+                // with `write` when it drops here.
+                drop(write);
+                return Ok(err(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    &format!("artifact exceeds the {limit} byte upload limit"),
+                ));
+            }
         }
         let artifact = s
             .artifacts_create(
@@ -210,7 +227,12 @@ async fn content(
         }
     };
 
-    let reader = store.read_range(org, &artifact.sha256, start, len).await?;
+    // `size` and this are two calls with nothing held between them, so a delete
+    // can land in the gap. Absence is None rather than an error precisely so
+    // that reads as "the artifact went away" — a 404, not a 500.
+    let Some(reader) = store.read_range(org, &artifact.sha256, start, len).await? else {
+        return Ok(not_found());
+    };
     let mut res = Response::builder()
         .status(status)
         .body(Body::from_stream(ReaderStream::new(reader)))?;

@@ -48,3 +48,6 @@ tokio-util = { version = "0.7", features = ["io"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Tests wrap the storage driver's write trait to interleave an upload with a
+# concurrent delete at an exact point (tests/artifacts.rs).
+async-trait = { workspace = true }
