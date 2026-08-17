@@ -21,17 +21,38 @@ pub struct NewUser {
 }
 
 impl Store {
+    /// Login accounts on the INSTANCE, deliberately unscoped: its one caller
+    /// is `onboarding_required`, which asks "has anyone ever set this server
+    /// up", and that question has no org. Do not reuse it for anything a
+    /// request renders.
     pub async fn users_count(&self) -> Result<i64> {
         Ok(crate::pgq::query_scalar("SELECT COUNT(*) FROM users")
             .fetch_one(self.db())
             .await?)
     }
 
+    /// The people in the ACTING org.
+    ///
+    /// A user row is global and `memberships` is what scopes it (see the note
+    /// on the `users` table in core/src/db.rs for why it cannot be otherwise:
+    /// a credential resolves through this table BEFORE any org exists). That
+    /// makes the join the whole access control here — without it this returned
+    /// every tenant's email, actor slug, role and id to any admin who called
+    /// `GET /api/users`, which is also how `/api/auth/me` and the token
+    /// admin-check in routes/admin.rs read it.
+    ///
+    /// `u.role` is the instance role, which is what `AuthCtx` compares
+    /// against; `m.role` is the per-org one. They are not the same question,
+    /// and mixing them here would quietly change who is an admin.
     pub async fn users_list(&self) -> Result<Vec<SafeUser>> {
-        let rows =
-            crate::pgq::query("SELECT id, actor, email, name, role FROM users ORDER BY created_at")
-                .fetch_all(self.db())
-                .await?;
+        let rows = crate::pgq::query(&format!(
+            "SELECT u.id, u.actor, u.email, u.name, u.role FROM users u \
+             JOIN memberships m ON m.user_id = u.id \
+             WHERE m.org_id = {org} ORDER BY u.created_at",
+            org = crate::db::ACTING_ORG
+        ))
+        .fetch_all(self.db())
+        .await?;
         rows.iter()
             .map(|r| {
                 Ok(SafeUser {

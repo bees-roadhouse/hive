@@ -418,15 +418,34 @@ async fn remove_in_tx(conn: &mut PgConnection, slug: &str) -> Result<ActorDelete
     .bind(slug)
     .fetch_one(&mut *conn)
     .await?;
+    // Which bytes were this actor's, read BEFORE the cascade takes the rows
+    // that say so. The sweep below used to be "every blob no attachment
+    // references anywhere", with no restriction to the purged actor and no
+    // age grace — so it also took another org's bytes (their attachments were
+    // invisible to the NOT EXISTS, which read an RLS-filtered table while the
+    // DELETE hit an unfiltered one) and any in-flight blob whose pointer had
+    // not committed yet.
+    let owned_hashes: Vec<String> = crate::pgq::query_scalar::<String>(
+        "SELECT DISTINCT t.blob_hash FROM mail_attachments t \
+         JOIN mail_messages m ON m.id = t.message_id \
+         JOIN mail_accounts a ON a.id = m.account_id \
+         WHERE a.owner = ? AND t.blob_hash IS NOT NULL",
+    )
+    .bind(slug)
+    .fetch_all(&mut *conn)
+    .await?;
     acc.mail_accounts +=
         exec_count(conn, "DELETE FROM mail_accounts WHERE owner = ?", &[slug]).await?;
-    acc.blobs += exec_count(
-        conn,
-        "DELETE FROM blobs b WHERE NOT EXISTS \
-         (SELECT 1 FROM mail_attachments a WHERE a.blob_hash = b.hash)",
-        &[],
-    )
-    .await?;
+    acc.blobs += crate::pgq::query(&format!(
+        "DELETE FROM blobs b WHERE b.hash = ANY(?) AND b.org_id = {org} AND NOT EXISTS \
+         (SELECT 1 FROM mail_attachments a \
+          WHERE a.org_id = b.org_id AND a.blob_hash = b.hash)",
+        org = crate::db::ACTING_ORG
+    ))
+    .bind(&owned_hashes)
+    .execute(&mut *conn)
+    .await?
+    .rows_affected() as i64;
 
     // 11. people.owner pointers (AIs this actor owned) → null, then the row itself.
     exec_count(

@@ -28,9 +28,22 @@ pub struct ResolvedToken {
 }
 
 impl Store {
+    /// Every token minted in the ACTING org, newest first.
+    ///
+    /// `api_tokens` is on the tenancy plane and deliberately has no row
+    /// policy: `tokens_resolve` below runs in the auth middleware, before an
+    /// acting org exists, and a policy would make the credential unreadable
+    /// by the lookup that discovers which org it pins. The price of that is
+    /// that every OTHER query on this table has to carry the predicate itself
+    /// — which this one did not, so one org's admin listed another org's
+    /// tokens (id, actor, label, expiry) through `GET /api/tokens`.
+    ///
+    /// No acting org is deny: the predicate is NULL, and NULL is not true.
     pub async fn tokens_list(&self) -> Result<Vec<ApiToken>> {
         let rows = crate::pgq::query(&format!(
-            "SELECT {TOKEN_COLS} FROM api_tokens ORDER BY created_at DESC"
+            "SELECT {TOKEN_COLS} FROM api_tokens WHERE org_id = {org} \
+             ORDER BY created_at DESC",
+            org = crate::db::ACTING_ORG
         ))
         .fetch_all(self.db())
         .await?;
@@ -197,6 +210,28 @@ impl Store {
                 return Ok(None);
             }
         }
+        // A token outlives its granting human's membership otherwise. Sessions
+        // re-check this on every resolve (store/sessions.rs) and delete the
+        // session when the membership is gone; a token that skipped the check
+        // kept acting in an org its human had been removed from — which is the
+        // revocation-only-stops-future-grants failure, in the credential that
+        // lives longest.
+        //
+        // Only a namespace user that RESOLVES to a login account is checked.
+        // `created_by` is also 'onboarding' or an operator label for tokens
+        // minted outside any user's session, and those have no membership to
+        // lose; revoking on a failed lookup would kill them at first use.
+        if let Some(org_id) = org {
+            if let Some(user) = self.users_by_actor(&namespace_user).await? {
+                if self.membership_of(&user.id, org_id).await?.is_none() {
+                    crate::pgq::query("DELETE FROM api_tokens WHERE id = ?")
+                        .bind(&id)
+                        .execute(self.db())
+                        .await?;
+                    return Ok(None);
+                }
+            }
+        }
         crate::pgq::query("UPDATE api_tokens SET last_used_at = ? WHERE id = ?")
             .bind(now_iso())
             .bind(&id)
@@ -209,20 +244,41 @@ impl Store {
         }))
     }
 
+    /// Revoke one token, if it belongs to the acting org. A token id from
+    /// another org is `false` (→ 404), not a deletion: an admin in one org
+    /// used to be able to revoke another org's agent credential by id, which
+    /// is a denial-of-service across a tenancy boundary.
     pub async fn tokens_remove(&self, token_id: &str) -> Result<bool> {
-        let res = crate::pgq::query("DELETE FROM api_tokens WHERE id = ?")
-            .bind(token_id)
-            .execute(self.db())
-            .await?;
+        let res = crate::pgq::query(&format!(
+            "DELETE FROM api_tokens WHERE id = ? AND org_id = {org}",
+            org = crate::db::ACTING_ORG
+        ))
+        .bind(token_id)
+        .execute(self.db())
+        .await?;
         Ok(res.rows_affected() > 0)
     }
 
-    /// Revoke every token minted by a given OAuth client_id (used on code replay).
+    /// Revoke every token an OAuth client holds IN THE ACTING ORG.
+    ///
+    /// `oauth_clients` is instance-global (registration is unauthenticated by
+    /// construction — RFC 7591 — so there is no org at that point), but the
+    /// tokens minted for a client are not: each one pins the org of the human
+    /// who consented. Revoking across all of them would let a disconnect in
+    /// one org cut every other org's agents off from the same client.
+    ///
+    /// The replay case is handled where the org is actually known: see
+    /// `oauth_codes_redeem`, which revokes in the REPLAYED CODE's org. The
+    /// route calls this afterwards from an unauthenticated endpoint with no
+    /// acting org, where it correctly does nothing.
     pub async fn tokens_revoke_by_client(&self, client_id: &str) -> Result<u64> {
-        let res = crate::pgq::query("DELETE FROM api_tokens WHERE client_id = ?")
-            .bind(client_id)
-            .execute(self.db())
-            .await?;
+        let res = crate::pgq::query(&format!(
+            "DELETE FROM api_tokens WHERE client_id = ? AND org_id = {org}",
+            org = crate::db::ACTING_ORG
+        ))
+        .bind(client_id)
+        .execute(self.db())
+        .await?;
         Ok(res.rows_affected())
     }
 }

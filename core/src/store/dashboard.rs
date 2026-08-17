@@ -172,6 +172,10 @@ impl Store {
         }
 
         // Mail archive totals — cheap COUNT/SUM scans, all zero pre-mail.
+        // Every one of these is scoped by the row policy on the table it
+        // reads, `blobs` included: it used to be the odd one out, summing
+        // every tenant's attachment bytes into one org's dashboard because it
+        // was the only mail table without a policy.
         let mail = MailDashboardStats {
             messages: count("SELECT count(*) FROM mail_messages WHERE deleted_at IS NULL").await?,
             accounts: count("SELECT count(*) FROM mail_accounts").await?,
