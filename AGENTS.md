@@ -5,170 +5,75 @@
 These instructions apply to the whole `bees-roadhouse/hive` repository.
 
 GitHub `main` is canonical (the old `development`/`release` pair collapsed into
-it on 2026-07-05). This repo is mid-pivot to a personal P2P desktop app
-(decisions in docs/DIRECTION.md, D16+ amended by the v2.1 node program D29+;
-Phases 1-2 teardown/rebuild history in docs/PLAN.md, whose forward half is
-superseded by the active execution plan docs/PLAN-v2.1.md; test tiers and
-conventions in docs/TESTING-STRATEGY.md):
+it on 2026-07-05). Hive is a self-hostable web application: an axum API over
+PostgreSQL with row-level security, serving a SolidJS SPA (design note in
+docs/WEB-APP.md; test tiers and conventions in docs/TESTING-STRATEGY.md).
+docs/DIRECTION.md, docs/PLAN.md, and docs/PLAN-v2.1.md are history. They
+describe the local-first desktop architecture WEB-APP.md replaced and carry
+superseded banners saying so ... read them for why a decision was made, never
+for what the tree looks like.
 
-- Rust workspace: `shared`, `embed`, `core`, `jmap-sync`, `sync`, `node`,
-  `app`, `bridge`, and `importer`, plus the test-tier crates `smoke-support`
-  and `smoke`. There is no Node/pnpm workspace anymore — the Solid SPA,
-  the legacy Node packages, the worker/mail daemons (PR 1.2), and the api
-  crate with its REST/auth/OAuth surface (PR 1.3) were deleted in Phase 1
-  teardown. The shipping binaries are the app, `hive-bridge` (PR 1.8),
-  the `hive-import` one-shot (PR 1.7), and `hive-node` (PLAN-v2.1 PR 4.6).
-- The datastore is the append-only op log + SQLCipher SQLite index under a
-  local data dir (the PR 1.6 cutover; D18). Postgres left the workspace —
-  the PR 1.7 importer is the one remaining Postgres reader and declares its
-  own sqlx (never in `[workspace.dependencies]`). The app may depend on the
-  hive-import LIBRARY (it ships the first-launch GUI import) but its sources
-  stay sqlx-token-free, and no other crate may depend on hive-import at all
-  — the grep gate in `importer/tests/no_postgres_gate.rs` states and
-  enforces the whole rule.
+- Rust workspace: `shared`, `embed`, `core`, `api`, `jmap-sync`, `relay`.
+  `hive-api` is the shipping binary; `relay/` also builds `hive-relay` and
+  `hive-relay-agent`. Beside it is a pnpm workspace, `packages/shared` and
+  `packages/web` (`@hive/shared`, `@hive/web`), and the API serves the built
+  SPA from `HIVE_WEB_DIST` (`api/src/routes/spa.rs`).
+- The datastore is PostgreSQL with pgvector. Access control is row-level
+  security keyed on an acting org, not application checks (`core/src/acting.rs`
+  for the scope, the policy DDL in `core/src/db.rs`). sqlx keeps its `sqlite`
+  feature for exactly one reason: reading an uploaded legacy `hive.db` during
+  import (`api/src/legacy_import.rs`).
 
 When docs disagree with code, workflows, or compose files, trust code and CI,
-then update the stale doc in the same change. `README.md` and parts of
-`RUST_REWRITE.md` may lag the current Rust/SQLite reality.
+then update the stale doc in the same change. `README.md` and `RUST_REWRITE.md`
+lag the current architecture (see Known Documentation Drift).
 
 ## Architecture
 
-- `core/`: hive-core — the op log (`oplog`), blockstore, key custody
-  (`keys` for the domain master, `identity` for the per-device transport
-  keypair), the SQLCipher index + fold projector (`index`, `fold`), and the
-  store layer riding ONE writer thread (`store/core.rs`: mpsc commands,
-  oneshot replies; the public `Store` surface stays async), plus the MCP tool
-  layer (`core/src/mcp.rs`, transport-free: request/response over serde_json
-  values; the PR 1.8 stdio bridge is its transport). `mcp::LocalCtx { actor }`
-  supplies the acting identity — there is no authentication layer (single
-  user, D16). Since PLAN-v2.1 PR 4.3 core also carries the sync READ
-  surface replication rides: `oplog::keyless` (segment enumeration, header
-  parse, frame walk — no master key anywhere, because D29's blind node
-  verifies structure holding none) and the blockstore's bare-32-byte-id
-  `has_block`/`get_block`/`put_block`/`list_block_ids`, all exposed as
-  `Store::sync_*`. Read-only apart from `sync_put_block`; foreign segment
-  ingest is PR 4.10's job, not this surface's. `identity` (PR 4.5) is the ONE
-  asymmetric introduction — ed25519 + x25519 (dalek) derived from a single
-  32-byte device seed, custody in the OS keychain beside the master key or in
-  the same 64-hex file format — reused by the mTLS carrier, control-record
-  signing, and sharing. It is NOT the master key: per-device, never shared,
-  encrypts nothing.
-- `sync/`: hive-sync — the replication protocol (PLAN-v2.1 PR 4.4, D29), lib
-  plus a skeleton binary. Length-prefixed CBOR control frames with raw
-  payload streams behind the two that carry bytes, generic over
-  `AsyncRead + AsyncWrite` (the `serve_bridge_connection` discipline), and a
-  session state machine scoped to ONE domain. Stage A is one-way backup, so
-  the halves are a `SyncSource` (implemented for `Store`, over PR 4.3's read
-  surface) and a `SyncSink` (implemented by `DirVault`, a directory in exact
-  store shape — the node's SegmentVault at PR 4.6 is that plus a server's
-  bookkeeping). Two things move and nothing else: verbatim segment bytes and
-  ciphertext blocks by bare id. The wire is deliberately NOT byte-frozen
-  while it churns (round-trips + HOSTILE-DECODE instead; compat fixtures at
-  the v0.8.0 proto-v1 tag), and every peer-declared length is capped before
-  it sizes an allocation. `tls` (PR 4.5) is the carrier those sessions ride:
-  self-signed certificates carrying the device's ed25519 key from
-  `hive_core::identity`, mutually pinned by SPKI (`SpkiPin`), TLS 1.3 only,
-  ring provider. The certificate is a CARRIER, never a trust root — nothing
-  validates a chain, checks a name, or reads an expiry, and the pin is the
-  whole verdict in both directions (`sync/tests/tls_loopback.rs` is the
-  harness every later transport PR extends). rustls/rcgen stop here: the
-  engine mints device keys, this crate carries them. `enroll` (PR 4.7) is the
-  ceremony's CLIENT half — code format (base32 over OS entropy), normalization,
-  the at-rest hash, and the six lines that redeem one — split from the node's
-  POLICY along the dependency arrow: the desktop redeems (PR 4.8) and must not
-  link the node crate. `UnpinnedEnrollment` is the ONE acceptor that takes any
-  key, named so the exception is greppable: a device redeeming a code has not
-  been told the node's key yet, and the grant is what ends the exception.
-- `node/`: hive-node — the always-on peer (PLAN-v2.1 PR 4.6, listener and
-  enrollment at 4.7; D29/D30/D33/D35), lib plus a thin `main`. Stage A is the
-  BLIND tier and only that: the node
-  holds no domain key, opens no Store, folds nothing. A domain is a
-  `SegmentVault` under `tenants/<t>/domains/<d>/` — hive-sync's `DirVault`
-  (verbatim `log/<device>/*.seg` + `blocks/<hh>/<id>`, exact store shape, so
-  restore is a copy) plus `node-meta.db`, PLAIN SQLite holding lengths,
-  hashes, sizes, pinned device keys, control epochs, hashed enrollment codes,
-  the auth audit, the pending-forget queue, and every integrity alarm. The
-  invariant the vault exists for is
-  WRITE-ONCE: a differing re-upload of an existing (device, start_seq) is an
-  alarm and a refusal, never an overwrite; a segment may only extend at its
-  end with its byte prefix intact; an identical re-upload is a silent no-op.
-  A SEALED segment may still be extended — sealing is a fact about the source,
-  not about what arrived here, and refusing it would strand a transfer that
-  was interrupted before the device rotated (`vault.rs::check_write`). The
-  DNS publisher (`dns`) upserts `_hive._tcp.<zone>` plus the node's own
-  per-class A/AAAA and refuses every other name before a request is made
-  (delta 13's code half) — the Cloudflare rail ships, `provider = "rfc2136"`
-  parses but refuses at boot rather than shipping an untestable wire.
-  `node.toml` is listen addr + `bind_scope` + node key + optional `[dns]`;
-  `tenant.toml` is
-  name, tier, and quotas, and D33 keeps IdP/KMS/console fields OUT. The two
-  GREP-FENCEs live in `node/tests/fences.rs` because this crate is their
-  exception (see Core Invariants).
-  `listen` (PR 4.7) is the door: PR 4.5's mTLS carrier with **node-meta as the
-  guest list, re-read per connection** — that is what makes `hive-node device
-  revoke` bite on the NEXT handshake with nothing restarted, and why a rustls
-  `ServerConfig` is built per connection rather than per listener. An unpinned
-  key completes a handshake only while some domain has a LIVE enrollment code
-  (there is no other way to enroll a key nobody has seen); with none
-  outstanding the pin set is the whole guest list. One opening frame then
-  decides — `enroll` or `hello`, read under `MAX_OPENING_FRAME` — and the
-  session's domain follows from the PIN, never from the hello. A handshake
-  deadline, an accept-rate token bucket, and a connection cap bound a stranger;
-  they are constants, not config. `enroll` is the POLICY half of the ceremony
-  (the wire half is `hive_sync::enroll`): codes are ~104 bits of OS randomness,
-  **hashed at rest**, single-use via one conditional UPDATE, ten-minute TTL,
-  and CHANNEL-BOUND — the ed25519 key in the request must be the key that
-  terminated the connection, or a relay could enroll keys it does not hold. v1
-  enrolls the domain's FIRST device only; a second needs the SAS ceremony
-  (PR 4.14) and is refused rather than quietly approved. Revocations are
-  PERMANENT tombstones (by device id and by key) and bump a monotonic
-  per-domain control epoch that never regresses. Every decision, granted or
-  refused, is written to the domain's `auth_audit` before it is answered, while
-  the wire says one sentence for every enrollment refusal — a redeemer that
-  could tell "wrong" from "expired" apart could probe the code space.
-  CLI: `hive-node [serve]`, `hive-node enroll --domain <t>/<d>`,
-  `hive-node device list|revoke`; the one-shots run beside the running node
-  against the same WAL database.
-- `bridge/`: the `hive-bridge` binary — the ONLY external doorway (D25),
-  in PROXY mode since PR 2.4: a sync stdio ↔ unix-socket pump (serve mode:
-  JSON-RPC 2.0, one message per line; `call` mode: one tool call for
-  hooks/scripts) against the RUNNING app's `<data_dir>/bridge.sock`, with
-  a one-line hello/ack handshake carrying the protocol version and the
-  `--actor` identity (wire contract: `hive_shared::bridge_proto`). The
-  bridge holds NO store access — deliberately no hive-core, tokio, or
-  keychain dependency (that is what keeps `cargo install --path bridge`
-  fast); when the app is not running it fails with the stable marker
-  "the hive app is not running" on stderr, exit 1, NOTHING on stdout —
-  the bridge tests and the plugin's soft-fail shape (stderr + no result
-  JSON) depend on exactly that surface. The app side lives in
-  `app/src/bridge_server.rs` (peer-cred checked, socket 0600, unlink at
-  BIND time only — a non-owning instance must never unlink a live
-  socket); the hello/ack + frame loop is
-  `core::mcp::serve_bridge_connection`, shared with the bridge's tests so
-  CI exercises the exact serving code the app runs. `HIVE_DATA_DIR`
-  relocates socket + store together for tests/nonstandard homes; since
-  PLAN-v2.1 PR 4.1 the app honors the same override as its test seam
-  (beside `HIVE_MASTER_KEY_FILE`, the 64-hex master file honored before
-  the keychain, and the `HIVE_TEST_NOW` frozen clock in `store::now_iso`)
-  — core still never reads it, the data dir is always passed down
-  explicitly; `HIVE_MEMORY_KEY_HEX` died with interim mode.
-- `importer/`: the `hive-import` binary (PR 1.7) — one-shot migration of a
-  hosted-era Postgres into a fresh data dir (refuses a non-empty one).
-  Records ride the `#[doc(hidden)]` `Store::import_batch` seam
-  (`core/src/store/import.rs`): original nanoid ids and timestamps preserved,
-  `origin` provenance on every payload (fold v3), commits still flow through
-  `Core::commit`. Honors `HIVE_DATA_DIR`; its keychain escape hatch is
-  `HIVE_IMPORT_KEY_HEX` (importer-only, mirroring the bridge's — each binary
-  names its own). Embeds nothing: the app backfills embeddings later.
-  Also a LIBRARY: `run(&Opts)` returns `RunOutcome::{Plan, Imported}` as
-  data (the CLI formats it; the app's onboarding renders it), and after a
-  real import the store is fully shut down so the same process can
-  immediately `Store::new` the dir — the app's first-launch GUI import
-  depends on both facts.
+- `core/`: hive-core ... the store layer plus the database plumbing under it.
+  `db.rs` owns the schema, the RLS policies, role provisioning, and the two
+  pools: `open_admin` (table owner, DDL at boot, never handed to
+  request-serving code) and `open_app` (the unprivileged `hive_app` role the
+  API serves as). `acting.rs` is the acting-org scope, a tokio task-local with
+  no setter, stamped onto every connection at checkout. `pgq.rs` rewrites the
+  codebase's SQLite-era `?` placeholders to `$N` and delegates to sqlx, so call
+  sites read like `sqlx::` minus the DB type param. `store/` is one
+  `impl Store` block per module (`journal.rs`, `tasks.rs`, `mail.rs`,
+  `orgs.rs`, and the rest); the `Store` struct is the pool plus an in-process
+  SSE bus, so `emit()` persists the wire event and fans it to listeners, with
+  the org riding along because a broadcast channel has no policies.
+  `artifact_storage.rs` holds artifact BYTES at
+  `<data_root>/artifacts/<org_id>/<hh>/<sha256>`: content addressed so the
+  object-storage swap is a driver change, org IN the address so a delete can
+  answer "is anything still referencing these bytes?" without escaping the
+  policy that is supposed to be unbypassable.
+- `api/`: hive-api ... the axum binary, and the only process that speaks to
+  the database. `routes/` composes REST, the SSE stream, the OAuth AS, and
+  `spa.rs` (serves `HIVE_WEB_DIST`). `mcp.rs` is the MCP tool layer, owning
+  tools/list and tools/call dispatch as a parity port of the Node SDK toolset;
+  `routes/mcp.rs` is its stateless HTTP transport at `POST /mcp`.
+  `middleware.rs` resolves a credential to an `AuthCtx`, and the CREDENTIAL
+  pins the org ... nothing reads an org from a header or a body.
+  `legacy_import.rs` reads an uploaded legacy SQLite `hive.db` and writes it
+  through the normal insert path. The store layer is re-exported here
+  (`pub use hive_core::{db, pgq, store}`), so a `crate::store::` path inside
+  `api/` resolves into hive-core.
+- `relay/`: hive-relay ... reaching a self-hosted hive without a forwarded
+  port or a certificate to wrangle. The daemon routes on the SNI in the
+  ClientHello (in the clear before the handshake) and splices raw sockets
+  without decrypting; the agent dials OUTBOUND from the house and terminates
+  TLS in front of `hive-api`. Two binaries, `hive-relay` and
+  `hive-relay-agent`. Design note: docs/RELAY.md.
 - `shared/`: Rust shared domain types.
 - `embed/`: embedding seam, ONNX/BGE implementation, and hash fallback.
-- `jmap-sync/`: JMAP mailbox sync library (kept through the pause; its offline
-  quote-corpus test keeps the mail parser alive until mail returns in Phase 3).
+- `jmap-sync/`: JMAP mailbox sync library. No Hive types and no database
+  dependency ... the consumer implements `CursorStore` and `MailSink`. The
+  `jmap-client` dependency is contained in `client.rs`, so replacing it with
+  reqwest+serde stays a one-module rewrite. Mail routes and the store's mail
+  archive live behind `HIVE_MAIL_ENABLED`.
+- `packages/web`: the SolidJS SPA (vite, TipTap editor), served in production
+  by `hive-api` from `HIVE_WEB_DIST`. `packages/shared` holds the TypeScript
+  domain types it shares with the API's wire shapes.
 
 ## Core Invariants
 
@@ -176,90 +81,69 @@ then update the stale doc in the same change. `README.md` and parts of
   and links derive from anchored spans or explicit structured operations.
 - Old journal entries are history. Do not rewrite old bodies to reflect status
   changes; render from canonical state instead.
-- Writes are RECORDS (D18): the command layer (store modules) mints ids and
-  timestamps, pre-computes emergence, and commits one record batch per
-  logical write — LogWriter::append_batch (fsync), then fold::apply in one
-  SQLite transaction. The fold (`core/src/fold`) is deterministic and never
-  mints anything; its module header is the payload contract. Never write
-  fold-owned tables directly from production code (the raw_sql seam is
-  tests/diagnostics only — direct writes do not survive a rebuild-by-replay).
-- Single user, single human (D16): there are no accounts, sessions, tokens,
-  scopes, or admin gates. Reads are unscoped. Do not reintroduce viewer/ACL
-  parameters. The `user_scope`/`owner` COLUMNS and the values writes stamp
-  are load-bearing — old data must stay readable and shape-stable for the
-  PR 1.6 cutover and the PR 1.7 importer; only the filtering was removed.
-- (Historical: the Postgres `db.rs::init`/no-DROP rule died with the PR 1.6
-  cutover. Old Postgres instances remain untouched on their servers for the
-  PR 1.7 importer to read.) Schema changes now mean bumping
-  `fold::FOLD_VERSION` — the index drops derived tables and rebuilds by
-  replaying the op log at next open.
-- ONE hive process per data dir: `Store::new` takes an exclusive advisory
-  flock on `<data_dir>/lock` and holds it until shutdown/exit, so two
-  store-opening processes (two apps, app + importer) can never co-write
-  the log/index. The refusal message contains "another hive process"
-  (core's cutover test matches that text). flock, not fcntl, deliberately:
-  a second open in the same process must conflict too. `Store::shutdown`
-  releasing the lock is what lets reopen-style tests proceed. The bridge
-  stopped competing for this lock in PR 2.4 (proxy mode) — the flock is
-  also what makes the app's unlink-then-bind of a leftover
-  `bridge.sock` safe: if the app holds the lock, no other hive process
-  can be serving that socket.
-- The bridge's stdout is the MCP protocol channel — frames only, one JSON
-  message per line. Every diagnostic goes to stderr. Never add a print to
-  stdout in `bridge/` (and keep HTTP stacks out of it: no reqwest/hyper/
-  axum — stdio is the transport, grep-auditably).
-- Every hive-core integration test constructs its store through
-  `core/tests/common/mod.rs::test_store()` (tempdir data dir + in-memory keys
-  + the injected hash embedder; `test_store_with` for mock 384-dim engines).
-  No test body constructs a store any other way, and core never reads
-  HIVE_EMBED — the embedder is injected at `Store::new`.
-- `core/tests/golden_retrieval.rs` + its checked-in fixture are the
-  cross-backend parity oracle. Regenerate only consciously
-  (`HIVE_GOLDEN_REGEN=1`) and diff; PR 1.6 may relax the score tolerance but
-  must keep the label-set and top-3 order assertions.
-- The smoke tier (real binaries, real sockets, multi-component scenarios —
-  docs/TESTING-STRATEGY.md §4) lives in `smoke/` plus each binary crate's own
-  `tests/`, and every one of its tests opens with `require_smoke!()`: without
-  `HIVE_SMOKE=1` it skips loudly and passes, so `cargo test --workspace` stays
-  green offline. `smoke-support/` holds its seams — `test_domain()`,
-  `test_identity()`, and `test_node()` (PR 4.7: spawns the REAL `hive-node`
-  from `HIVE_NODE_BIN`, pre-creates its domains, parses its contract lines, and
-  drives `enroll`/`device` beside it; `test_pair()` arrives with the push loop
-  at 4.8) — and carries the same clause
-  `test_store()` does: no test constructs a domain, device identity, node, or
-  device pair any other way. That crate deliberately does NOT depend on
-  hive-node or hive-sync: it drives the node as a process, which keeps the
-  dependency arrow one-way and lets hive-node's own tests dev-depend on it.
-  Harness rules: bind
-  `127.0.0.1:0` and parse the port from the
-  child's own output (never a fixed port), wait only through `wait_until` (no
-  bare sleeps), stay under 60s per test, tee child stdout/stderr into the test
-  log, and kill spawned children on drop. Binaries come from
-  `HIVE_APP_BIN`/`HIVE_BRIDGE_BIN`/`HIVE_NODE_BIN` via `require_bin!` —
-  `CARGO_BIN_EXE_*` exists only inside the crate that owns the binary and a
-  two-binary scenario needs both — and an unset path env is another loud skip.
-  Single-binary smoke stays in the crate that owns it: `node/tests/boot.rs`
-  spawns the real `hive-node` through `CARGO_BIN_EXE_hive-node` and pins its
-  stdout contract (`node key <hex>`, `domain <t>/<d>`, `listening on <addr>`,
-  and from `enroll`: `enrollment code <code>`, `expires <unix>`).
-  ADVERSARIAL-SMOKE (docs/TESTING-STRATEGY.md §2, §4.4) starts at
-  `smoke/tests/enrollment.rs`: every transport-auth claim PR 4.7 makes is a
-  scenario against the real binary with an in-proc device, and each asserts the
-  operator's audit trail, not just the wire outcome.
-  Run the tier with `./scripts/smoke.sh` (it builds the binaries, exports the
-  paths, and is what the CI `smoke` job runs).
-- Two GREP-FENCEs guard architecture rules the compiler cannot
-  (`node/tests/fences.rs`, PLAN-v2.1 PR 4.6). Identity: sessions, cookies,
-  JWTs and OIDC — `openidconnect`, `jsonwebtoken`, `use oauth2`, `oauth2::`,
-  `tower-sessions`, `axum-extra` — appear in no crate but `node/`, in sources
-  OR manifests, and a cargo-metadata walk proves none is reachable in any
-  other workspace crate's dependency tree. Tenancy: the identifiers
-  `tenant_id`, `Tenant`, `tenants/` appear nowhere under `core/` — the data
-  plane is tenancy-blind (D33). Both fence identifiers and dependency names,
-  never English words: the `"oauth_token"` credential kind in
-  `store/cc_credentials.rs` and a comment saying "tenancy-blind" are legal
-  and must stay that way.
-- Use `HIVE_EMBED=hash` for CI, local smoke tests, and offline checks.
+- Writes go through the store layer: the module mints ids (`new_id`) and
+  timestamps (`now_iso` ... millisecond ISO-8601 with a trailing `Z`, the
+  shape the Node API wrote, so rows still sort lexicographically together),
+  and calls `emit()` for anything other clients must see. `emit()` persists
+  the wire event AND fans it to the SSE bus, so skipping it leaves connected
+  clients stale. Emergence runs on the journal write path
+  (`store/journal.rs`): anchors and bracket tokens are parsed at append time
+  and the tasks, decisions, and events they name are created there.
+- Multi-org, and Postgres enforces it. A session or a token pins exactly ONE
+  acting org; `acting::scope` wraps a future and there is no setter, so
+  nothing switches orgs mid-request. Absence is deny-all, not bypass: with no
+  scope the GUC stamps empty, the predicate goes NULL, reads return nothing
+  and writes trip `org_id NOT NULL`. Work moved off the request task with
+  `tokio::spawn` loses the scope and hits that deny-all, deliberately. Do NOT
+  compose org or namespace filters in the store layer ... the `user_scope`
+  and `owner` COLUMNS are load-bearing, but they are policy predicates now
+  (`core/src/db.rs`), and a hand-composed filter is exactly the ACL-ordering
+  defect RLS was adopted to end. `api/tests/org_isolation.rs` is that model in
+  test form: if it fails, nothing else in the tree matters.
+- Schema is hybrid. sqlx migrations in `core/migrations/` run FIRST, then the
+  inline idempotent DDL in `core/src/db.rs` (`CREATE TABLE IF NOT EXISTS`,
+  `ADD COLUMN IF NOT EXISTS`), then org scoping. A new content table has to be
+  added to the org-scoping list in `db.rs`: nothing else in the tree filters
+  by org, so an omission is a hole. A reshape migration needs a test over BOTH
+  bases the convention promises to tolerate ... a fresh database where the
+  inline DDL builds the final shape and the migration no-ops, and an old-shape
+  database the migration has to reshape (`api/tests/migrations.rs`). The
+  greenfield case alone is not coverage, because greenfield is the case that
+  cannot break.
+- MCP is an HTTP surface, not a stdio one: `POST /mcp`, stateless, plain JSON
+  responses. Keep tool definitions and dispatch in `api/src/mcp.rs` and
+  transport concerns in `api/src/routes/mcp.rs`. The protocol constants, error
+  codes, and result shapes there mirror the Node SDK on purpose, so changing
+  one is a wire-contract change, not a cleanup.
+- Every test that needs a database gets it from `hive_core::db`, never by
+  opening a pool of its own: `test_pool()` for the general case,
+  `test_pool_strict()` for no fallback scope (exactly how the binary behaves),
+  `test_pool_single_conn()` when the claim is about one physical connection
+  being reused, `test_pool_unmigrated()` for laying down an old-shape table by
+  hand, `test_admin_pool()` for setup that has to happen from outside any org.
+  No test body opens a pool any other way. `TestDb` is `#[must_use]` and owns
+  its schema's lifetime: bind it for the whole test, and have any helper that
+  builds a `Store` or a `Router` hand it back with them, or the schema drops
+  out from under what the helper returned.
+- Tests connect as the same unprivileged role the API serves as.
+  `test_pool_with` calls `assert_rls_applies`, which refuses a SUPERUSER or
+  BYPASSRLS pool outright, because either one reads every org's rows with no
+  policy firing. Never work around it by widening the role.
+- There is no env-gated tier and no test-support crate.
+  `cargo test --workspace` runs exactly what CI runs: one command, no flags,
+  no switches to remember. The inline `#[cfg(test)] mod tests` block at the
+  foot of the source file is the dominant idiom; reach for a file under
+  `tests/` when the test needs the composition (a router with its middleware,
+  a migration over an old-shape database, two orgs sharing one schema). Tiers,
+  conventions, and what is deliberately uncovered: docs/TESTING-STRATEGY.md.
+- Anything that binds asks for `127.0.0.1:0` and reads back the assigned port
+  (`relay/tests/tunnel.rs`). Never a fixed port: they collide under a parallel
+  run and turn into flakes that only reproduce on a busy machine.
+- No test run touches the network. `HIVE_EMBED=hash` in CI and for local runs
+  keeps the embedder offline, since the default provider lazily pulls BGE
+  models from the HF hub. The provider latches once per process, so a binary
+  that needs a 384-dimension provider installs its own mock engine before the
+  first embed call.
 
 ## Branching
 
@@ -267,9 +151,8 @@ then update the stale doc in the same change. `README.md` and parts of
 - Work branches start from `main` and use `feature/{slug}`, `bug/{slug}`,
   `improvement/{slug}`, or `refactor/{slug}`, merging back via PR.
 - Releases are tag-driven: bump versions in a release PR, merge, then push
-  `v{version}` on the merge commit. (Dormant until Phase 2.5 rebuilds the
-  release pipeline — Phase 1 lands untagged and no release workflow exists
-  right now.)
+  `v{version}` on the merge commit. (Dormant: there is no release workflow
+  right now, and nothing is being tagged.)
 
 ## Setup
 
@@ -280,25 +163,38 @@ target dir outside the repo for Rust builds:
 $env:CARGO_TARGET_DIR = "$env:USERPROFILE\.cargo-target\hive"
 ```
 
-Tests are hermetic: tempdir data dirs, in-memory keys, the hash embedder —
-no database service, no network — with ONE deliberate exception: the
-importer's fixture tests are DATABASE_URL-gated (they skip loudly and pass
-without it, so `cargo test --workspace` stays green offline). To run them
-for real, point them at a pgvector Postgres:
+The suite needs a real PostgreSQL with pgvector. There is no in-memory or
+SQLite mode: Postgres is the store, RLS is the access control, and a test
+against anything else would prove nothing about either.
 
 ```bash
-DATABASE_URL=postgres://hive:hive@localhost:5432/hive cargo test -p hive-import
+./dev-setup.sh          # pgvector/pgvector:pg17 on :5432, idempotent
+
+DATABASE_URL=postgres://hive:hive@localhost:5432/hive \
+HIVE_EMBED=hash \
+HIVE_CRED_KEY=dev-credential-vault-key \
+  cargo test --workspace
 ```
 
-Everything else stays Postgres-free by construction — the grep gate
-(`importer/tests/no_postgres_gate.rs`) fails on any `sqlx`/`pgvector` token
-outside `importer/`, and on any crate other than `app/` depending on
-hive-import (the app rides the importer library for GUI import; the engine
-crates and the bridge stay Postgres-free even transitively).
+`DATABASE_URL` falls back to that same URL (`hive_core::db::database_url`), so
+locally you can usually leave it unset. The role it names must be able to
+`CREATE ROLE`: the suite provisions the unprivileged serving role the same way
+the binary does. `HIVE_CRED_KEY` arms the credential vault, any string.
+Per-test schemas drop with `TestDb`; a hard kill leaks one, and
+`./dev-setup.sh --drop-test-schemas` sweeps the leftovers.
 
-There is no compose path or shippable image anymore. The local binaries are
-the app (`cargo run -p hive-app`) and the bridge
-(`cargo install --path bridge`); packaged bundles arrive with Phase 2.5.
+The SPA:
+
+```bash
+pnpm install
+pnpm typecheck
+pnpm build
+```
+
+Local run: `cargo run -p hive-api` (port 7878, MCP at `/mcp`), with the SPA
+either on the vite dev server (`pnpm dev`) or built and pointed at by
+`HIVE_WEB_DIST`. The compose path is `docker/docker-compose.rust.yml`
+(hive-api plus a pgvector Postgres).
 
 ## Verification
 
@@ -310,15 +206,26 @@ Rust gate:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --all-targets
-HIVE_EMBED=hash cargo test --workspace
+cargo build --release -p hive-api
+HIVE_EMBED=hash DATABASE_URL=postgres://hive:hive@localhost:5432/hive \
+  HIVE_CRED_KEY=dev-credential-vault-key cargo test --workspace
 ```
 
-PowerShell hash-test equivalent:
+PowerShell test equivalent:
 
 ```powershell
 $env:HIVE_EMBED = "hash"
+$env:HIVE_CRED_KEY = "dev-credential-vault-key"
 cargo test --workspace
-Remove-Item Env:\HIVE_EMBED
+Remove-Item Env:\HIVE_EMBED, Env:\HIVE_CRED_KEY
+```
+
+Web gate:
+
+```bash
+pnpm install --frozen-lockfile
+pnpm typecheck
+pnpm build
 ```
 
 There is no dedicated lint script today. Do not claim one ran unless you add it
@@ -326,37 +233,40 @@ or verify it exists.
 
 ## CI And Release
 
-`.github/workflows/ci.yml` is the only workflow, with two jobs, triggered on
-PRs to `main`:
+`.github/workflows/ci.yml` is the only workflow, with two jobs, both
+merge-gating, triggered on PRs to `main` and pushes to `main`:
 
-- `rust`: runs `cargo fmt --all --check`,
+- `rust`: toolchain 1.94.1 matching `rust-toolchain.toml`, with a
+  `pgvector/pgvector:pg17` service attached. Runs `cargo fmt --all --check`,
   `cargo clippy --workspace --all-targets -- -D warnings`,
-  `cargo build --workspace --all-targets`, and `HIVE_EMBED=hash cargo test --workspace`.
-  No database service and no DATABASE_URL — that absence is the invariant
-  (the importer's DB tests self-skip); `HIVE_EMBED=hash` stays as
-  belt-and-braces against hive-embed's default provider downloading models.
-- `importer`: the PR 1.7 exception — a `pgvector/pgvector:pg17` service +
-  DATABASE_URL, running `cargo test -p hive-import` only. The only Postgres
-  anywhere in CI.
+  `cargo build --workspace --all-targets`, `cargo build --release -p hive-api`,
+  then `cargo test --workspace` with `HIVE_EMBED=hash`, `DATABASE_URL`, and
+  `HIVE_CRED_KEY` set. Postgres hangs off the job rather than one special test
+  job because every crate with a meaningful test needs a database. The extra
+  release build is there because the container ships the release binary and
+  borrow-check can differ between opt levels.
+- `web`: node 22, pnpm through corepack. `pnpm install --frozen-lockfile`,
+  then `@hive/web` typecheck, then `@hive/web` build. Typecheck runs FIRST on
+  purpose: vite transpiles with esbuild, which strips types without checking
+  them, so a type error still bundles clean and only `tsc` will ever see it.
 
-There is no release workflow: the bridge installs from the repo
-(`cargo install --path bridge`) and app bundles land with Phase 2.5 —
-releases return then. The version of record is the `[workspace.package]`
-version in the root `Cargo.toml`.
+There is no release workflow, no nightly job, and no perf gate in CI. The
+version of record is the `[workspace.package]` version in the root
+`Cargo.toml`.
 
 ## Rust Code Style
 
-- Keep store logic in `core/src/store/*` and the MCP tool layer in
-  `core/src/mcp.rs` (pure — no transport/HTTP types in core).
-- Use rusqlite with explicit queries that match the existing style; reads
-  run inside `Store::run` closures on the writer thread, writes go through
-  record drafts + `Core::commit`.
-- The derived schema lives in `core/src/index/mod.rs` (`DDL`), owned by the
-  fold contract: any change to it, to payload interpretation, or to handler
-  behavior bumps `fold::FOLD_VERSION` (drop-and-replay is the migration
-  story, D14/D18). The op-log record ENVELOPE and encodings stay frozen
-  (PR 1.4) — widening payload semantics is a documented fold-contract
-  amendment, not a drive-by.
+- Keep store logic in `core/src/store/*`, one `impl Store` block per module,
+  and keep transport out of it: no axum or HTTP types below `api/`. The MCP
+  tool layer is `api/src/mcp.rs`.
+- Use explicit SQL through `core/src/pgq.rs` (`pgq::query`, `query_as`,
+  `query_scalar`), matching the surrounding style. Placeholders are written
+  `?` and rewritten to `$N` at call time ... do not renumber them by hand and
+  do not mix in bare `sqlx::query` for new code.
+- The schema lives in `core/src/db.rs` (inline idempotent DDL plus the org
+  scoping) with reshapes in `core/migrations/`. A change to either is a
+  migration question, not a drive-by: see the hybrid rule under Core
+  Invariants.
 - Preserve the established wire/API shapes (inherited from the Node stack)
   unless intentionally changing the public contract.
 - Add comments only for non-obvious reasons, invariants, or security-sensitive
@@ -373,29 +283,30 @@ Prioritize these when reviewing before real use:
 - Embedding/search index maintenance: deletes must scrub search/embeddings
   rows (actor cascade, mail redaction) so nothing orphaned resurfaces in
   retrieval.
-- MCP tool layer (`core/src/mcp.rs`): every tool result is content the
-  calling agent will read — treat stored data as untrusted input to it.
+- MCP tool layer (`api/src/mcp.rs`): every tool result is content the calling
+  agent will read ... treat stored data as untrusted input to it.
 
 ## Data And Generated Files
 
 - Do not commit `target/`, `node_modules/`, package `dist/`, `.tsbuildinfo`, or
   generated database/model-cache files.
-- `.claude/worktrees/` is local state. Do not treat it as source. (`/node/`
-  used to be listed here too — the pre-teardown Node layout. It is the
-  hive-node crate now, and its `.gitignore` rule went with the rename.)
+- `.claude/worktrees/` is local state. Do not treat it as source.
 - Do not add secrets, real tokens, credentials, or personal data.
 - Use reserved fictional values in tests and docs.
 
 ## Known Documentation Drift
 
-- `RUST_REWRITE.md` contains useful Rust architecture notes but predates the
-  P2P pivot and the Phase 1 teardown.
-- `docs/mail-ops.md` describes hosted-era mail operations; mail returns as a
-  module in Phase 3 and the runbook gets rewritten then.
-
-(`README.md`, `plugins/`, and `integrations/` were rewritten for the pivot
-in PR 1.8 — the plugin and the `.mcpb` run through the stdio `hive-bridge`;
-the hosted-era Codex/Hermes adapters were deleted with the server they
-called.)
+- `README.md` still describes the local-first desktop app: op-log storage,
+  crypto-shred, a Dioxus shell, a stdio bridge. None of that is in the tree.
+- `RUST_REWRITE.md` has useful notes on the Node-to-Rust port, but it predates
+  orgs and RLS, and the worker binary it names is gone.
+- `docs/mail-ops.md` describes hosted-era mail operations against a compose
+  stack that no longer matches. Mail routes and the mail archive do exist,
+  behind `HIVE_MAIL_ENABLED`.
+- `plugins/claude-code-hive-memory/` and `integrations/claude-desktop/` both
+  tell the reader to `cargo install --path bridge` and run `hive-bridge` on
+  stdio. There is no bridge crate; MCP is `POST /mcp` on `hive-api`.
+- `docs/ARTIFACTS.md` and `docs/SELF-HOST.md` predate the current shape in
+  places (blockstore naming, a Node `hive-server`).
 
 Fix these docs when touching the related area.
