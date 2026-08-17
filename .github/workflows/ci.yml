@@ -80,7 +80,7 @@ jobs:
           # api/tests/org_isolation.rs provisions an unprivileged role and
           # serves as it, so this role must be able to CREATE ROLE. The
           # image's POSTGRES_USER is a superuser, which satisfies it.
-          DATABASE_URL: postgres://hive:hive@localhost:5432/hive
+          DATABASE_URL: postgres://hive:hive@127.0.0.1:5432/hive
           HIVE_CRED_KEY: ci-credential-vault-key-not-a-secret
         run: cargo test --workspace
 

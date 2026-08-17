@@ -21,7 +21,7 @@ done
 # The store layer is Postgres (the Rust rewrite retired SQLite). Bring up a
 # local dev container when a container runtime is available; otherwise the
 # printed commands rely on whatever DATABASE_URL the environment provides.
-DB_URL="${DATABASE_URL:-postgres://hive:hive@localhost:5432/hive}"
+DB_URL="${DATABASE_URL:-postgres://hive:hive@127.0.0.1:5432/hive}"
 RUNTIME="$(command -v podman || command -v docker || true)"
 if [ -n "$RUNTIME" ]; then
   if "$RUNTIME" ps --format '{{.Names}}' 2>/dev/null | grep -qx hive-pg; then

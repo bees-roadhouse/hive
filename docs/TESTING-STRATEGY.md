@@ -49,13 +49,13 @@ and a test against anything else would prove nothing about either.
 ```
 ./dev-setup.sh          # pgvector/pgvector:pg17 on :5432, idempotent
 
-DATABASE_URL=postgres://hive:hive@localhost:5432/hive \
+DATABASE_URL=postgres://hive:hive@127.0.0.1:5432/hive \
 HIVE_EMBED=hash \
 HIVE_CRED_KEY=dev-credential-vault-key \
   cargo test --workspace
 ```
 
-- **`DATABASE_URL`** falls back to `postgres://hive:hive@localhost:5432/hive`
+- **`DATABASE_URL`** falls back to `postgres://hive:hive@127.0.0.1:5432/hive`
   (`hive_core::db::database_url`), which is exactly what `dev-setup.sh` brings
   up, so locally you can usually leave it unset. The role it names must be able
   to `CREATE ROLE`: the suite provisions the unprivileged serving role the same

@@ -170,7 +170,7 @@ against anything else would prove nothing about either.
 ```bash
 ./dev-setup.sh          # pgvector/pgvector:pg17 on :5432, idempotent
 
-DATABASE_URL=postgres://hive:hive@localhost:5432/hive \
+DATABASE_URL=postgres://hive:hive@127.0.0.1:5432/hive \
 HIVE_EMBED=hash \
 HIVE_CRED_KEY=dev-credential-vault-key \
   cargo test --workspace
@@ -207,7 +207,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo build --workspace --all-targets
 cargo build --release -p hive-api
-HIVE_EMBED=hash DATABASE_URL=postgres://hive:hive@localhost:5432/hive \
+HIVE_EMBED=hash DATABASE_URL=postgres://hive:hive@127.0.0.1:5432/hive \
   HIVE_CRED_KEY=dev-credential-vault-key cargo test --workspace
 ```
 

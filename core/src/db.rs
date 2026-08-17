@@ -20,9 +20,15 @@ use crate::store::now_iso;
 
 /// Resolve the Postgres connection string from `DATABASE_URL`. Falls back to a
 /// local dev instance so tests + local runs work without extra config.
+///
+/// The host is `127.0.0.1`, not `localhost`, and that is load-bearing on
+/// Windows: `localhost` resolves AAAA-first, the container port forward listens
+/// on IPv4 only, and the `::1` attempt is dropped rather than refused — so every
+/// connection ate the full ~21s TCP SYN timeout before falling back. Two of
+/// those in the boot path made a 300ms startup take 45 seconds.
 pub fn database_url() -> String {
     std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://hive:hive@localhost:5432/hive".to_string())
+        .unwrap_or_else(|_| "postgres://hive:hive@127.0.0.1:5432/hive".to_string())
 }
 
 /// The org an existing single-tenant install is folded into, and the org the
