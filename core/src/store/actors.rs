@@ -332,26 +332,60 @@ async fn remove_in_tx(conn: &mut PgConnection, slug: &str) -> Result<ActorDelete
     // 6. Profile card.
     acc.profile += exec_count(conn, "DELETE FROM profile WHERE actor = ?", &[slug]).await?;
 
-    // 7. Login + credentials. Sessions hang off the user row (user_id), so reap
-    //    them first, then the user, then any bearer tokens for this actor.
+    // 7. Login + credentials, every one of them scoped to the ACTING org.
+    //
+    //    A user account is global and `memberships` is what scopes it (see the
+    //    note on `users` in core/src/db.rs), so purging an actor out of THIS
+    //    org must not delete a login that another org also holds. Dropping the
+    //    membership IS the purge; the account itself goes only when this was
+    //    the last org holding it. Unscoped, this deleted the global `users`
+    //    row, every session that human had anywhere, and every token they held
+    //    in any org — an admin in one org ending a person's access to all of
+    //    them.
+    //
+    //    Sessions and tokens each pin exactly one org, so "this org's" is a
+    //    column and not a judgement call.
+    let org = crate::db::ACTING_ORG;
     let usr_rows: Vec<(String,)> = crate::pgq::query_as("SELECT id FROM users WHERE actor = ?")
         .bind(slug)
         .fetch_all(&mut *conn)
         .await?;
     for (user_id,) in &usr_rows {
-        acc.sessions +=
-            exec_count(conn, "DELETE FROM sessions WHERE user_id = ?", &[user_id]).await?;
+        acc.sessions += exec_count(
+            conn,
+            &format!("DELETE FROM sessions WHERE user_id = ? AND org_id = {org}"),
+            &[user_id],
+        )
+        .await?;
+        exec_count(
+            conn,
+            &format!("DELETE FROM memberships WHERE user_id = ? AND org_id = {org}"),
+            &[user_id],
+        )
+        .await?;
+        acc.users += exec_count(
+            conn,
+            "DELETE FROM users u WHERE u.id = ? \
+             AND NOT EXISTS (SELECT 1 FROM memberships m WHERE m.user_id = u.id)",
+            &[user_id],
+        )
+        .await?;
     }
-    acc.users += exec_count(conn, "DELETE FROM users WHERE actor = ?", &[slug]).await?;
     acc.api_tokens += exec_count(
         conn,
-        "DELETE FROM api_tokens WHERE actor = ? OR created_by = ? OR granted_by = ?",
+        &format!(
+            "DELETE FROM api_tokens \
+             WHERE (actor = ? OR created_by = ? OR granted_by = ?) AND org_id = {org}"
+        ),
         &[slug, slug, slug],
     )
     .await?;
     acc.oauth_codes += exec_count(
         conn,
-        "DELETE FROM oauth_auth_codes WHERE ai_actor = ? OR granted_by = ?",
+        &format!(
+            "DELETE FROM oauth_auth_codes \
+             WHERE (ai_actor = ? OR granted_by = ?) AND org_id = {org}"
+        ),
         &[slug, slug],
     )
     .await?;
@@ -579,33 +613,38 @@ async fn merge_in_tx(conn: &mut PgConnection, from: &str, to: &str) -> Result<Ac
     }
 
     // Tokens + oauth codes: re-point actor + the granting/creating columns.
+    // Only this org's credentials — an actor slug is per-org, so another org's
+    // `nate` is a different person and a merge here must not rewrite theirs.
+    let org = crate::db::ACTING_ORG;
     acc.api_tokens += exec_count(
         conn,
-        "UPDATE api_tokens SET actor = ? WHERE actor = ?",
+        &format!("UPDATE api_tokens SET actor = ? WHERE actor = ? AND org_id = {org}"),
         &[to, from],
     )
     .await?;
     exec_count(
         conn,
-        "UPDATE api_tokens SET created_by = ? WHERE created_by = ?",
+        &format!("UPDATE api_tokens SET created_by = ? WHERE created_by = ? AND org_id = {org}"),
         &[to, from],
     )
     .await?;
     exec_count(
         conn,
-        "UPDATE api_tokens SET granted_by = ? WHERE granted_by = ?",
+        &format!("UPDATE api_tokens SET granted_by = ? WHERE granted_by = ? AND org_id = {org}"),
         &[to, from],
     )
     .await?;
     acc.oauth_codes += exec_count(
         conn,
-        "UPDATE oauth_auth_codes SET ai_actor = ? WHERE ai_actor = ?",
+        &format!("UPDATE oauth_auth_codes SET ai_actor = ? WHERE ai_actor = ? AND org_id = {org}"),
         &[to, from],
     )
     .await?;
     exec_count(
         conn,
-        "UPDATE oauth_auth_codes SET granted_by = ? WHERE granted_by = ?",
+        &format!(
+            "UPDATE oauth_auth_codes SET granted_by = ? WHERE granted_by = ? AND org_id = {org}"
+        ),
         &[to, from],
     )
     .await?;
@@ -669,22 +708,59 @@ async fn merge_in_tx(conn: &mut PgConnection, from: &str, to: &str) -> Result<Ac
         )
         .await?;
     }
+    // The login account. It is GLOBAL, so both branches below have to answer
+    // "does anyone else hold this account" before touching it — a merge is an
+    // assertion about two actors in ONE org, and an account can outlive that
+    // org's opinion of it.
     let to_has_user = crate::pgq::query("SELECT 1 FROM users WHERE actor = ?")
         .bind(to)
         .fetch_optional(&mut *conn)
         .await?
         .is_some();
+    let from_orgs: i64 = crate::pgq::query_scalar::<i64>(
+        "SELECT count(*) FROM memberships m JOIN users u ON u.id = m.user_id WHERE u.actor = ?",
+    )
+    .bind(from)
+    .fetch_one(&mut *conn)
+    .await?;
     if to_has_user {
-        // `to` already logs in; drop the `from` account + its sessions.
+        // `to` already logs in; drop `from`'s access to THIS org, and the
+        // account itself only if no other org still holds it.
         let usr_rows: Vec<(String,)> = crate::pgq::query_as("SELECT id FROM users WHERE actor = ?")
             .bind(from)
             .fetch_all(&mut *conn)
             .await?;
         for (user_id,) in &usr_rows {
-            exec_count(conn, "DELETE FROM sessions WHERE user_id = ?", &[user_id]).await?;
+            exec_count(
+                conn,
+                &format!("DELETE FROM sessions WHERE user_id = ? AND org_id = {org}"),
+                &[user_id],
+            )
+            .await?;
+            exec_count(
+                conn,
+                &format!("DELETE FROM memberships WHERE user_id = ? AND org_id = {org}"),
+                &[user_id],
+            )
+            .await?;
+            acc.users += exec_count(
+                conn,
+                "DELETE FROM users u WHERE u.id = ? \
+                 AND NOT EXISTS (SELECT 1 FROM memberships m WHERE m.user_id = u.id)",
+                &[user_id],
+            )
+            .await?;
         }
-        acc.users += exec_count(conn, "DELETE FROM users WHERE actor = ?", &[from]).await?;
     } else {
+        // Renaming the account's handle is not an org-scoped act: `users.actor`
+        // is the global one. Refuse rather than rename it out from under
+        // another org that still has this person as a member.
+        anyhow::ensure!(
+            from_orgs <= 1,
+            "{from} logs in to more than one org, so renaming its account handle to {to} would \
+             rename it in all of them. Remove it from the other orgs first, or merge the people \
+             rows without merging the login."
+        );
         acc.users += exec_count(
             conn,
             "UPDATE users SET actor = ? WHERE actor = ?",

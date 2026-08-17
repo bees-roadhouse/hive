@@ -91,17 +91,25 @@ impl Store {
     /// List every OAuth client with its live token stats: a count of currently
     /// active (non-expired) oauth tokens and the most-recent `last_used_at`. A
     /// token is active when `expires_at` is NULL (legacy) or still in the future.
+    ///
+    /// A client is instance-global (registration is unauthenticated, so there
+    /// is no org to record), but its TOKENS each pin one — so the counts and
+    /// the last-used time are this org's. Unscoped, the connected-apps screen
+    /// told one org's admin how many agents another org had connected and when
+    /// they last used them.
     pub async fn oauth_clients_list(&self) -> Result<Vec<OAuthClientStatus>> {
         let now = now_iso();
-        let rows = crate::pgq::query(
+        let rows = crate::pgq::query(&format!(
             "SELECT c.client_id, c.client_name, c.created_at, \
                     COUNT(t.id) FILTER (WHERE t.expires_at IS NULL OR t.expires_at > ?) AS active_tokens, \
                     MAX(t.last_used_at) AS last_used_at \
              FROM oauth_clients c \
              LEFT JOIN api_tokens t ON t.client_id = c.client_id AND t.kind = 'oauth' \
+               AND t.org_id = {org} \
              GROUP BY c.client_id, c.client_name, c.created_at \
              ORDER BY c.created_at DESC",
-        )
+            org = crate::db::ACTING_ORG
+        ))
         .bind(&now)
         .fetch_all(self.db())
         .await?;

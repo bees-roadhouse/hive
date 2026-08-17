@@ -283,6 +283,16 @@ async fn two_databases_on_one_cluster_both_keep_serving() {
         .execute(&owner)
         .await
         .expect("drop second database");
+    // And its role. Roles are cluster-wide, so DROP DATABASE does not take one
+    // with it — without this the test leaks a `hive_app_*` per run, which is
+    // also the note for operators decommissioning an instance.
+    sqlx::raw_sql(&format!(
+        "DROP ROLE IF EXISTS {}",
+        db::app_role(&second_url)
+    ))
+    .execute(&owner)
+    .await
+    .expect("drop second role");
     owner.close().await;
 
     // … and the FIRST one still does, which is the half that used to break:

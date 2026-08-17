@@ -1057,6 +1057,38 @@ const DDL_LOCK_TIMEOUT: &str = "10s";
 /// One connection for the whole pass, so `lock_timeout` covers all of it
 /// (a `SET` is per-session, and `raw_sql` on a pool takes whichever connection
 /// is free).
+///
+/// ## What the FIRST upgrade still costs, stated rather than discovered
+///
+/// The steady state is cheap — every step is probed, so a restart on an
+/// already-scoped database writes nothing and takes no heavy lock. The first
+/// boot over a pre-org database is a different matter, and these are the parts
+/// that are still a real lock:
+///
+/// * **The backfill `UPDATE`** rewrites every row of every content table. It
+///   only holds ROW EXCLUSIVE (readers and other writers continue), but it
+///   doubles the table's heap for the duration and leaves it to `VACUUM`. On a
+///   large journal, take the backup you would take anyway.
+/// * **`CREATE INDEX`, not `CREATE INDEX CONCURRENTLY`.** The org index and
+///   the per-org unique rebuilds block WRITES to their table while they build.
+///   CONCURRENTLY cannot run inside a transaction and leaves an INVALID index
+///   behind on failure, which `IF NOT EXISTS` would then skip forever — a
+///   worse failure than a slow one, so this stays as it is until someone
+///   writes the invalid-index recovery path to go with it.
+/// * **The policy transaction takes ACCESS EXCLUSIVE on every content table at
+///   once.** Each statement is a catalog write and finishes in microseconds,
+///   but they are held together until commit, so this is a brief full stop for
+///   the whole instance rather than a table-at-a-time one. That is the trade
+///   for never exposing a table with RLS on and no policy; see
+///   `apply_org_policies`.
+/// * **The `blobs` primary key moves**, which rebuilds its index over whatever
+///   attachment bytes are already stored, and the attachment foreign key that
+///   follows it is validated in the same transaction rather than NOT VALID —
+///   it has to be, or the key swap is not atomic with the reference to it.
+///
+/// `lock_timeout` means any of these FAILS the boot rather than queueing in
+/// front of every reader on the table. A crashed boot is idempotent — it
+/// re-runs from wherever it stopped — so failing is the cheap outcome.
 async fn apply_org_scoping(pool: &PgPool) -> Result<()> {
     let mut conn = pool.acquire().await?;
     sqlx::raw_sql(&format!("SET lock_timeout = '{DDL_LOCK_TIMEOUT}'"))
@@ -1143,8 +1175,9 @@ async fn org_scoping_pass(conn: &mut sqlx::PgConnection) -> Result<()> {
 /// issues no writes and takes no heavy lock at all.
 ///
 /// The probes are not an optimisation. Unguarded, this ran a full-table UPDATE
-/// and a full-table `SET NOT NULL` scan under ACCESS EXCLUSIVE on 31 tables at
-/// EVERY boot, which is a restart that gets slower as the install gets bigger.
+/// and a full-table `SET NOT NULL` scan under ACCESS EXCLUSIVE on every table
+/// in `ORG_TABLES` at EVERY boot — a restart that gets slower as the install
+/// gets bigger, for work that was already done the first time.
 async fn scope_org_column(conn: &mut sqlx::PgConnection, table: &str) -> Result<()> {
     // NULL = no such column yet; Some(false) = present but still nullable.
     let notnull: Option<bool> = crate::pgq::query_scalar::<bool>(
