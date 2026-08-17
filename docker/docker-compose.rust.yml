@@ -1,6 +1,10 @@
-# Hive — all-Rust deployment: hive-api (API + MCP) over Postgres. The worker
-# and mail daemons were retired in the P2P pivot (docs/DIRECTION.md D16); the
-# model cache lives on the hive-models volume.
+# Hive — deployment stack: Postgres plus hive-api, which serves the JSON API,
+# the MCP endpoint at POST /mcp, and the Solid SPA from one process. There is no
+# worker binary and no separate web container.
+#
+# For a zero-setup local try, use docker/docker-compose.local.yml instead. This
+# file is the deployment shape: it refuses to start without a real
+# HIVE_CRED_KEY, restarts unless stopped, and names its network.
 #
 # Run from the repo root:
 #   docker compose -f docker/docker-compose.rust.yml up --build
@@ -38,9 +42,13 @@ services:
       - "7878:7878"
     volumes:
       - hive-models:/models
+      # Artifact bytes default to ./data, which is /app/data in the image and
+      # would not survive the container. HIVE_DATA_DIR points them here.
+      - hive-data:/data
     environment:
       - DATABASE_URL=postgres://hive:hive@postgres:5432/hive
       - HIVE_MODEL_CACHE=/models
+      - HIVE_DATA_DIR=/data
       - PORT=7878
       - RUST_LOG=hive_api=info,tower_http=info
       # Hard-required since 0.6.0: the AES-GCM credential vault (runtime
@@ -66,6 +74,7 @@ services:
 volumes:
   hive-pgdata:
   hive-models:
+  hive-data:
 
 networks:
   hive:

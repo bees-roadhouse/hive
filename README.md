@@ -1,164 +1,181 @@
 # hive
 
-A personal memory engine: journal-first, local-first, yours. You (and your
-AIs) write prose; tasks, decisions, events, and a knowledge graph emerge from
-it by anchoring spans of the text. Everything lives in an append-only,
-encrypted store on your own machine — no server, no accounts, no telemetry —
-with device-to-device sync and pluggable ingestion (mail, files, calendar,
-browser) on the roadmap.
+A self-hostable, multi-org memory engine for people and their AIs. You write
+prose; tasks, decisions, events, and a knowledge graph emerge from it by
+anchoring spans of the text. Claude Code and Claude Desktop read and write the
+same store over MCP, so what an agent remembers and what you see in the browser
+are one thing.
 
-This is the P2P pivot of what used to be a hosted multi-user system. The
-decision record is [docs/DIRECTION.md](./docs/DIRECTION.md) (D16–D28), the
-PR-by-PR execution program is [docs/PLAN.md](./docs/PLAN.md), and the
-security posture is [docs/THREAT-MODEL.md](./docs/THREAT-MODEL.md).
+One Rust binary, `hive-api`, serves all of it: the JSON API, an OAuth 2.1
+authorization server, the MCP endpoint at `POST /mcp`, and the Solid.js SPA.
+PostgreSQL holds the data, and access is enforced by row-level security rather
+than by application checks.
 
 ## Where it stands
 
-Phase 1 (the engine) is complete; Phase 2 (the app) is underway:
+**Early. Self-host at your own risk.**
 
-- **Storage** — per-device append-only op log (CBOR records, encrypted
-  segments, blake3 hash chain) as the source of truth; SQLCipher SQLite as
-  a derived index (FTS5 + vector ANN) rebuilt by deterministic replay.
-  Deleting `index.db` loses nothing — CI proves the rebuild byte-identical.
-- **Blobs** — content-addressed encrypted blockstore (blake3 over
-  ciphertext, FastCDC chunking) with **crypto-shred** hard delete: destroy
-  the wrapped per-blob key and the bytes are unrecoverable, verified end to
-  end in `core/tests/crypto_shred.rs`.
-- **Keys** — master key in the OS keychain; passphrase export wrap
-  (Argon2id) and printable recovery code primitives in `core/src/keys.rs`.
-- **MCP** — the only external API (D25): 47 tools (journal, tasks, search,
-  semantic search, recall, entities, mail archive) in `core/src/mcp.rs`,
-  served over stdio by the `hive-bridge` binary.
-- **App shell** — Dioxus desktop window with journal + search riding the
-  engine, first-launch onboarding (identity + in-GUI legacy import), plus a
-  flatpak manifest (`packaging/flatpak/`).
-- **Importer** — `hive-import` (PR 1.7), the one-shot bridge out of the
-  hosted era: replays an old instance's Postgres into a fresh data dir as
-  op-log records, original ids and timestamps intact, attachment bytes
-  crypto-sharded into the blockstore. The one Postgres client left anywhere
-  in the workspace; the app's onboarding drives the same library for GUI
-  import, the CLI stays as the headless path.
+This branch is under active repair following a security review that reproduced
+cross-org data leaks. Fixes are landing. Until they have settled, treat a hive
+instance as single-tenant: run it for one household or one team, and do not put
+two parties who should not see each other's data in the same instance.
 
-Honest gaps, per plan: **mail sync is paused** (the archive is readable;
-the sync daemon returns as a WASM module in Phase 3), **device sync is
-Phase 4** (single machine until then), and **hive-bridge needs the app
-running** (D25 proxy mode: the bridge talks to the app over
-`<data_dir>/bridge.sock` and holds no store access of its own — when the
-app is closed, bridge calls fail with "the hive app is not running").
+Other things worth knowing before you commit to it:
 
-## Workspace
+- The API is the surface, and it is not versioned. Routes still move.
+- Offline behaviour is a cache, not local-first, and the write-conflict model is
+  still an open question ([docs/WEB-APP.md](./docs/WEB-APP.md)).
+- Mail sync is present but off by default (`HIVE_MAIL_ENABLED`).
+- The relay that lets you reach a home instance from elsewhere is a spike with
+  a demo, not a service ([docs/RELAY.md](./docs/RELAY.md)).
+- The Claude Code plugin under `plugins/` is broken and the Claude Desktop
+  `.mcpb` is dead. Both targeted the removed local-bridge architecture. Their
+  READMEs explain what to do instead.
+
+## Architecture
 
 | Crate | What it is |
 | --- | --- |
-| `core/` | hive-core — op log, blockstore, key custody, SQLCipher index + fold projector, the store (one writer thread), and the MCP tool layer |
-| `app/` | Dioxus desktop shell (journal + search) |
-| `bridge/` | `hive-bridge` — stdio MCP server over the local store; also `hive-bridge call` one-shot mode for hooks/scripts |
-| `importer/` | `hive-import` — one-shot hosted-Postgres → data-dir migration (the only sqlx in the workspace) |
-| `shared/` | domain types |
-| `embed/` | embedding seam: ONNX/BGE local models + deterministic hash fallback |
-| `jmap-sync/` | JMAP mail sync library (kept through the pause; returns in-module in Phase 3) |
+| `api/` | `hive-api` ... axum. JSON API, OAuth 2.1 AS, `POST /mcp`, and the SPA |
+| `core/` | `hive-core` ... the store, the Postgres schema and migrations, RLS, the acting-org scope |
+| `shared/` | domain types shared across the Rust crates |
+| `embed/` | embedding seam: ONNX/BGE local models with a deterministic hash fallback |
+| `jmap-sync/` | JMAP mail sync library |
+| `relay/` | `hive-relay` and `hive-relay-agent` ... SNI-passthrough tunnel so a home instance is reachable without port forwarding |
 
-## Build and run
+| Package | What it is |
+| --- | --- |
+| `packages/web` | the Solid.js SPA, built by vite and served by `hive-api` |
+| `packages/shared` | TypeScript types shared with the SPA |
 
-Rust toolchain is pinned by `rust-toolchain.toml`.
+### How access control works
+
+Two rules carry the weight, both in [docs/WEB-APP.md](./docs/WEB-APP.md):
+
+**Row-level security, not application checks.** Every content table carries an
+`org_id` and a policy keyed to `hive.acting_org`, set per request. Policies use
+`FORCE ROW LEVEL SECURITY` and `WITH CHECK` as well as `USING`, and the API
+connects as a role that is neither superuser nor `BYPASSRLS`. There is no code
+path that forgets the predicate, because it is not code.
+
+**One acting org per credential.** A session or an API token is minted against
+exactly one org and nothing afterwards changes it. No header, query parameter,
+or body selects an org. A human switching orgs logs in again; an agent cannot
+switch at all. That closes the leak RLS cannot see, where an identity reads from
+one scope it legitimately holds and writes into another it also holds.
+
+Encryption is at rest only, and deliberately so: full-text search and pgvector
+similarity cannot run on ciphertext, and search is the product. Mail account
+credentials are the exception and are column-encrypted, which is what
+`HIVE_CRED_KEY` is for. Back that key up separately from the database.
+
+## Run it locally
+
+### Containers
 
 ```bash
-# The desktop app (journal + search)
-cargo run -p hive-app
+podman compose -f docker/docker-compose.local.yml up -d --build
+```
 
-# The MCP bridge (installs `hive-bridge` on PATH)
-cargo install --path bridge
+Postgres plus `hive-api` on <http://localhost:7878>. The credential key in that
+file is a fixed dev value so it runs with no setup; for anything real use
+`docker/docker-compose.rust.yml`, which refuses to start without a
+`HIVE_CRED_KEY` you supply.
 
-# Migrate a hosted-era instance (one-shot; --dry-run to preview the plan)
-cargo run -p hive-import -- --from postgres://user:pass@host/hive --dry-run
+### From source
 
-# Flatpak (Bazzite/Fedora daily-driver path)
-flatpak-builder --user --install build-dir packaging/flatpak/com.beesroadhouse.Hive.yml
+Bring up a pgvector Postgres (`./dev-setup.sh` creates a `hive-pg` container on
+5432), build the SPA once, then run the API:
 
-# The full gate
+```bash
+corepack enable          # pnpm comes from the packageManager pin, not your PATH
+pnpm install
+pnpm --filter @hive/web build
+
+DATABASE_URL=postgres://hive:hive@127.0.0.1:5432/hive \
+HIVE_CRED_KEY=local-dev-credential-key-not-for-production \
+HIVE_EMBED=hash \
+HIVE_WEB_DIST=packages/web/dist \
+cargo run -p hive-api
+```
+
+`HIVE_WEB_DIST` is optional when you run from the repo root, since `packages/web/dist`
+is the default candidate; without a built SPA the API still serves the JSON API
+and MCP, and non-API paths 404.
+
+For SPA work, `pnpm --filter @hive/web dev` runs vite on 5173 and proxies `/api`,
+`/oauth`, `/authorize`, `/.well-known` and `/mcp` to `hive-api`.
+
+### First run
+
+A fresh database opens onto onboarding: instance name, admin name, admin email,
+password. That creates the admin user, the default org, and signs you in.
+
+### Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DATABASE_URL` | ... | pgvector-capable PostgreSQL 17. The role needs `CREATEROLE`, or set `HIVE_APP_DATABASE_URL` to a serving role you provisioned |
+| `HIVE_CRED_KEY` | ... | Required. AES-GCM key for the mail credential vault. Back it up separately from the database |
+| `PORT` | `7878` | HTTP listener |
+| `HIVE_EMBED` | ONNX | `hash` for a deterministic offline embedder with no model download |
+| `HIVE_WEB_DIST` | `packages/web/dist`, then `/app/web` | Where the built SPA lives |
+| `HIVE_PUBLIC_URL` | unset | Public origin for OAuth metadata. Also settable as the `instance.url` config value |
+| `HIVE_MAIL_ENABLED` | `0` | JMAP mail sync |
+
+## Connecting Claude
+
+`POST /mcp` is a streamable HTTP MCP endpoint carrying 53 tools (journal, tasks,
+search, semantic search, recall, entities, people, workspaces, mail archive,
+conversation capture), implemented in `api/src/mcp.rs` and served by
+`api/src/routes/mcp.rs`.
+
+Mint a token under **Account** in the SPA (admin only, shown once), then:
+
+```bash
+claude mcp add --transport http hive http://localhost:7878/mcp \
+  --header "Authorization: Bearer hive_pat_…"
+```
+
+Clients that prefer OAuth can register themselves: hive implements RFC 8414 and
+RFC 9728 discovery, RFC 7591 dynamic client registration, and authorization code
+with PKCE. See
+[integrations/claude-desktop/README.md](./integrations/claude-desktop/README.md)
+for the flow and the three things that reliably break it.
+
+## The gate
+
+Rust toolchain is pinned by `rust-toolchain.toml` so local runs and CI agree.
+
+```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo build --workspace --all-targets
+DATABASE_URL=postgres://hive:hive@127.0.0.1:5432/hive \
+HIVE_CRED_KEY=ci-credential-vault-key-not-a-secret \
 HIVE_EMBED=hash cargo test --workspace
+
+corepack enable
+pnpm install --frozen-lockfile
+pnpm --filter @hive/web build
 ```
 
-Tests are hermetic: tempdir data dirs, in-memory keys, hash embedder — no
-database service, no network. The one exception: the importer's fixture
-tests run only when `DATABASE_URL` points at a pgvector Postgres (they skip
-loudly otherwise), mirroring the CI split.
+Tests need a real pgvector Postgres: each one builds its own schema, migrates
+it, and drops it on the way out. The `DATABASE_URL` role must be able to
+`CREATE ROLE`, because the org-isolation tests provision an unprivileged role
+and serve as it to prove the policies actually fire.
 
-## First launch
+## Documentation
 
-When the data dir holds no store yet, the app opens onto onboarding instead
-of the journal:
-
-1. **Who writes here?** — the name that signs your journal entries
-   (prefilled from `$USER`; stored as the `identity.owner` config record,
-   which the composer reads from then on).
-2. **Start fresh** — creates the empty encrypted store and drops you into
-   the journal; or
-3. **Import from my old hive** — paste the legacy instance's Postgres URL
-   (its *database*, not the old app URL or an API key — the direct read is
-   what preserves original ids and timestamps). *Check first (dry run)*
-   shows the per-group counts without writing anything; *Import* runs the
-   one-shot migration and lands you in the journal with your history. If an
-   import fails part-way, *Clean up and retry* wipes the partial data dir —
-   safe precisely because this launch verified the dir was fresh and opened
-   no store on it.
-
-The GUI import is why the flatpak carries `--share=network`; what the app
-does with that hole (exhaustively: the Postgres connection you initiate) is
-pinned in [docs/THREAT-MODEL.md](./docs/THREAT-MODEL.md#telemetry-and-network).
-`hive-import` remains the headless equivalent — same library, same one-shot
-rules — for scripted migrations:
-
-```bash
-cargo run -p hive-import -- --from postgres://user:pass@host/hive --dry-run
-```
-
-## How Claude connects
-
-Both integrations run through `hive-bridge` on `PATH` (D25):
-
-- **Claude Code** — the [`hive-memory` plugin](./plugins/claude-code-hive-memory/)
-  wires the bridge as a stdio MCP server and injects a session-start recall
-  brief through a hook.
-- **Claude Desktop** — the [`hive.mcpb` extension](./integrations/claude-desktop/)
-  launches the same binary (build with `./scripts/build-mcpb.sh`).
-
-One-shot tool calls for scripts and hooks:
-
-```bash
-hive-bridge call journal_append --json '{"body": "Note to self about [topic: Bridges]."}'
-hive-bridge call recall --json '{"identity": "nate"}'
-```
-
-The acting identity defaults to `$USER` (`--actor` overrides), matching the
-app. The app must be running — the bridge is a proxy to it (D25), and any
-number of bridge clients can connect at once.
-
-## Data dir
-
-`$XDG_DATA_HOME/hive` (fallback `~/.local/share/hive`; the flatpak app maps
-this under `~/.var/app/com.beesroadhouse.Hive/data/hive`):
-
-```text
-device                      this installation's device id
-lock                        single-writer advisory lock (one hive process at a time)
-log/<device>/<seq>.seg      the op log: encrypted, append-only, the truth
-blocks/<hh>/<blake3>        encrypted content-addressed blob blocks
-index.db                    SQLCipher derived index — delete it and replay rebuilds it
-```
-
-Back up the whole directory (plus your OS keychain's `hive/master-key`
-entry — without it a backup is noise, which is the point). See
-[docs/THREAT-MODEL.md](./docs/THREAT-MODEL.md) for what that protects
-against, exactly.
+- [docs/WEB-APP.md](./docs/WEB-APP.md) ... the current architecture. Authoritative.
+- [docs/ARTIFACTS.md](./docs/ARTIFACTS.md) ... artifact types, derived text, thumbnails.
+- [docs/RELAY.md](./docs/RELAY.md) ... reaching a self-hosted hive from elsewhere.
+- [docs/DIRECTION.md](./docs/DIRECTION.md) ... the decision record. D16-D20, D29-D36 and D41-D44 describe the superseded local-first design; read them as history.
 
 ## Branching
 
-- `main` is the only long-lived branch; it must stay releasable.
-- Work branches: `feature/{slug}`, `bug/{slug}`, `improvement/{slug}`,
-  `refactor/{slug}`, merging back via PR (CI: fmt, clippy, build, test).
-- Releases are tag-driven and return with the Phase 2.5 packaging pipeline;
-  Phase 1 lands untagged. The version of record is `[workspace.package]` in
-  the root `Cargo.toml`.
+- `main` is the only long-lived branch and must stay releasable.
+- Work branches are `feature/{slug}`, `bug/{slug}`, `improvement/{slug}`,
+  `refactor/{slug}`, merged by PR. CI runs fmt, clippy, build, test, and the SPA
+  build.
+- The version of record is `[workspace.package]` in the root `Cargo.toml`.
