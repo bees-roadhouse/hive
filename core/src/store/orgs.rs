@@ -60,6 +60,17 @@ impl Store {
         row.as_ref().map(row_to_org).transpose()
     }
 
+    /// Every org id on the instance. For boot-time work that has to visit each
+    /// tenant in turn — a migration or a reconcile, which is not a request and
+    /// so carries no acting scope of its own.
+    pub async fn orgs_all(&self) -> Result<Vec<Uuid>> {
+        Ok(
+            crate::pgq::query_scalar::<Uuid>("SELECT id FROM orgs ORDER BY created_at")
+                .fetch_all(self.db())
+                .await?,
+        )
+    }
+
     /// How many orgs this instance holds. Read by the paths that may only
     /// assume an org when there is exactly one to assume.
     pub async fn orgs_count(&self) -> Result<i64> {

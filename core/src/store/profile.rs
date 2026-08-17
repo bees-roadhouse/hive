@@ -75,9 +75,31 @@ impl Store {
         Ok(next)
     }
 
+    /// [`Store::backfill_identity_cards`] over every org on the instance.
+    ///
+    /// The backfill reads `people`, which is row-secured, so it only ever sees
+    /// the acting org — and boot is not a request and inherits no scope. Called
+    /// bare from `main`, it therefore matched zero rows on every start and
+    /// reported a successful migration of nothing. Each org gets its own scope
+    /// here, the same way `artifacts_sweep_all` does.
+    pub async fn backfill_identity_cards_all(&self) -> Result<i64> {
+        let mut migrated = 0;
+        for org in self.orgs_all().await? {
+            migrated += crate::acting::scope(
+                crate::acting::ActingScope::new(org, "system".to_string(), true),
+                self.backfill_identity_cards(),
+            )
+            .await?;
+        }
+        Ok(migrated)
+    }
+
     /// One-time reconciliation (#31 → #37): fold legacy people.bio/role into the
     /// canonical profile card as sections.bio/sections.role. Idempotent — only
     /// fills a section that's missing/blank. Safe to run on every boot.
+    ///
+    /// Scoped to the acting org: drive it with `backfill_identity_cards_all`
+    /// unless you already hold a scope.
     pub async fn backfill_identity_cards(&self) -> Result<i64> {
         let rows = crate::pgq::query(
             "SELECT slug, name, kind, bio, role FROM people WHERE bio IS NOT NULL OR role IS NOT NULL",

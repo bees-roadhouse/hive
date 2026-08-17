@@ -60,8 +60,9 @@ async fn main() -> anyhow::Result<()> {
     let pool = hive_api::db::init().await?;
 
     let store = hive_api::store::Store::new(pool);
-    // Fold any legacy people.bio/role into the canonical profile card (idempotent).
-    store.backfill_identity_cards().await?;
+    // Fold any legacy people.bio/role into the canonical profile card
+    // (idempotent). Per-org: `people` is row-secured and boot holds no scope.
+    store.backfill_identity_cards_all().await?;
 
     spawn_artifact_sweeper(store.clone());
 
