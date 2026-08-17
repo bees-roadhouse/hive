@@ -35,7 +35,74 @@ pub const DEFAULT_ORG_SLUG: &str = "default";
 /// The unprivileged role the API serves requests as. It owns nothing and has
 /// neither SUPERUSER nor BYPASSRLS, because either one silently turns every
 /// policy below into a comment.
-pub const APP_ROLE: &str = "hive_app";
+///
+/// The name is a PREFIX, not the role: see [`app_role`].
+pub const APP_ROLE_PREFIX: &str = "hive_app";
+
+/// The unprivileged serving role FOR THIS DATABASE — `hive_app_<database>`.
+///
+/// It used to be one cluster-wide `hive_app` for every database, which was
+/// wrong twice over.
+///
+/// **It fought with itself.** A role lives in `pg_authid`, which is
+/// cluster-wide; its password was derived from `DATABASE_URL`, which is not.
+/// Two databases on one cluster therefore derived two different passwords for
+/// ONE row and each boot overwrote the other's, so whichever instance
+/// connected next got `28P01` and healed by overwriting back. Permanent, and
+/// nondeterministic, because it only bites in the window between one instance
+/// healing and the other re-breaking. `hive` + a staging copy on one Postgres
+/// is a supported self-hosting shape, so this was a product bug and not a
+/// test-harness one.
+///
+/// **And it over-shared.** Grants are per-database, so each instance's boot
+/// granted the SAME login DML on ITS tables. One credential accumulated read
+/// and write on every hive database in the cluster, and `CONNECT` is granted
+/// to `PUBLIC` by default — so staging's serving password opened production's
+/// journal. Splitting the identity per database is what closes that; the
+/// rotation fight was only the loud half of the defect.
+///
+/// A database name is unique within its cluster, which is exactly the scope a
+/// role name needs, and it is stable across everything the URL is not: the
+/// host spelling, the port, the owner's password. Over-long or exotic names
+/// fold into a hash suffix so the result always fits Postgres' 63-byte limit
+/// and is always `[a-z0-9_]`.
+pub fn app_role(url: &str) -> String {
+    app_role_for_db(
+        url.parse::<PgConnectOptions>()
+            .ok()
+            .and_then(|o| o.get_database().map(str::to_string))
+            .unwrap_or_default()
+            .as_str(),
+    )
+}
+
+/// [`app_role`] from a database name rather than a URL — what `grant_app_role`
+/// uses, because the role belongs to the database being migrated and not to
+/// whatever `DATABASE_URL` happens to say in this process.
+pub fn app_role_for_db(db: &str) -> String {
+    let safe: String = db
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // 63 is NAMEDATALEN - 1. Anything that would overflow it (or that
+    // sanitising could have collided) keeps a readable head and a hash tail,
+    // so two long names cannot land on one role.
+    const MAX: usize = 63 - 10; // "hive_app_" + '_' before the hash
+    if safe.is_empty() || safe.len() > MAX || safe != db {
+        use sha2::{Digest, Sha256};
+        let digest = hex::encode(Sha256::digest(db.as_bytes()));
+        let head: String = safe.chars().take(MAX - 8).collect();
+        return format!("{APP_ROLE_PREFIX}_{head}_{}", &digest[..8]);
+    }
+    format!("{APP_ROLE_PREFIX}_{safe}")
+}
 
 /// Open a pool WITHOUT the acting-org stamping — the owner/admin connection
 /// used for DDL at boot. Never hand this to request-serving code: it is the
@@ -79,7 +146,7 @@ async fn stamp_scope(
     Ok(())
 }
 
-/// The request-serving pool: connects as [`APP_ROLE`] and re-stamps the acting
+/// The request-serving pool: connects as [`app_role`] and re-stamps the acting
 /// scope on every checkout, so a connection can never carry one request's org
 /// into another's. The `after_release` clear is belt to that braces — even if
 /// it never ran, the next checkout overwrites the value before any statement.
@@ -352,6 +419,29 @@ const SCHEMA: &str = r#"
     );
 
     -- Login accounts. actor is the people.slug this user authenticates as.
+    --
+    -- ===== A user is GLOBAL, and membership is what scopes it =====
+    -- Deliberate, and the design note's shape (`docs/WEB-APP.md`): one account
+    -- per human, in as many orgs as `memberships` says. The alternative —
+    -- `org_id` on `users` and a policy over it — is not merely a bigger change,
+    -- it is circular: a credential is what supplies the acting org, and every
+    -- credential resolves through this table BEFORE any org exists. Login is
+    -- `email` → user → memberships → pick an org; a bearer token's granting
+    -- human is `actor` → user. Neither lookup has an org to be scoped by.
+    --
+    -- That is also why `actor` and `email` stay globally UNIQUE: they are the
+    -- two handles a credential is resolved by with no org in hand, so a
+    -- per-org key could not answer either lookup. The cost is real and worth
+    -- naming — an admin creating a user whose email or actor slug is already
+    -- taken ANYWHERE on the instance gets a uniqueness failure, which tells
+    -- them the account exists. It is an admin-only oracle on an instance the
+    -- operator runs, and the fix for it is an invite flow (attach an existing
+    -- global account to my org), not a schema change.
+    --
+    -- What does NOT follow from "global" is a global LIST: `users_list` joins
+    -- `memberships` on the acting org, so no org ever sees another's people.
+    -- `users` is on the tenancy-plane allowlist in api/tests/org_isolation.rs
+    -- for exactly the reason above, and nothing else may join it.
     CREATE TABLE IF NOT EXISTS users (
       id            TEXT PRIMARY KEY,
       actor         TEXT NOT NULL UNIQUE,
@@ -655,6 +745,14 @@ const SCHEMA_SEARCH: &str = r#"
     -- strings, backfill cursor, backoff bookkeeping) lives on mail_accounts,
     -- and the account credential is a cc_credentials row named by cred_id.
     -- user_scope is NEVER NULL for mail (there is no global mail).
+    -- Attachment bytes, content-addressed. The PRIMARY KEY here is the
+    -- pre-org shape and `apply_org_scoping` moves it to (org_id, hash): a
+    -- hash is only unique INSIDE an org now. Global dedup made one org's
+    -- bytes literally the same row as another's, so either org's delete cut
+    -- both pointers — and Postgres runs a foreign key's ON DELETE action with
+    -- row security bypassed, so no policy could have stopped it. Two orgs
+    -- holding identical bytes now store them twice, which is the same trade
+    -- `artifacts` already makes (per-org content address, store/artifacts.rs).
     CREATE TABLE IF NOT EXISTS blobs (
       hash       TEXT PRIMARY KEY,
       size       BIGINT NOT NULL DEFAULT 0,
@@ -742,6 +840,10 @@ const SCHEMA_SEARCH: &str = r#"
     CREATE TABLE IF NOT EXISTS mail_attachments (
       id             TEXT PRIMARY KEY,
       message_id     TEXT NOT NULL REFERENCES mail_messages(id) ON DELETE CASCADE,
+      -- Rebuilt as (org_id, blob_hash) → blobs(org_id, hash) by
+      -- `apply_org_scoping`; see the note on `blobs` above for why a
+      -- single-column reference to a globally-keyed table was a cross-org
+      -- delete channel that RLS could not close.
       blob_hash      TEXT REFERENCES blobs(hash) ON DELETE SET NULL,
       jmap_blob_id   TEXT NOT NULL DEFAULT '',
       filename       TEXT NOT NULL DEFAULT '',
@@ -832,7 +934,25 @@ const ORG_TABLES: &[&str] = &[
     "mail_mailboxes",
     "mail_messages",
     "mail_attachments",
+    // Attachment BYTES. Content, and the one table where a missing policy was
+    // not a read leak but a write one: three call sites asked an RLS-filtered
+    // `mail_attachments` whether a blob was orphaned and then deleted from an
+    // unfiltered `blobs`.
+    "blobs",
+    // Short-lived OAuth handshake state (owner, PKCE verifier, return path).
+    // Both endpoints that touch it are authenticated, so an acting org is
+    // always in hand; the state string being unguessable is not a reason to
+    // leave the row reachable from another org.
+    "runtime_oauth_states",
 ];
+
+/// Tables that already carry `org_id` in their own DDL and need only the
+/// policy pass. `artifacts` is one: the file-artifacts workstream shipped its
+/// column, FK and index inline, and its policy used to be created ONCE behind
+/// an `IF NOT EXISTS` probe — so editing the predicate in this file changed
+/// nothing on a database that already had it. It is rewritten every boot now,
+/// with the same `nullif(…, true)` predicate as every other table.
+const POLICY_ONLY_TABLES: &[&str] = &["artifacts"];
 
 /// Content tables carrying a per-user namespace column. The namespace used to
 /// be enforced by `Visibility` filters composed into every query in the store
@@ -873,7 +993,17 @@ const ORG_UNIQUE_REBUILDS: &[(&str, &str, &str)] = &[
     ("shares", "shares_uniq", "scope, ref, viewer"),
 ];
 
-const ACTING_ORG: &str = "nullif(current_setting('hive.acting_org', true), '')::uuid";
+/// The acting org as SQL. Public because the store layer needs the SAME
+/// expression for the handful of tables that legitimately have no policy
+/// (`api_tokens`) and for the belt-to-RLS's-braces predicates elsewhere: one
+/// definition, so a query cannot read a session variable the policies do not.
+///
+/// `nullif(…, true)` twice over is load-bearing. The `true` is
+/// `missing_ok` — an unset variable is NULL rather than an error — and the
+/// `nullif` turns the empty string the pool stamps for "no scope" into NULL
+/// too. `org_id = NULL` is NULL, which is not true, so no scope denies
+/// everything instead of raising `22P02: invalid input syntax for type uuid`.
+pub const ACTING_ORG: &str = "nullif(current_setting('hive.acting_org', true), '')::uuid";
 const ACTING_USER: &str = "nullif(current_setting('hive.acting_user', true), '')";
 const ACTING_ADMIN: &str = "current_setting('hive.acting_admin', true) = 'on'";
 
@@ -912,11 +1042,38 @@ fn journal_read_predicate() -> String {
     )
 }
 
+/// How long a boot waits for a lock before giving up. Every statement in the
+/// scoping pass wants ACCESS EXCLUSIVE at least briefly, and a lock request
+/// that queues also blocks every reader that arrives behind it — so a boot
+/// racing one long-running SELECT can stall the whole instance rather than
+/// just itself. Failing loudly after ten seconds is shorter and easier to read
+/// in a log than an unexplained freeze.
+const DDL_LOCK_TIMEOUT: &str = "10s";
+
 /// Add `org_id` everywhere, fold pre-org rows into the default org, and turn
 /// RLS on. Idempotent, and runs after the inline base DDL because it has to
 /// reference tables that DDL creates (sqlx migrations run before it).
+///
+/// One connection for the whole pass, so `lock_timeout` covers all of it
+/// (a `SET` is per-session, and `raw_sql` on a pool takes whichever connection
+/// is free).
 async fn apply_org_scoping(pool: &PgPool) -> Result<()> {
-    sqlx::raw_sql(SCHEMA_ORGS).execute(pool).await?;
+    let mut conn = pool.acquire().await?;
+    sqlx::raw_sql(&format!("SET lock_timeout = '{DDL_LOCK_TIMEOUT}'"))
+        .execute(&mut *conn)
+        .await?;
+    let outcome = org_scoping_pass(&mut conn).await;
+    // Hand the connection back the way it was found, success or not.
+    let _ = sqlx::raw_sql("RESET lock_timeout")
+        .execute(&mut *conn)
+        .await;
+    drop(conn);
+    outcome?;
+    grant_app_role(pool).await
+}
+
+async fn org_scoping_pass(conn: &mut sqlx::PgConnection) -> Result<()> {
+    sqlx::raw_sql(SCHEMA_ORGS).execute(&mut *conn).await?;
 
     crate::pgq::query(
         "INSERT INTO orgs (id, slug, name) VALUES (?, ?, ?) ON CONFLICT (id) DO NOTHING",
@@ -924,7 +1081,7 @@ async fn apply_org_scoping(pool: &PgPool) -> Result<()> {
     .bind(DEFAULT_ORG_ID)
     .bind(DEFAULT_ORG_SLUG)
     .bind("Default")
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
 
     // The credential, not the request, decides the acting org: a session and a
@@ -934,13 +1091,13 @@ async fn apply_org_scoping(pool: &PgPool) -> Result<()> {
         "ALTER TABLE api_tokens       ADD COLUMN IF NOT EXISTS org_id UUID",
         "ALTER TABLE oauth_auth_codes ADD COLUMN IF NOT EXISTS org_id UUID",
     ] {
-        sqlx::raw_sql(ddl).execute(pool).await?;
+        sqlx::raw_sql(ddl).execute(&mut *conn).await?;
     }
     for table in ["sessions", "api_tokens", "oauth_auth_codes"] {
         sqlx::raw_sql(&format!(
             "UPDATE {table} SET org_id = '{DEFAULT_ORG_ID}'::uuid WHERE org_id IS NULL"
         ))
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     }
     // A token and an auth code are minted inside a request that already has an
@@ -951,7 +1108,7 @@ async fn apply_org_scoping(pool: &PgPool) -> Result<()> {
             "ALTER TABLE {table} ALTER COLUMN org_id \
              SET DEFAULT nullif(current_setting('hive.acting_org', true), '')::uuid"
         ))
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     }
 
@@ -959,43 +1116,151 @@ async fn apply_org_scoping(pool: &PgPool) -> Result<()> {
     // (the journal's read predicate joins `shares`), so every `org_id` has to
     // exist before any policy is written.
     for table in ORG_TABLES {
-        let stmts = [
-            format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS org_id UUID"),
-            format!("UPDATE {table} SET org_id = '{DEFAULT_ORG_ID}'::uuid WHERE org_id IS NULL"),
-            // The default is what keeps ~180 hand-written INSERTs correct
-            // without editing (and forgetting) any of them: omit org_id and
-            // the row lands in the acting org, or fails NOT NULL if there
-            // isn't one.
-            format!(
-                "ALTER TABLE {table} ALTER COLUMN org_id \
-                 SET DEFAULT nullif(current_setting('hive.acting_org', true), '')::uuid"
-            ),
-            format!("ALTER TABLE {table} ALTER COLUMN org_id SET NOT NULL"),
-            format!("CREATE INDEX IF NOT EXISTS {table}_org ON {table} (org_id)"),
-        ];
-        for sql in stmts {
-            sqlx::raw_sql(&sql)
-                .execute(pool)
-                .await
-                .with_context(|| format!("org-scoping {table}: {sql}"))?;
-        }
-        // The FK is added separately: a pre-existing one makes ADD CONSTRAINT
-        // fail, and Postgres has no ADD CONSTRAINT IF NOT EXISTS.
-        let fk = format!("{table}_org_fk");
-        sqlx::raw_sql(&format!(
-            "DO $$ BEGIN \
-               IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '{fk}') THEN \
-                 ALTER TABLE {table} ADD CONSTRAINT {fk} FOREIGN KEY (org_id) REFERENCES orgs(id); \
-               END IF; \
-             END $$"
-        ))
-        .execute(pool)
-        .await
-        .with_context(|| format!("org FK on {table}"))?;
+        scope_org_column(conn, table)
+            .await
+            .with_context(|| format!("org-scoping {table}"))?;
     }
 
-    // Pass two: the policies.
-    for table in ORG_TABLES {
+    apply_org_policies(conn).await?;
+
+    // Every existing login joins the default org, so an upgraded install keeps
+    // working the moment it boots.
+    crate::pgq::query(
+        "INSERT INTO memberships (user_id, org_id, role, created_at) \
+         SELECT u.id, ?, CASE WHEN u.role = 'admin' THEN 'admin' ELSE 'member' END, ? \
+         FROM users u ON CONFLICT (user_id, org_id) DO NOTHING",
+    )
+    .bind(DEFAULT_ORG_ID)
+    .bind(now_iso())
+    .execute(&mut *conn)
+    .await?;
+
+    Ok(())
+}
+
+/// Pass one for one table: the column, its default, the backfill, NOT NULL,
+/// the index, and the FK — each probed first, so every boot after the first
+/// issues no writes and takes no heavy lock at all.
+///
+/// The probes are not an optimisation. Unguarded, this ran a full-table UPDATE
+/// and a full-table `SET NOT NULL` scan under ACCESS EXCLUSIVE on 31 tables at
+/// EVERY boot, which is a restart that gets slower as the install gets bigger.
+async fn scope_org_column(conn: &mut sqlx::PgConnection, table: &str) -> Result<()> {
+    // NULL = no such column yet; Some(false) = present but still nullable.
+    let notnull: Option<bool> = crate::pgq::query_scalar::<bool>(
+        "SELECT attnotnull FROM pg_attribute \
+         WHERE attrelid = to_regclass(?) AND attname = 'org_id' AND NOT attisdropped",
+    )
+    .bind(table)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    let mut stmts = vec![
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS org_id UUID"),
+        // The default is what keeps ~180 hand-written INSERTs correct without
+        // editing (and forgetting) any of them: omit org_id and the row lands
+        // in the acting org, or fails NOT NULL if there isn't one.
+        format!(
+            "ALTER TABLE {table} ALTER COLUMN org_id \
+             SET DEFAULT nullif(current_setting('hive.acting_org', true), '')::uuid"
+        ),
+    ];
+    if notnull != Some(true) {
+        // Backfill, then NOT NULL without the full-table scan under ACCESS
+        // EXCLUSIVE that a bare `SET NOT NULL` does: a NOT VALID CHECK takes
+        // the heavy lock for a catalog write only, VALIDATE scans under SHARE
+        // UPDATE EXCLUSIVE (readers and writers keep running), and SET NOT
+        // NULL then trusts the validated constraint instead of re-scanning
+        // (PG 12+). The DROP IF EXISTS first covers a boot that died mid-way.
+        stmts.extend([
+            format!("UPDATE {table} SET org_id = '{DEFAULT_ORG_ID}'::uuid WHERE org_id IS NULL"),
+            format!("ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {table}_org_nn"),
+            format!(
+                "ALTER TABLE {table} ADD CONSTRAINT {table}_org_nn \
+                 CHECK (org_id IS NOT NULL) NOT VALID"
+            ),
+            format!("ALTER TABLE {table} VALIDATE CONSTRAINT {table}_org_nn"),
+            format!("ALTER TABLE {table} ALTER COLUMN org_id SET NOT NULL"),
+            format!("ALTER TABLE {table} DROP CONSTRAINT {table}_org_nn"),
+        ]);
+    }
+    stmts.push(format!(
+        "CREATE INDEX IF NOT EXISTS {table}_org ON {table} (org_id)"
+    ));
+    for sql in stmts {
+        sqlx::raw_sql(&sql)
+            .execute(&mut *conn)
+            .await
+            .with_context(|| sql.clone())?;
+    }
+
+    // The FK is added separately: Postgres has no ADD CONSTRAINT IF NOT
+    // EXISTS, and the probe has to name the RELATION as well as the
+    // constraint. `conname` is unique per table, not per database — so a
+    // probe on the name alone finds the FIRST schema that took it (every
+    // parallel test schema shares one `pg_constraint`) and then silently
+    // skips the FK for every other schema, this one included.
+    let fk = format!("{table}_org_fk");
+    let fk_exists: bool = crate::pgq::query_scalar::<bool>(
+        "SELECT EXISTS (SELECT 1 FROM pg_constraint \
+                        WHERE conname = ? AND conrelid = to_regclass(?))",
+    )
+    .bind(&fk)
+    .bind(table)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !fk_exists {
+        // NOT VALID first: ADD CONSTRAINT otherwise scans the whole table
+        // under ACCESS EXCLUSIVE, while VALIDATE takes only SHARE UPDATE
+        // EXCLUSIVE and lets reads and writes through for the scan.
+        for sql in [
+            format!(
+                "ALTER TABLE {table} ADD CONSTRAINT {fk} \
+                 FOREIGN KEY (org_id) REFERENCES orgs(id) NOT VALID"
+            ),
+            format!("ALTER TABLE {table} VALIDATE CONSTRAINT {fk}"),
+        ] {
+            sqlx::raw_sql(&sql)
+                .execute(&mut *conn)
+                .await
+                .with_context(|| sql.clone())?;
+        }
+    }
+    Ok(())
+}
+
+/// Pass two: the policies, and every rebuild with an unsafe window if it is
+/// interrupted. ONE transaction, because the alternative is a genuine hole
+/// rather than an untidiness — between `DROP POLICY` and `CREATE POLICY` a
+/// table has RLS FORCEd and no policy at all, which is default-deny returning
+/// ZERO ROWS SILENTLY. A rolling restart would serve an empty journal and an
+/// empty inbox for the width of that gap, with nothing in any log. The unique
+/// rebuilds have the same shape: between DROP and CREATE the constraint is
+/// unenforced on `identities`, `mail_accounts` and `shares`, and one duplicate
+/// landing in that window makes every LATER boot's CREATE UNIQUE INDEX fail
+/// permanently.
+///
+/// Postgres has no `CREATE OR REPLACE POLICY`, so the transaction IS the
+/// mechanism here, not a preference. DDL is transactional, so the whole pass
+/// is atomic: either the new policies are visible or the old ones still are,
+/// and no session ever observes the gap. The advisory lock is belt to that —
+/// two instances booting together serialize instead of racing the same
+/// DROP/CREATE and losing one to `tuple concurrently updated`.
+async fn apply_org_policies(conn: &mut sqlx::PgConnection) -> Result<()> {
+    use sqlx::Acquire;
+    let mut tx = conn.begin().await?;
+    sqlx::raw_sql(&format!("SET LOCAL lock_timeout = '{DDL_LOCK_TIMEOUT}'"))
+        .execute(&mut *tx)
+        .await?;
+    // Keyed on the SCHEMA, not the string: advisory locks are cluster-wide, so
+    // a fixed key would make every parallel test schema queue behind every
+    // other one for work that cannot collide. Two boots against the same
+    // schema — the case this actually guards — still serialize.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('hive:org-scoping:' || current_schema()))")
+        .execute(&mut *tx)
+        .await?;
+
+    for table in ORG_TABLES.iter().chain(POLICY_ONLY_TABLES) {
         let write = org_predicate(table);
         let read = if *table == "journal" {
             journal_read_predicate()
@@ -1013,7 +1278,7 @@ async fn apply_org_scoping(pool: &PgPool) -> Result<()> {
             format!("CREATE POLICY {table}_org ON {table} USING {read} WITH CHECK {write}"),
         ] {
             sqlx::raw_sql(&sql)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await
                 .with_context(|| format!("org policy on {table}: {sql}"))?;
         }
@@ -1028,7 +1293,7 @@ async fn apply_org_scoping(pool: &PgPool) -> Result<()> {
             ),
         ] {
             sqlx::raw_sql(&sql)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await
                 .with_context(|| format!("per-org uniqueness on {table}: {sql}"))?;
         }
@@ -1039,7 +1304,7 @@ async fn apply_org_scoping(pool: &PgPool) -> Result<()> {
         "CREATE UNIQUE INDEX IF NOT EXISTS cc_sessions_captured_ext ON cc_sessions \
          (org_id, runtime, claude_session_id) WHERE origin = 'captured'",
     ] {
-        sqlx::raw_sql(sql).execute(pool).await?;
+        sqlx::raw_sql(sql).execute(&mut *tx).await?;
     }
     // `profile` is keyed on an actor slug, which is only unique inside an org
     // now — so its PRIMARY KEY has to move too, or two orgs cannot both have a
@@ -1054,23 +1319,45 @@ async fn apply_org_scoping(pool: &PgPool) -> Result<()> {
            END IF; \
          END $$",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .context("per-org profile key")?;
 
-    // Every existing login joins the default org, so an upgraded install keeps
-    // working the moment it boots.
-    crate::pgq::query(
-        "INSERT INTO memberships (user_id, org_id, role, created_at) \
-         SELECT u.id, ?, CASE WHEN u.role = 'admin' THEN 'admin' ELSE 'member' END, ? \
-         FROM users u ON CONFLICT (user_id, org_id) DO NOTHING",
+    // `blobs` is keyed on a content hash, which is only unique inside an org
+    // now. This is the one rebuild that is a SECURITY fix rather than a
+    // usability one: with a global key, two orgs holding identical attachment
+    // bytes shared one row, and `mail_attachments.blob_hash → blobs(hash) ON
+    // DELETE SET NULL` then let either org's blob GC null out the other's
+    // pointer. Foreign key actions run with row security bypassed, so the
+    // policy above could not have stopped it — the KEY had to move.
+    //
+    // `ON DELETE SET NULL (blob_hash)` names its column (PG 15+): the default
+    // form nulls every column in the key, and `org_id` is NOT NULL.
+    sqlx::raw_sql(
+        "DO $$ BEGIN \
+           IF EXISTS (SELECT 1 FROM pg_index i \
+                      WHERE i.indrelid = 'blobs'::regclass AND i.indisprimary \
+                        AND i.indnatts = 1) THEN \
+             ALTER TABLE mail_attachments DROP CONSTRAINT IF EXISTS mail_attachments_blob_hash_fkey; \
+             ALTER TABLE mail_attachments DROP CONSTRAINT IF EXISTS mail_attachments_blob_fk; \
+             ALTER TABLE blobs DROP CONSTRAINT blobs_pkey; \
+             ALTER TABLE blobs ADD PRIMARY KEY (org_id, hash); \
+           END IF; \
+           IF NOT EXISTS (SELECT 1 FROM pg_constraint \
+                          WHERE conname = 'mail_attachments_blob_fk' \
+                            AND conrelid = 'mail_attachments'::regclass) THEN \
+             ALTER TABLE mail_attachments ADD CONSTRAINT mail_attachments_blob_fk \
+               FOREIGN KEY (org_id, blob_hash) REFERENCES blobs (org_id, hash) \
+               ON DELETE SET NULL (blob_hash); \
+           END IF; \
+         END $$",
     )
-    .bind(DEFAULT_ORG_ID)
-    .bind(now_iso())
-    .execute(pool)
-    .await?;
+    .execute(&mut *tx)
+    .await
+    .context("per-org blob key")?;
 
-    grant_app_role(pool).await
+    tx.commit().await?;
+    Ok(())
 }
 
 /// The serving role's password, derived rather than stored.
@@ -1082,6 +1369,9 @@ async fn apply_org_scoping(pool: &PgPool) -> Result<()> {
 /// `DATABASE_URL` already holds the owner's credentials and does not need this
 /// one. `HIVE_APP_DATABASE_URL` opts out for operators who provision the role
 /// themselves.
+///
+/// "Identical on every instance sharing the database" is the whole property,
+/// and it only holds when the role is per-database too — see [`app_role`].
 fn app_password(url: &str) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(format!("hive-app-role-v1:{url}").as_bytes()))
@@ -1091,28 +1381,30 @@ fn app_password(url: &str) -> String {
 /// instances (or two parallel tests) boot against the same row in `pg_authid`;
 /// every write here is guarded by a check so the steady state is zero writes
 /// and a genuine race is `duplicate_object`, which is the outcome we wanted.
-async fn ensure_app_role(pool: &PgPool, password: &str) -> Result<()> {
+async fn ensure_app_role(pool: &PgPool, role: &str, password: &str) -> Result<()> {
     let mut tx = pool.begin().await?;
     // Roles are cluster-wide. Guards make each write conditional, but two boots
     // can still evaluate the guard and write in the same instant, which
     // Postgres reports as "tuple concurrently updated". An advisory lock makes
     // the whole check-then-write atomic across processes; it releases at
-    // commit, so a crashed boot cannot wedge the next one.
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('hive:app-role'))")
+    // commit, so a crashed boot cannot wedge the next one. Keyed on the ROLE,
+    // so provisioning one database's role never queues behind another's.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('hive:app-role:' || $1))")
+        .bind(role)
         .execute(&mut *tx)
         .await?;
     sqlx::raw_sql(&format!(
         "DO $$ BEGIN \
-           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{APP_ROLE}') THEN \
+           IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN \
              BEGIN \
-               CREATE ROLE {APP_ROLE} LOGIN PASSWORD '{password}'; \
+               CREATE ROLE {role} LOGIN PASSWORD '{password}'; \
              EXCEPTION WHEN duplicate_object THEN NULL; \
              END; \
            END IF; \
-           IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{APP_ROLE}' \
+           IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}' \
                       AND (rolsuper OR rolbypassrls OR rolcreatedb OR rolcreaterole \
                            OR NOT rolcanlogin)) THEN \
-             ALTER ROLE {APP_ROLE} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS; \
+             ALTER ROLE {role} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS; \
            END IF; \
          END $$"
     ))
@@ -1126,10 +1418,32 @@ async fn ensure_app_role(pool: &PgPool, password: &str) -> Result<()> {
     Ok(())
 }
 
-/// Give [`APP_ROLE`] exactly DML on the current schema — never ownership, never
-/// DDL. Re-run every boot so a table added since the last one is covered.
+/// Give this database's serving role exactly DML on the current schema — never
+/// ownership, never DDL. Re-run every boot so a table added since the last one
+/// is covered.
+///
+/// Grants are per-database, which is the other half of why [`app_role`] has to
+/// be too: a role shared across databases accumulates one grant set per
+/// database and ends up a key to all of them.
 async fn grant_app_role(pool: &PgPool) -> Result<()> {
-    ensure_app_role(pool, &app_password(&database_url())).await?;
+    // The role is named for the database THIS POOL is migrating, not for the
+    // one `DATABASE_URL` names: `migrate` is public and gets called against
+    // other databases (the upgrade tests, an operator's second instance).
+    // The password still comes from the URL the process was launched with; if
+    // that is a different database, the derived password will not match and
+    // `connect_app` heals it on the first real connection, which is the case
+    // that path was written for.
+    let db: String = crate::pgq::query_scalar::<String>("SELECT current_database()")
+        .fetch_one(pool)
+        .await?;
+    let (role, provision) = match explicit_app_url() {
+        Some(_) => serving_role(&database_url()),
+        None => (app_role_for_db(&db), true),
+    };
+    let role = checked_role(&role)?;
+    if provision {
+        ensure_app_role(pool, role, &app_password(&database_url())).await?;
+    }
     let schema: String = crate::pgq::query_scalar::<String>("SELECT current_schema()")
         .fetch_one(pool)
         .await?;
@@ -1138,31 +1452,66 @@ async fn grant_app_role(pool: &PgPool) -> Result<()> {
     // both want, and Postgres answers that with "tuple concurrently updated".
     sqlx::raw_sql(&format!(
         "DO $$ BEGIN \
-           IF NOT has_schema_privilege('{APP_ROLE}', 'public', 'USAGE') THEN \
-             GRANT USAGE ON SCHEMA public TO {APP_ROLE}; \
+           IF NOT has_schema_privilege('{role}', 'public', 'USAGE') THEN \
+             GRANT USAGE ON SCHEMA public TO {role}; \
            END IF; \
          END $$"
     ))
     .execute(pool)
     .await
-    .with_context(|| format!("granting {APP_ROLE} usage on public"))?;
+    .with_context(|| format!("granting {role} usage on public"))?;
     for sql in [
-        format!("GRANT USAGE ON SCHEMA \"{schema}\" TO {APP_ROLE}"),
+        format!("GRANT USAGE ON SCHEMA \"{schema}\" TO {role}"),
         format!(
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA \"{schema}\" TO {APP_ROLE}"
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA \"{schema}\" TO {role}"
         ),
-        format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA \"{schema}\" TO {APP_ROLE}"),
+        format!("GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA \"{schema}\" TO {role}"),
         format!(
             "ALTER DEFAULT PRIVILEGES IN SCHEMA \"{schema}\" \
-             GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {APP_ROLE}"
+             GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {role}"
         ),
     ] {
         sqlx::raw_sql(&sql)
             .execute(pool)
             .await
-            .with_context(|| format!("granting {APP_ROLE}: {sql}"))?;
+            .with_context(|| format!("granting {role}: {sql}"))?;
     }
     Ok(())
+}
+
+/// `HIVE_APP_DATABASE_URL`, if the operator set one.
+fn explicit_app_url() -> Option<String> {
+    std::env::var("HIVE_APP_DATABASE_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+}
+
+/// The role the API will actually serve as, and whether hive provisions it.
+///
+/// `HIVE_APP_DATABASE_URL` is the documented opt-out for operators who make
+/// the role themselves — so the grants have to follow it. They used to go to
+/// the derived role regardless, which left the opt-out pointing at a login
+/// with no privileges on anything: the escape hatch did not work.
+fn serving_role(url: &str) -> (String, bool) {
+    match explicit_app_url() {
+        Some(explicit) => match explicit.parse::<PgConnectOptions>() {
+            Ok(opts) => (opts.get_username().to_string(), false),
+            Err(_) => (app_role(url), true),
+        },
+        None => (app_role(url), true),
+    }
+}
+
+/// Refuse to interpolate anything but a plain identifier. Role names reach SQL
+/// by `format!` (no bind parameter can carry one), and this one can come from
+/// an environment variable.
+fn checked_role(role: &str) -> Result<&str> {
+    anyhow::ensure!(
+        !role.is_empty() && role.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        "the serving role name {role:?} is not a plain identifier — HIVE_APP_DATABASE_URL must \
+         name a role matching [A-Za-z0-9_]+"
+    );
+    Ok(role)
 }
 
 /// Connect options for the serving role. Nothing is rotated and nothing is
@@ -1170,16 +1519,15 @@ async fn grant_app_role(pool: &PgPool) -> Result<()> {
 /// `HIVE_APP_DATABASE_URL` opts out entirely for deployments that provision the
 /// role themselves.
 async fn app_connect_options(admin: &PgPool, url: &str) -> Result<PgConnectOptions> {
-    if let Ok(explicit) = std::env::var("HIVE_APP_DATABASE_URL") {
-        if !explicit.trim().is_empty() {
-            return Ok(explicit.parse::<PgConnectOptions>()?);
-        }
+    if let Some(explicit) = explicit_app_url() {
+        return Ok(explicit.parse::<PgConnectOptions>()?);
     }
     let password = app_password(url);
-    ensure_app_role(admin, &password).await?;
+    let role = app_role(url);
+    ensure_app_role(admin, checked_role(&role)?, &password).await?;
     Ok(url
         .parse::<PgConnectOptions>()?
-        .username(APP_ROLE)
+        .username(&role)
         .password(&password))
 }
 
@@ -1187,22 +1535,46 @@ async fn app_connect_options(admin: &PgPool, url: &str) -> Result<PgConnectOptio
 /// The heal is triggered by a failed connection rather than by inspecting
 /// `pg_authid` (superuser-only) and writes the same deterministic value every
 /// instance would, so a concurrent heal is a no-op rather than a fight.
+///
+/// Exactly one heal, and then a hard error naming the cause. The old code
+/// retried into the same silence: with a cluster-wide role, two databases
+/// overwrote each other's password forever and every boot healed, connected,
+/// and got 28P01 again at some unpredictable later dial. The role is
+/// per-database now, so the only way to reach the message below is two
+/// instances of ONE database disagreeing about how to spell its URL — which is
+/// a thing an operator can fix, once they are told.
 async fn connect_app(admin: &PgPool, opts: PgConnectOptions, url: &str) -> Result<PgPool> {
     match open_app(opts.clone()).await {
         Ok(pool) => Ok(pool),
-        Err(e) if is_auth_failure(&e) => {
+        Err(e) if is_auth_failure(&e) && explicit_app_url().is_none() => {
+            let role = app_role(url);
             let mut tx = admin.begin().await?;
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtext('hive:app-role'))")
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtext('hive:app-role:' || $1))")
+                .bind(&role)
                 .execute(&mut *tx)
                 .await?;
             sqlx::raw_sql(&format!(
-                "ALTER ROLE {APP_ROLE} WITH PASSWORD '{}'",
+                "ALTER ROLE {} WITH PASSWORD '{}'",
+                checked_role(&role)?,
                 app_password(url)
             ))
             .execute(&mut *tx)
             .await?;
             tx.commit().await?;
-            open_app(opts).await
+            open_app(opts).await.map_err(|e| {
+                if is_auth_failure(&e) {
+                    anyhow::anyhow!(
+                        "{role} rejected the password this instance derives from DATABASE_URL, \
+                         even after resetting it. Another process is deriving a different one — \
+                         two instances of this database whose DATABASE_URL differs (a host alias, \
+                         a port, a changed owner password) will overwrite each other forever. \
+                         Give them identical URLs, or set HIVE_APP_DATABASE_URL on both to a role \
+                         you provision yourself."
+                    )
+                } else {
+                    e
+                }
+            })
         }
         Err(e) => Err(e),
     }
@@ -1299,29 +1671,13 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
         // Attachment bytes arrive pre-compressed (images, PDFs, zips):
         // skipping TOAST compression on the BYTEA saves CPU on both sides.
         "ALTER TABLE blobs ALTER COLUMN data SET STORAGE EXTERNAL",
-        // Row-level security on artifacts. FORCE, because the API role owns the
-        // tables and an owner bypasses its own policies without it; WITH CHECK
-        // as well as USING, or a caller could INSERT into an org it cannot read.
-        // `CREATE POLICY` has no IF NOT EXISTS, hence the probe.
-        //
-        // The policy reads `hive.acting_org`, set per transaction by
-        // Store::org_tx today and per request by the auth middleware once the
-        // orgs workstream lands. Note that RLS is only as good as the role: a
-        // superuser or BYPASSRLS role defeats it entirely, and the local dev
-        // role is currently both.
-        "ALTER TABLE artifacts ENABLE ROW LEVEL SECURITY",
-        "ALTER TABLE artifacts FORCE ROW LEVEL SECURITY",
-        "DO $$ BEGIN \
-           IF NOT EXISTS ( \
-             SELECT 1 FROM pg_policies \
-             WHERE schemaname = current_schema() AND tablename = 'artifacts' \
-               AND policyname = 'artifacts_org' \
-           ) THEN \
-             CREATE POLICY artifacts_org ON artifacts \
-               USING      (org_id = current_setting('hive.acting_org')::uuid) \
-               WITH CHECK (org_id = current_setting('hive.acting_org')::uuid); \
-           END IF; \
-         END $$",
+        // `artifacts` used to enable + FORCE RLS and create its policy here,
+        // behind an `IF NOT EXISTS` probe. Two problems, both now fixed by
+        // `POLICY_ONLY_TABLES` in the scoping pass: the predicate was the bare
+        // `current_setting('hive.acting_org')::uuid`, which raises 22P02 on an
+        // empty scope instead of denying cleanly, and the probe made it
+        // create-once, so editing the predicate in this file changed nothing
+        // on any database that already had the policy.
     ] {
         sqlx::raw_sql(ddl).execute(pool).await?;
     }
@@ -1368,7 +1724,14 @@ async fn set_config(pool: &PgPool, key: &str, value: &str) -> Result<()> {
 /// Two connections, two roles: DDL runs as the owner, and the pool handed back
 /// for serving requests is the unprivileged one the policies actually apply to.
 pub async fn init() -> Result<PgPool> {
-    let url = database_url();
+    init_with(&database_url()).await
+}
+
+/// [`init`] against a named database rather than `DATABASE_URL` — the whole
+/// boot path, so a test can stand up a SECOND instance on the same cluster and
+/// assert both keep serving.
+pub async fn init_with(url: &str) -> Result<PgPool> {
+    let url = url.to_string();
     let admin = open_admin(&url).await?;
     migrate(&admin).await?;
     let opts = app_connect_options(&admin, &url).await?;

@@ -491,13 +491,24 @@ impl Store {
 
     /// Delete an account and everything derived from it. Messages and
     /// attachments go via FK cascade; search/embeddings/inbox/links rows and
-    /// the vault credential go explicitly, then orphaned blobs. One
-    /// transaction — an account is never left half-deleted.
+    /// the vault credential go explicitly, then the blobs THIS account's
+    /// attachments pointed at, if nothing else still does. One transaction —
+    /// an account is never left half-deleted.
     pub async fn mail_account_delete(&self, id: &str) -> Result<bool> {
         let Some(owner) = self.mail_account_owner(id).await? else {
             return Ok(false);
         };
         let mut tx = self.db().begin().await?;
+        // Read before the cascade: after the accounts go, so do the rows that
+        // say which bytes were theirs.
+        let hashes: Vec<String> = crate::pgq::query_scalar::<String>(
+            "SELECT DISTINCT t.blob_hash FROM mail_attachments t \
+             JOIN mail_messages m ON m.id = t.message_id \
+             WHERE m.account_id = ? AND t.blob_hash IS NOT NULL",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
         for sql in [
             "DELETE FROM search WHERE kind = 'mail' AND ref_id IN (SELECT id FROM mail_messages WHERE account_id = ?)",
             "DELETE FROM embeddings WHERE ref_kind = 'mail' AND ref_id IN (SELECT id FROM mail_messages WHERE account_id = ?)",
@@ -521,10 +532,17 @@ impl Store {
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        crate::pgq::query(
-            "DELETE FROM blobs b WHERE NOT EXISTS \
-             (SELECT 1 FROM mail_attachments a WHERE a.blob_hash = b.hash)",
-        )
+        // Only the hashes this account held, only in this org, only when
+        // nothing else points at them. The sweep used to be "every blob no
+        // attachment references", which reached past this account entirely —
+        // and, before `blobs` carried `org_id`, past this ORG.
+        crate::pgq::query(&format!(
+            "DELETE FROM blobs b WHERE b.hash = ANY(?) AND b.org_id = {org} AND NOT EXISTS \
+             (SELECT 1 FROM mail_attachments a \
+              WHERE a.org_id = b.org_id AND a.blob_hash = b.hash)",
+            org = crate::db::ACTING_ORG
+        ))
+        .bind(&hashes)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1271,10 +1289,15 @@ impl Store {
         Ok(())
     }
 
-    /// Store fetched bytes content-addressed: blob insert dedups on hash
-    /// (identical attachments across messages share one row), then the
-    /// attachment points at it. One transaction so a crash can't leave the
-    /// pointer without the bytes.
+    /// Store fetched bytes content-addressed: blob insert dedups on
+    /// (org, hash) — identical attachments across messages IN ONE ORG share
+    /// one row — then the attachment points at it. One transaction so a crash
+    /// can't leave the pointer without the bytes.
+    ///
+    /// Dedup stops at the org boundary deliberately. It used to be global,
+    /// which made two tenants' identical bytes one row and one shared delete;
+    /// `org_id` comes off the acting scope by column default, so there is no
+    /// argument here that could aim it at another org.
     pub async fn mail_attachment_store_blob(
         &self,
         att_id: &str,
@@ -1285,7 +1308,7 @@ impl Store {
         let mut tx = self.db().begin().await?;
         crate::pgq::query(
             "INSERT INTO blobs (hash, size, mime, data, created_at) VALUES (?, ?, ?, ?, ?) \
-             ON CONFLICT (hash) DO NOTHING",
+             ON CONFLICT (org_id, hash) DO NOTHING",
         )
         .bind(hash)
         .bind(bytes.len() as i64)
@@ -1313,7 +1336,7 @@ impl Store {
             "SELECT m.user_scope, t.filename, t.mime, t.blob_hash, b.data \
              FROM mail_attachments t \
              JOIN mail_messages m ON m.id = t.message_id \
-             LEFT JOIN blobs b ON b.hash = t.blob_hash \
+             LEFT JOIN blobs b ON b.org_id = t.org_id AND b.hash = t.blob_hash \
              WHERE t.id = ?",
         )
         .bind(att_id)
@@ -1364,10 +1387,12 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         for hash in &hashes {
-            crate::pgq::query(
-                "DELETE FROM blobs b WHERE b.hash = ? AND NOT EXISTS \
-                 (SELECT 1 FROM mail_attachments a WHERE a.blob_hash = b.hash)",
-            )
+            crate::pgq::query(&format!(
+                "DELETE FROM blobs b WHERE b.hash = ? AND b.org_id = {org} AND NOT EXISTS \
+                 (SELECT 1 FROM mail_attachments a \
+                  WHERE a.org_id = b.org_id AND a.blob_hash = b.hash)",
+                org = crate::db::ACTING_ORG
+            ))
             .bind(hash)
             .execute(&mut *tx)
             .await?;
@@ -1380,14 +1405,22 @@ impl Store {
     /// attachment points at, but only ones older than 24h — the grace window
     /// covers a fetch pipeline that has inserted the blob but not yet
     /// committed the attachment pointer in a racing transaction.
+    ///
+    /// Both halves are org-scoped, and both halves matter. The old sweep asked
+    /// an RLS-filtered `mail_attachments` whether a blob was orphaned and then
+    /// deleted from an unfiltered `blobs`: every OTHER org's attachment was
+    /// invisible to the question, so their bytes read as orphaned and went.
+    /// A sweep with no acting org now deletes nothing rather than everything.
     pub async fn mail_blobs_gc(&self) -> Result<u64> {
         let cutoff = (chrono::Utc::now() - chrono::Duration::hours(24))
             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
             .to_string();
-        Ok(crate::pgq::query(
-            "DELETE FROM blobs b WHERE b.created_at < ? AND NOT EXISTS \
-             (SELECT 1 FROM mail_attachments a WHERE a.blob_hash = b.hash)",
-        )
+        Ok(crate::pgq::query(&format!(
+            "DELETE FROM blobs b WHERE b.created_at < ? AND b.org_id = {org} AND NOT EXISTS \
+             (SELECT 1 FROM mail_attachments a \
+              WHERE a.org_id = b.org_id AND a.blob_hash = b.hash)",
+            org = crate::db::ACTING_ORG
+        ))
         .bind(cutoff)
         .execute(self.db())
         .await?

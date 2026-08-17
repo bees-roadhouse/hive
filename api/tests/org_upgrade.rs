@@ -122,6 +122,31 @@ async fn a_pre_org_database_backfills_into_the_default_org() {
     .expect("membership");
     assert_eq!(role.as_deref(), Some("admin"), "admins stay admins");
 
+    // The foreign key came BACK. `rewind_to_v0_6` drops `{table}_org_fk`, and
+    // the probe that decides whether to re-add it used to match on `conname`
+    // alone — which is unique per table, not per database, so the first test
+    // schema to run took the name and every other schema (this one included)
+    // silently skipped its FKs. This test passed for that reason rather than
+    // for the right one, because nothing here asked. It asks now, and it asks
+    // for `convalidated` too: an FK added NOT VALID and never validated
+    // enforces new rows only, which is not what "the FK is back" means.
+    for table in ["journal", "people", "wire", "search"] {
+        let valid: Option<bool> = hive_core::pgq::query_scalar::<bool>(
+            "SELECT convalidated FROM pg_constraint \
+             WHERE conname = ? AND conrelid = to_regclass(?) AND contype = 'f'",
+        )
+        .bind(format!("{table}_org_fk"))
+        .bind(table)
+        .fetch_optional(&admin)
+        .await
+        .expect("fk probe");
+        assert_eq!(
+            valid,
+            Some(true),
+            "{table}_org_fk must exist and be validated after the upgrade"
+        );
+    }
+
     // The live session kept working rather than being invalidated by upgrade.
     let session_org: Option<Uuid> = hive_core::pgq::query_scalar::<Uuid>(
         "SELECT org_id FROM sessions WHERE id = 'ses_legacy1'",
@@ -180,8 +205,91 @@ async fn the_tenancy_migration_is_idempotent() {
     .fetch_one(&admin)
     .await
     .expect("policies");
-    // 30 at the orgs workstream, +1 for `artifacts`. The number is not the
-    // point ... running the migration three times must not triple it, which is
-    // what a CREATE POLICY without a DROP-if-exists would do.
-    assert_eq!(policies, 31, "one policy per content table, not three");
+    // 30 at the orgs workstream, +1 for `artifacts`, +2 for `blobs` and
+    // `runtime_oauth_states`. The number is not the point ... running the
+    // migration three times must not triple it, which is what a CREATE POLICY
+    // without a DROP-if-exists would do.
+    assert_eq!(policies, 33, "one policy per content table, not three");
+}
+
+/// Two databases on ONE Postgres cluster — a self-hoster with a staging copy,
+/// and the shape that nothing covered.
+///
+/// The serving role lives in `pg_authid`, which is cluster-wide, while its
+/// password was derived from `DATABASE_URL`, which is not. One `hive_app` for
+/// every database therefore meant every boot overwrote the other's password:
+/// each instance healed, connected, and then failed `28P01` at some later,
+/// unpredictable dial. The role is per-database now, so this asserts the thing
+/// that was actually broken — both instances still serve after both have
+/// booted, in that order.
+#[tokio::test]
+async fn two_databases_on_one_cluster_both_keep_serving() {
+    // The first instance: the usual migrated schema, on DATABASE_URL's database.
+    let first = db::test_pool_strict().await;
+
+    // The second: a real second database on the same cluster, booted through
+    // the actual boot path rather than a test helper.
+    let base = db::database_url();
+    let name = format!("hive_two_db_{}", uuid::Uuid::new_v4().simple());
+    let owner = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&base)
+        .await
+        .expect("connect owner");
+    sqlx::raw_sql(&format!("CREATE DATABASE \"{name}\""))
+        .execute(&owner)
+        .await
+        .expect("create second database");
+    let second_url = base
+        .rsplit_once('/')
+        .map(|(head, _)| head)
+        .expect("url")
+        .to_string()
+        + "/"
+        + &name;
+
+    let second = db::init_with(&second_url).await;
+
+    // Whatever happened, drop the database before asserting, or a failure
+    // leaks it. It has to be closed first: DROP DATABASE refuses while a
+    // session is attached.
+    let outcome = match second {
+        Ok(pool) => {
+            // Both roles exist, and they are DIFFERENT roles — which is the
+            // property that makes the password fight impossible rather than
+            // merely unlikely.
+            let mine = db::app_role(&base);
+            let theirs = db::app_role(&second_url);
+            assert_ne!(mine, theirs, "two databases must not share one role");
+
+            // The second instance serves …
+            let ok: i32 = hive_core::pgq::query_scalar::<i32>("SELECT 1")
+                .fetch_one(&pool)
+                .await
+                .expect("second instance serves");
+            pool.close().await;
+            ok
+        }
+        Err(e) => {
+            sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+                .execute(&owner)
+                .await
+                .ok();
+            panic!("second instance failed to boot: {e:#}");
+        }
+    };
+    assert_eq!(outcome, 1);
+    sqlx::raw_sql(&format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"))
+        .execute(&owner)
+        .await
+        .expect("drop second database");
+    owner.close().await;
+
+    // … and the FIRST one still does, which is the half that used to break:
+    // the second boot rotated the shared role's password out from under it.
+    let ok: i32 = hive_core::pgq::query_scalar::<i32>("SELECT 1")
+        .fetch_one(&first.pool)
+        .await
+        .expect("first instance still serves after the second booted");
+    assert_eq!(ok, 1);
 }

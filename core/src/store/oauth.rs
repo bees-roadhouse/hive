@@ -158,9 +158,26 @@ impl Store {
         };
         let used_at: Option<String> = row.try_get("used_at")?;
         if used_at.is_some() {
-            return Ok(RedeemOutcome::Replay {
-                client_id: row.try_get("client_id")?,
-            });
+            // Code reuse is treated as compromise, so every token that client
+            // holds is revoked. It has to happen HERE because here is the only
+            // place that knows which org to revoke in: the code carries the
+            // org of the human who consented, and `/oauth/token` is
+            // unauthenticated by construction, so the route has no acting
+            // scope of its own to scope the revocation by. Revoking across all
+            // orgs instead would turn one org's replayed code into every other
+            // org's outage — a cross-tenant kill switch reachable by anyone
+            // holding one spent code.
+            let client_id: String = row.try_get("client_id")?;
+            let org: Option<uuid::Uuid> = row.try_get("org_id")?;
+            if let Some(org) = org {
+                crate::pgq::query("DELETE FROM api_tokens WHERE client_id = ? AND org_id = ?")
+                    .bind(&client_id)
+                    .bind(org)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+            }
+            return Ok(RedeemOutcome::Replay { client_id });
         }
         let expires_at: String = row.try_get("expires_at")?;
         let expired = chrono::DateTime::parse_from_rfc3339(&expires_at)
