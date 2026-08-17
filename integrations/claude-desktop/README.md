@@ -1,52 +1,93 @@
 # Claude Desktop
 
-One way to point Claude Desktop at hive now: the **`hive.mcpb` extension**,
-which launches the `hive-bridge` binary over MCP's stdio transport against
-the running hive app on this machine. The hosted-era paths (OAuth custom
-connector, bearer tokens, `POST /mcp`) died with the P2P pivot — there is no
-server to connect to ([DIRECTION.md](../../docs/DIRECTION.md) D25).
+**The `hive.mcpb` extension in this directory is dead.** `mcpb/manifest.json`
+launches a `hive-bridge` binary against a local hive app. There is no `bridge/`
+crate, no `hive-bridge` binary, and no local data directory: hive is now an HTTP
+API over PostgreSQL ([docs/WEB-APP.md](../../docs/WEB-APP.md)) and MCP is served
+at `POST /mcp` by `hive-api`. `scripts/build-mcpb.sh` still packs the bundle, so
+it produces a `.mcpb` that installs and then fails to start.
 
-## Requirements
+Connect Claude Desktop as a **custom connector** pointed at your hive's `/mcp`
+URL instead. `hive-api` is a full OAuth 2.1 authorization server, so Desktop can
+register itself and authorize without you pasting a token anywhere.
 
-- `hive-bridge` on `PATH`. From a hive checkout:
+## What hive serves
 
-  ```bash
-  cargo install --path bridge
-  ```
+Verified against a running instance:
 
-  The `.mcpb` does not bundle the binary yet — real packaging (bundled
-  per-platform binaries) arrives with the Phase 2 app bundles
-  ([PLAN.md](../../docs/PLAN.md) PR 2.5).
+| Endpoint | What it is |
+| --- | --- |
+| `POST /mcp` | Streamable HTTP MCP. Bearer auth; 401 carries `WWW-Authenticate` with an RFC 9728 `resource_metadata` pointer |
+| `/.well-known/oauth-authorization-server` | RFC 8414 metadata |
+| `/.well-known/oauth-protected-resource` | RFC 9728 metadata |
+| `POST /oauth/register` | RFC 7591 dynamic client registration, no client secret |
+| `GET /authorize` | Validates, then redirects to the SPA consent screen |
+| `POST /oauth/token` | Authorization code + PKCE (S256 only), scope `mcp` |
 
-- The hive desktop app **running**. The bridge is a proxy (D25): it
-  connects to the app over `<data_dir>/bridge.sock` and has no store
-  access of its own. While the app is closed, calls fail with "the hive
-  app is not running". Claude Desktop, Claude Code, and hooks can all be
-  connected at the same time.
+## Connecting
 
-## Install
+1. Put your hive on an HTTPS origin Claude Desktop can reach. Localhost works
+   only for a client running on the same machine.
+2. In Claude Desktop, **Settings → Connectors → Add custom connector**, and give
+   it `https://<your-hive>/mcp`.
+3. Sign in to that hive in a browser when the consent screen appears, choose the
+   AI identity the connector acts as, and pick a token lifetime.
 
-1. Build the extension: `./scripts/build-mcpb.sh` → `dist/hive.mcpb`
-   (releases attach it once the Phase 2 release pipeline returns).
-2. Claude Desktop → **Settings → Extensions**, then drag `hive.mcpb` in (or
-   open the file). There is nothing to configure — no URL, no token.
+Honest scope: the server half of this flow is verified end to end (registration,
+`/authorize`, consent, code-plus-PKCE exchange, and the resulting token calling
+tools on `/mcp`). The Claude Desktop side of it has not been run, so treat step
+2 as the documented shape rather than a tested one.
 
-Under the hood: `manifest.json` tells Claude Desktop to run `hive-bridge`,
-which speaks MCP's stdio framing (one JSON-RPC message per line) and pumps
-it to the running app over the unix socket at `<data_dir>/bridge.sock`
-(`$XDG_DATA_HOME/hive`, fallback `~/.local/share/hive`). The app owns the
-store and the keychain; the bridge touches neither. stdout carries protocol
-frames only; the bridge's logs go to stderr, which Claude Desktop collects
-into its MCP log files.
+## Three things that will stop you
 
-## Troubleshooting
+**The consent screen needs an AI identity you own.** It only offers `people`
+rows with `kind = 'ai'` whose `owner` is your slug. With none, the screen has
+nothing to grant and the flow dead-ends. `POST /api/people` creates the row but
+leaves `owner` null, so it takes two calls and there is no UI for either yet:
 
-| Symptom | Fix |
-| ------- | --- |
-| "spawn hive-bridge ENOENT" / extension fails to start | `hive-bridge` isn't on the PATH Claude Desktop sees. `cargo install --path bridge`, then restart Claude Desktop. GUI apps don't always inherit your shell PATH — on macOS, install to a standard location or launch Desktop from a terminal to verify. |
-| "the hive app is not running" | The bridge proxies to the app and cannot work without it. Start the hive app, then retry (reconnect the extension if the session already failed). |
-| "did not answer the hive handshake" | Something other than the hive app is bound at `<data_dir>/bridge.sock`, or app and bridge are from very different builds. Update both to the same release. |
-| Tools answer but the store looks empty | The bridge found a different socket than the app you meant. Both derive it from `$XDG_DATA_HOME/hive` (fallback `~/.local/share/hive`); a flatpak-installed app serves `~/.var/app/com.beesroadhouse.Hive/data/hive/bridge.sock` — point the bridge there with `HIVE_DATA_DIR` until Phase 2.5 packaging aligns the two out of the box. |
+```bash
+curl -X POST  https://<your-hive>/api/people     -b cookies.txt \
+  -H 'Content-Type: application/json' -d '{"name":"Pia","kind":"ai"}'
+curl -X PATCH https://<your-hive>/api/people/pia -b cookies.txt \
+  -H 'Content-Type: application/json' -d '{"owner":"your-slug"}'
+```
 
-Bridge logs land in Claude Desktop's MCP logs (the `mcp-server-*.log` files —
-macOS: `~/Library/Logs/Claude/`, Windows: `%APPDATA%\Claude\logs\`).
+**The advertised issuer has to be the public one.** Every OAuth URL derives from
+it, so if hive advertises `http://localhost:7878` a remote client cannot follow
+the flow. Resolution order is the `instance.url` config value, then
+`HIVE_PUBLIC_URL`, then `X-Forwarded-Proto` / `X-Forwarded-Host`, then the
+`Host` header. Behind a TLS-terminating proxy, either set `HIVE_PUBLIC_URL` or
+make sure the proxy forwards both headers, or the metadata advertises `http://`
+and OAuth 2.1 clients refuse it.
+
+**Redirect URIs must be HTTPS**, except on loopback (`localhost`, `127.0.0.1`,
+`::1`), where plain HTTP is allowed for development callbacks. Fragments are
+rejected.
+
+## Bearer token instead
+
+If you would rather not run OAuth, mint a token in the SPA under **Account**
+(admin only, shown once) and hand it to any MCP client that sends a header:
+
+```
+Authorization: Bearer hive_pat_…
+```
+
+A token's acting org is fixed when it is minted and never changes. That is the
+design, not a limitation: an agent authenticates into one org and cannot read
+from one and write to another.
+
+## Tuning
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `HIVE_PUBLIC_URL` | unset | Public origin for OAuth metadata, unless `instance.url` config is set |
+| `HIVE_OAUTH_ALLOW_NEVER_EXPIRES` | `true` | Lets the consent screen offer a non-expiring token |
+| `HIVE_LOCAL_AUTH_ENABLED` | `true` | Set false for SSO-only; onboarding still works |
+| `HIVE_OIDC_ENABLED` | `true` | OIDC login, dormant unless `OIDC_ISSUER`, `OIDC_CLIENT_ID` and `OIDC_REDIRECT_URI` are all set |
+
+## Disconnecting
+
+An admin can list registered clients and revoke every token one holds from
+**Account**, or over the API: `GET /api/oauth/clients` and
+`DELETE /api/oauth/clients/{client_id}`.

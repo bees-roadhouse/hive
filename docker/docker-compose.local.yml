@@ -1,56 +1,67 @@
-# Local hive stack for podman/docker compose.
+# Local hive stack: Postgres + hive-api. The API process serves the JSON API,
+# the MCP endpoint at POST /mcp, and the Solid SPA. There is no separate web
+# container and no worker binary.
+#
 #   podman compose -f docker/docker-compose.local.yml up -d --build
-# Browser:  http://localhost:8080   ·   API: http://localhost:8787/api/healthz
-name: hive
+#
+# Browser: http://localhost:7878    Health: http://localhost:7878/api/healthz
+#
+# The credential key below is a fixed dev value on purpose, so this file runs
+# with no setup. It is NOT a production posture. For anything you care about,
+# use docker/docker-compose.rust.yml, which refuses to start without a real
+# HIVE_CRED_KEY.
+name: hive-local
 
 services:
+  postgres:
+    # pgvector/pgvector:pg17 = the official postgres:17 plus the vector
+    # extension. Not published to the host: only hive-api talks to it, and
+    # binding 5432 would collide with any Postgres already running there.
+    image: docker.io/pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive
+      POSTGRES_DB: hive
+    volumes:
+      - hive-local-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive -d hive"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
   hive-api:
     build:
       context: ..
-      dockerfile: docker/Containerfile
+      dockerfile: docker/Dockerfile.rust
       target: runtime
-    command: ["node", "--experimental-strip-types", "packages/api/src/server.ts"]
     environment:
-      PORT: "8787"
-      HIVE_DB: /data/hive.db
+      DATABASE_URL: postgres://hive:hive@postgres:5432/hive
+      PORT: "7878"
+      # Hash embedder: deterministic, no model download. Swap for the ONNX
+      # backend once you want real semantic search.
       HIVE_EMBED: hash
+      HIVE_MODEL_CACHE: /data/models
+      # Artifact bytes default to ./data, which is /app/data in the image and
+      # would not survive the container. Point them at the volume.
+      HIVE_DATA_DIR: /data
+      HIVE_CRED_KEY: local-dev-credential-key-not-for-production
+      RUST_LOG: hive_api=info,hive_core=info,tower_http=info
     volumes:
-      - hive-data:/data
+      - hive-local-data:/data
     ports:
-      - "8787:8787"
+      - "7878:7878"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:8787/api/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "curl", "-fsS", "http://localhost:7878/api/healthz"]
       interval: 10s
       timeout: 5s
       retries: 6
-      start_period: 5s
-
-  hive-worker:
-    build:
-      context: ..
-      dockerfile: docker/Containerfile
-      target: runtime
-    command: ["node", "--experimental-strip-types", "packages/worker/src/index.ts"]
-    environment:
-      HIVE_DB: /data/hive.db
-      HIVE_EMBED: hash
-      HIVE_WORKER_TICK: "30"
-    volumes:
-      - hive-data:/data
+      start_period: 20s
     depends_on:
-      hive-api:
-        condition: service_healthy
-
-  hive-web:
-    build:
-      context: ..
-      dockerfile: docker/Containerfile
-      target: web
-    ports:
-      - "8080:8080"
-    depends_on:
-      hive-api:
+      postgres:
         condition: service_healthy
 
 volumes:
-  hive-data:
+  hive-local-pgdata:
+  hive-local-data:

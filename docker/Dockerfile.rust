@@ -1,15 +1,31 @@
 # syntax=docker/dockerfile:1
 
-# hive (rust) — one image, one binary: hive-api (axum) serves the API + MCP.
-# The retired Solid SPA no longer ships (routes/spa.rs warns and 404s non-API
-# paths unless HIVE_WEB_DIST points at a dist built elsewhere).
+# hive: one image, one binary. `hive-api` (axum) serves the JSON API, the MCP
+# endpoint at POST /mcp, and the Solid SPA built from packages/web. There is no
+# second container: the API process is the web server (api/src/routes/spa.rs).
 #
 # Build from the repo root:
-#   docker build -f docker/Dockerfile.rust -t beesroadhouse/hive-rust:latest .
+#   podman build -f docker/Dockerfile.rust -t beesroadhouse/hive-rust:latest .
+
+# ----- web: vite build of packages/web -----
+# @hive/shared exports its TypeScript source directly, so vite compiles it as
+# part of the web build; there is no separate tsc step to run first.
+FROM node:22-trixie-slim AS web
+RUN corepack enable
+WORKDIR /src
+# Manifests first so the install layer caches unless dependencies change. The
+# lockfile's importers are exactly `.`, packages/shared and packages/web, so
+# this is the whole workspace and --frozen-lockfile is satisfied.
+COPY pnpm-workspace.yaml pnpm-lock.yaml package.json ./
+COPY packages/shared/package.json ./packages/shared/
+COPY packages/web/package.json ./packages/web/
+RUN pnpm install --frozen-lockfile
+COPY packages ./packages
+RUN pnpm --filter @hive/web build
 
 # ----- rust: release build of hive-api -----
-# rust-toolchain.toml pins 1.94.1; rustup in the base image installs the pinned
-# toolchain on first cargo invocation if the image's minor differs.
+# rust-toolchain.toml pins the toolchain; rustup in the base image installs the
+# pinned version on first cargo invocation if the image's minor differs.
 # Trixie, not bookworm: ort's prebuilt onnxruntime static libs are compiled
 # against glibc >= 2.38 (__isoc23_strtol*); bookworm's 2.36 fails to link.
 FROM rust:1.94-trixie AS build
@@ -20,6 +36,7 @@ COPY embed ./embed
 COPY core ./core
 COPY api ./api
 COPY jmap-sync ./jmap-sync
+COPY relay ./relay
 # Cache mounts keep the registry + incremental artifacts across builds; the
 # binary is copied out because the target dir vanishes with the mount.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
@@ -28,7 +45,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && mkdir -p /out \
  && cp target/release/hive-api /out/
 
-# ----- runtime: slim debian + the api binary -----
+# ----- runtime: slim debian + the api binary + the built SPA -----
 # trixie-slim to match the build stage's glibc (the binaries link 2.38+ symbols).
 FROM debian:trixie-slim AS runtime
 # ca-certificates for outbound TLS (reqwest/rustls feed polling); curl for the
@@ -37,12 +54,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl \
   && rm -rf /var/lib/apt/lists/* \
   && useradd --system --uid 10001 --create-home hive
-# Data + model cache live on the mounted /data volume.
-ENV HIVE_DB=/data/hive.db
+# Postgres holds the data. /data is only the artifact bytes and the model cache.
 ENV HIVE_MODEL_CACHE=/data/models
 ENV PORT=7878
 WORKDIR /app
 COPY --from=build /out/hive-api /app/
+# /app/web is where routes/spa.rs looks when HIVE_WEB_DIST is unset.
+COPY --from=web /src/packages/web/dist /app/web
 RUN mkdir -p /data && chown -R hive /data
 USER hive
 VOLUME /data
