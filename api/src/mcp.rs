@@ -7,14 +7,15 @@
 // The JSON-RPC / HTTP layer lives in routes/mcp.rs; this module owns
 // tools/list and tools/call dispatch. The authenticated actor pins authorship:
 // journal_append writes as the token's actor, identity_update edits the
-// caller's own card, admin tools gate on the actor's user role.
+// caller's own card, admin tools gate on `ctx.is_admin()` — the credential's
+// role in its acting org, never a name the credential carries.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use hive_shared::{
     actor_names, ActorKind, NewIdentity, NewJournalEntry, NewShare, NewSource, ProfilePatch,
-    Severity, ShareScope, SourcePatch, TaskPatch, TaskStatus, UserRole,
+    Severity, ShareScope, SourcePatch, TaskPatch, TaskStatus,
 };
 use serde_json::{json, Map, Value};
 
@@ -1756,7 +1757,7 @@ async fn dispatch(
             Ok(ok_content(&store.shares_create(input).await?))
         }
         "actor_delete" => {
-            if !is_admin(store, actor).await? {
+            if !ctx.is_admin() {
                 return Ok(forbidden());
             }
             let mut a = Args::new("actor_delete", args);
@@ -1774,7 +1775,7 @@ async fn dispatch(
             }
         }
         "actor_merge" => {
-            if !is_admin(store, actor).await? {
+            if !ctx.is_admin() {
                 return Ok(forbidden());
             }
             let mut a = Args::new("actor_merge", args);
@@ -1861,7 +1862,7 @@ async fn dispatch(
             ))
         }
         "entity_type_create" => {
-            if !is_admin(store, actor).await? {
+            if !ctx.is_admin() {
                 return Ok(forbidden());
             }
             let input: hive_shared::NewEntityType =
@@ -1876,7 +1877,7 @@ async fn dispatch(
             }
         }
         "entity_type_update" => {
-            if !is_admin(store, actor).await? {
+            if !ctx.is_admin() {
                 return Ok(forbidden());
             }
             let mut a = Args::new("entity_type_update", args);
@@ -2158,13 +2159,13 @@ async fn can_edit_actor_profile(
     Ok(false)
 }
 
-/// mcp.ts isAdmin(): the token's actor maps to a user with role 'admin'.
-async fn is_admin(store: &Store, actor: &str) -> Result<bool, ToolFailure> {
-    let users = store.users_list().await?;
-    Ok(users
-        .iter()
-        .any(|u| u.actor == actor && u.role == UserRole::Admin))
-}
+// Admin over MCP is `ctx.is_admin()`, the same rule the HTTP routes use.
+//
+// The old `is_admin(store, actor)` matched `api_tokens.actor` — free text
+// chosen at mint — against `users_list()`, which spans every org, and never
+// consulted the context at all. Naming an AI identity after an admin was
+// therefore enough to reach `actor_delete`, `actor_merge` and the entity-type
+// tools. See routes/admin.rs for the same removal on the HTTP side.
 
 fn forbidden() -> Value {
     ok_content(&json!({"error": "forbidden — admin only"}))

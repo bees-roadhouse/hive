@@ -7,7 +7,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Json};
 use axum::routing::{delete, get, patch, post};
 use axum::{Extension, Router};
-use hive_shared::{LegacyImport, NewSource, SourcePatch, UserRole};
+use hive_shared::{LegacyImport, NewSource, SourcePatch};
 use serde::Deserialize;
 
 use crate::error::{err, forbidden, not_found, ApiResult};
@@ -35,21 +35,20 @@ pub fn router() -> Router<Store> {
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
 }
 
-/// Node requireAdminActor: session admin, or a Bearer token whose actor maps to
-/// an admin user (sessions carry role directly; tokens don't, so resolve via
-/// the user record).
-pub(crate) async fn require_admin_actor(
-    s: &Store,
-    ctx: &AuthCtx,
-) -> Result<bool, crate::error::ApiError> {
-    if ctx.is_admin() {
-        return Ok(true);
-    }
-    Ok(s.users_list()
-        .await?
-        .iter()
-        .any(|u| u.actor == ctx.actor() && u.role == UserRole::Admin))
-}
+// Admin authority is `ctx.is_admin()` and nothing else.
+//
+// There used to be a fallback here: if the context was not admin, match
+// `ctx.actor()` against `users_list()` and accept any admin row with that
+// actor. For a Bearer token `ctx.actor()` is `api_tokens.actor` — free text
+// chosen at mint, never re-derived from the granting human — and `users_list()`
+// spans every org, so a member who could name an identity after an admin got
+// `actor_delete`, `actor_merge`, `/api/import` and the entity-type routes.
+// `actors_merge` reassigns every row of one actor to another in one
+// transaction, which is a full account takeover.
+//
+// `ctx.is_admin()` (middleware.rs) is the rule: role Admin IN THE ACTING ORG,
+// and either a session principal or a token acting as the same human who
+// granted it.
 
 // ---- actor lifecycle (admin): delete-with-cascade + merge ----
 // Both are destructive and admin-gated. Pass ?dryRun=1 to get the per-table
@@ -73,7 +72,7 @@ async fn actors_remove(
     Path(slug): Path<String>,
     Query(q): Query<DryRunQuery>,
 ) -> ApiResult {
-    if !require_admin_actor(&s, &ctx).await? {
+    if !ctx.is_admin() {
         return Ok(forbidden());
     }
     if s.people_get(&slug).await?.is_none() {
@@ -99,7 +98,7 @@ async fn actors_merge(
     Query(q): Query<DryRunQuery>,
     body: Option<Json<MergeBody>>,
 ) -> ApiResult {
-    if !require_admin_actor(&s, &ctx).await? {
+    if !ctx.is_admin() {
         return Ok(forbidden());
     }
     let into = body
@@ -146,7 +145,7 @@ async fn import_json(
     Extension(ctx): Extension<AuthCtx>,
     Json(payload): Json<LegacyImport>,
 ) -> ApiResult {
-    if !require_admin_actor(&s, &ctx).await? {
+    if !ctx.is_admin() {
         return Ok(forbidden());
     }
     Ok(Json(s.import_legacy(payload).await?).into_response())
@@ -159,7 +158,7 @@ async fn import_sqlite(
     Extension(ctx): Extension<AuthCtx>,
     mut multipart: Multipart,
 ) -> ApiResult {
-    if !require_admin_actor(&s, &ctx).await? {
+    if !ctx.is_admin() {
         return Ok(forbidden());
     }
     let mut file = None;
@@ -277,7 +276,7 @@ async fn sources_poll(
     Extension(ctx): Extension<AuthCtx>,
     body: Option<Json<PollBody>>,
 ) -> ApiResult {
-    if !require_admin_actor(&s, &ctx).await? {
+    if !ctx.is_admin() {
         return Ok(forbidden());
     }
     let id = body.and_then(|Json(b)| b.id);

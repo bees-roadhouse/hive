@@ -654,6 +654,49 @@ async fn oidc_callback(
     }
 }
 
+/// The org an auto-provisioned IdP user is put in, or `None` when there is no
+/// unambiguous answer and the sign-in must be refused instead of guessing.
+///
+/// `OIDC_ORG` (a slug) is the explicit answer and wins — an unknown slug is a
+/// refusal, not a fallback. Without it the default org is only assumed on a
+/// single-org instance, the shape the unconditional `orgs_default()` silently
+/// assumed everywhere.
+async fn provisioning_org(s: &Store) -> AnyResult<Option<hive_core::store::orgs::Org>> {
+    match std::env::var("OIDC_ORG")
+        .ok()
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty())
+    {
+        Some(slug) => Ok(s.orgs_by_slug(&slug).await?),
+        None if s.orgs_count().await? <= 1 => Ok(Some(s.orgs_default().await?)),
+        None => Ok(None),
+    }
+}
+
+/// A `people.slug` for a newly provisioned IdP user that nobody else holds.
+///
+/// Auto-provisioning must never ADOPT an identity. `users_create` derives the
+/// actor by slugifying the display name and calls `people_ensure`, which
+/// RETURNS THE EXISTING PERSON when that slug is taken — so an id_token whose
+/// `name` claim matched an AI (say "Pia") provisioned an account authenticating
+/// as that AI, and one matching a human failed on `users_actor_key` with a raw
+/// database error. `name` is an unverified string chosen by whoever registered
+/// at the provider; it decides a display label and nothing else.
+async fn free_actor_slug(s: &Store, name: &str) -> AnyResult<String> {
+    let base = match hive_shared::slugify(name) {
+        slug if slug.is_empty() => "user".to_string(),
+        slug => slug,
+    };
+    for candidate in std::iter::once(base.clone()).chain((2..=64).map(|n| format!("{base}-{n}"))) {
+        if s.people_get(&candidate).await?.is_none()
+            && s.users_by_actor(&candidate).await?.is_none()
+        {
+            return Ok(candidate);
+        }
+    }
+    bail!("no free actor slug for '{base}'")
+}
+
 /// The body of server.ts's callback try-block; any Err becomes the
 /// "OIDC sign-in failed: …" page.
 async fn oidc_sign_in(
@@ -679,11 +722,22 @@ async fn oidc_sign_in(
     // provider account maps to exactly one local identity; adding a SECOND
     // provider to an identity means signing in with the first, which is a
     // different flow and not this one.
-    let existing = s.identity_user(&claims.issuer, &claims.subject).await?;
-    let mut user = match &existing {
-        Some(uid) => s.users_by_id(uid).await?,
-        None => None,
-    };
+    let mut user = None;
+    if let Some(uid) = s.identity_user(&claims.issuer, &claims.subject).await? {
+        // A `user_identities` row whose user is gone is a broken instance, not
+        // a new sign-up. Falling through to provisioning was worse than
+        // useless: `identity_link` is ON CONFLICT DO NOTHING so the new account
+        // never got linked, and every later login tripped the
+        // already-registered-email refusal instead — an account locked out by a
+        // message that names the wrong cause. Say the real one.
+        let Some(found) = s.users_by_id(&uid).await? else {
+            return Ok(html_error(
+                "This identity provider account is linked to a hive account that no longer \
+                 exists. An operator must remove the stale link before it can be used again.",
+            ));
+        };
+        user = Some(found);
+    }
     if user.is_none() {
         let domain = email.split('@').nth(1).unwrap_or("").to_string();
         if !cfg.allowed_domains.contains(&domain) {
@@ -700,16 +754,31 @@ async fn oidc_sign_in(
                  first, then link this provider.",
             ));
         }
-        let org = s.orgs_default().await?;
+        // Which org a brand-new IdP user joins. `orgs_default()` unconditionally
+        // was fine while there was one org and wrong the moment there were two:
+        // every new provider account landed in `default` and could then read
+        // its content legitimately, which no policy would ever flag. `OIDC_ORG`
+        // says where they go; without it, auto-provisioning only happens where
+        // there is exactly one org to mean.
+        let Some(org) = provisioning_org(s).await? else {
+            return Ok(html_error(
+                "There is no unambiguous org for a new identity on this instance. Set OIDC_ORG \
+                 to an existing org slug, or have an operator create the account.",
+            ));
+        };
+        let display_name = claims.name.clone().unwrap_or_else(|| email.clone());
         let scope = hive_core::ActingScope::new(org.id, "oidc".to_string(), false);
         let safe = hive_core::acting::scope(scope, async {
+            // Inside the scope, because a free slug is only free relative to an
+            // org: `people` is unique per org, `users.actor` globally.
+            let actor = free_actor_slug(s, &display_name).await?;
             s.users_create(
                 NewUser {
-                    name: claims.name.clone().unwrap_or_else(|| email.clone()),
+                    name: display_name.clone(),
                     email: email.clone(),
                     password: token_hash(&random_hash()),
                     role: None,
-                    actor: None,
+                    actor: Some(actor),
                     kind: Some(ActorKind::Human),
                 },
                 "oidc",

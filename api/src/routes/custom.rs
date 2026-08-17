@@ -14,7 +14,6 @@ use axum::{Extension, Router};
 use hive_shared::{CustomEntityPatch, EntityTypePatch, NewCustomEntity, NewEntityType};
 use serde_json::json;
 
-use super::admin::require_admin_actor;
 use crate::error::{err, forbidden, not_found, ApiResult};
 use crate::middleware::AuthCtx;
 use crate::store::custom_entities::{EntityFilter, EntityWriteError};
@@ -83,7 +82,7 @@ async fn types_create(
     Extension(ctx): Extension<AuthCtx>,
     Json(input): Json<NewEntityType>,
 ) -> ApiResult {
-    if !require_admin_actor(&s, &ctx).await? {
+    if !ctx.is_admin() {
         return Ok(forbidden());
     }
     match s.entity_types_create(input, ctx.actor()).await {
@@ -105,7 +104,7 @@ async fn types_update(
     Path(id_or_slug): Path<String>,
     Json(patch): Json<EntityTypePatch>,
 ) -> ApiResult {
-    if !require_admin_actor(&s, &ctx).await? {
+    if !ctx.is_admin() {
         return Ok(forbidden());
     }
     match s.entity_types_update(&id_or_slug, patch, ctx.actor()).await {
@@ -120,7 +119,7 @@ async fn types_delete(
     Extension(ctx): Extension<AuthCtx>,
     Path(id_or_slug): Path<String>,
 ) -> ApiResult {
-    if !require_admin_actor(&s, &ctx).await? {
+    if !ctx.is_admin() {
         return Ok(forbidden());
     }
     match s.entity_types_delete(&id_or_slug, ctx.actor()).await? {
