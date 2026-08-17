@@ -14,14 +14,30 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
-use crate::control::{line, ClientMsg, ServerMsg};
+use crate::control::{line, ClientMsg, LineReader, ServerMsg};
+use crate::tap::Splice;
+
+/// Ceiling on the TLS handshake with a browser the relay paired us with. The
+/// relay is not trusted from in here, and neither is whoever it paired us
+/// with, so a peer that opens a socket and then says nothing must cost this
+/// house a bounded amount of time.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// No bytes either way for this long and a proxied session is over. Matches
+/// the relay's own default; whichever fires first is fine.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The relay pings every 20 seconds. Silence for this long means the control
+/// connection is dead in a way TCP has not noticed yet, and reconnecting is
+/// how this house gets its id back.
+const CONTROL_SILENCE: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -77,11 +93,14 @@ pub async fn run(cfg: AgentConfig) -> Result<()> {
 }
 
 async fn session(cfg: &AgentConfig, tls: TlsAcceptor) -> Result<()> {
-    let sock = TcpStream::connect(&cfg.relay)
+    let sock = tokio::time::timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(&cfg.relay))
         .await
+        .with_context(|| format!("timed out dialling relay {}", cfg.relay))?
         .with_context(|| format!("dial relay {}", cfg.relay))?;
     sock.set_nodelay(true).ok();
-    let mut ctrl = BufReader::new(sock);
+    // Bounded and cancel safe. The relay is somebody else's machine: a line
+    // with no newline in it must not be able to grow this house's memory.
+    let mut ctrl = LineReader::new(sock);
 
     let hello = line(&ClientMsg::Hello {
         instance: cfg.instance.clone(),
@@ -90,12 +109,13 @@ async fn session(cfg: &AgentConfig, tls: TlsAcceptor) -> Result<()> {
     })?;
     ctrl.get_mut().write_all(hello.as_bytes()).await?;
 
-    let mut buf = String::new();
     loop {
-        buf.clear();
-        if ctrl.read_line(&mut buf).await? == 0 {
+        let Some(buf) = tokio::time::timeout(CONTROL_SILENCE, ctrl.next_line())
+            .await
+            .context("relay went silent between heartbeats")??
+        else {
             return Ok(());
-        }
+        };
         match serde_json::from_str::<ServerMsg>(buf.trim())
             .with_context(|| format!("relay sent something unparseable: {}", buf.trim()))?
         {
@@ -126,25 +146,44 @@ async fn session(cfg: &AgentConfig, tls: TlsAcceptor) -> Result<()> {
 /// Dial back for one paired client, complete the TLS handshake the browser
 /// started, and pipe the decrypted stream to hive-api.
 async fn serve_one(cfg: &AgentConfig, tls: TlsAcceptor, nonce: String) -> Result<()> {
-    let mut sock = TcpStream::connect(&cfg.relay).await?;
+    let mut sock = tokio::time::timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(&cfg.relay))
+        .await
+        .context("timed out dialling back")??;
     sock.set_nodelay(true).ok();
     sock.write_all(line(&ClientMsg::Data { nonce })?.as_bytes())
         .await?;
 
     // The handshake here is with the BROWSER, not with the relay. The relay is
     // copying these bytes without being able to interpret them.
-    let tls_stream = tls.accept(sock).await.context("TLS handshake")?;
-
-    let upstream = TcpStream::connect(&cfg.target)
+    //
+    // The timeout is not optional: whoever is on the other end is an
+    // unauthenticated stranger from the internet, and without it a stranger
+    // who opens a socket and says nothing pins one of this house's sessions
+    // open indefinitely.
+    let tls_stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, tls.accept(sock))
         .await
+        .context("TLS handshake timed out")?
+        .context("TLS handshake")?;
+
+    let upstream = tokio::time::timeout(HANDSHAKE_TIMEOUT, TcpStream::connect(&cfg.target))
+        .await
+        .with_context(|| format!("timed out connecting hive-api at {}", cfg.target))?
         .with_context(|| format!("connect hive-api at {}", cfg.target))?;
     upstream.set_nodelay(true).ok();
 
     // `plaintext_tap` records the DECRYPTED stream. It exists to be diffed
     // against the relay's capture of the same session: same bytes, one side
     // readable and one side not. Demo affordance, never a shipping default.
-    let (up, down) =
-        crate::tap::splice(tls_stream, upstream, &[], cfg.plaintext_tap.clone()).await?;
+    let (up, down) = crate::tap::splice(
+        tls_stream,
+        upstream,
+        Splice {
+            idle_timeout: Some(IDLE_TIMEOUT),
+            tap: cfg.plaintext_tap.clone(),
+            ..Default::default()
+        },
+    )
+    .await?;
     tracing::debug!(up, down, "session closed");
     Ok(())
 }

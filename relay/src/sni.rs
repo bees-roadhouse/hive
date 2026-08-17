@@ -27,45 +27,100 @@
 //! `None` instead of panicking.
 
 /// A ClientHello has to arrive within this many bytes or the connection is not
-/// something this relay can route.
+/// something this relay can route. It is also the cap on a single TLS record,
+/// which the protocol puts at 2^14 anyway.
 pub const MAX_HELLO: usize = 16 * 1024;
+
+/// What a peek at the buffered bytes established.
+///
+/// These three are deliberately distinct. Conflating the first two costs a
+/// connection slot for the whole handshake deadline every time someone sends a
+/// hello with no SNI, which is the cheapest resource hold on the port.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Peek {
+    /// Well-formed so far, and truncated. Read more and ask again.
+    Incomplete,
+    /// A complete ClientHello naming this host.
+    Name(String),
+    /// A complete ClientHello carrying no usable `server_name`. There is
+    /// nothing to route on and no amount of further reading changes that, so
+    /// the caller must fail immediately rather than wait for more bytes.
+    Nameless,
+}
 
 /// Extract the SNI host from a buffered TLS ClientHello.
 ///
-/// Returns `Ok(None)` when the buffer holds a well-formed but incomplete
-/// record and more bytes should be read, and `Err(())` when it is not a TLS
-/// handshake at all.
+/// `Err(())` means the bytes are not a TLS handshake at all.
 #[allow(clippy::result_unit_err)]
-pub fn peek_sni(buf: &[u8]) -> Result<Option<String>, ()> {
-    // TLS record: type(1) version(2) length(2)
-    if buf.len() < 5 {
+pub fn peek_sni(buf: &[u8]) -> Result<Peek, ()> {
+    let Some((first, mut next)) = record_at(buf, 0)? else {
+        return Ok(Peek::Incomplete);
+    };
+    if let Some(body) = client_hello_body(first)? {
+        return parse_hello(body);
+    }
+
+    // The hello is fragmented across records. Legal, some stacks do it, and
+    // refusing it would be a compat break rather than a security property ...
+    // so coalesce, bounded by MAX_HELLO like everything else here.
+    let mut msg = first.to_vec();
+    loop {
+        let Some((more, after)) = record_at(buf, next)? else {
+            return Ok(Peek::Incomplete);
+        };
+        msg.extend_from_slice(more);
+        if msg.len() > MAX_HELLO {
+            return Err(());
+        }
+        next = after;
+        if let Some(body) = client_hello_body(&msg)? {
+            return parse_hello(body);
+        }
+    }
+}
+
+/// One TLS record body starting at `at`, plus the offset just past it.
+/// `Ok(None)` means the record is not fully buffered yet.
+fn record_at(buf: &[u8], at: usize) -> Result<Option<(&[u8], usize)>, ()> {
+    // record: type(1) version(2) length(2)
+    let head = buf.get(at..).ok_or(())?;
+    if head.len() < 5 {
         return Ok(None);
     }
-    if buf[0] != 0x16 {
+    if head[0] != 0x16 {
         return Err(()); // not a handshake record
     }
-    let record_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
-    if record_len == 0 || record_len > MAX_HELLO {
+    let len = u16::from_be_bytes([head[3], head[4]]) as usize;
+    if len == 0 || len > MAX_HELLO {
         return Err(());
     }
-    if buf.len() < 5 + record_len {
+    let Some(body) = head.get(5..5 + len) else {
         return Ok(None);
-    }
-    let body = &buf[5..5 + record_len];
-
-    // Handshake: type(1) length(3)
-    let Some(&msg_type) = body.first() else {
-        return Err(());
     };
-    if msg_type != 0x01 {
+    Ok(Some((body, at + 5 + len)))
+}
+
+/// The ClientHello body inside a handshake message. `Ok(None)` means the
+/// message continues into a record that has not been read yet.
+fn client_hello_body(msg: &[u8]) -> Result<Option<&[u8]>, ()> {
+    // handshake: type(1) length(3)
+    if msg.is_empty() {
+        return Err(());
+    }
+    if msg[0] != 0x01 {
         return Err(()); // not a ClientHello
     }
-    if body.len() < 4 {
+    if msg.len() < 4 {
+        return Ok(None); // header itself split across records
+    }
+    let len = u32::from_be_bytes([0, msg[1], msg[2], msg[3]]) as usize;
+    if len > MAX_HELLO {
         return Err(());
     }
-    let hs_len = u32::from_be_bytes([0, body[1], body[2], body[3]]) as usize;
-    let hello = body.get(4..4 + hs_len).ok_or(())?;
+    Ok(msg.get(4..4 + len))
+}
 
+fn parse_hello(hello: &[u8]) -> Result<Peek, ()> {
     let mut c = Cursor::new(hello);
     c.skip(2)?; // legacy_version
     c.skip(32)?; // random
@@ -78,7 +133,7 @@ pub fn peek_sni(buf: &[u8]) -> Result<Option<String>, ()> {
 
     // Extensions are optional in the grammar; absent means no SNI.
     if c.remaining() == 0 {
-        return Ok(None);
+        return Ok(Peek::Nameless);
     }
     let ext_total = c.u16()? as usize;
     let mut ext = Cursor::new(c.take(ext_total)?);
@@ -100,12 +155,12 @@ pub fn peek_sni(buf: &[u8]) -> Result<Option<String>, ()> {
             let host = list.take(name_len)?;
             if name_type == 0 {
                 let host = std::str::from_utf8(host).map_err(|_| ())?;
-                return Ok(Some(host.to_ascii_lowercase()));
+                return Ok(Peek::Name(host.to_ascii_lowercase()));
             }
         }
-        return Ok(None);
+        return Ok(Peek::Nameless);
     }
-    Ok(None)
+    Ok(Peek::Nameless)
 }
 
 /// Bounds-checked forward reader. Every accessor returns `Err` rather than
@@ -177,6 +232,17 @@ pub fn test_client_hello(host: &str) -> Vec<u8> {
     ext.extend_from_slice(&(list.len() as u16).to_be_bytes());
     ext.extend_from_slice(&list);
 
+    client_hello_with_extensions(&ext)
+}
+
+/// A well-formed ClientHello with no extensions at all, so no SNI. Test
+/// support: this is the shape that must fail fast rather than be waited on.
+#[doc(hidden)]
+pub fn test_client_hello_without_sni() -> Vec<u8> {
+    client_hello_with_extensions(&[])
+}
+
+fn client_hello_with_extensions(ext: &[u8]) -> Vec<u8> {
     let mut hello = Vec::new();
     hello.extend_from_slice(&0x0303u16.to_be_bytes()); // legacy_version
     hello.extend_from_slice(&[0u8; 32]); // random
@@ -185,8 +251,10 @@ pub fn test_client_hello(host: &str) -> Vec<u8> {
     hello.extend_from_slice(&[0x13, 0x01]);
     hello.push(1); // compression methods length
     hello.push(0);
-    hello.extend_from_slice(&(ext.len() as u16).to_be_bytes());
-    hello.extend_from_slice(&ext);
+    if !ext.is_empty() {
+        hello.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        hello.extend_from_slice(ext);
+    }
 
     let mut hs = Vec::new();
     hs.push(0x01); // ClientHello
@@ -201,6 +269,22 @@ pub fn test_client_hello(host: &str) -> Vec<u8> {
     rec
 }
 
+/// Re-frame a single-record ClientHello into records of at most `chunk` bytes
+/// of handshake payload each. Test support for the fragmented case, which is
+/// legal TLS and which some stacks emit.
+#[doc(hidden)]
+pub fn test_fragment_records(single_record: &[u8], chunk: usize) -> Vec<u8> {
+    let hs = &single_record[5..];
+    let mut out = Vec::new();
+    for piece in hs.chunks(chunk.max(1)) {
+        out.push(0x16);
+        out.extend_from_slice(&0x0301u16.to_be_bytes());
+        out.extend_from_slice(&(piece.len() as u16).to_be_bytes());
+        out.extend_from_slice(piece);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,7 +296,7 @@ mod tests {
         let hello = client_hello("hv7bqk.relay.example");
         assert_eq!(
             peek_sni(&hello).expect("parse"),
-            Some("hv7bqk.relay.example".to_string())
+            Peek::Name("hv7bqk.relay.example".to_string())
         );
     }
 
@@ -221,7 +305,7 @@ mod tests {
         let hello = client_hello("HV7BQK.Relay.Example");
         assert_eq!(
             peek_sni(&hello).expect("parse"),
-            Some("hv7bqk.relay.example".to_string())
+            Peek::Name("hv7bqk.relay.example".to_string())
         );
     }
 
@@ -229,7 +313,44 @@ mod tests {
     fn asks_for_more_bytes_when_truncated() {
         let hello = client_hello("a.relay.example");
         for cut in [0, 1, 4, 5, 20, hello.len() - 1] {
-            assert_eq!(peek_sni(&hello[..cut]), Ok(None), "cut at {cut}");
+            assert_eq!(
+                peek_sni(&hello[..cut]),
+                Ok(Peek::Incomplete),
+                "cut at {cut}"
+            );
+        }
+    }
+
+    /// A complete hello with no SNI is a decided answer, not a truncated one.
+    /// The daemon must be able to hang up on it immediately instead of
+    /// holding a slot until the handshake deadline.
+    #[test]
+    fn a_complete_hello_without_sni_is_not_incomplete() {
+        let hello = test_client_hello_without_sni();
+        assert_eq!(peek_sni(&hello), Ok(Peek::Nameless));
+    }
+
+    /// A ClientHello split across TLS records is legal and some stacks emit
+    /// it. Refusing it would be a compat break, not a security property.
+    #[test]
+    fn reassembles_a_hello_split_across_records() {
+        let single = client_hello("frag.relay.example");
+        for chunk in [1, 3, 17, 64] {
+            let split = test_fragment_records(&single, chunk);
+            assert!(split.len() > single.len(), "chunk {chunk} should fragment");
+            assert_eq!(
+                peek_sni(&split).expect("parse"),
+                Peek::Name("frag.relay.example".to_string()),
+                "chunk {chunk}"
+            );
+            // ... and every prefix of it still just asks for more bytes.
+            for cut in 0..split.len() {
+                assert_eq!(
+                    peek_sni(&split[..cut]),
+                    Ok(Peek::Incomplete),
+                    "chunk {chunk} cut at {cut}"
+                );
+            }
         }
     }
 

@@ -35,3 +35,14 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "tls12",
     "logging",
 ] }
+
+[dev-dependencies]
+# The blindness proof needs a real certificate for `<id>.<zone>` and a real
+# handshake, and a public CA cannot issue for `relay.test`. Issued in-process,
+# thrown away with the temp dir. `ring` rather than the default aws-lc-rs: the
+# tree already links ring through tokio-rustls, and aws-lc-rs would drag cmake
+# and a C toolchain into CI for a test fixture.
+rcgen = { version = "0.14", default-features = false, features = [
+    "pem",
+    "ring",
+] }

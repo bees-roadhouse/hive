@@ -24,20 +24,34 @@
 //! which would turn "we cannot read it" into "we cannot read it today".
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
-use crate::control::{line, valid_instance_id, ClientMsg, ServerMsg};
+use crate::control::{line, valid_instance_id, ClientMsg, LineReader, ServerMsg};
 use crate::limits::Limits;
-use crate::sni::{instance_from_sni, peek_sni, MAX_HELLO};
-use crate::tap::Tap;
+use crate::sni::{instance_from_sni, peek_sni, Peek, MAX_HELLO};
+use crate::tap::{Splice, Tap};
+
+/// How often the daemon pings a registered house, and therefore how long a
+/// dead one keeps its id.
+///
+/// This is not cosmetic. Registration is exclusive, so an instance whose
+/// network dropped is locked out of reconnecting for as long as the daemon
+/// believes the zombie socket is alive. Before the pong was read, that was
+/// however long TCP retransmission took ... minutes. Now it is two intervals.
+const HEARTBEAT: Duration = Duration::from_secs(20);
+
+/// A data connection the agent dialled back on, plus anything it sent past the
+/// `Data` line. The residue is normally empty and is carried rather than
+/// dropped so that stops being load-bearing.
+type DataConn = (TcpStream, Vec<u8>);
 
 pub struct Config {
     /// Public TLS port. Nothing here terminates TLS; it only routes.
@@ -66,46 +80,99 @@ pub struct Instance {
     pub bytes_up: AtomicU64,
     pub bytes_down: AtomicU64,
     control: mpsc::Sender<ServerMsg>,
-    pending: Mutex<HashMap<String, oneshot::Sender<TcpStream>>>,
+    pending: Mutex<HashMap<String, oneshot::Sender<DataConn>>>,
 }
 
-impl Instance {
-    /// Registry-free constructor for tests.
-    #[doc(hidden)]
-    pub fn for_test(id: String, host: String) -> Self {
-        let (control, _rx) = mpsc::channel(1);
-        Self {
-            label: id.clone(),
-            id,
-            host,
-            connected_at: chrono::Utc::now(),
-            live: Arc::new(AtomicUsize::new(0)),
-            bytes_up: AtomicU64::new(0),
-            bytes_down: AtomicU64::new(0),
-            control,
-            pending: Mutex::new(HashMap::new()),
-        }
-    }
+/// Why a registration was refused. One rejection message goes on the wire for
+/// all of them, so the control port is not an instance-id oracle.
+enum Refused {
+    AtCapacity,
+    Duplicate,
 }
 
+/// The routing table.
+///
+/// A `std` lock rather than a `tokio` one, deliberately: every operation is a
+/// hash lookup with no await in it, and being synchronous is what lets
+/// deregistration live in a `Drop` guard instead of a fallthrough path that
+/// four `?` operators were skipping past.
 #[derive(Default)]
 pub struct Registry {
     by_id: RwLock<HashMap<String, Arc<Instance>>>,
 }
 
 impl Registry {
-    pub async fn get(&self, id: &str) -> Option<Arc<Instance>> {
-        self.by_id.read().await.get(id).cloned()
+    pub fn get(&self, id: &str) -> Option<Arc<Instance>> {
+        self.read().get(id).cloned()
     }
 
-    pub async fn list(&self) -> Vec<Arc<Instance>> {
-        let mut v: Vec<_> = self.by_id.read().await.values().cloned().collect();
+    pub fn list(&self) -> Vec<Arc<Instance>> {
+        let mut v: Vec<_> = self.read().values().cloned().collect();
         v.sort_by(|a, b| a.id.cmp(&b.id));
         v
     }
 
-    pub async fn count(&self) -> usize {
-        self.by_id.read().await.len()
+    pub fn count(&self) -> usize {
+        self.read().len()
+    }
+
+    /// Capacity check, duplicate check, and insert under ONE lock. Split
+    /// across three they raced: two agents claiming the same id could both
+    /// pass the check before either inserted.
+    fn claim(&self, inst: Arc<Instance>, max_instances: usize) -> Result<(), Refused> {
+        let mut by_id = self.write();
+        if by_id.contains_key(&inst.id) {
+            return Err(Refused::Duplicate);
+        }
+        if by_id.len() >= max_instances {
+            return Err(Refused::AtCapacity);
+        }
+        by_id.insert(inst.id.clone(), inst);
+        Ok(())
+    }
+
+    /// Remove, but only if the entry is still the one that was claimed. The
+    /// identity check means a late drop can never evict a live successor.
+    fn release(&self, inst: &Arc<Instance>) -> bool {
+        let mut by_id = self.write();
+        match by_id.get(&inst.id) {
+            Some(current) if Arc::ptr_eq(current, inst) => {
+                by_id.remove(&inst.id);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // A poisoned registry is not a reason to stop routing: nothing here can
+    // leave the map half-updated.
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Arc<Instance>>> {
+        self.by_id.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, Arc<Instance>>> {
+        self.by_id.write().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Deregisters on drop, which is the only way to be sure.
+///
+/// Registration used to be undone by code at the bottom of `register`, past
+/// four `?` operators that could return early. One of them was the welcome
+/// write: a peer that reset between the insert and that write left an entry
+/// pointing at a dead control channel, and because registration is exclusive,
+/// that house could never reconnect until the relay restarted.
+struct Registration {
+    daemon: Arc<Daemon>,
+    inst: Arc<Instance>,
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        if self.daemon.registry.release(&self.inst) {
+            // The off switch taking effect: nothing routes here now.
+            tracing::info!(instance = %self.inst.id, "instance disconnected");
+        }
     }
 }
 
@@ -149,7 +216,13 @@ impl Daemon {
     }
 
     async fn route(self: Arc<Self>, mut client: TcpStream, peer: SocketAddr) -> Result<()> {
-        if let Err(e) = self.limits_state.check_rate(peer.ip(), Instant::now()) {
+        // The global ceiling comes first and is held for the whole session,
+        // splice included. A rate limit alone bounds arrivals, not residents.
+        let Some(_slot) = self.limits_state.ingress_slot() else {
+            tracing::warn!(%peer, "ingress at global capacity");
+            return Ok(());
+        };
+        if let Err(e) = self.limits_state.check_ingress(peer.ip(), Instant::now()) {
             // No response. This port speaks TLS and we are below it, so there
             // is nothing meaningful to say ... close and move on.
             tracing::warn!(%peer, reason = %e, "ingress refused");
@@ -157,14 +230,19 @@ impl Daemon {
         }
         client.set_nodelay(true).ok();
 
+        // ONE deadline for the whole read, not one per read. Per-read, a byte
+        // every nine seconds holds the connection for as long as the attacker
+        // has patience.
+        let deadline = tokio::time::Instant::now() + self.cfg.limits.handshake_timeout;
+
         // Read only as far as the ClientHello, then stop looking.
         let mut hello = Vec::with_capacity(1024);
         let sni = loop {
-            if hello.len() > MAX_HELLO {
+            if hello.len() >= MAX_HELLO {
                 bail!("no ClientHello within {MAX_HELLO} bytes");
             }
             let mut chunk = [0u8; 2048];
-            let n = tokio::time::timeout(Duration::from_secs(10), client.read(&mut chunk))
+            let n = tokio::time::timeout_at(deadline, client.read(&mut chunk))
                 .await
                 .context("timed out waiting for a ClientHello")??;
             if n == 0 {
@@ -172,8 +250,11 @@ impl Daemon {
             }
             hello.extend_from_slice(&chunk[..n]);
             match peek_sni(&hello) {
-                Ok(Some(name)) => break name,
-                Ok(None) => continue,
+                Ok(Peek::Name(name)) => break name,
+                Ok(Peek::Incomplete) => continue,
+                // Decided, not truncated: waiting for more bytes would hold a
+                // slot for the whole deadline and still end here.
+                Ok(Peek::Nameless) => bail!("ClientHello carried no server_name"),
                 Err(()) => bail!("not a TLS ClientHello"),
             }
         };
@@ -181,7 +262,7 @@ impl Daemon {
         let Some(id) = instance_from_sni(&sni, &self.cfg.zone) else {
             bail!("SNI {sni} is not in zone {}", self.cfg.zone);
         };
-        let Some(inst) = self.registry.get(&id).await else {
+        let Some(inst) = self.registry.get(&id) else {
             // Closing without a TLS alert is indistinguishable from a network
             // drop, so this does not confirm whether the id exists.
             bail!("no instance connected for {id}");
@@ -208,34 +289,47 @@ impl Daemon {
         };
 
         let nonce = nanoid::nanoid!(21);
-        let (tx, rx) = oneshot::channel::<TcpStream>();
+        let (tx, rx) = oneshot::channel::<DataConn>();
         inst.pending.lock().await.insert(nonce.clone(), tx);
 
-        if inst
-            .control
-            .send(ServerMsg::Open {
+        // Timed, because the control channel is bounded and a house that has
+        // stopped reading its socket would otherwise park this task, its
+        // permit, and its slot for as long as the process lives.
+        let told = tokio::time::timeout(
+            self.cfg.limits.handshake_timeout,
+            inst.control.send(ServerMsg::Open {
                 nonce: nonce.clone(),
-            })
-            .await
-            .is_err()
-        {
+            }),
+        )
+        .await;
+        if !matches!(told, Ok(Ok(()))) {
             inst.pending.lock().await.remove(&nonce);
-            bail!("instance control channel gone");
+            bail!("instance control channel gone or blocked");
         }
 
-        let upstream = match tokio::time::timeout(Duration::from_secs(10), rx).await {
-            Ok(Ok(s)) => s,
-            _ => {
-                inst.pending.lock().await.remove(&nonce);
-                bail!("instance did not dial back in time");
-            }
-        };
+        let (upstream, residue) =
+            match tokio::time::timeout(self.cfg.limits.handshake_timeout, rx).await {
+                Ok(Ok(s)) => s,
+                _ => {
+                    inst.pending.lock().await.remove(&nonce);
+                    bail!("instance did not dial back in time");
+                }
+            };
         upstream.set_nodelay(true).ok();
 
         // The peeked bytes are replayed verbatim, so the instance sees the
         // browser's original ClientHello and the handshake is between them.
-        let (up, down) =
-            crate::tap::splice(client, upstream, &hello, self.cfg.audit_tap.clone()).await?;
+        let (up, down) = crate::tap::splice(
+            client,
+            upstream,
+            Splice {
+                to_instance: &hello,
+                to_client: &residue,
+                idle_timeout: Some(self.cfg.limits.idle_timeout),
+                tap: self.cfg.audit_tap.clone(),
+            },
+        )
+        .await?;
 
         inst.bytes_up.fetch_add(up, Ordering::Relaxed);
         inst.bytes_down.fetch_add(down, Ordering::Relaxed);
@@ -268,18 +362,26 @@ impl Daemon {
     }
 
     async fn handle_control(self: Arc<Self>, sock: TcpStream, peer: SocketAddr) -> Result<()> {
+        // Same two-part shape as ingress. The control port is public and
+        // unauthenticated until the first line parses, so it gets the same
+        // ceiling and the same rate limit ... it had neither.
+        let Some(_slot) = self.limits_state.control_slot() else {
+            tracing::warn!(%peer, "control at global capacity");
+            return Ok(());
+        };
+        if let Err(e) = self.limits_state.check_control(peer.ip(), Instant::now()) {
+            tracing::warn!(%peer, reason = %e, "control refused");
+            return Ok(());
+        }
         sock.set_nodelay(true).ok();
-        let mut reader = BufReader::new(sock);
-        let mut first = String::new();
-        let read = tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut first))
+
+        let mut lines = LineReader::new(sock);
+        let first = tokio::time::timeout(self.cfg.limits.handshake_timeout, lines.next_line())
             .await
             .context("timed out waiting for the opening line")??;
-        if read == 0 {
+        let Some(first) = first else {
             bail!("peer closed before saying anything");
-        }
-        if first.len() > 8 * 1024 {
-            bail!("opening line too long");
-        }
+        };
 
         match serde_json::from_str::<ClientMsg>(first.trim())
             .context("opening line was not a control message")?
@@ -288,46 +390,41 @@ impl Daemon {
                 instance,
                 token,
                 label,
-            } => self.register(reader, peer, instance, token, label).await,
-            ClientMsg::Data { nonce } => self.pair_data(reader.into_inner(), nonce).await,
+            } => self.register(lines, peer, instance, token, label).await,
+            ClientMsg::Data { nonce } => {
+                let (sock, residue) = lines.into_parts();
+                self.pair_data(sock, residue, nonce).await
+            }
             ClientMsg::Pong => bail!("pong is not an opening message"),
         }
     }
 
     async fn register(
         self: Arc<Self>,
-        mut reader: BufReader<TcpStream>,
+        mut lines: LineReader<TcpStream>,
         peer: SocketAddr,
         id: String,
         token: String,
         label: Option<String>,
     ) -> Result<()> {
-        async fn reject(mut reader: BufReader<TcpStream>, msg: &str) {
+        async fn reject(sock: &mut TcpStream, msg: &str) {
             if let Ok(l) = line(&ServerMsg::Error {
                 msg: msg.to_string(),
             }) {
-                let _ = reader.get_mut().write_all(l.as_bytes()).await;
+                let _ = sock.write_all(l.as_bytes()).await;
             }
-            let _ = reader.get_mut().shutdown().await;
+            let _ = sock.shutdown().await;
         }
 
         if !valid_instance_id(&id) {
-            reject(reader, "registration refused").await;
+            reject(lines.get_mut(), "registration refused").await;
             bail!("invalid instance id from {peer}");
         }
         if !self.check_token(&id, &token) {
             // One message for "unknown id" and "wrong token" so the control
             // port is not an instance-id oracle.
-            reject(reader, "registration refused").await;
+            reject(lines.get_mut(), "registration refused").await;
             bail!("registration refused for {id} from {peer}");
-        }
-        if self.registry.count().await >= self.cfg.limits.max_instances {
-            reject(reader, "relay at capacity").await;
-            bail!("at capacity, refused {id}");
-        }
-        if self.registry.get(&id).await.is_some() {
-            reject(reader, "instance already connected").await;
-            bail!("duplicate registration for {id}");
         }
 
         let host = format!("{id}.{}", self.cfg.zone);
@@ -344,49 +441,67 @@ impl Daemon {
             pending: Mutex::new(HashMap::new()),
         });
 
-        self.registry
-            .by_id
-            .write()
-            .await
-            .insert(id.clone(), inst.clone());
+        match self
+            .registry
+            .claim(inst.clone(), self.cfg.limits.max_instances)
+        {
+            Ok(()) => {}
+            Err(Refused::AtCapacity) => {
+                reject(lines.get_mut(), "relay at capacity").await;
+                bail!("at capacity, refused {id}");
+            }
+            Err(Refused::Duplicate) => {
+                reject(lines.get_mut(), "instance already connected").await;
+                bail!("duplicate registration for {id}");
+            }
+        }
+
+        // From here on, every exit path deregisters ... including the `?` on
+        // the welcome write immediately below, which was the leak.
+        let _registered = Registration {
+            daemon: self.clone(),
+            inst: inst.clone(),
+        };
         tracing::info!(instance = %id, %host, %peer, "instance registered");
 
         let welcome = line(&ServerMsg::Welcome { host })?;
-        reader.get_mut().write_all(welcome.as_bytes()).await?;
+        lines.get_mut().write_all(welcome.as_bytes()).await?;
 
-        let mut heartbeat = tokio::time::interval(Duration::from_secs(20));
+        let mut heartbeat = tokio::time::interval(HEARTBEAT);
+        // Delay rather than burst: a runner that stalled must not fire two
+        // ticks back to back and read that as a missed pong.
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         heartbeat.tick().await;
-        let mut incoming = String::new();
-        let result: Result<()> = loop {
+        // The heartbeat is a question, so somebody has to check for an answer.
+        let mut awaiting_pong = false;
+        loop {
             tokio::select! {
                 msg = rx.recv() => {
-                    let Some(msg) = msg else { break Ok(()) };
+                    let Some(msg) = msg else { return Ok(()) };
                     let l = line(&msg)?;
-                    if let Err(e) = reader.get_mut().write_all(l.as_bytes()).await {
-                        break Err(e.into());
-                    }
+                    lines.get_mut().write_all(l.as_bytes()).await?;
                 }
                 _ = heartbeat.tick() => {
-                    let l = line(&ServerMsg::Ping)?;
-                    if let Err(e) = reader.get_mut().write_all(l.as_bytes()).await {
-                        break Err(e.into());
+                    if awaiting_pong {
+                        bail!("no pong within {HEARTBEAT:?}");
                     }
+                    let l = line(&ServerMsg::Ping)?;
+                    lines.get_mut().write_all(l.as_bytes()).await?;
+                    awaiting_pong = true;
                 }
-                n = reader.read_line(&mut incoming) => {
-                    match n {
-                        Ok(0) => break Ok(()),
-                        Ok(_) => incoming.clear(),
-                        Err(e) => break Err(e.into()),
+                // Cancel safe: a partial line stays in the reader's buffer.
+                incoming = lines.next_line() => {
+                    let Some(incoming) = incoming? else { return Ok(()) };
+                    match serde_json::from_str::<ClientMsg>(incoming.trim())
+                        .context("control message from the instance was unparseable")?
+                    {
+                        ClientMsg::Pong => awaiting_pong = false,
+                        ClientMsg::Hello { .. } => bail!("hello twice on one control connection"),
+                        ClientMsg::Data { .. } => bail!("data is not a control-session message"),
                     }
                 }
             }
-        };
-
-        // Deregistration is the off switch taking effect: the moment the house
-        // stops holding this connection, nothing routes to it.
-        self.registry.by_id.write().await.remove(&id);
-        tracing::info!(instance = %id, "instance disconnected");
-        result
+        }
     }
 
     fn check_token(&self, id: &str, presented: &str) -> bool {
@@ -399,14 +514,15 @@ impl Daemon {
         expected.as_bytes().ct_eq(presented.as_bytes()).into()
     }
 
-    async fn pair_data(&self, sock: TcpStream, nonce: String) -> Result<()> {
-        // Nonces are single-use, instance-scoped, and live for 10 seconds, so
-        // a guess has to hit a 21-character nanoid inside that window.
-        for inst in self.registry.list().await {
+    async fn pair_data(&self, sock: TcpStream, residue: Vec<u8>, nonce: String) -> Result<()> {
+        // Nonces are single-use, instance-scoped, and live as long as the
+        // handshake timeout, so a guess has to hit a 21-character nanoid
+        // inside that window.
+        for inst in self.registry.list() {
             let taken = inst.pending.lock().await.remove(&nonce);
             if let Some(tx) = taken {
                 return tx
-                    .send(sock)
+                    .send((sock, residue))
                     .map_err(|_| anyhow::anyhow!("waiting client vanished"));
             }
         }
@@ -424,6 +540,3 @@ impl Drop for ConnPermit {
         self.live.fetch_sub(1, Ordering::SeqCst);
     }
 }
-
-/// Unused-import guard: `IpAddr` is referenced only through `peer.ip()`.
-const _: fn(IpAddr) = |_| {};

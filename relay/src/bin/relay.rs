@@ -99,7 +99,6 @@ async fn status(State(daemon): State<Arc<Daemon>>) -> impl IntoResponse {
     let rows: Vec<_> = daemon
         .registry
         .list()
-        .await
         .iter()
         .map(|i| {
             serde_json::json!({

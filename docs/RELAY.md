@@ -89,6 +89,16 @@ Asserting "the relay cannot read it" is worthless. The demo captures the SAME
 session twice: once as the relay forwarded it, once as the instance decrypted
 it. Then it greps both.
 
+**`relay/tests/blindness.rs` is the same experiment inside `cargo test`**, so
+the headline property is gated rather than demonstrated on request. It issues a
+throwaway certificate for `<id>.<zone>` in process (the instance holds it, the
+relay never sees the key), runs a real handshake through a real splice, and
+asserts both halves: the canary IS in the instance's plaintext, and is NOT in
+what the relay forwarded, in either direction. The demo below is still the
+better artefact for a human, because it runs against a real `hive-api` and real
+curl. It was also never invoked by CI, which is how the one property this
+design exists for ended up being the one thing with no test behind it.
+
 ```
 == control: the canary IS in the plaintext, so the grep works
    ok    canary present in instance-plaintext.bin
@@ -108,7 +118,9 @@ could just mean the grep was broken.
 
 Blindness is structural rather than disciplined. The data path is
 `tokio::io::copy_bidirectional` over two raw sockets. There is no buffer holding
-a payload and no parser pointed at one.
+a payload and no parser pointed at one. The idle watchdog added below sits in
+the same place and keeps that true: it stamps a clock when a read returns
+bytes, and never looks at which bytes.
 
 ## What the operator can see
 
@@ -160,10 +172,32 @@ One process on one small VPS, plus DNS.
 The cost that actually bites is not bandwidth, it is **no upstream DDoS
 absorption**. Grey-clouded DNS means port 443 is exposed directly on a machine
 run for free. The relay sits below TLS, so it can count connections and cannot
-inspect requests: no WAF, no per-route limits, no request-size caps. What
-`relay/src/limits.rs` provides is per-source-IP connection rate limiting, a
-per-instance concurrent-session cap, and a total instance cap. Anything shaped
-like "block this URL" has to happen on the instance.
+inspect requests: no WAF, no per-route limits, no request-size caps. Anything
+shaped like "block this URL" has to happen on the instance.
+
+What `relay/src/limits.rs` provides, and the shape of each:
+
+| cap | default | what it is for |
+|---|---|---|
+| global concurrent connections | 8192 ingress, 1024 control | the backstop. A rate limit is not a concurrency limit |
+| per-source arrival rate | 60 per 10s ingress, 120 control | cheap to evade from a large address block, so never the only defence |
+| per-instance concurrent sessions | 64 | one house cannot be flooded off the relay |
+| handshake deadline | 10s | bounds the WHOLE pre-routing read, not each `read` inside it |
+| idle timeout on an established splice | 120s | no bytes in either direction. Idle, not total |
+| total instances | 64 | |
+
+Three of those exist because of what the others do not do, and the reasoning is
+worth keeping:
+
+* **A rate limit is not a concurrency limit.** Sixty connections per ten
+  seconds is unlimited connections if none of them is ever released. The
+  per-instance cap plus no idle timeout meant sixty-four silent connections
+  took a house off the relay until the process restarted.
+* **A per-read timeout bounds nothing.** One byte every nine seconds resets a
+  ten-second per-read timeout forever. The deadline covers the whole read.
+* **Per-source counting is per-/64 on IPv6**, not per address. A single
+  subscriber is handed a /64, so counting /128s gives an attacker 2^64 free
+  retries and a limit that never fires.
 
 ## What can and cannot be promised to a household
 
