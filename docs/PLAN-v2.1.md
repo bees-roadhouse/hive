@@ -1,5 +1,29 @@
 # Hive v2.1: always-on node, web head, sharing — execution plan
 
+> **Superseded 2026-08-10 by [WEB-APP.md](./WEB-APP.md).** This is the PR-by-PR
+> program for the decisions WEB-APP.md replaced ... D29-D36, the always-on node
+> ... and it was overtaken before most of it landed. Nothing below describes the
+> tree. There is no `node/`, `sync/`, `smoke/`, `smoke-support/`, `app/`,
+> `bridge/`, or `importer/` crate; the workspace is
+> `[shared, embed, core, api, jmap-sync, relay]`, an axum API over PostgreSQL
+> serving a SolidJS SPA. The `hive-core` this plan builds on is gone too: no op
+> log, no blockstore, no SQLCipher index, no fold.
+>
+> Specifically dead, since these are the parts most likely to be mistaken for
+> current process: the smoke and screenshot test tiers and their `HIVE_SMOKE` /
+> `HIVE_SHOTS` gating (see [TESTING-STRATEGY.md](./TESTING-STRATEGY.md), which
+> was rewritten against the real suite), `scripts/smoke.sh` (deleted), the
+> identity and tenancy grep fences, the `smoke`, `ui-shots`, `wasm-gate`, and
+> `nightly` CI jobs (never written; CI is two jobs, `rust` and `web`), and the
+> version ladder from v0.8.0 through v0.13.0.
+>
+> What survives is the relay, arriving by a different road:
+> [RELAY.md](./RELAY.md) solves this plan's reachability problem for a browser
+> instead of for a device. Phase 3's mail work also landed, inside the API.
+>
+> Kept intact as the record of a program that was overtaken. History, not
+> roadmap.
+
 Status: adopted 2026-07-24. Companion to [DIRECTION.md](./DIRECTION.md)
 (D16-D28; v2.1 amends D16/D21/D27 at PR 4.0 below, D17/D18/D19/D20 stay untouched)
 and successor to [PLAN.md](./PLAN.md)'s forward half: Phase 1 is complete, Phase 2

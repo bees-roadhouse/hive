@@ -1,5 +1,26 @@
 # Prompt: multimodal embeddings + local voice/face identity
 
+> **Historical. Do not paste this as-is.** This is the brief that produced
+> [MULTIMODAL-IDENTITY.md](../MULTIMODAL-IDENTITY.md) on 2026-08-02. Its
+> Orientation section describes the local-first architecture that
+> [WEB-APP.md](../WEB-APP.md) replaced on 2026-08-10, so a fresh session
+> following it would design against a repo that does not exist. Dead:
+> the blockstore, crypto-shred, `FOLD_VERSION`, the in-memory ANN rebuilt at
+> every `Index::open`, `hive-app`, and the distrobox/webkit build story. Live:
+> Postgres and pgvector as the store, `embeddings` with its
+> `(ref_kind, ref_id, chunk_idx)` key intact, ANN as HNSW over
+> `vec_v vector(384)`, and BGE-small at 384 dims with the 256-dim hash
+> fallback under `HIVE_EMBED=hash`.
+>
+> To re-run the brief, the gates are the ones in `.github/workflows/ci.yml`:
+> `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
+> warnings`, and `cargo test --workspace` with `HIVE_EMBED=hash`, a
+> `DATABASE_URL` pointing at a pgvector Postgres, and `HIVE_CRED_KEY` set. The
+> release gate is `cargo build --release -p hive-api`, not `hive-app`. The web
+> half is `pnpm --filter @hive/web build`.
+>
+> Kept intact below as the record of what was asked.
+
 Paste into a fresh Claude Code session at the hive repo root. Self-contained on
 purpose: assume the session knows nothing about this conversation.
 
