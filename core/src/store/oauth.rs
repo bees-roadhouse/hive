@@ -149,10 +149,16 @@ impl Store {
             .await?;
 
         let mut tx = self.db().begin().await?;
-        let row = crate::pgq::query("SELECT * FROM oauth_auth_codes WHERE code_hash = ?")
-            .bind(token_hash(code))
-            .fetch_optional(&mut *tx)
-            .await?;
+        // FOR UPDATE, or single-use is only single-use when nobody races it.
+        // Under READ COMMITTED two concurrent redemptions of the same code both
+        // read `used_at IS NULL`, both mint a token, and the replay branch that
+        // treats reuse as a compromise never fires. The row lock serializes
+        // them: the second waits, then sees `used_at` set and is a Replay.
+        let row =
+            crate::pgq::query("SELECT * FROM oauth_auth_codes WHERE code_hash = ? FOR UPDATE")
+                .bind(token_hash(code))
+                .fetch_optional(&mut *tx)
+                .await?;
         let Some(row) = row else {
             return Ok(RedeemOutcome::Unknown);
         };

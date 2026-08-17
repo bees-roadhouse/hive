@@ -147,6 +147,14 @@ async fn me(State(s): State<Store>, Extension(ctx): Extension<AuthCtx>) -> ApiRe
         Some(a) => s.users_list().await?.into_iter().find(|u| &u.actor == a),
         None => None,
     };
+    // Report the role this credential actually holds — its membership role in
+    // the org it is acting in — not the account-wide default in `users.role`.
+    // The SPA gates its admin surfaces on this field, and a nav that offers
+    // what the API will refuse is a worse answer than no nav.
+    let user = user.map(|u| hive_shared::SafeUser {
+        role: ctx.role.unwrap_or(u.role),
+        ..u
+    });
     Ok(Json(AuthMe {
         user,
         principal: ctx.principal.map(String::from),

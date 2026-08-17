@@ -74,6 +74,14 @@ async fn people_create(
     Ok((StatusCode::CREATED, Json(p)).into_response())
 }
 
+/// Editable by an admin, the AI's owner, or the identity itself — asked of a
+/// row rather than of a slug, so the SAME question can be asked of the row a
+/// patch would produce.
+fn may_edit_person(ctx: &AuthCtx, owner: Option<&str>, slug: &str) -> bool {
+    let me = ctx.actor.as_deref();
+    ctx.is_admin() || owner == me || Some(slug) == me
+}
+
 async fn people_update(
     State(s): State<Store>,
     Extension(ctx): Extension<AuthCtx>,
@@ -83,11 +91,62 @@ async fn people_update(
     let Some(target) = s.people_get(&slug).await? else {
         return Ok(not_found());
     };
-    // Editable by an admin, the AI's owner, or the identity itself.
-    let me = ctx.actor.as_deref();
-    if !ctx.is_admin() && target.owner.as_deref() != me && Some(target.slug.as_str()) != me {
+    if !may_edit_person(&ctx, target.owner.as_deref(), &target.slug) {
         return Ok(forbidden());
     }
+
+    // `kind` and `owner` ARE the delegation gate, so a delegate does not get to
+    // move them. `people_ais_owned_by` — which decides whose identities a human
+    // may grant an OAuth token for — is `kind = 'ai' AND owner = <me>`, a plain
+    // string compare with no foreign key. Left self-editable, one PATCH of your
+    // own row to `{kind: ai, owner: self}` makes you your own grantable
+    // identity, and combined with a rename it makes you someone else's. The
+    // admin screen is the only surface that sets either field.
+    if !ctx.is_admin() {
+        let moves_kind = patch.kind.is_some_and(|k| k != target.kind);
+        let moves_owner = patch
+            .owner
+            .as_ref()
+            .is_some_and(|o| o.as_deref() != target.owner.as_deref());
+        if moves_kind || moves_owner {
+            return Ok(forbidden());
+        }
+    }
+
+    // The gate is evaluated against the PATCHED row as well as the prior one:
+    // `people_update` re-slugs from `name`, and a rename that walks the row out
+    // of the caller's reach is a rename they may not make. `after_slug` mirrors
+    // the store exactly — a present `name` re-slugs, an absent one keeps the
+    // slug — and a name that slugifies to nothing is a bad request rather than
+    // a nameless row.
+    let after_slug = match patch.name.as_deref() {
+        Some(name) => hive_shared::slugify(name),
+        None => target.slug.clone(),
+    };
+    if after_slug.is_empty() {
+        return Ok(err(StatusCode::BAD_REQUEST, "name required"));
+    }
+    let after_owner = match &patch.owner {
+        Some(o) => o.clone(),
+        None => target.owner.clone(),
+    };
+    if !may_edit_person(&ctx, after_owner.as_deref(), &after_slug) {
+        return Ok(forbidden());
+    }
+    // A rename onto a slug someone else already holds is a conflict, answered
+    // as one. (The DB agrees — `people` is UNIQUE on (org_id, slug) — but a
+    // constraint violation surfaces as a 500 and reads like a bug.)
+    if after_slug != target.slug {
+        if let Some(clash) = s.people_get(&after_slug).await? {
+            if clash.id != target.id {
+                return Ok(err(
+                    StatusCode::CONFLICT,
+                    &format!("actor '{after_slug}' already exists"),
+                ));
+            }
+        }
+    }
+
     match s.people_update(&slug, patch, ctx.actor()).await? {
         Some(p) => Ok(Json(p).into_response()),
         None => Ok(not_found()),

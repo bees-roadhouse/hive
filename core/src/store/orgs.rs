@@ -60,6 +60,14 @@ impl Store {
         row.as_ref().map(row_to_org).transpose()
     }
 
+    /// How many orgs this instance holds. Read by the paths that may only
+    /// assume an org when there is exactly one to assume.
+    pub async fn orgs_count(&self) -> Result<i64> {
+        Ok(crate::pgq::query_scalar("SELECT COUNT(*) FROM orgs")
+            .fetch_one(self.db())
+            .await?)
+    }
+
     /// The single-tenant org an upgraded install folded into, created by
     /// `apply_org_scoping` and never absent on a migrated database.
     pub async fn orgs_default(&self) -> Result<Org> {

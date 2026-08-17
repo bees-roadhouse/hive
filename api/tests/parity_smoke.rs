@@ -34,6 +34,7 @@ fn reset_auth_env() {
         "OIDC_CLIENT_SECRET",
         "OIDC_REDIRECT_URI",
         "OIDC_ALLOWED_DOMAINS",
+        "OIDC_ORG",
     ] {
         std::env::remove_var(key);
     }

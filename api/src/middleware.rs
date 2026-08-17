@@ -38,6 +38,8 @@ pub struct AuthCtx {
     pub actor: Option<String>,
     /// "session" | "token"
     pub principal: Option<&'static str>,
+    /// The role the principal holds IN ITS ACTING ORG, read from
+    /// `memberships.role`. Never `users.role` — see [`org_role`].
     pub role: Option<UserRole>,
     /// The ONE org this request acts in, read off the credential. `None` for an
     /// unauthenticated request, which then reads nothing: no acting org means
@@ -157,6 +159,29 @@ pub fn cookie_value(headers: &axum::http::HeaderMap, name: &str) -> Option<Strin
     })
 }
 
+/// The role a user holds INSIDE one org, read from `memberships.role`.
+///
+/// `users.role` is deliberately not consulted. It is one global column, so
+/// reading it made an admin an admin in every org they were ever added to: an
+/// operator adding a global admin to a second org as a plain member handed them
+/// admin there, and with it the admin-wide read of that org's journal,
+/// entities, mail, sessions and credentials. Authorization is a property of the
+/// membership, and a membership names exactly one org.
+///
+/// What `users.role` still means: the account's DEFAULT — `users_create` seeds
+/// the new membership's role from it, and the users list shows it. Nothing
+/// authorizes on it. No membership in the acting org means no role at all,
+/// which is refusal rather than a quiet fallback to `Member`.
+async fn org_role(store: &Store, user_id: &str, org: Option<Uuid>) -> Option<UserRole> {
+    let org = org?;
+    let membership = store.membership_of(user_id, org).await.ok().flatten()?;
+    Some(if membership.is_admin() {
+        UserRole::Admin
+    } else {
+        UserRole::Member
+    })
+}
+
 pub async fn resolve_auth(store: &Store, headers: &axum::http::HeaderMap) -> AuthCtx {
     let mut ctx = AuthCtx::default();
 
@@ -169,14 +194,15 @@ pub async fn resolve_auth(store: &Store, headers: &axum::http::HeaderMap) -> Aut
         if let Ok(Some(resolved)) = store.tokens_resolve(bearer).await {
             ctx.actor = Some(resolved.actor);
             ctx.principal = Some("token");
-            // Admin-bypass and namespace follow the granting human user.
-            if let Ok(Some(u)) = store.users_by_actor(&resolved.namespace_user).await {
-                ctx.role = Some(u.role);
-            }
-            ctx.namespace_user = Some(resolved.namespace_user);
             // The org was fixed when the token was minted. There is no route
             // that changes it: an agent authenticates into one org, forever.
             ctx.org = resolved.org;
+            // Admin-bypass and namespace follow the granting human user, and
+            // the role is that human's membership in THIS token's org.
+            if let Ok(Some(u)) = store.users_by_actor(&resolved.namespace_user).await {
+                ctx.role = org_role(store, &u.id, ctx.org).await;
+            }
+            ctx.namespace_user = Some(resolved.namespace_user);
         }
     }
 
@@ -186,7 +212,7 @@ pub async fn resolve_auth(store: &Store, headers: &axum::http::HeaderMap) -> Aut
             if let Ok(Some((user, org))) = store.sessions_resolve(value).await {
                 ctx.actor = Some(user.actor.clone());
                 ctx.principal = Some("session");
-                ctx.role = Some(user.role);
+                ctx.role = org_role(store, &user.id, org).await;
                 ctx.namespace_user = Some(user.actor);
                 // Fixed at login, same as a token. Switching orgs means
                 // logging in again, which mints a different session.
