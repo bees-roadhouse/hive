@@ -15,6 +15,11 @@ use std::borrow::Cow;
 /// Strip quoted replies, forwarded blocks, signatures, and newsletter footers
 /// from `text`, returning the original when stripping would remove nearly
 /// everything.
+///
+/// Output is always LF. The stripping path rebuilds the kept lines with `\n`,
+/// so the two pass-through paths have to agree ... otherwise the same function
+/// returns CRLF or LF depending on which branch happened to run, and no corpus
+/// fixture can be correct for both.
 pub fn strip_quoted(text: &str) -> Cow<'_, str> {
     let lines: Vec<&str> = text.lines().collect();
     let mut keep = vec![true; lines.len()];
@@ -26,7 +31,7 @@ pub fn strip_quoted(text: &str) -> Cow<'_, str> {
     mark_newsletter_footer(&lines, &mut keep);
 
     if keep.iter().all(|k| *k) {
-        return Cow::Borrowed(text);
+        return lf(text);
     }
 
     let stripped: String = lines
@@ -41,9 +46,19 @@ pub fn strip_quoted(text: &str) -> Cow<'_, str> {
     // Safety valve: refuse to strip the message down to (nearly) nothing.
     let original_weight = non_ws_len(text);
     if original_weight > 0 && non_ws_len(&stripped) * 10 < original_weight {
-        return Cow::Borrowed(text);
+        return lf(text);
     }
     Cow::Owned(stripped)
+}
+
+/// CRLF to LF, borrowing when there is nothing to convert so the common case
+/// stays zero-copy.
+fn lf(s: &str) -> Cow<'_, str> {
+    if s.contains("\r\n") {
+        Cow::Owned(s.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(s)
+    }
 }
 
 fn non_ws_len(s: &str) -> usize {
@@ -253,6 +268,27 @@ mod tests {
     fn safety_valve_keeps_quote_only_messages() {
         let text = "> the entire message\n> is one big quote\n> with nothing new";
         assert_eq!(strip_quoted(text), text);
+    }
+
+    // The three exits from strip_quoted (pass-through, safety valve, stripped)
+    // must all emit LF. These two cover the exits that return the input, which
+    // is where CRLF used to leak through.
+    #[test]
+    fn passthrough_converts_crlf_to_lf() {
+        let text = "Just a normal message.\r\n\r\nWith two paragraphs.";
+        assert_eq!(
+            strip_quoted(text),
+            "Just a normal message.\n\nWith two paragraphs."
+        );
+    }
+
+    #[test]
+    fn safety_valve_converts_crlf_to_lf() {
+        let text = "> the entire message\r\n> is one big quote\r\n> with nothing new";
+        assert_eq!(
+            strip_quoted(text),
+            "> the entire message\n> is one big quote\n> with nothing new"
+        );
     }
 
     #[test]

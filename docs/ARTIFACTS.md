@@ -3,6 +3,21 @@
 Design note, 2026-08-10. Three decisions taken (see *Decided*, at the end);
 the rest is for reaction.
 
+> **Live design, stale mechanism.** [WEB-APP.md](./WEB-APP.md), written the
+> same day, replaced the blockstore this note names throughout. The design
+> carries: artifact types and ingest dispatch, derived text as one kind with
+> several producers, thumbnails eager and originals on demand, and derived text
+> authored by its model. What does not carry is every sentence about `BlobRef`,
+> wrapped content keys, crypto-shred, blind caches, and the fold. Bytes now
+> live at `<data>/artifacts/<org_id>/<hh>/<sha256>`
+> (`core/src/artifact_storage.rs`), the row lives in `artifacts` under
+> row-level security, and delete is `DELETE` plus an org-scoped refcounted
+> unlink. Stale passages are marked in place below rather than removed.
+>
+> The D37-D40 cross-references just below were never ratified;
+> [MULTIMODAL-IDENTITY.md](./MULTIMODAL-IDENTITY.md), which argues them,
+> carries its own banner about what in it still holds.
+
 ## What this does NOT cover
 
 The multimodal retrieval design is already written and this note does not
@@ -21,6 +36,9 @@ One thing worth recording: the note's stated prerequisite is now **cleared**.
 The `blob_refs` hazard ("it blocks the design") was fixed by PR #135, which is
 the tip of `main`. `blob_refs` no longer rides `DROP_DERIVED`, so a
 `FOLD_VERSION` bump no longer crypto-shreds every stored attachment.
+
+> **Moot.** `blob_refs`, `DROP_DERIVED`, and `FOLD_VERSION` all went with the
+> op log. Neither the hazard nor its fix means anything now.
 
 What follows is only what those decisions do not reach: what the blob layer is
 CALLED, what happens to bytes on the way in, and where derived text lives.
@@ -57,10 +75,22 @@ artifact, not the artifact, and the crypto-shred property lives there: the
 wrapped content key in `BlobRef` IS the artifact's life, so destroying it makes
 the bytes unreachable. That is already the delete story.
 
+> **The rename landed; the mechanism under it did not survive.** `artifacts` is
+> the file-artifact store (`core/src/store/artifacts.rs`) and the four MCP
+> tools carry the `identity_artifacts_` prefix, exactly as the table above
+> proposes. But `BlobRef` and the blockstore did not keep their names, they
+> were deleted. What sits under an artifact now is a content-addressed file on
+> disk, and the delete story is a refcounted unlink scoped to the org rather
+> than the destruction of a wrapped key.
+
 ## Part 2 — types, and what each one triggers
 
 The blockstore keys on `(master key, bytes, mime)`, so a type discriminator
 already exists. What is new is dispatch on it.
+
+> **Stale mechanism, same conclusion.** The address is now a plain sha256 over
+> the bytes, scoped by org, and `mime` is a column on the `artifacts` row. A
+> type discriminator still exists, so the dispatch table below is unaffected.
 
 | mime | on ingest |
 |---|---|
@@ -102,6 +132,18 @@ The fetch chain is main device, then blind cache if the user enabled one, then
 unavailable and say so. Caching everything on every device is not a cache; for
 a household's whole photographic history it is a copy.
 
+> **The tier split survives; everything under it here does not.** Eager
+> thumbnails and on-demand originals carry forward, and WEB-APP.md names the
+> route, live in `api/src/routes/artifacts.rs` as
+> `GET /api/artifacts/{id}/content`, range-aware from the start, precisely so
+> this tier can exist. The rest of this section is void. D43 is
+> superseded along with D41-D44, blind hosting is gone by decision rather than
+> deferred, and content addressing is over PLAINTEXT sha256 now, not
+> ciphertext ... which is why the stored address carries the org id and dedup
+> is scoped inside one org rather than falling out of a per-household content
+> key. A thumbnail is still shred-with-its-parent in spirit, but the mechanism
+> is a cascading delete and an unlink, not a destroyed key.
+
 ## Part 3 — derived text is one kind with several producers
 
 OCR, speech-to-text, and image captioning are the same shape: **text derived
@@ -115,6 +157,12 @@ Reasons, in order of weight:
    pick it up with no new machinery. Scanning a receipt makes it findable three
    months later by half-remembering it. That is the entire payoff and it
    already exists.
+
+   > **One name changed.** `search_fts` is now Postgres FTS behind
+   > `Store::search` (`core/src/store/semantic.rs`, `tsv @@ to_tsquery`).
+   > `embeddings` and `backfill_embeddings` kept their names. The argument
+   > is unaffected.
+
 2. **It is re-derivable.** A better model next year re-derives, and the
    `model`-per-row stamping that already lets an embedder swap re-backfill only
    mismatched rows applies unchanged.
@@ -248,6 +296,19 @@ decision, not implementation detail:
 
 `THREAT-MODEL.md`'s exhaustive list grows by one entry, stated as plainly as
 the Postgres one is.
+
+> **Boundaries renamed, gate gone, host doc superseded.** There is no
+> `node-core` and no Electron main process. The split is `hive-core` (the
+> store) under `hive-api` (the server), with the browser SPA above that, so
+> "offline geocoding in core, online above core" maps cleanly onto
+> core-versus-API and the argument survives the rename. The grep gate does not:
+> `importer/tests/no_postgres_gate.rs` went with the importer crate, and
+> WEB-APP.md retires that fence deliberately, since Postgres is the store now
+> rather than the exception. A one-module-may-dial-out fence is still the right
+> shape for this feature, but it has to be built rather than mirrored. And
+> `docs/THREAT-MODEL.md` is superseded: its "exhaustively one outbound call"
+> claim held for a single-machine app and is false for a hosted one, so the
+> entry this section proposes adding has no current list to join.
 
 Provider is unresolved. Nominatim's usage policy restricts volume and requires
 a real User-Agent; Photon is OSM-based and more permissive; commercial

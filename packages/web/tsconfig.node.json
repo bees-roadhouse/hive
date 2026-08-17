@@ -1,0 +1,17 @@
+{
+  // vite.config.ts runs in node, not the browser, so it needs node's globals
+  // (`process`). It gets its own config so @types/node never reaches src ...
+  // node's fetch/Request/Event declarations collide with the DOM lib, and a
+  // component that typechecks against `process.env` is broken at runtime.
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "verbatimModuleSyntax": true
+  },
+  "include": ["vite.config.ts"]
+}

@@ -1,5 +1,44 @@
 # Hive Direction v2: Personal P2P Desktop
 
+> **Superseded 2026-08-10 by [WEB-APP.md](./WEB-APP.md). History, not
+> direction.** This file is the decision record of the local-first pivot ...
+> D16-D44, across the v2 record and the amendments appended to it ... and the
+> architecture all of them describe was replaced wholesale. Hive is a
+> self-hostable web application now: an axum API over PostgreSQL with row-level
+> security, a SolidJS SPA in the browser, several orgs per install, encryption
+> at rest only. The workspace is `[shared, embed, core, api, jmap-sync, relay]`.
+> There is no `app`, `node`, `sync`, `bridge`, or `importer` crate, no Dioxus
+> and no iroh anywhere in the tree.
+>
+> WEB-APP.md states what it replaces, and each of those decisions carries its
+> own marker below:
+>
+> * **D16-D20** ... the single-user local-first desktop, the all-Rust UI, the
+>   append-only op log, content-addressed blocks, crypto-shred as delete.
+> * **D29-D36** ... hive-node, hub-and-spoke mTLS replication, the blind and
+>   trusted tiers, the signed control log, tenancy by partition, DNS-first
+>   addressing.
+> * **D41-D44** ... the relay amendment. D41's forwarding relay survives in
+>   spirit and in code (`relay/`, [RELAY.md](./RELAY.md)); D42's blind cache
+>   tier does not.
+>
+> **D21-D28 are not named by WEB-APP.md and carry no marker**, which does not
+> make them current: they specify iroh device sync, WASM ingestion modules, the
+> MCP-only bridge binary, and a closeout plan for a hosted era that has since
+> restarted. They assume the same substrate as D16-D20. Check any mechanism
+> claim against the tree before acting on it. D37-D40 (perception) were
+> PROPOSED and never adopted;
+> [MULTIMODAL-IDENTITY.md](./MULTIMODAL-IDENTITY.md) carries their status.
+>
+> One inversion is worth stating plainly, because it is the whole shape of the
+> reversal: D16 retired multi-user operation, the auth stack, the REST API, the
+> Solid SPA, and the Node packages, and every one of them is back. WEB-APP.md's
+> *The security argument that killed v1* section is the argument for why, and
+> for what now buys the safety D16 bought by deleting them.
+>
+> Kept intact below, wording untouched, as the record of how the project got
+> here.
+
 Status: decided 2026-07-10. Supersedes the 2026-07-01 record "Hive Direction: Mail as
 Substrate" (preserved in git history at this file's prior revision, and on BookStack as
 "Hive Direction: Mail as Substrate", page 2360, to be marked historical). Written
@@ -82,6 +121,12 @@ its keep).
 
 ## Decision log
 
+> **D16 superseded by [WEB-APP.md](./WEB-APP.md).** Multi-user came back on
+> purpose: several orgs per install, users belonging to more than one, sessions
+> and OIDC alive in `api/`. The deletion list below reads as an inventory of
+> things that exist again. What replaced the safety of deleting them is
+> row-level security plus the acting-org rule, argued in WEB-APP.md.
+
 D16. **Product: a personal P2P desktop app.** Single user, single human. No hosted
 deployment, no tenancy, no accounts. Delete: api/src/auth.rs, routes/auth.rs,
 routes/oauth.rs, sessions, onboarding, the Visibility/user_scope machinery in
@@ -93,6 +138,15 @@ benign exfiltration loop where an agent journals private mail into global scope)
 with their surfaces rather than getting fixed; the untrusted-content rendering class
 does not die and is governed by explicit policy in D17. Mobile comes later; hive-core
 (D17) is the layer it will reuse.
+
+> **D17 superseded by [WEB-APP.md](./WEB-APP.md).** No Dioxus, no RSX, no
+> system webview, no single process. The client is the SolidJS SPA in
+> `packages/web`, served by the API over HTTP, so "not a Tauri-plus-SPA
+> revival" resolved as an SPA against a server after all. The untrusted-content
+> policy is the half worth carrying, and it has to be re-derived for a real
+> browser: there is no ammonia pass and no sandboxed-frame CSP in the tree, and
+> the only HTML sanitizer anywhere is DOMPurify in
+> `packages/web/src/markdown.tsx`.
 
 D17. **UI: Dioxus, all Rust; webview-rendered now, native-rendered later.** The app
 is one process: a Dioxus shell over a new hive-core crate (store, emergence parser,
@@ -122,6 +176,12 @@ when it matures, the same components drop the system webview without a rewrite,
 which is the end state "no web frameworks" was reaching for. dioxus-mobile (webview
 on iOS and Android) is the credible path for the later mobile app.
 
+> **D18 superseded by [WEB-APP.md](./WEB-APP.md).** There is no op log. Rows in
+> Postgres are the truth, updated in place, so nothing folds, replays, or
+> rebuilds: no per-device logs, no versioned fold, no SQLCipher derived index.
+> The last-writer-wins question survives in one narrow place, the SPA's offline
+> write queue, and WEB-APP.md leaves it open.
+
 D18. **Storage: append-only, event-sourced, never overwrite.** This applies to all
 storage, not just ingested data. The source of truth is a set of per-device,
 single-writer, append-only op logs. Every record is immutable: journal appends,
@@ -140,6 +200,12 @@ that makes deferral safe: personal text corpora are small (a 200k-message mailbo
 low single-digit GB of text; browser capture is tens of MB per month), so logs grow
 slowly and replay stays cheap for a long time.
 
+> **D19 superseded by [WEB-APP.md](./WEB-APP.md).** Crypto-shred is gone by
+> decision, not deferred. Delete is `DELETE`, plus unlinking the bytes once the
+> last row in that org releases them. The collision this decision resolved does
+> not exist any more, because nothing is append-only. Encryption at rest is now
+> volume or cluster level, with column encryption for `cc_credentials` alone.
+
 D19. **Hard delete: crypto-shredding.** Append-only and privacy collide exactly at
 deletion, and hive will hold the most sensitive corpus a person has (mail, files,
 browsing). Resolution: payload bodies (mail bodies, file text, page captures,
@@ -152,6 +218,13 @@ device, which generalizes the attachment redaction replay-resurrection invariant
 the v0.6.0 train into a storage-wide rule. Small metadata records are encrypted in
 segment units; the shredding granularity users see (delete this page capture, this
 message, this file) is the blob.
+
+> **D20 superseded by [WEB-APP.md](./WEB-APP.md).** No blockstore: no blake3
+> block ids, no FastCDC chunking, no manifests, no have/want negotiation.
+> Content addressing survives in the plainest possible form, sha256 over whole
+> artifact bytes at `<data_root>/artifacts/<org_id>/<hh>/<sha256>`, streamed by
+> the API with range support (`core/src/artifact_storage.rs`,
+> [ARTIFACTS.md](./ARTIFACTS.md)). Dedup is a unique key, not a DAG.
 
 D20. **Blobstore: content-addressed blocks with a manifest layer.** blake3 ids over
 encrypted blocks; FastCDC content-defined chunking for large payloads; manifest
@@ -483,6 +556,11 @@ amendment — not a side effect of a test plan.
 
 ## Decision log
 
+> **D29 superseded by [WEB-APP.md](./WEB-APP.md).** There is no `node/` crate
+> and no replication protocol. The always-on machine is the API itself, reached
+> over HTTP by browsers, and the thing it stores for you is a Postgres row, not
+> a sealed segment. Neither storage tier exists.
+
 D29. **hive-node: hub-and-spoke replication; the server is a peer you never turn
 off.** One new crate/binary embedding hive-core exactly as the app does (Store::new is
 UI-free and proven headless). Transport is TLS 1.3 over TCP with mTLS device
@@ -537,6 +615,13 @@ alert peers see, not a node.toml edit they cannot. Deployment is a container wit
 separately encrypts under an offline key — the node KEK, the credential vault, and
 recovery blobs, because snapshotting them beside the ciphertext collapses at-rest
 encryption into one exfiltratable artifact (delta 9).
+
+> **D30 superseded by [WEB-APP.md](./WEB-APP.md).** No control log, no device
+> keypairs, no enrollment-pinned certificates, no custody grants. Identity is a
+> user row plus `user_identities` keyed on `(issuer, subject)`, a membership in
+> an org, and a session carrying one acting org. The one rule that carried
+> across is the anti-rule: never link identities on email. Actor strings do
+> survive as authorship.
 
 D30. **Identity: actor, device keys, domain custody — and a dedicated signed control
 log.** Actor stays a free string: authorship, not authentication. Every device
@@ -595,6 +680,12 @@ oauth2 crate — not bare words, since "oauth_token" already exists legitimately
 credential vault) plus a cargo-metadata walk asserting those crates resolve nowhere
 outside node/ — landing with an empty allowlist because there is nothing to allow.
 
+> **D31 superseded by [WEB-APP.md](./WEB-APP.md).** Nothing is per-recipient
+> wrapped, because the server reads plaintext by design. Sharing is now a
+> membership question decided by RLS: rows carry `org_id`, and a policy either
+> lets you see them or does not. Cross-org sharing is unbuilt, and crossing orgs
+> is a human action, never an agent one.
+
 D31. **Sharing: per-recipient rewrap; a grant is a serve stub plus a sealed payload.**
 Granularity is the blob — segments are master-wrapped, the wrong layer — and text
 items are materialized into a blob at grant time, so shares are snapshots and one
@@ -626,6 +717,12 @@ revokes every live grant first. Sharing is sequenced after the trusted tier as i
 format decision; the stub/sealed split and the random-key default are decided now so
 nothing wrong gets frozen in the meantime.
 
+> **D32 superseded by [WEB-APP.md](./WEB-APP.md).** The web head is the whole
+> product now, and it is not RSX. `packages/web` is a SolidJS SPA built by
+> vite, served by the API from `HIVE_WEB_DIST` (`api/src/routes/spa.rs`). There
+> is no `ui`/`app`/`web` crate split and no wasm bundle, because there is no
+> second head to share components with.
+
 D32. **Web head: the same RSX, CSR-only, in-process on the trusted node.** Dioxus 0.6
 web, client-side rendering only — no SSR, no hydration, which is 0.6's documented
 flaky class — matching what desktop effectively does today (use_resource polling). One
@@ -654,6 +751,12 @@ PR, not v1; desktop adopts the same rail afterward for D17 parity. The sentence 
 head makes a trusted node a remotely reachable plaintext oracle" goes into the threat
 model verbatim (delta 7).
 
+> **D33 superseded by [WEB-APP.md](./WEB-APP.md).** Tenancy is rows, not
+> directories. Every content table carries `org_id` and is RLS-protected on it,
+> so the data plane is the opposite of tenancy-blind: it is tenancy-enforcing,
+> in the database, on every statement. The grep fence that banned tenancy
+> identifiers under `core/` was retired with the architecture it guarded.
+
 D33. **Multi-tenancy by partition; enterprise custody is designed, not shipped.** On
 disk: `tenants/<tenant>/domains/<domain>/`, each leaf a verbatim store data dir with its own
 flock, master, and derivations — per-domain masters already kill cross-tenant
@@ -672,6 +775,13 @@ processes, and per-tenant audit of every KMS unwrap. Rationale: D16 retired tena
 wholesale; this amendment restores the partition because it is cheap now and painful
 to retrofit, while golden-freezing member and escrow schemas with zero consumers would
 be exactly the speculation the closed-set discipline exists to prevent.
+
+> **D34 superseded by [WEB-APP.md](./WEB-APP.md).** None of the four tiers
+> exist: no smoke crate, no dioxus-ssr snapshots, no screenshot container, no
+> grep fences, and no loud-skip gating. [TESTING-STRATEGY.md](./TESTING-STRATEGY.md)
+> was rewritten against what the tree actually has. The principle survives and
+> is worth keeping: a security claim with no test behind it is only a sentence.
+> `api/tests/org_isolation.rs` is where the current one gets tested.
 
 D34. **Testing: every threat-model sentence maps to a test.** Four tiers — unit; smoke
 (real binaries, real sockets); DOM snapshots (dioxus-ssr plus insta, the zero-flake
@@ -704,6 +814,12 @@ canary (nightly, deliberately loose order-of-magnitude bound) never gate merges.
 web screenshots arrive with the web head, they pin their browser exactly as the
 desktop tier pins WebKitGTK — an unpinned Chromium over committed pixels is the
 flaky-then-deleted pattern with a different logo.
+
+> **D35 superseded by [WEB-APP.md](./WEB-APP.md).** No addresses, no SRV
+> discovery, no DNS publisher. A user reaches their hive at a URL and logs in;
+> email is a display label on the user row and explicitly not a join key. The
+> off-LAN reachability problem D35 was solving is answered by the relay
+> instead ([RELAY.md](./RELAY.md)).
 
 D35. **Addresses and discovery: email-shaped identity; DNS-first, multi-path, never
 authoritative.** The user-facing identifier is an *address*, `<localpart>@<zone>`
@@ -760,6 +876,12 @@ contact with a foreign zone is TOFU plus grant-carried key confirmation, with
 TXT/TLSA under DNSSEC as a hint. The web head is unaffected: multi-path dialing is
 the sync plane's affair; web-head v1 auth remains tailnet-whois regardless of which
 path sync took.
+
+> **D36 superseded by [WEB-APP.md](./WEB-APP.md).** "Source of truth" is a
+> place again, and it is the Postgres database. There are no per-device logs to
+> be authoritative over, no anchor node, and thin clients are the only clients:
+> a browser holding an IndexedDB cache, which WEB-APP.md is careful to call a
+> cache rather than local-first.
 
 D36. **Multi-node and thin clients: designed now, shipped later; truth stays the
 logs.** v2.1 ships exactly one node per domain — but the formats stop pretending it
@@ -1140,6 +1262,14 @@ Written against `docs/SELF-HOST.md` and `docs/ARTIFACTS.md`. Three of v2.1's
 new decision record rather than a quiet drift: iroh, third-party relays, and
 the single-user posture. Each is reopened for a stated reason.
 
+> **D41 survives in spirit, superseded in mechanism by
+> [WEB-APP.md](./WEB-APP.md).** The goal held and shipped: `relay/` exists,
+> both sides dial outbound, and the relay holds no key. What it relays changed
+> completely. There is no device replication to forward, so the relay carries a
+> browser's TLS session to a household's `hive-api`, routed on SNI.
+> [RELAY.md](./RELAY.md) is the current record. The iroh argument reopened here
+> stayed closed: no iroh, no QUIC, just TCP splicing.
+
 D41. **The relay is a transport, it is blind, and it is how a self-hoster is
 reachable.** A person who wants their own data from a coffee shop must not have
 to own a domain, forward a port, or run a reverse proxy. Both the node and the
@@ -1169,6 +1299,13 @@ vouching. A relay that only forwards vouches for nothing and needs no
 verification surface, because client and node already pinned each other at
 enrollment and D35's rule holds unchanged: addressing is never authentication.
 A relay that STORES does need it, and that is D42.
+
+> **D42 superseded by [WEB-APP.md](./WEB-APP.md).** The blind cache tier does
+> not survive. Blind hosting is gone by decision, not deferred: a server that
+> must read plaintext to run full-text search and pgvector similarity cannot
+> hold another household's journal without reading it, so hosting for other
+> people is a trust statement and not a cryptographic guarantee. The relay
+> stays blind, but the relay stores nothing.
 
 D42. **Two tiers, chosen by who operates the machine. Storing for others is
 optional and always blind.** v2.1 shipped the blind tier and only that. This
@@ -1209,6 +1346,14 @@ storage that grows forever on the operator's bill, and content that cannot be
 moderated because it cannot be read. "We cannot look" is a position to take
 deliberately.
 
+> **D43 superseded by [WEB-APP.md](./WEB-APP.md).** The conclusion survives and
+> the machinery under it does not. Bytes still stream on demand with range
+> requests, and metadata is still cheap to hold while the bytes are not ... but
+> there is no op log carrying `BlobRef`s, no ciphertext content addressing, and
+> no three-tier client sync, because there is no client-side replica to tier.
+> `GET /api/artifacts/:id/content` is the whole mechanism
+> ([ARTIFACTS.md](./ARTIFACTS.md), which otherwise carries over).
+
 D43. **Artifact bytes stream; the log carries references, not payloads.** A
 client holds the whole op-log and index — every artifact's existence, mime,
 size, manifest hash, and wrapped content key — while holding none of the bytes.
@@ -1232,6 +1377,15 @@ The fetch chain is main device, then blind cache if the user enabled one, then
 unavailable-and-say-so. An offline-cache-everything client would put every
 photo on every device, which for a product holding a household's whole
 photographic history is not a cache, it is a copy.
+
+> **D44 superseded by [WEB-APP.md](./WEB-APP.md), and already corrected in
+> place below.** The path-routing half was withdrawn the same day (see the
+> addressing amendment at the end of this section): addressing is
+> `<id>.relay.example` by subdomain, routed on SNI, which is what `relay/`
+> implements. The rest of D44 assumes a pinned key identifying a node to a
+> device, and that pinning does not exist ... a browser trusts the household's
+> certificate, not a key it pinned at enrollment. [RELAY.md](./RELAY.md) is the
+> current record.
 
 D44. **An instance has a permanent id and an optional mutable alias; the pinned
 key is what identifies it.** Addressing is `relay.example/<id>` by path, not a

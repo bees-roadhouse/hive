@@ -23,23 +23,15 @@ fn corpus() {
         let expected = fs::read_to_string(dir.join(format!("{case}.out.txt")))
             .unwrap_or_else(|_| panic!("{case}.out.txt missing"));
         let got = jmap_sync::quote::strip_quoted(&input);
-        // Compare on content, not on line endings. `strip_quoted` is currently
-        // INCONSISTENT about them — the stripping path rebuilds with LF while
-        // the pass-through path (a body with nothing to strip) returns the
-        // input verbatim, CRLF and all. That is worth fixing in the parser, but
-        // it is not what this corpus pins: these cases are about which text
-        // survives quote removal. Comparing raw made the suite fail in opposite
-        // directions on different cases depending on which path ran, and made
-        // the fixtures unstable under git's autocrlf on Windows.
+        // Compared as bytes, line endings included. `strip_quoted` emits LF on
+        // every path and `.gitattributes` pins the fixtures to LF, so there is
+        // nothing left to normalise here ... and normalising anyway would hide
+        // the corpus silently turning CRLF, which is exactly what happened once.
+        // `trim_end` absorbs the fixture's trailing newline and nothing else.
         assert_eq!(
-            lf(got.trim_end()),
-            lf(expected.trim_end()),
+            got.trim_end(),
+            expected.trim_end(),
             "case {case}: stripped output diverged"
         );
     }
-}
-
-/// Line endings normalised, so a case is compared on its text.
-fn lf(s: &str) -> String {
-    s.replace("\r\n", "\n")
 }

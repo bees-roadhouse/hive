@@ -86,6 +86,7 @@ jobs:
 
   # The SPA is shipped by the API (routes/spa.rs serves HIVE_WEB_DIST), so a
   # frontend that does not build is a broken release even when Rust is green.
+  # Building is not enough on its own, though, hence the typecheck below.
   web:
     runs-on: ubuntu-latest
     steps:
@@ -104,6 +105,15 @@ jobs:
         env:
           CI: 'true'
         run: pnpm install --frozen-lockfile
+
+      # vite build transpiles with esbuild, which strips types without ever
+      # checking them, so a type error anywhere in the SPA still bundles clean.
+      # tsc is the only thing that reads packages/web/tsconfig.json's `strict`.
+      # Runs first: a type error is cheaper to surface than a full bundle.
+      - name: Typecheck the SPA
+        env:
+          CI: 'true'
+        run: pnpm --filter @hive/web typecheck
 
       - name: Build the SPA
         env:

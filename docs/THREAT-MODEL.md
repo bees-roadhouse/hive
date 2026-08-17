@@ -1,5 +1,47 @@
 # Threat model
 
+> **Superseded 2026-08-10 by [WEB-APP.md](./WEB-APP.md). Do not read this as
+> current.** It models the local-first desktop: one machine, one user, an
+> encrypted op log under `$XDG_DATA_HOME/hive`, a master key in the OS
+> keychain, crypto-shred as delete, and effectively no network. Hive is now a
+> self-hosted web application ... an axum API over PostgreSQL with row-level
+> security, a browser SPA, multiple orgs, and a public relay. Several claims
+> below are not merely dated, they are false:
+>
+> * **Assets.** There is no op log, no SQLCipher `index.db`, no `blocks/`
+>   blockstore, and no keychain master key. Content lives in Postgres tables.
+>   Artifact bytes live at `<data>/artifacts/<org_id>/<hh>/<sha256>`
+>   (`core/src/artifact_storage.rs`).
+> * **What encryption covers at rest.** Per-frame segment encryption and
+>   per-blob content keys are gone. WEB-APP.md's *Encryption* section is the
+>   replacement: volume or cluster-level encryption, TLS in transit, and column
+>   encryption for `cc_credentials` alone. The server reads plaintext because it
+>   must ... full-text search and pgvector similarity cannot run on ciphertext.
+> * **What the keychain protects.** No keychain. Custody of the database and
+>   the artifact path is whatever the operator's host gives them.
+> * **Crypto-shred.** Gone by decision, not deferred. Delete is `DELETE` plus
+>   unlinking the bytes once the last row in that org releases them. The whole
+>   *What crypto-shred guarantees* section describes a mechanism that no longer
+>   exists, so its careful limits list now protects nothing.
+> * **Telemetry and network.** "Nothing else dials out" was true of a
+>   single-machine app and is false of a hosted one. The API serves browsers,
+>   the relay (`relay/`, [RELAY.md](./RELAY.md)) accepts connections from
+>   outside the house, JMAP mail sync dials a mail server, and the embedder's
+>   default provider fetches models unless pinned. The
+>   `importer/tests/no_postgres_gate.rs` fence cited here is retired
+>   deliberately (WEB-APP.md) ... Postgres is the store now, not the exception.
+> * **Adversaries considered.** A hosted multi-org app faces adversaries this
+>   document never had to: another org's user, an authenticated user inside
+>   your own org, and whoever operates the relay.
+>
+> What survives is the discipline rather than the content: stating limits
+> plainly, the *Current gaps* habit, and the prompt-injection note that stored
+> content is untrusted input to whatever agent reads it. A replacement owes a
+> restated asset list, the RLS trust argument from WEB-APP.md, and a fresh
+> exhaustive statement of outbound calls. Nobody has written it yet.
+>
+> Kept intact below as the record of what the local-first design promised.
+
 Status: ships with Phase 1 (DIRECTION.md D27). Single user, single machine —
 sync (Phase 4) will extend this with the relay-observability section D21
 promises. Engineering statement, not marketing; when the code and this

@@ -1,5 +1,19 @@
 # Hive P2P Pivot: execution plan (Phases 1-5)
 
+> **Superseded 2026-08-10 by [WEB-APP.md](./WEB-APP.md).** Every phase below
+> builds the local-first desktop architecture: a Dioxus UI, per-device op logs
+> as truth, a SQLCipher index, a blake3/FastCDC blockstore with crypto-shred,
+> iroh device sync, WASM ingestion modules, and an MCP-only surface through a
+> bridge binary. That architecture was replaced wholesale. None of the crates
+> this plan creates are in the tree ... no `app/`, `bridge/`, `importer/`, and
+> none of the `node`/`sync`/`smoke` crates its successor added. The workspace
+> is `[shared, embed, core, api, jmap-sync, relay]`: an axum API over Postgres
+> serving a Solid SPA, with row-level security doing the access control that
+> D16 deleted multi-user to avoid. Phase 4's own note below points forward to
+> [PLAN-v2.1.md](./PLAN-v2.1.md), which WEB-APP.md supersedes in turn.
+>
+> Kept intact as the record of how the project got here. History, not roadmap.
+
 Status: approved 2026-07-10. Companion to [DIRECTION.md](./DIRECTION.md) (the
 decision record, D16-D28); this document is the PR-by-PR execution program.
 Grounded in a full repo inventory and a stress-tested Phase 1 sequencing review.
@@ -192,7 +206,8 @@ Gate: mailbox, chosen directories, calendar, contacts searchable + citable;
 ## Phase 4: iroh sync + relay (v0.9.0)
 
 > **Superseded:** Phase 4 onward is replaced by [PLAN-v2.1.md](./PLAN-v2.1.md)
-> (adopted 2026-07-24); Phases 1-2 above stand as history.
+> (adopted 2026-07-24); Phases 1-2 above stand as history. PLAN-v2.1.md is
+> itself superseded ... see the banner at the top of this file.
 
 - **PR 4.1 identity + pairing.** iroh node keypairs, ticket/QR pairing UX, paired
   device table + revocation.

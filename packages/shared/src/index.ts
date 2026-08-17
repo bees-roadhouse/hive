@@ -641,9 +641,10 @@ export interface Phase {
   created_at: string;
 }
 
-/** A resolved bracket token reference in a journal entry body. */
+/** A resolved bracket token reference in a journal entry body.
+ *  Mirrors core's TOKEN_KINDS ... mail included, which is id-addressed. */
 export interface JournalRef {
-  kind: "person" | "topic" | "project" | "phase" | "task";
+  kind: "person" | "topic" | "project" | "phase" | "task" | "mail";
   id: string;
   slug: string;
   name: string;
