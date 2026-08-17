@@ -1,6 +1,6 @@
 import { createResource, createSignal, For, Show, type Component } from "solid-js";
 import { ACTOR_NAMES, SEVERITIES, type Severity, type SourceKind } from "@hive/shared";
-import { api, getActor, getCurrentUser } from "./api.ts";
+import { api, getActor, getCurrentUser, type RuntimeKind } from "./api.ts";
 import { relTime } from "./lib.tsx";
 import { liveRev } from "./live.ts";
 import { EmptyState } from "./primitives.tsx";
@@ -45,7 +45,11 @@ export const Settings: Component = () => {
   const [credForm, setCredForm] = createSignal({ kind: "codex_oauth", label: "", secret: "" });
   const [credPanelOpen, setCredPanelOpen] = createSignal(false);
   let secretInput: HTMLInputElement | undefined;
-  const credentialDefaults = (kind: string) => {
+  // Annotated because the arms' `runtime` literals widen to `string` otherwise,
+  // and saveCcCredential wants the closed RuntimeKind.
+  const credentialDefaults = (
+    kind: string,
+  ): { kind: string; runtime: RuntimeKind; provider?: string; label: string } => {
     switch (kind) {
       case "codex_oauth":
         return { kind: "oauth_token", runtime: "codex", label: "Codex subscription" };

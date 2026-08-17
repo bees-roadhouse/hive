@@ -1,8 +1,16 @@
 import { createEffect, createResource, onCleanup, onMount, For, type Component } from "solid-js";
-import ForceGraph from "force-graph";
+import ForceGraph, { type LinkObject, type NodeObject } from "force-graph";
+import type { GraphNode } from "@hive/shared";
 import { api } from "./api.ts";
 import { liveRev } from "./live.ts";
 import { KIND, resolveColor } from "./kinds.ts";
+
+/** Our node payload plus the simulation's own fields. x/y stay optional: the
+ *  layout owns them and hasn't placed anything before the first tick. */
+type SimNode = NodeObject & GraphNode;
+/** force-graph rewrites source/target into node objects, so only `rel` (which
+ *  we set and it never touches) is ours to read. */
+type SimLink = LinkObject<SimNode> & { rel: string };
 
 /** "#rrggbb" + alpha → "#rrggbbaa" (the :root tokens are authored as 6-digit hex). */
 const withAlpha = (color: string, alpha: number): string =>
@@ -17,8 +25,7 @@ const withAlpha = (color: string, alpha: number): string =>
 export const Graph: Component = () => {
   const [data] = createResource(() => ({ _r: liveRev() }), () => api.graph());
   let host!: HTMLDivElement;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let fg: any;
+  let fg: ForceGraph<SimNode, SimLink> | undefined;
 
   // Canvas paint can't read var() strings, so resolve each kind's token from
   // the registry ONCE at mount into a plain map. Unknown kinds (custom entity
@@ -32,50 +39,53 @@ export const Graph: Component = () => {
   const ink = resolveColor("ink");
 
   onMount(() => {
-    fg = new ForceGraph(host)
+    // Annotated so the onNodeClick closure can name it without the initializer
+    // referring to its own inferred type.
+    const graph: ForceGraph<SimNode, SimLink> = new ForceGraph<SimNode, SimLink>(host)
       .backgroundColor(bg)
       .nodeRelSize(5)
       // Chain edges (per-author journal timeline) are subtler than entity links.
-      .linkColor((l: { rel?: string }) => (l.rel === "chain" ? withAlpha(dim, 0.18) : withAlpha(dim, 0.22)))
-      .linkWidth((l: { rel?: string }) => l.rel === "chain" ? 0.8 : 1.2)
+      .linkColor((l) => (l.rel === "chain" ? withAlpha(dim, 0.18) : withAlpha(dim, 0.22)))
+      .linkWidth((l) => l.rel === "chain" ? 0.8 : 1.2)
       .linkDirectionalParticles(0)
-      .nodeLabel((n: { kind: string; title: string }) => `${n.kind} · ${n.title}`)
-      .nodeCanvasObject(
-        (node: { x: number; y: number; kind: string; title: string }, ctx: CanvasRenderingContext2D, scale: number) => {
-          const r = 4;
-          ctx.beginPath();
-          ctx.arc(node.x, node.y, r, 0, 2 * Math.PI);
-          ctx.fillStyle = nodeColor[node.kind] ?? honey;
-          ctx.fill();
-          // Labels fade in once you've zoomed past the cluttered overview.
-          if (scale > 1.3) {
-            const label = node.title.length > 26 ? `${node.title.slice(0, 26)}…` : node.title;
-            ctx.font = `${11 / scale}px ui-sans-serif, system-ui, sans-serif`;
-            ctx.fillStyle = withAlpha(ink, 0.85);
-            ctx.textAlign = "left";
-            ctx.textBaseline = "middle";
-            ctx.fillText(label, node.x + r + 2 / scale, node.y);
-          }
-        },
-      )
-      .onNodeClick((node: { x: number; y: number }) => {
-        fg.centerAt(node.x, node.y, 600);
-        fg.zoom(4, 600);
+      .nodeLabel((n) => `${n.kind} · ${n.title}`)
+      .nodeCanvasObject((node, ctx, scale) => {
+        // Unplaced node (added between ticks) ... there is no coordinate to paint at.
+        if (node.x === undefined || node.y === undefined) return;
+        const r = 4;
+        ctx.beginPath();
+        ctx.arc(node.x, node.y, r, 0, 2 * Math.PI);
+        ctx.fillStyle = nodeColor[node.kind] ?? honey;
+        ctx.fill();
+        // Labels fade in once you've zoomed past the cluttered overview.
+        if (scale > 1.3) {
+          const label = node.title.length > 26 ? `${node.title.slice(0, 26)}…` : node.title;
+          ctx.font = `${11 / scale}px ui-sans-serif, system-ui, sans-serif`;
+          ctx.fillStyle = withAlpha(ink, 0.85);
+          ctx.textAlign = "left";
+          ctx.textBaseline = "middle";
+          ctx.fillText(label, node.x + r + 2 / scale, node.y);
+        }
+      })
+      .onNodeClick((node) => {
+        graph.centerAt(node.x, node.y, 600);
+        graph.zoom(4, 600);
       })
       // Keep the simulation alive so the graph stays gently floaty + reacts to drags.
       .cooldownTime(Infinity)
       .d3VelocityDecay(0.28);
+    fg = graph;
 
     // Spread things out a touch for the airy Obsidian look.
-    fg.d3Force("charge")?.strength(-120);
-    fg.d3Force("link")?.distance(46);
+    graph.d3Force("charge")?.strength(-120);
+    graph.d3Force("link")?.distance(46);
 
-    const resize = () => fg.width(host.clientWidth).height(host.clientHeight);
+    const resize = () => graph.width(host.clientWidth).height(host.clientHeight);
     resize();
     window.addEventListener("resize", resize);
     onCleanup(() => {
       window.removeEventListener("resize", resize);
-      fg._destructor?.();
+      graph._destructor();
     });
   });
 
@@ -83,15 +93,16 @@ export const Graph: Component = () => {
   let fitted = false;
   createEffect(() => {
     const g = data();
-    if (!g || !fg) return;
-    fg.graphData({
+    const graph = fg;
+    if (!g || !graph) return;
+    graph.graphData({
       nodes: g.nodes.map((n) => ({ ...n })),
       links: g.edges.map((e) => ({ source: e.source, target: e.target, rel: e.rel })),
     });
     // Continuous simulation never auto-fits, so frame the graph once it spreads.
     if (!fitted) {
       fitted = true;
-      setTimeout(() => fg.zoomToFit(800, 60), 1400);
+      setTimeout(() => graph.zoomToFit(800, 60), 1400);
     }
   });
 

@@ -386,7 +386,9 @@ export const Journal: Component = () => {
 
   // Initialise TipTap when the overlay opens (the div is mounted).
   // Destroy on overlay close (onCleanup fires when Show unmounts).
-  const initEditor = () => {
+  // Returns the instance so callers can drive it without re-reading `editor`,
+  // which they cannot narrow across this call.
+  const initEditor = (): Editor => {
     editor = new Editor({
       element: editorDiv,
       extensions: [
@@ -440,6 +442,7 @@ export const Journal: Component = () => {
         setSelectedText(editorSelectionText(ed));
       },
     });
+    return editor;
   };
 
   const destroyEditor = () => {
@@ -877,7 +880,7 @@ export const Journal: Component = () => {
                     // onMount fires after ref assignment; initEditor uses editorDiv.
                     queueMicrotask(() => {
                       if (!editor) {
-                        initEditor();
+                        const ed = initEditor();
                         // Attach keydown handler for AC nav and Esc.
                         editorDiv?.addEventListener("keydown", onRichKeyDown);
                         onCleanup(() => {
@@ -886,9 +889,9 @@ export const Journal: Component = () => {
                         });
                         // Set initial content if returning from source mode.
                         if (markdownBody()) {
-                          editor?.commands.setContent(markdownBody(), false);
+                          ed.commands.setContent(markdownBody(), false);
                         }
-                        editor?.commands.focus("end");
+                        ed.commands.focus("end");
                       }
                     });
                   }}

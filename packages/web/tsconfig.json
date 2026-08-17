@@ -9,7 +9,11 @@
     "strict": true,
     "skipLibCheck": true,
     "noEmit": true,
+    // The source imports siblings with their real extension (`./api.ts`).
+    // esbuild resolves that; tsc needs telling, and the flag is only legal
+    // because nothing is emitted from here.
+    "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true
   },
-  "include": ["src", "vite.config.ts"]
+  "include": ["src"]
 }

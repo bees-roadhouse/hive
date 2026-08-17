@@ -228,8 +228,10 @@ export const EntityBoard: Component = () => {
     () => api.entityTypes(true),
   );
   const ty = createMemo(() => (types.latest ?? []).find((t) => t.slug === params.slug));
+  // No slug (the route matched with an empty segment) means nothing to fetch:
+  // a null source leaves the resource unresolved instead of GETting /entities/undefined.
   const [items] = createResource(
-    () => ({ _r: liveRev(), slug: params.slug }),
+    () => (params.slug ? { _r: liveRev(), slug: params.slug } : null),
     (k) => api.entities(k.slug),
   );
   const [editing, setEditing] = createSignal<CustomEntity | "new" | null>(null);
@@ -294,7 +296,7 @@ export const EntityBoard: Component = () => {
               <EntityList
                 config={{
                   kind: kind()!,
-                  fetch: () => api.entities(params.slug),
+                  fetch: () => api.entities(t().slug),
                   row: {
                     title: (e: CustomEntity) => e.title,
                     badges: (e) => {

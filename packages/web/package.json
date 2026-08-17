@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -23,6 +24,8 @@
   },
   "devDependencies": {
     "@types/dompurify": "^3.2.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.3",
     "vite": "^6.0.11",
     "vite-plugin-solid": "^2.11.2"
   }
