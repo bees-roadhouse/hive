@@ -23,7 +23,11 @@
 set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
-bin="${BIN_DIR:-G:/cargo-target/hive-relay-wt/debug}"
+# BIN_DIR overrides where the built binaries live; the default is the
+# workspace's own target/debug. Set it when CARGO_TARGET_DIR pointed elsewhere.
+bin="${BIN_DIR:-$here/../../target/debug}"
+# The binaries carry a .exe suffix on Windows (git bash counts).
+exe() { case "${OSTYPE:-}" in msys* | cygwin* | win32) printf '%s.exe' "$1" ;; *) printf '%s' "$1" ;; esac; }
 id="${ID:-hv7bqk2m9x}"
 zone="${ZONE:-relay.localtest.me}"
 host="$id.$zone"
@@ -51,7 +55,7 @@ HIVE_RELAY_ZONE="$zone" \
 HIVE_RELAY_TOKENS="$id=$token" \
 HIVE_RELAY_AUDIT_TAP="$relay_tap" \
 RUST_LOG=hive_relay=info \
-  "$bin/hive-relay.exe" >"$here/relay.log" 2>&1 &
+  "$bin/$(exe hive-relay)" >"$here/relay.log" 2>&1 &
 relay_pid=$!
 
 sleep 2
@@ -66,7 +70,7 @@ HIVE_RELAY_KEY="$here/pki/instance.key" \
 HIVE_RELAY_LABEL="The Roadhouse" \
 HIVE_RELAY_PLAINTEXT_TAP="$plain_tap" \
 RUST_LOG=hive_relay=info \
-  "$bin/hive-relay-agent.exe" >"$here/agent.log" 2>&1 &
+  "$bin/$(exe hive-relay-agent)" >"$here/agent.log" 2>&1 &
 agent_pid=$!
 
 sleep 3
