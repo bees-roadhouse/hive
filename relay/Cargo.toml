@@ -16,7 +16,7 @@ path = "src/bin/agent.rs"
 
 [dependencies]
 tokio = { workspace = true }
-# Only for the loopback admin endpoint (status + Traefik config). The data
+# Only for the loopback admin endpoint (/status and /healthz). The data
 # path never touches it: there is no HTTP anywhere near a forwarded byte.
 axum = { workspace = true }
 serde = { workspace = true }

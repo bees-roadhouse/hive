@@ -4,23 +4,23 @@
 //! # Shape
 //!
 //! ```text
-//!   browser ──TLS(<id>.relay.example)──▶ Traefik ──passthrough──▶ relay daemon
-//!                                                                      │
-//!                                                    control + data, dialled
-//!                                                    OUTBOUND from the house
-//!                                                                      ▼
-//!                                                                relay agent
-//!                                                            (terminates TLS)
-//!                                                                      │
-//!                                                                 loopback
-//!                                                                      ▼
-//!                                                             hive-api :7878
+//!   browser ──TLS(<id>.relay.example)──▶ relay daemon
+//!                                          │
+//!                          control + data, dialled
+//!                          OUTBOUND from the house
+//!                                          ▼
+//!                                    relay agent
+//!                                  (terminates TLS)
+//!                                          │
+//!                                     loopback
+//!                                          ▼
+//!                                 hive-api :7878
 //! ```
 //!
-//! Traefik matches the SNI in the ClientHello, which is in the clear before the
-//! handshake, and forwards the stream without decrypting it. The daemon splices
-//! raw sockets. TLS terminates at the agent, inside the house, on a certificate
-//! whose private key never leaves it.
+//! The daemon itself listens on the public port and matches the SNI in the
+//! ClientHello, which is in the clear before the handshake, then splices raw
+//! sockets without decrypting anything. TLS terminates at the agent, inside
+//! the house, on a certificate whose private key never leaves it.
 //!
 //! So the relay operator sees: instance ids, client addresses, timing, and byte
 //! counts. Not requests, not responses, not journal prose.

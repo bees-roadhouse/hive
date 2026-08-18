@@ -53,23 +53,27 @@ operator reading every journal entry that passes through, it is the smaller
 cost. Two consequences follow:
 
 * Instance ids need enough entropy to be unguessable anyway, which D44 already
-  requires (21-character `nanoid`, 104 bits). CT changes enumeration from
-  impossible to trivial, so nothing may depend on an id being secret.
+  requires (21-character `nanoid`, about 109 bits once it is constrained to a
+  DNS-safe label). CT changes enumeration from impossible to trivial, so
+  nothing may depend on an id being secret.
 * **Addressing is never authentication** (D35) becomes load-bearing rather than
   tidy. Knowing an id gets you a TCP connection and nothing else.
 
 ## What was actually built and measured
 
 `relay/` is one crate, two binaries, no new external dependencies beyond
-`tokio-rustls`.
+`tokio-rustls` (plus `rcgen` as a dev-dependency, so the blindness test can
+issue its own certificate in-process).
 
 | file | what it does |
 |---|---|
-| `relay/src/sni.rs` | reads the SNI out of a ClientHello, bounded and allocation-free |
+| `relay/src/sni.rs` | reads the SNI out of a ClientHello, bounded; a malformed hello is an answer, not a panic |
 | `relay/src/daemon.rs` | ingress + control listeners, registry, pairing |
+| `relay/src/control.rs` | the control channel: newline-delimited JSON, the only thing either side parses |
 | `relay/src/tap.rs` | the data path, and the audit tap that proves what is in it |
 | `relay/src/agent.rs` | household side: dials out, terminates TLS, proxies to loopback |
 | `relay/src/limits.rs` | connection caps |
+| `relay/src/bin/{relay,agent}.rs` | the two executables: env parsing, the admin `/status`, the off switch |
 
 The live demo runs a real `hive-api`, a real relay, a real agent, and a real
 HTTPS request:
@@ -82,6 +86,9 @@ $ TARGET=127.0.0.1:7981 bash relay/demo/run.sh
 {"mcp":"/mcp","ok":true,"service":"hive-rust","ts":"2026-08-11T03:07:02.380Z"}
    [http 200] [peer 127.0.0.1:8443]
 ```
+
+`BIN_DIR` overrides where the script finds the binaries; the default is the
+workspace's `target/debug`.
 
 ### The blindness proof
 
@@ -129,7 +136,7 @@ The `/status` endpoint publishes the complete list deliberately:
 ```json
 {"instances":[{"id":"hv7bqk2m9x","label":"The Roadhouse",
   "host":"hv7bqk2m9x.relay.localtest.me",
-  "connected_at":"2026-08-11T03:06:59Z","live_sessions":0,
+  "connected_at":"2026-08-11T03:06:59.380214+00:00","live_sessions":0,
   "bytes_client_to_instance":807,"bytes_instance_to_client":1951}]}
 ```
 

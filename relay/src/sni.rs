@@ -22,9 +22,10 @@
 //! better instinct. The parse below is the same idea done by hand, kept small
 //! and bounded, because it must run before any allocation decision is made.
 //!
-//! Every length is checked against the remaining slice. There is no recursion,
-//! no allocation beyond the caller's buffer, and a malformed hello returns
-//! `None` instead of panicking.
+//! Every length is checked against the remaining slice. There is no recursion
+//! and a malformed hello returns `None` instead of panicking. Allocation is
+//! bounded by [`MAX_HELLO`]: one `String` for the name, plus one coalescing
+//! copy when a hello arrives fragmented across records.
 
 /// A ClientHello has to arrive within this many bytes or the connection is not
 /// something this relay can route. It is also the cap on a single TLS record,
