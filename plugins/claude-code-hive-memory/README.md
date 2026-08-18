@@ -80,9 +80,13 @@ the flow is authorization code + PKCE (S256 only), scope `mcp`.
 
 One prerequisite that is easy to hit and gives a bad error: **consent only
 offers AI identities that the signed-in human owns.** With none, the consent
-screen has nothing to grant and the flow dead-ends. An AI identity is a `people`
-row with `kind = 'ai'` and `owner` set to your slug. `POST /api/people` creates
-the row but does not set `owner`, so it takes a second call:
+screen has nothing to grant and the flow dead-ends. An AI identity is a
+`people` row with `kind = 'ai'` and `owner` set to your slug.
+
+The SPA's **Admin** screen does both halves: the Writers section creates the
+person (set the kind to `ai`) and shows an owner picker on every AI row.
+Over HTTP instead, as an admin — `POST /api/people` creates the row but does
+not set `owner`, and moving `owner` is admin-only, so it takes a second call:
 
 ```bash
 curl -X POST  http://localhost:7878/api/people        -b cookies.txt \
@@ -91,7 +95,7 @@ curl -X PATCH http://localhost:7878/api/people/pia    -b cookies.txt \
   -H 'Content-Type: application/json' -d '{"owner":"your-slug"}'
 ```
 
-The SPA has no screen for either call yet.
+`cookies.txt` is the same admin session as in step 2.
 
 ## What the plugin still carries
 

@@ -1,11 +1,12 @@
 # Claude Desktop
 
-**The `hive.mcpb` extension in this directory is dead.** `mcpb/manifest.json`
-launches a `hive-bridge` binary against a local hive app. There is no `bridge/`
-crate, no `hive-bridge` binary, and no local data directory: hive is now an HTTP
-API over PostgreSQL ([docs/WEB-APP.md](../../docs/WEB-APP.md)) and MCP is served
-at `POST /mcp` by `hive-api`. `scripts/build-mcpb.sh` still packs the bundle, so
-it produces a `.mcpb` that installs and then fails to start.
+**The `hive.mcpb` extension this directory described is dead.** What remains is
+`mcpb/manifest.json`, which launches a `hive-bridge` binary against a local
+hive app. There is no `bridge/` crate, no `hive-bridge` binary, and no local
+data directory: hive is now an HTTP API over PostgreSQL
+([docs/WEB-APP.md](../../docs/WEB-APP.md)) and MCP is served at `POST /mcp` by
+`hive-api`. Nothing here packs the bundle any more, and the manifest is kept
+only as a record of the shape it had.
 
 Connect Claude Desktop as a **custom connector** pointed at your hive's `/mcp`
 URL instead. `hive-api` is a full OAuth 2.1 authorization server, so Desktop can
@@ -42,8 +43,11 @@ tools on `/mcp`). The Claude Desktop side of it has not been run, so treat step
 
 **The consent screen needs an AI identity you own.** It only offers `people`
 rows with `kind = 'ai'` whose `owner` is your slug. With none, the screen has
-nothing to grant and the flow dead-ends. `POST /api/people` creates the row but
-leaves `owner` null, so it takes two calls and there is no UI for either yet:
+nothing to grant and the flow dead-ends. The SPA's **Admin** screen does both
+halves: the Writers section creates the person (set the kind to `ai`) and
+shows an owner picker on every AI row. Over HTTP instead, as an admin —
+`POST /api/people` creates the row but leaves `owner` null, and moving
+`owner` is admin-only, so it takes two calls:
 
 ```bash
 curl -X POST  https://<your-hive>/api/people     -b cookies.txt \
