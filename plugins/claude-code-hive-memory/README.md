@@ -1,92 +1,110 @@
 # Hive Memory for Claude Code
 
-Claude Code plugin for Hive-backed AI memory — against the hive store on
-**this machine**. Zero JS dependencies: the MCP server entry and the hooks
-both run the `hive-bridge` binary, which opens the local data dir directly.
-There is no server, no URL, and no API token (hive is personal and
-local-first — [DIRECTION.md](../../docs/DIRECTION.md) D25); the OS user
-boundary is the auth.
+**This plugin does not currently work. Skip to [Connecting Claude Code to hive
+today](#connecting-claude-code-to-hive-today) for the path that does.**
 
-It provides:
+The plugin's MCP entry (`.mcp.json`) and both hook handlers
+(`hooks-handlers/*.mjs`) run a `hive-bridge` binary against a local hive data
+directory. There is no `bridge/` crate and no `hive-bridge` binary: hive is now
+an HTTP API over PostgreSQL ([docs/WEB-APP.md](../../docs/WEB-APP.md)), MCP is
+served at `POST /mcp` by `hive-api`, and there is no local data dir to open.
+Installing the plugin as-is gets you an MCP server that fails to spawn and two
+hooks that soft-fail with "hive-bridge not found on PATH".
 
-- an MCP server entry (`hive-bridge` on stdio) exposing Hive's tools —
-  journal, tasks, search, semantic search, recall, entities, dashboard;
-- a `SessionStart` hook that injects the Hive recall brief (identity
-  profile, open tasks, unread inbox, relevant journal, recent events,
-  projects) and syncs the identity's enabled skills/agents/commands into the
-  project's `.claude/` directory;
-- a skill and a `/save-hive-memory` command teaching Claude to save durable
-  memory as Hive journal prose.
+Porting it means rewriting `.mcp.json` as an HTTP server entry and rewriting the
+hooks to call `POST /mcp` over HTTP with a bearer token. That work has not been
+done.
 
-Transcript capture at session end is paused: it died with the hosted
-teardown and returns as an MCP-fed source in Phase 3
-([PLAN.md](../../docs/PLAN.md) PR 3.6).
+## Connecting Claude Code to hive today
 
-## Requirements
+No plugin involved. Claude Code speaks MCP over HTTP, and so does hive.
 
-`hive-bridge` must be on `PATH`. From a hive checkout:
+### 1. Have a hive running
+
+From a checkout, with a PostgreSQL 17 + pgvector database:
 
 ```bash
-cargo install --path bridge
+podman compose -f docker/docker-compose.local.yml up -d --build
 ```
 
-(Release packaging that bundles the binary lands with the Phase 2 app
-bundles; until then, installing from the repo is the supported path.)
+That serves everything on <http://localhost:7878>. See the
+[root README](../../README.md) for running `hive-api` from source instead.
 
-**The hive app must be running.** The bridge is a proxy (D25): it connects
-to the app over `<data_dir>/bridge.sock` and has no store access of its
-own. While the app is closed, MCP calls and hooks fail with "the hive app
-is not running" — start the app to use Claude Code with hive. Any number
-of bridge clients (Claude Code, Claude Desktop, hooks) can connect to the
-running app at once.
+### 2. Finish onboarding and mint a token
 
-## Install
+Open <http://localhost:7878>. A fresh database opens onto the onboarding form
+(instance name, admin name, admin email, password); it creates the admin user
+and signs you in.
 
-Add the marketplace and install:
+Then, as an admin, open **Account** and mint an API token: pick the actor the
+token writes as, give it a label, choose an expiry. The token is shown once.
+It looks like `hive_pat_…`.
+
+The same thing over HTTP, if you would rather not click:
 
 ```bash
-claude plugin marketplace add bees-roadhouse/hive
-claude plugin install hive-memory@bees-roadhouse
+curl -X POST http://localhost:7878/api/tokens \
+  -H 'Content-Type: application/json' -b cookies.txt \
+  -d '{"actor":"pia","label":"claude-code"}'
 ```
 
-Development (from a checkout):
+`cookies.txt` is a session from `POST /api/auth/login`. Token creation is
+admin-only, and the acting org is fixed when the token is minted: a token reads
+and writes in exactly one org, forever.
+
+### 3. Point Claude Code at it
 
 ```bash
-claude --plugin-dir /path/to/hive/plugins/claude-code-hive-memory
+claude mcp add --transport http hive http://localhost:7878/mcp \
+  --header "Authorization: Bearer hive_pat_…"
 ```
+
+Check it:
+
+```bash
+claude mcp list
+# hive: http://localhost:7878/mcp (HTTP) - ✔ Connected
+```
+
+53 tools land in the session: journal, tasks, search, semantic search, recall,
+entities, people, workspaces, mail archive, conversation capture. Writes are
+authored by the token's actor, not by whatever the caller claims.
+
+### The OAuth alternative
+
+`hive-api` is also an OAuth 2.1 authorization server, so a client that does
+dynamic client registration can authorize itself instead of carrying a token
+you pasted. Discovery is at `/.well-known/oauth-authorization-server` and
+`/.well-known/oauth-protected-resource`; registration is `POST /oauth/register`;
+the flow is authorization code + PKCE (S256 only), scope `mcp`.
+
+One prerequisite that is easy to hit and gives a bad error: **consent only
+offers AI identities that the signed-in human owns.** With none, the consent
+screen has nothing to grant and the flow dead-ends. An AI identity is a `people`
+row with `kind = 'ai'` and `owner` set to your slug. `POST /api/people` creates
+the row but does not set `owner`, so it takes a second call:
+
+```bash
+curl -X POST  http://localhost:7878/api/people        -b cookies.txt \
+  -H 'Content-Type: application/json' -d '{"name":"Pia","kind":"ai"}'
+curl -X PATCH http://localhost:7878/api/people/pia    -b cookies.txt \
+  -H 'Content-Type: application/json' -d '{"owner":"your-slug"}'
+```
+
+The SPA has no screen for either call yet.
+
+## What the plugin still carries
+
+Two pieces are independent of the transport and still make sense:
+
+- `skills/hive-memory/SKILL.md` and `commands/save-hive-memory.md` teach Claude
+  to save durable memory as journal prose. Nothing in them assumes a bridge.
+- `hooks-handlers/session-start.mjs` composes a session brief from the `recall`
+  tool and syncs the identity's enabled skills/agents/commands into `.claude/`.
+  The logic is sound; only its transport is dead.
 
 ## Environment
 
-All optional:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `HIVE_ACTOR` | `$USER` | Acting identity for hook calls (authorship pin) — matches the app's author default |
-| `HIVE_BRIDGE_BIN` | `hive-bridge` | Path to the bridge binary when it isn't on `PATH` |
-| `HIVE_PEER` | — | Optional focus actor for the recall brief |
-| `HIVE_HOOK_TIMEOUT_MS` | `10000` | Per-call timeout for hook bridge calls |
-
-## Hook behavior
-
-**SessionStart** runs `hive-bridge call recall` and injects the composed
-brief as session context, then `hive-bridge call identity_artifacts_sync`
-and writes the enabled artifacts into the session cwd:
-`.claude/skills/<name>/SKILL.md`, `.claude/agents/<name>.md`,
-`.claude/commands/<name>.md`. The sync records what it wrote in
-`.claude/.hive-synced.json` and prunes only files listed there when they
-leave the enabled set — it never touches files you authored.
-
-The hook soft-fails: no `hive-bridge` on `PATH` means a silent no-op, and
-any other failure (the hive app not running) costs one stderr line — a
-broken hive never blocks a session.
-
-Note: the brief's *relevant journal* section rides the semantic index, whose
-backfill daemon is paused until the Phase 2/3 app loop — profile, tasks,
-inbox, and events populate regardless.
-
-## Uninstall
-
-Removing the plugin stops the hook; it does not remove artifacts already
-synced into projects. To clean a project, delete the files listed in
-`.claude/.hive-synced.json` (and the index itself) — everything else under
-`.claude/` is yours, not the plugin's.
+The variables the hooks read (`HIVE_ACTOR`, `HIVE_BRIDGE_BIN`, `HIVE_PEER`,
+`HIVE_HOOK_TIMEOUT_MS`) all describe the bridge that no longer exists. They are
+documented here only so nobody wastes time setting them expecting an effect.

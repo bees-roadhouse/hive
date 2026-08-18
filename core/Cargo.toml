@@ -13,66 +13,33 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+sqlx = { workspace = true }
+pgvector = { workspace = true }
 reqwest = { workspace = true }
 
 hive-shared = { workspace = true }
 hive-embed = { workspace = true }
 
-# Mail sync DRIVER (Slice A): the loop that runs jmap-sync's intact engine over
-# the store. jmap-sync has NO hive deps, so core → jmap-sync is acyclic. The
-# JMAP client itself stays contained in jmap-sync/src/client.rs (see the
-# workspace Cargo.toml mail section); core only speaks the CursorStore/MailSink
-# traits and the Syncer driver methods.
-jmap-sync = { path = "../jmap-sync" }
-async-trait = { workspace = true }
-
-# Crypto primitives for the credential vault (mail account credentials at rest)
+# Auth/crypto primitives the store layer uses (tokens, sessions, passwords)
 rand = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
+scrypt = { workspace = true }
+subtle = { workspace = true }
+hex = { workspace = true }
 
-# Feeds (sources polling)
+# Feeds (pollSources runs api-side too; the worker reuses it)
 rss = { workspace = true }
+
+# The SSE bus: one broadcast channel serves every org, so `subscribe` filters
+# it down to the caller's before anything leaves the process.
+async-stream = "0.3"
+futures-core = "0.3"
 
 # Misc
 nanoid = { workspace = true }
-# Credential vault: reversible encryption of mail credentials at rest
-# (Phase 3 replaces this with the OS keychain).
+uuid = { workspace = true }
+# Object-safe async storage driver trait (artifact_storage.rs).
+async-trait = { workspace = true }
+# Credential vault: reversible encryption of per-user Claude Code tokens at rest.
 aes-gcm = "0.10"
-
-# Durable layer (PR 1.4): op log envelope + segments, blockstore, key management
-ciborium = { workspace = true }
-blake3 = { workspace = true }
-fastcdc = { workspace = true }
-chacha20poly1305 = { workspace = true }
-argon2 = { workspace = true }
-keyring = { workspace = true }
-data-encoding = { workspace = true }
-
-# Device transport identity (PLAN-v2.1 PR 4.5): the ONE asymmetric stack, used
-# by the mTLS carrier (hive-sync), control signing, and sharing. Core owns it
-# because all three consumers already sit above core, and because per-device
-# key custody belongs beside master-key custody (keys.rs), not in a transport
-# crate. No TLS here: core mints keys, hive-sync carries them.
-ed25519-dalek = { workspace = true }
-x25519-dalek = { workspace = true }
-
-# The store (PR 1.6 cutover): the SQLCipher-encrypted SQLite index the fold
-# projects into. sqlx/pgvector left core here (the PR 1.7 importer crate
-# re-adds sqlx for itself), so the `links = "sqlite3"` collision that pinned
-# rusqlite to 0.32 is gone — the pin can lift whenever convenient.
-rusqlite = { workspace = true }
-
-# Single-writer data-dir lock (PR 1.8): flock semantics so a second open in
-# the SAME process conflicts too (fcntl record locks are per-process and
-# would not). Already in the tree via keyring→zbus→async-io; Windows uses
-# std's share_mode(0) instead, so this stays unix-scoped.
-[target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1", features = ["fs"] }
-
-[dev-dependencies]
-# Hermetic tempdir stores for the oplog/blockstore/keys/store tests.
-tempfile = { workspace = true }
-# HOSTILE-DECODE proptests over the record-envelope decoder (PLAN-v2.1
-# PR 4.1): fixed seeds, bounded cases, normal CI.
-proptest = { workspace = true }

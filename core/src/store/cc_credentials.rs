@@ -1,36 +1,19 @@
-// The credential vault, encrypted at rest — today its ONLY consumer is mail
-// account credentials (mail_accounts.cred_id names a row here; store/mail.rs
-// writes and decrypts through it). Reversible (AES-256-GCM) because the mail
-// sync driver needs the real secret. The key derives from the store's MASTER
-// key (the OS-keychain secret, resolved at open) via a domain-separated
-// SHA-256 — so the vault works wherever the store opens, with no external
-// configuration. `HIVE_CRED_KEY`, when set, overrides it (a hosted-era / test
-// escape hatch). Named cc_credentials for hosted-era reasons; Phase 3 folds
-// it fully into the OS keychain.
-//
-// Cutover decision (PR 1.6): this stays a RUNTIME table in the derived index
-// (see index/mod.rs) rather than becoming records — least churn, and the
-// whole vault is scheduled to die in Phase 3. The AES-GCM layer is kept on
-// top of SQLCipher so the trust story is unchanged from the Postgres era.
+// Per-user Claude Code credentials, encrypted at rest. The runner needs the real
+// token to launch Claude Code, so this is *reversible* (AES-256-GCM) — unlike PATs
+// and passwords, which are hashed. The key derives from HIVE_CRED_KEY (any string;
+// SHA-256 → 32-byte key). Plaintext is returned ONLY to the internal runtime-auth
+// path (cc_cred_decrypt_for_runtime), never to a public route.
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use rand::RngCore;
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::workspaces::normalize_runtime;
 use super::{new_id, now_iso, Store};
-
-/// Canonical runtime names (inherited shape; mail rows use "jmap").
-fn normalize_runtime(runtime: Option<&str>) -> String {
-    match runtime.unwrap_or("claude_code").trim() {
-        "" | "claude" | "claude_code" => "claude_code".to_string(),
-        other => other.to_string(),
-    }
-}
 
 /// A stored credential, redacted for display — never the secret itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,8 +29,8 @@ pub struct CcCredentialView {
     pub last_used_at: Option<String>,
 }
 
-/// Save-a-credential request. `secret` is plaintext in memory and is
-/// encrypted immediately; it is never persisted in the clear.
+/// Save-a-credential request. `secret` is plaintext on the wire (TLS) and is
+/// encrypted server-side immediately; it is never persisted in the clear.
 #[derive(Debug, Clone, Deserialize)]
 pub struct NewCcCredential {
     pub kind: String, // e.g. "api_key" | "oauth_token" | "subscription_login" | "provider_config"
@@ -57,37 +40,42 @@ pub struct NewCcCredential {
     pub secret: String,
 }
 
-/// Domain-separation label so the vault subkey is distinct from the SQLCipher
-/// database key even though both descend from the same master key.
-const VAULT_KDF_LABEL: &[u8] = b"hive:cc-credentials:v1";
-
-/// Derive the 32-byte AES-GCM vault key. Normally `SHA-256(master ‖ label)` so
-/// it is bound to the store's master key and available wherever the store
-/// opens. `env_override` (from `HIVE_CRED_KEY`), when present and non-blank,
-/// wins and is `SHA-256(override)` — kept as a hosted-era / test escape hatch.
-/// Pure: the caller reads the env so this stays unit-testable without touching
-/// process-global state.
-fn vault_key(master: &[u8; 32], env_override: Option<&str>) -> [u8; 32] {
-    let mut h = Sha256::new();
-    match env_override {
-        Some(raw) if !raw.trim().is_empty() => h.update(raw.as_bytes()),
-        _ => {
-            h.update(master);
-            h.update(VAULT_KDF_LABEL);
-        }
-    }
-    h.finalize().into()
+#[derive(sqlx::FromRow)]
+struct CredViewRow {
+    id: String,
+    owner: String,
+    kind: String,
+    runtime: String,
+    provider: Option<String>,
+    label: String,
+    tail: String,
+    created_at: String,
+    last_used_at: Option<String>,
 }
 
-/// The optional `HIVE_CRED_KEY` override, read once at a call site.
-fn env_override() -> Option<String> {
-    std::env::var("HIVE_CRED_KEY")
+#[derive(sqlx::FromRow)]
+struct CredSecretRow {
+    id: String,
+    kind: String,
+    runtime: String,
+    provider: Option<String>,
+    ciphertext: String,
+    nonce: String,
+}
+
+fn cred_key() -> Result<[u8; 32]> {
+    let raw = std::env::var("HIVE_CRED_KEY")
         .ok()
         .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("HIVE_CRED_KEY is not set; the credential vault is disabled"))?;
+    let mut h = Sha256::new();
+    h.update(raw.as_bytes());
+    Ok(h.finalize().into())
 }
 
-fn encrypt(plaintext: &str, key: &[u8; 32]) -> Result<(String, String)> {
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+fn encrypt(plaintext: &str) -> Result<(String, String)> {
+    let key = cred_key()?;
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -97,8 +85,9 @@ fn encrypt(plaintext: &str, key: &[u8; 32]) -> Result<(String, String)> {
     Ok((STANDARD.encode(ct), STANDARD.encode(nonce_bytes)))
 }
 
-fn decrypt(ciphertext_b64: &str, nonce_b64: &str, key: &[u8; 32]) -> Result<String> {
-    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+fn decrypt(ciphertext_b64: &str, nonce_b64: &str) -> Result<String> {
+    let key = cred_key()?;
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
     let ct = STANDARD
         .decode(ciphertext_b64)
         .context("bad ciphertext base64")?;
@@ -106,7 +95,7 @@ fn decrypt(ciphertext_b64: &str, nonce_b64: &str, key: &[u8; 32]) -> Result<Stri
     let nonce = Nonce::from_slice(&nonce_bytes);
     let pt = cipher
         .decrypt(nonce, ct.as_ref())
-        .map_err(|e| anyhow!("aes-gcm decrypt failed (vault key mismatch): {e}"))?;
+        .map_err(|e| anyhow!("aes-gcm decrypt failed (wrong HIVE_CRED_KEY?): {e}"))?;
     String::from_utf8(pt).context("decrypted credential is not utf-8")
 }
 
@@ -123,8 +112,7 @@ impl Store {
         owner: &str,
         input: NewCcCredential,
     ) -> Result<CcCredentialView> {
-        let key = vault_key(&self.master, env_override().as_deref());
-        let (ciphertext, nonce) = encrypt(&input.secret, &key)?;
+        let (ciphertext, nonce) = encrypt(&input.secret)?;
         let id = new_id("cred");
         let ts = now_iso();
         let runtime = normalize_runtime(input.runtime.as_deref());
@@ -136,7 +124,29 @@ impl Store {
             .map(str::to_string);
         let label = input.label.unwrap_or_default();
         let tail = tail_of(&input.secret);
-        let view = CcCredentialView {
+        crate::pgq::query(
+            "INSERT INTO cc_credentials (id, owner, kind, runtime, provider, label, ciphertext, nonce, tail, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(owner)
+        .bind(&input.kind)
+        .bind(&runtime)
+        .bind(&provider)
+        .bind(&label)
+        .bind(&ciphertext)
+        .bind(&nonce)
+        .bind(&tail)
+        .bind(&ts)
+        .execute(self.db())
+        .await?;
+        self.emit(
+            "credential.saved",
+            owner,
+            serde_json::json!({"id": id, "kind": input.kind, "runtime": runtime, "provider": provider}),
+        )
+        .await?;
+        Ok(CcCredentialView {
             id,
             owner: owner.to_string(),
             kind: input.kind,
@@ -146,27 +156,72 @@ impl Store {
             tail,
             created_at: ts,
             last_used_at: None,
-        };
-        let row = view.clone();
-        self.run(move |core| {
-            core.conn().execute(
-                "INSERT INTO cc_credentials (id, owner, kind, runtime, provider, label, ciphertext, nonce, tail, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                rusqlite::params![
-                    row.id, row.owner, row.kind, row.runtime, row.provider, row.label,
-                    ciphertext, nonce, row.tail, row.created_at
-                ],
-            )?;
-            Ok(())
         })
-        .await?;
-        self.emit(
-            "credential.saved",
-            owner,
-            serde_json::json!({"id": view.id, "kind": view.kind, "runtime": view.runtime, "provider": view.provider}),
+    }
+
+    /// Redacted list of an owner's credentials.
+    pub async fn cc_cred_list(&self, owner: &str) -> Result<Vec<CcCredentialView>> {
+        let rows = crate::pgq::query_as::<CredViewRow>(
+            "SELECT id, owner, kind, runtime, provider, label, tail, created_at, last_used_at \
+             FROM cc_credentials WHERE owner = ? ORDER BY created_at DESC",
         )
+        .bind(owner)
+        .fetch_all(self.db())
         .await?;
-        Ok(view)
+        Ok(rows
+            .into_iter()
+            .map(|r| CcCredentialView {
+                id: r.id,
+                owner: r.owner,
+                kind: r.kind,
+                runtime: normalize_runtime(Some(&r.runtime)),
+                provider: r.provider,
+                label: r.label,
+                tail: r.tail,
+                created_at: r.created_at,
+                last_used_at: r.last_used_at,
+            })
+            .collect())
+    }
+
+    pub async fn cc_cred_delete(&self, owner: &str, id: &str) -> Result<bool> {
+        let res = crate::pgq::query("DELETE FROM cc_credentials WHERE id = ? AND owner = ?")
+            .bind(id)
+            .bind(owner)
+            .execute(self.db())
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Decrypt the owner's most recent credential for the requested runtime (INTERNAL only —
+    /// the only path that ever yields plaintext). Returns `(kind, runtime, provider, secret)`.
+    pub async fn cc_cred_decrypt_for_runtime(
+        &self,
+        owner: &str,
+        runtime: &str,
+    ) -> Result<Option<(String, String, Option<String>, String)>> {
+        let runtime = normalize_runtime(Some(runtime));
+        let row = crate::pgq::query_as::<CredSecretRow>(
+            "SELECT id, kind, runtime, provider, ciphertext, nonce FROM cc_credentials \
+             WHERE owner = ? AND runtime = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(owner)
+        .bind(&runtime)
+        .fetch_optional(self.db())
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let secret = decrypt(&row.ciphertext, &row.nonce)?;
+        crate::pgq::query("UPDATE cc_credentials SET last_used_at = ? WHERE id = ?")
+            .bind(now_iso())
+            .bind(&row.id)
+            .execute(self.db())
+            .await?;
+        Ok(Some((
+            row.kind,
+            normalize_runtime(Some(&row.runtime)),
+            row.provider,
+            secret,
+        )))
     }
 
     /// Decrypt one credential by row id (INTERNAL only). Mail accounts name
@@ -174,56 +229,19 @@ impl Store {
     /// runtime picker above would be wrong the moment a second account
     /// exists.
     pub async fn cc_cred_decrypt_by_id(&self, id: &str) -> Result<Option<String>> {
-        let id = id.to_string();
-        let row: Option<(String, String, String)> = self
-            .run(move |core| {
-                let row = core
-                    .conn()
-                    .query_row(
-                        "SELECT id, ciphertext, nonce FROM cc_credentials WHERE id = ?1",
-                        rusqlite::params![id],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                    )
-                    .optional()?;
-                if let Some((rid, _, _)) = &row {
-                    core.conn().execute(
-                        "UPDATE cc_credentials SET last_used_at = ?1 WHERE id = ?2",
-                        rusqlite::params![now_iso(), rid],
-                    )?;
-                }
-                Ok(row)
-            })
+        let row = crate::pgq::query_as::<CredSecretRow>(
+            "SELECT id, kind, runtime, provider, ciphertext, nonce FROM cc_credentials WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(self.db())
+        .await?;
+        let Some(row) = row else { return Ok(None) };
+        let secret = decrypt(&row.ciphertext, &row.nonce)?;
+        crate::pgq::query("UPDATE cc_credentials SET last_used_at = ? WHERE id = ?")
+            .bind(now_iso())
+            .bind(&row.id)
+            .execute(self.db())
             .await?;
-        let Some((_, ciphertext, nonce)) = row else {
-            return Ok(None);
-        };
-        let key = vault_key(&self.master, env_override().as_deref());
-        Ok(Some(decrypt(&ciphertext, &nonce, &key)?))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::vault_key;
-
-    #[test]
-    fn vault_key_is_deterministic_and_master_bound() {
-        let m1 = [7u8; 32];
-        let m2 = [9u8; 32];
-        // Same master → same key; different master → different key.
-        assert_eq!(vault_key(&m1, None), vault_key(&m1, None));
-        assert_ne!(vault_key(&m1, None), vault_key(&m2, None));
-    }
-
-    #[test]
-    fn env_override_wins_and_is_master_independent() {
-        let m1 = [1u8; 32];
-        let m2 = [2u8; 32];
-        // A set override ignores the master (same key across masters)…
-        assert_eq!(vault_key(&m1, Some("k")), vault_key(&m2, Some("k")));
-        // …a blank/whitespace override falls back to master derivation…
-        assert_eq!(vault_key(&m1, Some("   ")), vault_key(&m1, None));
-        // …and the override key differs from the master-derived one.
-        assert_ne!(vault_key(&m1, Some("k")), vault_key(&m1, None));
+        Ok(Some(secret))
     }
 }

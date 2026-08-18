@@ -1,5 +1,5 @@
 [workspace]
-members = ["shared", "embed", "core", "jmap-sync", "sync", "node", "app", "bridge", "importer", "smoke-support", "smoke"]
+members = ["shared", "embed", "core", "api", "jmap-sync", "relay"]
 resolver = "2"
 
 [workspace.package]
@@ -20,22 +20,36 @@ thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# --- HTTP client (source polling, outbox webhooks) ---
+# --- Async / HTTP ---
+axum = { version = "0.8", features = ["ws", "multipart"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+hyper = { version = "1.5", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 
 # --- Database ---
-# Postgres left the workspace at the PR 1.6 cutover. The PR 1.7 importer crate
-# (the one remaining Postgres reader) declares its own sqlx dependency so
-# "no Postgres in the app" stays grep-auditable.
+# postgres is the datastore; sqlite stays only so the import path can READ an
+# uploaded legacy hive.db file (api/src/legacy_import.rs) when migrating data in.
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "sqlite", "migrate", "chrono", "uuid", "json"] }
+# Native `vector` column binding (embeddings.vec_v). 0.4 pairs with sqlx 0.8.
+pgvector = { version = "0.4", features = ["sqlx"] }
 
-# --- Crypto (credential vault: reversible encryption of mail credentials) ---
+# --- Auth / Crypto ---
+jsonwebtoken = "9.3"
 rand = "0.8"
 sha2 = "0.10"
 base64 = "0.22"
+scrypt = "0.11"
+subtle = "2.6"
+hex = "0.4"
 
 # --- Time / IDs ---
 chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
 nanoid = "0.4"
+
+# --- Config / Env ---
+dotenvy = "0.15"
 
 # --- Embeddings / ML (the hive-embed crate wraps these) ---
 ort = { version = "2.0.0-rc.12", features = ["ndarray"] }
@@ -45,12 +59,10 @@ ndarray = { version = "0.16", features = ["serde"] }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 # 0.4+: huggingface.co serves relative redirect Locations that 0.3 can't follow.
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "default-tls"] }
-# The optional manual Ollama embedder posts to a LOCAL server; ureq is the same
-# blocking client hf-hub already links (2.x line to share that build), + json.
-ureq = { version = "2.12", features = ["json"] }
 
 # --- Feeds ---
 rss = "2.0"
+atom_syndication = "0.12"
 
 # --- Mail (the jmap-sync crate wraps these) ---
 # Pinned exact: jmap-client went dormant 2024-01..2025-09; the containment rule
@@ -61,77 +73,6 @@ jmap-client = { version = "=0.4.2", default-features = false, features = ["async
 html2text = "0.17"
 async-trait = "0.1"
 futures-util = "0.3"
-
-# --- Durable layer (PR 1.4: op log + blockstore + keys; record format frozen) ---
-# CBOR encoding of the frozen record envelope and blob manifests.
-ciborium = "0.2"
-# Content addressing (block ids, frame chain) + keyed-hash/derive-key KDF modes.
-blake3 = "1.8"
-# Content-defined chunking for large blobs (v2020 gear table).
-fastcdc = "4.0"
-# XChaCha20-Poly1305 AEAD for segment frames, blob blocks, and key wraps.
-# 0.10 line: 0.11 raises MSRV to 1.85, above the workspace's 1.84.
-chacha20poly1305 = "0.10"
-# Argon2id KEK derivation for the passphrase export wrap (RFC 9106 params).
-argon2 = "0.5"
-# OS keychain custody of the master key. Pure-rust zbus Secret Service on Linux
-# (headless CI still links; no libdbus); v3 line because v4 raises MSRV to 1.88.
-keyring = { version = "3.6", features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
-# base32 recovery codes + lowercase-hex block filenames.
-data-encoding = "2"
-
-# --- Device transport identity (PLAN-v2.1 PR 4.5: the ONE asymmetric stack) ---
-# The dalek suite over ring/aws-lc-rs, decided by the 4.5 spike: identity,
-# control signing (4.11) and sharing (6.x) all reuse these two crates, and only
-# dalek gives a *seed-in, keypair-out* API with no context object — which is
-# what makes `DeviceIdentity::from_seed` a pure function we can golden. ring is
-# still what terminates TLS (rustls' provider below); it just never holds the
-# device key. `pkcs8` on ed25519-dalek is the one bridge between them: rcgen
-# takes the signing key as PKCS#8 DER.
-ed25519-dalek = { version = "2.2", features = ["pkcs8"] }
-# static_secrets: the device's x25519 half is long-lived (it is an identity),
-# not an ephemeral handshake secret, and 2.x gates `StaticSecret` behind it.
-x25519-dalek = { version = "2.0", features = ["static_secrets"] }
-
-# --- mTLS carrier (PLAN-v2.1 PR 4.5/4.7) ---
-# Self-signed certs carrying the device key, pinned by SPKI — decided over
-# rustls' raw-public-key mode, which needs both ends to negotiate RFC 7250 and
-# has no story for the openssl/wireshark-shaped debugging a transport gets in
-# the field. The certificate is a carrier, never a trust root: nothing in this
-# tree parses a chain, checks a name, or looks at an expiry.
-# ring provider (not the default aws-lc-rs), matching the jmap/reqwest line
-# above — one TLS backend in the tree, no cmake/NASM in the build.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
-# The peer's SPKI, extracted from its certificate — the ONE X.509 read the
-# transport performs, and the same parser rustls itself links.
-rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
-# Minting the device's own self-signed cert. ring backend, no x509-parser: we
-# generate certificates, we never introspect foreign ones here.
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
-
-# --- Node config (PLAN-v2.1 PR 4.6) ---
-# node.toml / tenant.toml. TOML rather than the JSON already in the tree
-# because these files are hand-edited by whoever runs the box, and comments
-# are the difference between a config someone maintains and one they retype.
-# Already in the lock as a transitive dependency, so it costs no new crate.
-toml = "0.8"
-
-# --- Derived index (PR 1.5/1.6: the SQLite store) ---
-# Bundled SQLCipher (SQLite 3.45, FTS5 compiled in, JSON core) with vendored
-# OpenSSL so mac/Windows need no system crypto lib — the exact feature combo
-# the PR 1.4 spike proved (core/tests/sqlcipher_spike.rs). The 0.32 pin dates
-# from the sqlx-sqlite `links = "sqlite3"` collision; sqlx left the workspace
-# at the 1.6 cutover, so the pin can lift whenever convenient.
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
-
-# --- Dev/test only ---
-# Hermetic tempdir stores for the oplog/blockstore/keys tests.
-tempfile = "3"
-# HOSTILE-DECODE proptests (docs/TESTING-STRATEGY.md §2): adversarial-input
-# coverage over network-facing decoders — fixed seeds, bounded cases, runs
-# in normal CI (cargo-fuzz stays nightly-only and out of the workspace).
-proptest = "1"
 
 # --- Shared workspace crates ---
 hive-shared = { path = "shared" }

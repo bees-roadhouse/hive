@@ -79,6 +79,37 @@ pub fn parse_ack(line: &str) -> Option<AppAck> {
         .map(|w| w.hive_app)
 }
 
+/// The Windows doorway name for a data dir.
+///
+/// Windows has no filesystem sockets. The unix socket took its identity from
+/// its PATH — one `bridge.sock` per data dir, so two hives (a test store, a
+/// HIVE_DATA_DIR relocation) could never share a doorway. A named pipe lives
+/// in the machine-global `\\.\pipe\` namespace instead, so that identity has
+/// to move into the NAME or those two hives would collide on one pipe.
+///
+/// FNV-1a over the lowercased path: this NAMESPACES, it does not authenticate.
+/// A crypto hash here would imply the name is a secret, and it is not — the
+/// pipe name is discoverable by anything on the machine. Access control is the
+/// pipe's DACL (owner-only) plus FILE_FLAG_FIRST_PIPE_INSTANCE on the app
+/// side, exactly as the unix side leant on 0600 plus SO_PEERCRED rather than
+/// on an unguessable path.
+///
+/// Lowercased because Windows paths are case-insensitive: the app and the
+/// bridge must land on the same name having each resolved the dir themselves.
+#[cfg(windows)]
+pub fn pipe_path(data_dir: &std::path::Path) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let key = data_dir.to_string_lossy().to_lowercase();
+    let mut hash = FNV_OFFSET;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!(r"\\.\pipe\hive-bridge-{hash:016x}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +129,35 @@ mod tests {
         assert!(parse_hello("{\"jsonrpc\":\"2.0\",\"id\":1}").is_none());
         assert!(parse_hello("not json").is_none());
         assert!(parse_ack("{}").is_none());
+    }
+
+    /// The app and the bridge each resolve the data dir themselves and must
+    /// meet on one name. If this ever stops being a pure function of the path,
+    /// they stop meeting and the doorway silently does not exist.
+    #[cfg(windows)]
+    #[test]
+    fn the_pipe_name_is_stable_per_data_dir_and_case_insensitive() {
+        use std::path::Path;
+
+        let a = pipe_path(Path::new(r"C:\Users\nate\AppData\Local\hive"));
+        assert_eq!(a, pipe_path(Path::new(r"C:\Users\nate\AppData\Local\hive")));
+        // Windows paths are case-insensitive, so these are the SAME store —
+        // the app writing one casing and the bridge another must not split
+        // the doorway in two.
+        assert_eq!(a, pipe_path(Path::new(r"c:\users\nate\appdata\local\hive")));
+        assert!(a.starts_with(r"\\.\pipe\hive-bridge-"));
+    }
+
+    /// Two stores, two doorways. The unix side got this free from the path;
+    /// on Windows it is the hash doing the work, so it is worth asserting.
+    #[cfg(windows)]
+    #[test]
+    fn different_data_dirs_get_different_pipes() {
+        use std::path::Path;
+
+        assert_ne!(
+            pipe_path(Path::new(r"C:\Users\nate\AppData\Local\hive")),
+            pipe_path(Path::new(r"C:\tmp\hive-test-store")),
+        );
     }
 }

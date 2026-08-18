@@ -1,0 +1,11 @@
+# The quote corpus is compared byte for byte, so it has to be LF in the blob
+# AND LF in the working tree, on every platform. `text eol=lf` says exactly
+# that: normalise to LF on commit, check out LF whatever core.autocrlf happens
+# to be set to. `-text` does NOT say that ... it means "leave these bytes
+# alone", which pins whatever was on disk when they were added. That is how
+# this corpus silently turned CRLF on a Windows checkout and then stayed CRLF
+# for Linux CI too.
+jmap-sync/tests/** text eol=lf
+
+# Shell scripts must stay LF or they will not execute in a container.
+*.sh text eol=lf

@@ -1,0 +1,67 @@
+# Local hive stack: Postgres + hive-api. The API process serves the JSON API,
+# the MCP endpoint at POST /mcp, and the Solid SPA. There is no separate web
+# container and no worker binary.
+#
+#   podman compose -f docker/docker-compose.local.yml up -d --build
+#
+# Browser: http://localhost:7878    Health: http://localhost:7878/api/healthz
+#
+# The credential key below is a fixed dev value on purpose, so this file runs
+# with no setup. It is NOT a production posture. For anything you care about,
+# use docker/docker-compose.rust.yml, which refuses to start without a real
+# HIVE_CRED_KEY.
+name: hive-local
+
+services:
+  postgres:
+    # pgvector/pgvector:pg17 = the official postgres:17 plus the vector
+    # extension. Not published to the host: only hive-api talks to it, and
+    # binding 5432 would collide with any Postgres already running there.
+    image: docker.io/pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: hive
+      POSTGRES_PASSWORD: hive
+      POSTGRES_DB: hive
+    volumes:
+      - hive-local-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hive -d hive"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  hive-api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.rust
+      target: runtime
+    environment:
+      DATABASE_URL: postgres://hive:hive@postgres:5432/hive
+      PORT: "7878"
+      # Hash embedder: deterministic, no model download. Swap for the ONNX
+      # backend once you want real semantic search.
+      HIVE_EMBED: hash
+      HIVE_MODEL_CACHE: /data/models
+      # Artifact bytes default to ./data, which is /app/data in the image and
+      # would not survive the container. Point them at the volume.
+      HIVE_DATA_DIR: /data
+      HIVE_CRED_KEY: local-dev-credential-key-not-for-production
+      RUST_LOG: hive_api=info,hive_core=info,tower_http=info
+    volumes:
+      - hive-local-data:/data
+    ports:
+      - "7878:7878"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:7878/api/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  hive-local-pgdata:
+  hive-local-data:

@@ -23,6 +23,11 @@ fn corpus() {
         let expected = fs::read_to_string(dir.join(format!("{case}.out.txt")))
             .unwrap_or_else(|_| panic!("{case}.out.txt missing"));
         let got = jmap_sync::quote::strip_quoted(&input);
+        // Compared as bytes, line endings included. `strip_quoted` emits LF on
+        // every path and `.gitattributes` pins the fixtures to LF, so there is
+        // nothing left to normalise here ... and normalising anyway would hide
+        // the corpus silently turning CRLF, which is exactly what happened once.
+        // `trim_end` absorbs the fixture's trailing newline and nothing else.
         assert_eq!(
             got.trim_end(),
             expected.trim_end(),

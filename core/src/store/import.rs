@@ -1,67 +1,131 @@
-// The PR 1.7 import seam: batch-append PRE-BUILT records for the one-shot
-// hosted-Postgres importer (the `hive-import` binary).
-//
-// Why a seam exists at all: every normal store write MINTS ids and
-// timestamps in the command layer, but an import must preserve the original
-// nanoid ids (citations resolve natively) and the original wall times
-// verbatim. `import_batch` therefore accepts finished payloads and record
-// timestamps from the caller — and nothing else changes: drafts still flow
-// through `Core::commit`, so device/seq/lc assignment, the fsync'd op-log
-// append, and the one-transaction fold stay exactly the canonical write
-// path. Fail-closed at the edge: unknown kinds and off-shape timestamps are
-// rejected here, malformed payloads by the fold itself.
-//
-// Importer-only by contract (#[doc(hidden)]): production features must keep
-// using the typed store surface, which owns emergence, fan-out, and policy.
+// Bulk historical import — legacy hive.db → this instance (store.ts importLegacy).
+// Idempotent: rows keep their original ids + timestamps; existing ids are
+// skipped (INSERT OR IGNORE). Unlike journal.append this does NOT fan out
+// inbox/anchor/share side effects; it only persists + indexes.
 
-use anyhow::{bail, Result};
-use serde_json::Value as Json;
+use anyhow::Result;
+use hive_shared::{is_ai, parse_mentions, snip, ActorKind, ImportResult, LegacyImport, TaskStatus};
 
-use super::{Draft, Store};
-
-/// One record-to-be from the importer: a closed-set kind, the ORIGINAL
-/// author and timestamp, and a payload already shaped per the fold contract
-/// (core/src/fold header) — including the v3 `origin` provenance key.
-pub struct ImportRecord {
-    /// One of the closed record kinds (oplog::kind::ALL).
-    pub kind: String,
-    /// Record author — the original writer where the source row names one,
-    /// else "importer".
-    pub actor: String,
-    /// Record timestamp in the frozen 24-char ISO shape (oplog::ts_shape_ok)
-    /// — the original wall time, not "now".
-    pub ts: String,
-    /// Fold-contract payload for `kind`.
-    pub payload: Json,
-}
+use super::search::index_entity_conn;
+use super::Store;
 
 impl Store {
-    /// Append one ordered batch of import records: validate kind + timestamp
-    /// shape, then commit through the canonical path (op-log append + fold in
-    /// one transaction). The batch is all-or-nothing.
-    #[doc(hidden)]
-    pub async fn import_batch(&self, records: Vec<ImportRecord>) -> Result<()> {
-        self.run(move |core| {
-            let mut drafts = Vec::with_capacity(records.len());
-            for r in records {
-                let Some(kind) = crate::oplog::kind::ALL
-                    .iter()
-                    .copied()
-                    .find(|k| *k == r.kind)
-                else {
-                    bail!("import_batch rejects unknown record kind {:?}", r.kind);
-                };
-                if !crate::oplog::ts_shape_ok(&r.ts) {
-                    bail!(
-                        "import_batch rejects record ts {:?} (kind {kind}): not the \
-                         frozen 24-char ISO shape — normalize before importing",
-                        r.ts
-                    );
-                }
-                drafts.push(Draft::new(kind, &r.actor, &r.ts, r.payload));
+    pub async fn import_legacy(&self, payload: LegacyImport) -> Result<ImportResult> {
+        let mut res = ImportResult::default();
+
+        // people.ensure fans through the pool (it's idempotent and additive), so
+        // run it before the transactional batch like Node effectively does.
+        for e in payload.journal.as_deref().unwrap_or_default() {
+            self.people_ensure(
+                &e.author,
+                if is_ai(&e.author) {
+                    ActorKind::Ai
+                } else {
+                    ActorKind::Human
+                },
+            )
+            .await?;
+        }
+
+        let mut tx = self.db().begin().await?;
+
+        for p in payload.projects.as_deref().unwrap_or_default() {
+            let r = crate::pgq::query(
+                "INSERT INTO projects (id, name, slug, created_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            )
+            .bind(&p.id)
+            .bind(&p.name)
+            .bind(&p.slug)
+            .bind(&p.created_at)
+            .execute(&mut *tx)
+            .await?;
+            if r.rows_affected() > 0 {
+                res.projects.inserted += 1;
+            } else {
+                res.projects.skipped += 1;
             }
-            core.commit(drafts)
-        })
-        .await
+        }
+
+        for e in payload.journal.as_deref().unwrap_or_default() {
+            let r = crate::pgq::query(
+                "INSERT INTO journal (id, author, body, tags, mentions, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            )
+            .bind(&e.id)
+            .bind(&e.author)
+            .bind(&e.body)
+            .bind(serde_json::to_string(&e.tags)?)
+            .bind(serde_json::to_string(&parse_mentions(&e.body))?)
+            .bind(&e.created_at)
+            .execute(&mut *tx)
+            .await?;
+            if r.rows_affected() > 0 {
+                let title = format!("{}: {}", e.author, snip(&e.body, 50));
+                index_entity_conn(&mut tx, "journal", &e.id, &title, &e.body, &e.tags).await?;
+                res.journal.inserted += 1;
+            } else {
+                res.journal.skipped += 1;
+            }
+        }
+
+        for t in payload.tasks.as_deref().unwrap_or_default() {
+            let status = if TaskStatus::parse(&t.status).is_some() {
+                t.status.as_str()
+            } else {
+                "todo"
+            };
+            let priority = if t.priority.is_empty() {
+                "normal"
+            } else {
+                t.priority.as_str()
+            };
+            let r = crate::pgq::query(
+                "INSERT INTO tasks (id, project, title, body, status, priority, tags, assignees, due, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            )
+            .bind(&t.id)
+            .bind(&t.project)
+            .bind(&t.title)
+            .bind(&t.body)
+            .bind(status)
+            .bind(priority)
+            .bind(serde_json::to_string(&t.tags)?)
+            .bind(serde_json::to_string(&t.assignees)?)
+            .bind(&t.due)
+            .bind(&t.created_at)
+            .bind(&t.updated_at)
+            .execute(&mut *tx)
+            .await?;
+            if r.rows_affected() > 0 {
+                index_entity_conn(&mut tx, "task", &t.id, &t.title, &t.body, &t.tags).await?;
+                res.tasks.inserted += 1;
+            } else {
+                res.tasks.skipped += 1;
+            }
+        }
+
+        for l in payload.links.as_deref().unwrap_or_default() {
+            let r = crate::pgq::query(
+                "INSERT INTO links (id, source_kind, source_id, target_kind, target_id, rel, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+            )
+            .bind(&l.id)
+            .bind(&l.source_kind)
+            .bind(&l.source_id)
+            .bind(&l.target_kind)
+            .bind(&l.target_id)
+            .bind(&l.rel)
+            .bind(&l.created_at)
+            .execute(&mut *tx)
+            .await?;
+            if r.rows_affected() > 0 {
+                res.links.inserted += 1;
+            } else {
+                res.links.skipped += 1;
+            }
+        }
+
+        tx.commit().await?;
+        Ok(res)
     }
 }

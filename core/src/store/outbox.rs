@@ -1,12 +1,10 @@
 // Outbound work queue (store.ts `outbox` + the worker's drainOutbox).
-// RUNTIME state (see index/mod.rs): a transient retry queue writes directly —
-// attempt bookkeeping does not belong in the append-only log, and losing
-// pending webhook jobs on an index rebuild is the accepted trade.
+// Owned by the admin workstream; the worker crate calls these via the lib.
 
 use anyhow::Result;
 use hive_shared::{OutboxJob, OutboxStatus, WorkerOutboxCounts};
-use rusqlite::OptionalExtension;
 use serde_json::json;
+use sqlx::Row;
 
 use super::{new_id, now_iso, placeholders_or_never, Store};
 
@@ -35,23 +33,18 @@ impl Store {
             created_at: now_iso(),
             completed_at: None,
         };
-        let row = job.clone();
-        self.run(move |core| {
-            core.conn().execute(
-                "INSERT INTO outbox (id, kind, payload, status, attempts, last_error, run_after, created_at, completed_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, NULL)",
-                rusqlite::params![
-                    row.id,
-                    row.kind,
-                    row.payload.to_string(),
-                    row.status.as_str(),
-                    row.attempts,
-                    row.run_after,
-                    row.created_at
-                ],
-            )?;
-            Ok(())
-        })
+        crate::pgq::query(
+            "INSERT INTO outbox (id, kind, payload, status, attempts, last_error, run_after, created_at, completed_at) \
+             VALUES (?, ?, ?, ?, ?, NULL, ?, ?, NULL)",
+        )
+        .bind(&job.id)
+        .bind(&job.kind)
+        .bind(job.payload.to_string())
+        .bind(job.status.as_str())
+        .bind(job.attempts)
+        .bind(&job.run_after)
+        .bind(&job.created_at)
+        .execute(self.db())
         .await?;
         self.emit(
             "outbox.enqueued",
@@ -63,68 +56,36 @@ impl Store {
     }
 
     pub async fn outbox_list(&self, limit: i64) -> Result<Vec<OutboxJob>> {
-        self.run(move |core| {
-            let mut stmt = core
-                .conn()
-                .prepare("SELECT * FROM outbox ORDER BY created_at DESC LIMIT ?1")?;
-            let rows = stmt.query_map(rusqlite::params![limit], row_to_job)?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        })
-        .await
+        let rows = crate::pgq::query("SELECT * FROM outbox ORDER BY created_at DESC LIMIT ?")
+            .bind(limit)
+            .fetch_all(self.db())
+            .await?;
+        rows.iter().map(row_to_job).collect()
     }
 
     /// Pending jobs of the given kinds whose run_after has elapsed, oldest
     /// first. Kinds are explicit so each drainer claims only work it owns.
     pub async fn outbox_claim(&self, kinds: &[&str], limit: i64) -> Result<Vec<OutboxJob>> {
-        let kinds: Vec<String> = kinds.iter().map(|k| k.to_string()).collect();
-        self.run(move |core| {
-            let sql = format!(
-                "SELECT * FROM outbox WHERE status = 'pending' AND run_after <= ? \
-                 AND kind IN ({}) ORDER BY run_after LIMIT ?",
-                placeholders_or_never(kinds.len())
-            );
-            let mut stmt = core.conn().prepare(&sql)?;
-            let mut binds: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(now_iso())];
-            for k in &kinds {
-                binds.push(Box::new(k.clone()));
-            }
-            binds.push(Box::new(limit));
-            let rows = stmt.query_map(
-                rusqlite::params_from_iter(binds.iter().map(|b| b.as_ref())),
-                row_to_job,
-            )?;
-            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-        })
-        .await
-    }
-
-    /// One job by id, or `None` when it's gone. The compose UI polls this to
-    /// turn a queued send into a Sent/Failed status.
-    pub async fn outbox_get(&self, job_id: &str) -> Result<Option<OutboxJob>> {
-        let job_id = job_id.to_string();
-        self.run(move |core| {
-            Ok(core
-                .conn()
-                .query_row(
-                    "SELECT * FROM outbox WHERE id = ?1",
-                    rusqlite::params![job_id],
-                    row_to_job,
-                )
-                .optional()?)
-        })
-        .await
+        let sql = format!(
+            "SELECT * FROM outbox WHERE status = 'pending' AND run_after <= ? \
+             AND kind IN ({}) ORDER BY run_after LIMIT ?",
+            placeholders_or_never(kinds.len())
+        );
+        let mut q = crate::pgq::query(&sql).bind(now_iso());
+        for k in kinds {
+            q = q.bind(*k);
+        }
+        let rows = q.bind(limit).fetch_all(self.db()).await?;
+        rows.iter().map(row_to_job).collect()
     }
 
     pub async fn outbox_complete(&self, job_id: &str) -> Result<()> {
-        let job_id = job_id.to_string();
-        self.run(move |core| {
-            core.conn().execute(
-                "UPDATE outbox SET status='done', completed_at=?1 WHERE id=?2",
-                rusqlite::params![now_iso(), job_id],
-            )?;
-            Ok(())
-        })
-        .await
+        crate::pgq::query("UPDATE outbox SET status='done', completed_at=? WHERE id=?")
+            .bind(now_iso())
+            .bind(job_id)
+            .execute(self.db())
+            .await?;
+        Ok(())
     }
 
     /// Exponential backoff 2^attempts × 30s capped at 3600s; permanently failed
@@ -138,33 +99,31 @@ impl Store {
         } else {
             OutboxStatus::Pending
         };
-        let (job_id, error) = (job_id.to_string(), error.to_string());
-        self.run(move |core| {
-            core.conn().execute(
-                "UPDATE outbox SET status=?1, attempts=?2, last_error=?3, run_after=?4 WHERE id=?5",
-                rusqlite::params![status.as_str(), attempts, error, run_after, job_id],
-            )?;
-            Ok(())
-        })
-        .await
+        crate::pgq::query(
+            "UPDATE outbox SET status=?, attempts=?, last_error=?, run_after=? WHERE id=?",
+        )
+        .bind(status.as_str())
+        .bind(attempts)
+        .bind(error)
+        .bind(&run_after)
+        .bind(job_id)
+        .execute(self.db())
+        .await?;
+        Ok(())
     }
 
     pub async fn outbox_counts(&self) -> Result<WorkerOutboxCounts> {
-        self.run(|core| {
-            let count = |status: &str| -> rusqlite::Result<i64> {
-                core.conn().query_row(
-                    "SELECT count(*) FROM outbox WHERE status = ?1",
-                    rusqlite::params![status],
-                    |r| r.get(0),
-                )
-            };
-            Ok(WorkerOutboxCounts {
-                pending: count("pending")?,
-                done: count("done")?,
-                failed: count("failed")?,
-            })
+        let count = |status: &'static str| async move {
+            crate::pgq::query_scalar::<i64>("SELECT count(*) FROM outbox WHERE status = ?")
+                .bind(status)
+                .fetch_one(self.db())
+                .await
+        };
+        Ok(WorkerOutboxCounts {
+            pending: count("pending").await?,
+            done: count("done").await?,
+            failed: count("failed").await?,
         })
-        .await
     }
 
     /// The worker's drainOutbox: claim up to 20 due jobs of the kinds it owns
@@ -225,18 +184,18 @@ pub(crate) fn backoff_secs(attempts: i64) -> i64 {
     exp.saturating_mul(30).min(3600)
 }
 
-fn row_to_job(r: &rusqlite::Row) -> rusqlite::Result<OutboxJob> {
+fn row_to_job(r: &sqlx::postgres::PgRow) -> Result<OutboxJob> {
     Ok(OutboxJob {
-        id: r.get("id")?,
-        kind: r.get("kind")?,
-        payload: serde_json::from_str(&r.get::<_, String>("payload")?)
+        id: r.try_get("id")?,
+        kind: r.try_get("kind")?,
+        payload: serde_json::from_str(&r.try_get::<String, _>("payload")?)
             .unwrap_or(serde_json::Value::Null),
-        status: OutboxStatus::from_str_lossy(r.get::<_, String>("status")?.as_str()),
-        attempts: r.get("attempts")?,
-        last_error: r.get("last_error")?,
-        run_after: r.get("run_after")?,
-        created_at: r.get("created_at")?,
-        completed_at: r.get("completed_at")?,
+        status: OutboxStatus::from_str_lossy(r.try_get::<String, _>("status")?.as_str()),
+        attempts: r.try_get("attempts")?,
+        last_error: r.try_get("last_error")?,
+        run_after: r.try_get("run_after")?,
+        created_at: r.try_get("created_at")?,
+        completed_at: r.try_get("completed_at")?,
     })
 }
 

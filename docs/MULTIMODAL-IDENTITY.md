@@ -1,5 +1,50 @@
 # Multimodal search and local identity: design note
 
+> **Still PROPOSED, and now argued against an architecture that is gone.**
+> [WEB-APP.md](./WEB-APP.md) (2026-08-10) replaced the local-first design this
+> note is built on. D37-D40 were never ratified, so nothing here was ever
+> adopted; what changed is that half the reasoning no longer describes the
+> repo. Read it for the argument, and check every mechanism claim against the
+> tree before acting on it.
+>
+> **What survives.** Part 1's recommendation holds: text stays on BGE, images
+> get their own space under their own `ref_kind`, and cross-space results fuse
+> by reciprocal rank rather than score. `embeddings` came through the rewrite
+> with the same `PRIMARY KEY (ref_kind, ref_id, chunk_idx)` and the same
+> per-row `model` and `dim`, so "give each space its own `ref_kind`" is still
+> the cheap move and still needs no schema change. Part 3 (enrollment, gating
+> on margin as well as similarity, `unknown` as a first-class outcome, and the
+> correction that the model must not adapt) is model-level and untouched. Part
+> 5's consent argument gets sharper under multi-org, not weaker: a faceprint of
+> someone who never agreed to any of this now sits in a shared database.
+>
+> **What does not.** Two things, and the first inverts a load-bearing claim:
+>
+> * **"The index is already plural" is no longer true.** `SqliteIndex`,
+>   `AnnIndex`, and the `anns: HashMap<String, Box<dyn AnnIndex>>` rebuilt at
+>   every open are gone. ANN is pgvector HNSW over one fixed-width column,
+>   `embeddings.vec_v vector(384)`
+>   (`core/migrations/0002_pgvector_embeddings.sql`); the 256-dim hash tier
+>   rides the separate `vec BYTEA` column rather than a second ANN structure.
+>   A 512- or 768-dim CLIP space does not fit either. Adding one now means a
+>   second vector column or a second table plus its own HNSW index ... more
+>   work than this note prices, not less.
+> * **Part 2 is void.** No blockstore, no `BlobRef`, no wrapped content key, no
+>   `blob_refs`, no fold, no `FOLD_VERSION`. Crypto-shred is gone by decision
+>   (WEB-APP.md, *Encryption*), and it is the entire reason Part 2 concludes a
+>   print must be a blob. That argument has to be made again from scratch
+>   against Postgres, RLS, and `DELETE`. The `blob_refs` / `DROP_DERIVED`
+>   hazard the note calls a hard prerequisite ... and item 10 of *What I could
+>   not verify* ... is moot: the machinery it breaks does not exist.
+>
+> One correction to *What the repo actually does today*: contact cards no
+> longer exist. `core/src/store/contacts.rs` is still on disk but is not
+> declared in `core/src/store/mod.rs`, so it is never compiled, and the
+> `contact` entity type is seeded nowhere. The prerequisite this note records
+> as already shipped has to ship again.
+>
+> Kept intact below.
+
 Status: PROPOSED 2026-08-02, not adopted. Written against `main` at 8a1d2bc
 from a read of the embedding seam, the index, the blockstore, and the journal
 write path. Companion to [DIRECTION.md](./DIRECTION.md) (proposes D37-D40) and

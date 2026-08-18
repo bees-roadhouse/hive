@@ -1,19 +1,19 @@
-// Mutable per-actor card — the durable-identity write target (store.ts
-// `profiles`). The Postgres path's UPSERT splits into create-then-update
-// records per the fold contract (body carried wholesale, pre-merged here).
+// Mutable per-actor card — the durable-identity write target (store.ts `profiles`).
 
 use anyhow::Result;
 use hive_shared::{is_ai, ActorKind, Profile, ProfileBody, ProfilePatch, ProfileSource};
-use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
+use sqlx::Row;
 
-use super::{now_iso, Draft, Store};
+use super::{now_iso, Store};
 
 impl Store {
     pub async fn profile_get(&self, actor: &str) -> Result<Option<Profile>> {
-        let actor = actor.to_string();
-        self.run(move |core| profile_get_conn(core.conn(), &actor))
-            .await
+        let row = crate::pgq::query("SELECT * FROM profile WHERE actor = ?")
+            .bind(actor)
+            .fetch_optional(self.db())
+            .await?;
+        row.as_ref().map(row_to_profile).transpose()
     }
 
     /// Deep-merge `sections` into body.sections (per-key replace), stamp
@@ -24,58 +24,48 @@ impl Store {
         patch: ProfilePatch,
         by: &str,
     ) -> Result<Profile> {
-        let actor_s = actor.to_string();
-        let by_s = by.to_string();
-        let next = self
-            .run(move |core| {
-                let cur = profile_get_conn(core.conn(), &actor_s)?;
-                let mut sections = cur
-                    .as_ref()
-                    .map(|p| p.body.sections.clone())
-                    .unwrap_or_default();
-                if let Some(new_sections) = patch.sections {
-                    sections.extend(new_sections);
-                }
-                let next = Profile {
-                    actor: actor_s.clone(),
-                    kind: patch.kind.or(cur.as_ref().map(|p| p.kind)).unwrap_or(
-                        if is_ai(&actor_s) {
-                            ActorKind::Ai
-                        } else {
-                            ActorKind::Human
-                        },
-                    ),
-                    display_name: patch
-                        .display_name
-                        .or(cur.as_ref().map(|p| p.display_name.clone()))
-                        .unwrap_or_default(),
-                    body: ProfileBody { sections },
-                    source: ProfileSource::Manual,
-                    derived_at: cur.as_ref().and_then(|p| p.derived_at.clone()),
-                    updated_at: now_iso(),
-                };
-                let fields = json!({
-                    "kind": next.kind.as_str(),
-                    "display_name": next.display_name,
-                    "body": serde_json::to_string(&next.body)?,
-                    "source": next.source.as_str(),
-                    "derived_at": next.derived_at,
-                    "updated_at": next.updated_at,
-                });
-                let record_kind = if cur.is_some() {
-                    crate::oplog::kind::ENTITY_UPDATE
+        let cur = self.profile_get(actor).await?;
+        let mut sections = cur
+            .as_ref()
+            .map(|p| p.body.sections.clone())
+            .unwrap_or_default();
+        if let Some(new_sections) = patch.sections {
+            sections.extend(new_sections);
+        }
+        let next = Profile {
+            actor: actor.to_string(),
+            kind: patch
+                .kind
+                .or(cur.as_ref().map(|p| p.kind))
+                .unwrap_or(if is_ai(actor) {
+                    ActorKind::Ai
                 } else {
-                    crate::oplog::kind::ENTITY_CREATE
-                };
-                core.commit(vec![Draft::new(
-                    record_kind,
-                    &by_s,
-                    &next.updated_at,
-                    json!({"kind": "profile", "id": next.actor, "fields": fields}),
-                )])?;
-                Ok(next)
-            })
-            .await?;
+                    ActorKind::Human
+                }),
+            display_name: patch
+                .display_name
+                .or(cur.as_ref().map(|p| p.display_name.clone()))
+                .unwrap_or_default(),
+            body: ProfileBody { sections },
+            source: ProfileSource::Manual,
+            derived_at: cur.as_ref().and_then(|p| p.derived_at.clone()),
+            updated_at: now_iso(),
+        };
+        crate::pgq::query(
+            "INSERT INTO profile (actor, kind, display_name, body, source, derived_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT (org_id, actor) DO UPDATE SET kind=excluded.kind, display_name=excluded.display_name, \
+               body=excluded.body, source=excluded.source, derived_at=excluded.derived_at, updated_at=excluded.updated_at",
+        )
+        .bind(&next.actor)
+        .bind(next.kind.as_str())
+        .bind(&next.display_name)
+        .bind(serde_json::to_string(&next.body)?)
+        .bind(next.source.as_str())
+        .bind(&next.derived_at)
+        .bind(&next.updated_at)
+        .execute(self.db())
+        .await?;
         self.emit(
             "profile.updated",
             by,
@@ -85,38 +75,46 @@ impl Store {
         Ok(next)
     }
 
+    /// [`Store::backfill_identity_cards`] over every org on the instance.
+    ///
+    /// The backfill reads `people`, which is row-secured, so it only ever sees
+    /// the acting org — and boot is not a request and inherits no scope. Called
+    /// bare from `main`, it therefore matched zero rows on every start and
+    /// reported a successful migration of nothing. Each org gets its own scope
+    /// here, the same way `artifacts_sweep_all` does.
+    pub async fn backfill_identity_cards_all(&self) -> Result<i64> {
+        let mut migrated = 0;
+        for org in self.orgs_all().await? {
+            migrated += crate::acting::scope(
+                crate::acting::ActingScope::new(org, "system".to_string(), true),
+                self.backfill_identity_cards(),
+            )
+            .await?;
+        }
+        Ok(migrated)
+    }
+
     /// One-time reconciliation (#31 → #37): fold legacy people.bio/role into the
     /// canonical profile card as sections.bio/sections.role. Idempotent — only
     /// fills a section that's missing/blank. Safe to run on every boot.
+    ///
+    /// Scoped to the acting org: drive it with `backfill_identity_cards_all`
+    /// unless you already hold a scope.
     pub async fn backfill_identity_cards(&self) -> Result<i64> {
-        #[derive(Clone)]
-        struct Row {
-            slug: String,
-            name: String,
-            kind: ActorKind,
-            bio: Option<String>,
-            role: Option<String>,
-        }
-        let rows: Vec<Row> = self
-            .run(|core| {
-                let mut stmt = core.conn().prepare(
-                    "SELECT slug, name, kind, bio, role FROM people WHERE bio IS NOT NULL OR role IS NOT NULL",
-                )?;
-                let rows = stmt.query_map([], |r| {
-                    Ok(Row {
-                        slug: r.get("slug")?,
-                        name: r.get("name")?,
-                        kind: ActorKind::from_str_lossy(r.get::<_, String>("kind")?.as_str()),
-                        bio: r.get("bio")?,
-                        role: r.get("role")?,
-                    })
-                })?;
-                Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-            })
-            .await?;
+        let rows = crate::pgq::query(
+            "SELECT slug, name, kind, bio, role FROM people WHERE bio IS NOT NULL OR role IS NOT NULL",
+        )
+        .fetch_all(self.db())
+        .await?;
         let mut migrated = 0;
         for r in rows {
-            let card = self.profile_get(&r.slug).await?;
+            let slug: String = r.try_get("slug")?;
+            let name: String = r.try_get("name")?;
+            let kind = ActorKind::from_str_lossy(r.try_get::<String, _>("kind")?.as_str());
+            let bio: Option<String> = r.try_get("bio")?;
+            let role: Option<String> = r.try_get("role")?;
+
+            let card = self.profile_get(&slug).await?;
             let mut sections = std::collections::BTreeMap::new();
             let card_has = |key: &str| {
                 card.as_ref()
@@ -129,12 +127,12 @@ impl Store {
                     })
                     .unwrap_or(false)
             };
-            if let Some(b) = r.bio.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+            if let Some(b) = bio.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
                 if !card_has("bio") {
                     sections.insert("bio".to_string(), b.to_string());
                 }
             }
-            if let Some(ro) = r.role.as_deref().map(str::trim).filter(|ro| !ro.is_empty()) {
+            if let Some(ro) = role.as_deref().map(str::trim).filter(|ro| !ro.is_empty()) {
                 if !card_has("role") {
                     sections.insert("role".to_string(), ro.to_string());
                 }
@@ -146,12 +144,12 @@ impl Store {
                 .as_ref()
                 .map(|c| c.display_name.clone())
                 .filter(|d| !d.is_empty())
-                .unwrap_or(r.name);
+                .unwrap_or(name);
             self.profile_update(
-                &r.slug,
+                &slug,
                 ProfilePatch {
                     display_name: Some(display_name),
-                    kind: Some(r.kind),
+                    kind: Some(kind),
                     sections: Some(sections),
                 },
                 "migration",
@@ -163,26 +161,16 @@ impl Store {
     }
 }
 
-pub(crate) fn profile_get_conn(conn: &Connection, actor: &str) -> Result<Option<Profile>> {
-    Ok(conn
-        .query_row(
-            "SELECT * FROM profile WHERE actor = ?1",
-            rusqlite::params![actor],
-            row_to_profile,
-        )
-        .optional()?)
-}
-
-fn row_to_profile(r: &rusqlite::Row) -> rusqlite::Result<Profile> {
-    let body: String = r.get("body")?;
+fn row_to_profile(r: &sqlx::postgres::PgRow) -> Result<Profile> {
+    let body: String = r.try_get("body")?;
     let parsed: ProfileBody = serde_json::from_str(&body).unwrap_or_default();
     Ok(Profile {
-        actor: r.get("actor")?,
-        kind: ActorKind::from_str_lossy(r.get::<_, String>("kind")?.as_str()),
-        display_name: r.get("display_name")?,
+        actor: r.try_get("actor")?,
+        kind: ActorKind::from_str_lossy(r.try_get::<String, _>("kind")?.as_str()),
+        display_name: r.try_get("display_name")?,
         body: parsed,
-        source: ProfileSource::from_str_lossy(r.get::<_, String>("source")?.as_str()),
-        derived_at: r.get("derived_at")?,
-        updated_at: r.get("updated_at")?,
+        source: ProfileSource::from_str_lossy(r.try_get::<String, _>("source")?.as_str()),
+        derived_at: r.try_get("derived_at")?,
+        updated_at: r.try_get("updated_at")?,
     })
 }
