@@ -1,9 +1,10 @@
 import { createResource, ErrorBoundary, For, onCleanup, onMount, Show, Suspense, type Component, type JSX } from "solid-js";
 import { Navigate, Route, Router, A, useLocation } from "@solidjs/router";
-import { api, getActor, getCurrentUser, setCurrentUser } from "./api.ts";
+import { api, clearReadCache, getActor, getCurrentUser, setCurrentUser } from "./api.ts";
 import { connectLive, liveRev } from "./live.ts";
 import { setPaletteOpen } from "./ui.ts";
 import { CommandPalette } from "./CommandPalette.tsx";
+import { OutboxPanel } from "./OutboxPanel.tsx";
 import { Journal } from "./Journal.tsx";
 import { Inbox } from "./Inbox.tsx";
 import { Dashboard } from "./Dashboard.tsx";
@@ -195,6 +196,7 @@ const Workspace = (props: {
         </main>
 
         <CommandPalette />
+        <OutboxPanel />
       </div>
     );
   };
@@ -237,6 +239,10 @@ export const App: Component = () => {
     try {
       await api.logout();
     } finally {
+      // The read cache is per-browser; don't leave this user's data for the
+      // next login. The outbox survives — its ops are identity-stamped and
+      // fail loudly rather than replay under a different user.
+      void clearReadCache();
       setCurrentUser(null);
       refetch();
     }

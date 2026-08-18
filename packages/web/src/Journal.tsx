@@ -36,7 +36,7 @@ import { Editor } from "@tiptap/core";
 import StarterKit from "@tiptap/starter-kit";
 import Link from "@tiptap/extension-link";
 import { Markdown as MarkdownExt } from "tiptap-markdown";
-import { api, getActor } from "./api.ts";
+import { api, getActor, isQueuedWrite } from "./api.ts";
 import { liveRev } from "./live.ts";
 import { composeReq, consumeComposeRequest } from "./ui.ts";
 import { ANCHOR_GLYPH, relTime } from "./lib.tsx";
@@ -661,7 +661,14 @@ export const Journal: Component = () => {
       });
     }
 
-    await api.append({ author: getActor(), body: md, anchors });
+    // A queued write (offline) counts as accepted: the outbox replays it on
+    // reconnect, and the sync pill tells the story. The feed below reloads
+    // from the read cache until then, so the entry appears after replay.
+    try {
+      await api.append({ author: getActor(), body: md, anchors });
+    } catch (e) {
+      if (!isQueuedWrite(e)) throw e;
+    }
 
     // Reset state.
     setMarkdownBody("");
