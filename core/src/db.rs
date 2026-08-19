@@ -207,13 +207,18 @@ const SCHEMA: &str = r#"
       author     TEXT NOT NULL,
       body       TEXT NOT NULL,
       tags       TEXT NOT NULL DEFAULT '[]',
-      mentions   TEXT NOT NULL DEFAULT '[]',
+      -- JSONB (reshaped from TEXT by migration 0003): the RLS read predicate
+      -- and the store's mention probes use @> containment against it, which
+      -- the GIN index below serves. The wire shape is unchanged — a string
+      -- array serializes identically either way.
+      mentions   JSONB NOT NULL DEFAULT '[]',
       -- Namespace owner: the human user this entry belongs to. NULL = global /
       -- "continuous" history visible to everyone. Non-NULL = visible only to
       -- that user (+ admins). See the Visibility model in middleware.rs.
       user_scope TEXT,
       created_at TEXT NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS journal_mentions_gin ON journal USING gin (mentions jsonb_path_ops);
 
     -- A span of a journal entry that produced a structured entity.
     CREATE TABLE IF NOT EXISTS anchors (
@@ -1043,7 +1048,7 @@ fn journal_read_predicate() -> String {
                     AND s.viewer = {ACTING_USER} \
                     AND ((s.scope = 'entry' AND s.ref = journal.id) \
                       OR (s.scope = 'journal' AND s.ref = journal.author))) \
-            OR journal.mentions LIKE '%\"' || {ACTING_USER} || '\"%' \
+            OR journal.mentions @> jsonb_build_array({ACTING_USER}) \
          )))"
     )
 }
