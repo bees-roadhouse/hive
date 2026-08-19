@@ -108,29 +108,29 @@ impl Store {
         actor: &str,
         payload: serde_json::Value,
     ) -> Result<WireEvent> {
-        let ev = WireEvent {
-            id: new_id("wire"),
-            kind: kind.to_string(),
-            actor: actor.to_string(),
-            payload,
-            created_at: now_iso(),
-        };
-        crate::pgq::query(
-            "INSERT INTO wire (id, kind, actor, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(&ev.id)
-        .bind(&ev.kind)
-        .bind(&ev.actor)
-        .bind(ev.payload.to_string())
-        .bind(&ev.created_at)
-        .execute(&self.db)
-        .await?;
-        // A lagging/absent subscriber must never fail the mutation path.
+        let ev = emit_persist(&self.db, kind, actor, payload).await?;
+        self.publish(ev.clone());
+        Ok(ev)
+    }
+
+    /// Fan a persisted event out to SSE subscribers. Kept apart from
+    /// [`emit_persist`] because a transaction's events must not reach the bus
+    /// until AFTER commit — a listener must never observe an event whose row
+    /// could roll back. A lagging/absent subscriber must never fail the
+    /// mutation path.
+    pub(crate) fn publish(&self, ev: WireEvent) {
         let _ = self.bus.send(ScopedEvent {
             org: crate::acting::current().map(|s| s.org),
-            event: ev.clone(),
+            event: ev,
         });
-        Ok(ev)
+    }
+
+    /// Publish a transaction's events in persist order. Call only once the
+    /// commit is durable.
+    pub(crate) fn publish_all(&self, events: Vec<WireEvent>) {
+        for ev in events {
+            self.publish(ev);
+        }
     }
 
     /// The wire log, newest first.
@@ -143,6 +143,38 @@ impl Store {
         .await?;
         Ok(rows.into_iter().map(WireRow::into_event).collect())
     }
+}
+
+/// The persist half of `emit`, split from the bus fan-out so a transaction can
+/// hold the wire row until commit. Callers on a transaction collect the
+/// returned events and `publish` them themselves once the commit lands.
+pub(crate) async fn emit_persist<'e, E>(
+    exec: E,
+    kind: &str,
+    actor: &str,
+    payload: serde_json::Value,
+) -> Result<WireEvent>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    let ev = WireEvent {
+        id: new_id("wire"),
+        kind: kind.to_string(),
+        actor: actor.to_string(),
+        payload,
+        created_at: now_iso(),
+    };
+    crate::pgq::query(
+        "INSERT INTO wire (id, kind, actor, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&ev.id)
+    .bind(&ev.kind)
+    .bind(&ev.actor)
+    .bind(ev.payload.to_string())
+    .bind(&ev.created_at)
+    .execute(exec)
+    .await?;
+    Ok(ev)
 }
 
 #[derive(sqlx::FromRow)]

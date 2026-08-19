@@ -1,11 +1,14 @@
 // Decisions list/get/update (store.ts `decisions`). Owned by core-stores.
 
 use anyhow::Result;
-use hive_shared::{Decision, DecisionPatch, DecisionStatus, EntityKind};
+use hive_shared::{Decision, DecisionPatch, DecisionStatus, EntityKind, WireEvent};
 use serde_json::json;
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 
-use super::{json_vec, new_id, now_iso, to_json, Store};
+use super::links::links_create_conn;
+use super::projects::{projects_ensure_conn, projects_get_conn};
+use super::search::index_entity_conn;
+use super::{emit_persist, json_vec, new_id, now_iso, to_json, Store};
 
 /// Inputs for the internal creation path (store.ts `decisions.create` input shape).
 #[derive(Debug, Clone)]
@@ -39,90 +42,15 @@ impl Store {
     }
 
     pub async fn decisions_get(&self, decision_id: &str) -> Result<Option<Decision>> {
-        let row = crate::pgq::query("SELECT * FROM decisions WHERE id = ?")
-            .bind(decision_id)
-            .fetch_optional(self.db())
-            .await?;
-        row.as_ref().map(row_to_decision).transpose()
+        let mut conn = self.db().acquire().await?;
+        decisions_get_conn(&mut conn, decision_id).await
     }
 
     pub async fn decisions_create(&self, input: DecisionCreate, actor: &str) -> Result<Decision> {
-        if let Some(project) = &input.project {
-            if self.projects_get(project).await?.is_none() {
-                self.projects_ensure(project).await?;
-            }
-        }
-        let ts = now_iso();
-        let d = Decision {
-            id: new_id("dec"),
-            title: input.title,
-            context: input.context,
-            decision: input.decision,
-            consequences: input.consequences,
-            status: input.status,
-            tags: input.tags,
-            assignees: input.assignees,
-            project: input.project,
-            supersedes: input.supersedes,
-            origin_entry_id: input.origin_entry_id,
-            anchor_text: input.anchor_text,
-            created_at: ts.clone(),
-            updated_at: ts,
-        };
-        crate::pgq::query(
-            "INSERT INTO decisions (id, title, context, decision, consequences, status, tags, assignees, \
-             project, supersedes, origin_entry_id, anchor_text, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&d.id)
-        .bind(&d.title)
-        .bind(&d.context)
-        .bind(&d.decision)
-        .bind(&d.consequences)
-        .bind(d.status.as_str())
-        .bind(to_json(&d.tags))
-        .bind(to_json(&d.assignees))
-        .bind(&d.project)
-        .bind(&d.supersedes)
-        .bind(&d.origin_entry_id)
-        .bind(&d.anchor_text)
-        .bind(&d.created_at)
-        .bind(&d.updated_at)
-        .execute(self.db())
-        .await?;
-        self.index_entity(
-            "decision",
-            &d.id,
-            &d.title,
-            &format!("{} {} {}", d.context, d.decision, d.consequences),
-            &d.tags,
-        )
-        .await?;
-        if let Some(supersedes) = &d.supersedes {
-            if let Some(prior) = self.decisions_get(supersedes).await? {
-                crate::pgq::query(
-                    "UPDATE decisions SET status='superseded', updated_at=? WHERE id=?",
-                )
-                .bind(now_iso())
-                .bind(&prior.id)
-                .execute(self.db())
-                .await?;
-                self.links_create(
-                    EntityKind::Decision.as_str(),
-                    &d.id,
-                    EntityKind::Decision.as_str(),
-                    &prior.id,
-                    "supersedes",
-                )
-                .await?;
-            }
-        }
-        self.emit(
-            "decision.created",
-            actor,
-            json!({"id": d.id, "title": d.title, "status": d.status.as_str()}),
-        )
-        .await?;
+        let mut conn = self.db().acquire().await?;
+        let mut outbox = Vec::new();
+        let d = decisions_create_conn(&mut conn, input, actor, &mut outbox).await?;
+        self.publish_all(outbox);
         Ok(d)
     }
 
@@ -176,6 +104,109 @@ impl Store {
         .await?;
         Ok(Some(next))
     }
+}
+
+pub(crate) async fn decisions_get_conn(
+    conn: &mut PgConnection,
+    decision_id: &str,
+) -> Result<Option<Decision>> {
+    let row = crate::pgq::query("SELECT * FROM decisions WHERE id = ?")
+        .bind(decision_id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    row.as_ref().map(row_to_decision).transpose()
+}
+
+/// Connection-level variant so decision emergence can ride a caller's
+/// transaction (the journal write path). The `decision.created` event is
+/// persisted on the same connection and pushed to `outbox`; the caller
+/// publishes after its commit.
+pub(crate) async fn decisions_create_conn(
+    conn: &mut PgConnection,
+    input: DecisionCreate,
+    actor: &str,
+    outbox: &mut Vec<WireEvent>,
+) -> Result<Decision> {
+    if let Some(project) = &input.project {
+        if projects_get_conn(conn, project).await?.is_none() {
+            projects_ensure_conn(conn, project).await?;
+        }
+    }
+    let ts = now_iso();
+    let d = Decision {
+        id: new_id("dec"),
+        title: input.title,
+        context: input.context,
+        decision: input.decision,
+        consequences: input.consequences,
+        status: input.status,
+        tags: input.tags,
+        assignees: input.assignees,
+        project: input.project,
+        supersedes: input.supersedes,
+        origin_entry_id: input.origin_entry_id,
+        anchor_text: input.anchor_text,
+        created_at: ts.clone(),
+        updated_at: ts,
+    };
+    crate::pgq::query(
+        "INSERT INTO decisions (id, title, context, decision, consequences, status, tags, assignees, \
+         project, supersedes, origin_entry_id, anchor_text, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&d.id)
+    .bind(&d.title)
+    .bind(&d.context)
+    .bind(&d.decision)
+    .bind(&d.consequences)
+    .bind(d.status.as_str())
+    .bind(to_json(&d.tags))
+    .bind(to_json(&d.assignees))
+    .bind(&d.project)
+    .bind(&d.supersedes)
+    .bind(&d.origin_entry_id)
+    .bind(&d.anchor_text)
+    .bind(&d.created_at)
+    .bind(&d.updated_at)
+    .execute(&mut *conn)
+    .await?;
+    index_entity_conn(
+        conn,
+        "decision",
+        &d.id,
+        &d.title,
+        &format!("{} {} {}", d.context, d.decision, d.consequences),
+        &d.tags,
+    )
+    .await?;
+    if let Some(supersedes) = &d.supersedes {
+        if let Some(prior) = decisions_get_conn(conn, supersedes).await? {
+            crate::pgq::query("UPDATE decisions SET status='superseded', updated_at=? WHERE id=?")
+                .bind(now_iso())
+                .bind(&prior.id)
+                .execute(&mut *conn)
+                .await?;
+            links_create_conn(
+                conn,
+                EntityKind::Decision.as_str(),
+                &d.id,
+                EntityKind::Decision.as_str(),
+                &prior.id,
+                "supersedes",
+            )
+            .await?;
+        }
+    }
+    outbox.push(
+        emit_persist(
+            conn,
+            "decision.created",
+            actor,
+            json!({"id": d.id, "title": d.title, "status": d.status.as_str()}),
+        )
+        .await?,
+    );
+    Ok(d)
 }
 
 pub(crate) fn row_to_decision(r: &sqlx::postgres::PgRow) -> Result<Decision> {
