@@ -2,6 +2,8 @@
 // convention promises to tolerate: a fresh database (inline DDL builds the
 // final shape, the migration no-ops) and an old-shape database (2-col PK,
 // NOT NULL vec, no chunk_idx/owner/vec_v — the migration wipes + reshapes).
+// Below it, migration 0004 (cc_credentials.kdf_version) gets the same
+// both-bases treatment.
 
 use sqlx::PgPool;
 
@@ -146,4 +148,93 @@ async fn migration_reshapes_and_wipes_old_embeddings_table() {
     // DDL + a second boot racing are the everyday case).
     hive_api::db::migrate(&pool).await.expect("re-migrate");
     assert_final_embeddings_shape(&pool).await;
+}
+
+// ---- migration 0004: cc_credentials.kdf_version ----
+
+async fn assert_final_cc_credentials_shape(pool: &PgPool) {
+    let (data_type, is_nullable, default): (String, String, Option<String>) = sqlx::query_as(
+        "SELECT data_type, is_nullable, column_default FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = 'cc_credentials' \
+           AND column_name = 'kdf_version'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("kdf_version probe");
+    assert_eq!(data_type, "integer");
+    assert_eq!(is_nullable, "NO");
+    // DEFAULT 1 is the backfill: rows that predate the column were sealed
+    // under the SHA-256 derivation, so the default labels them correctly.
+    assert_eq!(default.as_deref(), Some("1"));
+}
+
+#[tokio::test]
+async fn fresh_database_lands_on_final_cc_credentials_shape() {
+    // test_pool runs the migrator + the inline DDL, exactly like a boot.
+    let test_db = hive_api::db::test_pool().await;
+    assert_final_cc_credentials_shape(&test_db.pool).await;
+}
+
+#[tokio::test]
+async fn migration_labels_legacy_cc_credentials_rows_v1() {
+    // An empty schema with migrate() NOT run: lay down the old shape by hand
+    // and migrate over it.
+    let test_db = hive_api::db::test_pool_unmigrated().await;
+    let pool = test_db.pool.clone();
+
+    // The pre-kdf_version shape, verbatim from the old inline DDL, plus one
+    // legacy row that must come out the other side labeled kdf_version 1.
+    sqlx::raw_sql(
+        "CREATE TABLE cc_credentials (
+           id           TEXT PRIMARY KEY,
+           owner        TEXT NOT NULL,
+           kind         TEXT NOT NULL,
+           runtime      TEXT NOT NULL DEFAULT 'claude_code',
+           provider     TEXT,
+           label        TEXT NOT NULL DEFAULT '',
+           ciphertext   TEXT NOT NULL,
+           nonce        TEXT NOT NULL,
+           tail         TEXT NOT NULL DEFAULT '',
+           created_at   TEXT NOT NULL,
+           last_used_at TEXT
+         )",
+    )
+    .execute(&pool)
+    .await
+    .expect("old-shape table");
+    sqlx::query(
+        "INSERT INTO cc_credentials (id, owner, kind, ciphertext, nonce, created_at) \
+         VALUES ('cred-legacy', 'nate', 'api_key', 'b3BhYXVl', 'bm9uY2U=', '2025-01-01T00:00:00.000Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy row");
+
+    hive_api::db::migrate(&pool).await.expect("migrate");
+
+    assert_final_cc_credentials_shape(&pool).await;
+
+    // The legacy row is labeled v1. The migrated table is FORCE-RLS and this
+    // pool is the owner role with no scope stamping, so read it through a
+    // transaction-local scope (org backfill targets DEFAULT_ORG_ID).
+    let mut tx = pool.begin().await.expect("tx");
+    sqlx::query(
+        "SELECT set_config('hive.acting_org', $1, true), \
+                set_config('hive.acting_admin', 'on', true)",
+    )
+    .bind(hive_api::db::DEFAULT_ORG_ID.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("local scope");
+    let version: i32 =
+        sqlx::query_scalar("SELECT kdf_version FROM cc_credentials WHERE id = 'cred-legacy'")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("legacy row readable in its org");
+    assert_eq!(version, 1, "legacy rows must be labeled v1 (SHA-256)");
+    tx.commit().await.expect("commit");
+
+    // And migrate() must be re-runnable on the now-final shape.
+    hive_api::db::migrate(&pool).await.expect("re-migrate");
+    assert_final_cc_credentials_shape(&pool).await;
 }

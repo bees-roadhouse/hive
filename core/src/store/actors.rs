@@ -794,7 +794,7 @@ mod tests {
     /// same counts without deleting anything.
     #[tokio::test]
     async fn remove_cascades_mail_with_zero_orphans() {
-        std::env::set_var("HIVE_CRED_KEY", "actors-cascade-test-key");
+        std::env::set_var("HIVE_CRED_KEY", "dev-credential-vault-key");
         let test_db = crate::db::test_pool().await;
         let store = Store::new(test_db.pool.clone());
         let now = "2026-07-09T00:00:00.000Z";
