@@ -1566,9 +1566,10 @@ mod tests {
 
     #[tokio::test]
     async fn account_lifecycle_create_toggle_resync_delete() {
-        // Same constant every test uses; set_var is process-global but
-        // idempotent here.
-        std::env::set_var("HIVE_CRED_KEY", "mail-store-test-key");
+        // Same constant every vault-touching test in this binary uses (the
+        // documented suite key), so the process-global set_var is
+        // order-independent: a mid-test flip writes the same value.
+        std::env::set_var("HIVE_CRED_KEY", "dev-credential-vault-key");
         let test_db = db::test_pool().await;
         let store = Store::new(test_db.pool.clone());
 
@@ -2049,7 +2050,8 @@ mod tests {
 
     #[tokio::test]
     async fn backoff_disables_after_eight_failures() {
-        std::env::set_var("HIVE_CRED_KEY", "mail-store-test-key");
+        // Same shared HIVE_CRED_KEY constant as every vault-touching test.
+        std::env::set_var("HIVE_CRED_KEY", "dev-credential-vault-key");
         let test_db = db::test_pool().await;
         let store = Store::new(test_db.pool.clone());
         let view = store

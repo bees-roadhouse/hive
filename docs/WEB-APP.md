@@ -102,12 +102,24 @@ provider requires already being authenticated with the first.
 
 ### RLS
 
-One session variable, set per request after authentication:
+Three session GUCs carry the acting scope: `hive.acting_org`,
+`hive.acting_user`, `hive.acting_admin`. They are not `SET LOCAL` inside a
+request transaction — the connection pool stamps them session-wide
+(`set_config(..., false)`) at every checkout: `after_connect` for a freshly
+dialled connection and `before_acquire` for one coming off the idle queue.
+Both hooks run inside the acquiring task, so that task's scope lands on the
+connection before any statement does, and an `after_release` hook clears all
+three to empty/off as the connection goes back — a pooled connection can
+never carry one request's org into another's:
 
 ```sql
-SET LOCAL hive.acting_org = '<org_id>';
-SET LOCAL hive.acting_user = '<user_id>';
+SELECT set_config('hive.acting_org',  '<org_id>',  false),
+       set_config('hive.acting_user', '<user_id>', false),
+       set_config('hive.acting_admin', 'off',       false);
 ```
+
+No scope stamps empty strings, which make the policy predicate NULL: reads
+return nothing and writes trip `org_id NOT NULL`. Deny, not bypass.
 
 Policy shape on every content table:
 
@@ -129,9 +141,12 @@ Three things that are easy to get wrong and expensive to discover:
 3. **The API connects as a role that is not superuser and does not own the
    tables.** `BYPASSRLS` and superuser both defeat the entire mechanism.
 
-Membership is checked once at session start to decide whether `acting_org` may
-be set; RLS then enforces it on every statement without the application
-re-deriving anything.
+Membership decides the scope before any of this runs: resolving the
+credential reads `memberships.role` in the org the credential pins, the
+resulting `AuthCtx` yields exactly one acting org, and `acting::scope` wraps
+the request future with no setter, so nothing switches orgs mid-request. RLS
+then enforces it on every statement without the application re-deriving
+anything.
 
 ## Encryption
 

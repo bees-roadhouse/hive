@@ -37,6 +37,10 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
 ];
 
 pub const SERVER_NAME: &str = "hive";
+/// Wire-contract constant, NOT the app version: the Node server hardcoded
+/// `version: "0.1.0"` in buildMcpServer even after packages/api had moved to
+/// 0.1.3 (removed in 5b93751), so clients have only ever seen "0.1.0". Keep
+/// it unless the wire contract itself is deliberately changed.
 pub const SERVER_VERSION: &str = "0.1.0";
 
 /// The McpServer `instructions` string (mcp.ts buildMcpServer).

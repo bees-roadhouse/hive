@@ -642,6 +642,10 @@ const SCHEMA: &str = r#"
     -- Per-user Claude Code credentials, encrypted at rest (AES-256-GCM via
     -- HIVE_CRED_KEY). Reversible (unlike PAT/password hashes): the runner must
     -- hand the real token to Claude Code. Plaintext never leaves the server.
+    -- kdf_version marks the key derivation per row (1 = bare SHA-256, the
+    -- pre-versioning derivation the DEFAULT labels legacy rows with; 2 =
+    -- scrypt, bound explicitly by every write). Migration 0004 adds the
+    -- column to old-shape tables.
     CREATE TABLE IF NOT EXISTS cc_credentials (
       id           TEXT PRIMARY KEY,
       owner        TEXT NOT NULL,
@@ -652,6 +656,7 @@ const SCHEMA: &str = r#"
       ciphertext   TEXT NOT NULL,
       nonce        TEXT NOT NULL,
       tail         TEXT NOT NULL DEFAULT '',
+      kdf_version  INTEGER NOT NULL DEFAULT 1,
       created_at   TEXT NOT NULL,
       last_used_at TEXT
     );
