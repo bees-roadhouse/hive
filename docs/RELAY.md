@@ -288,3 +288,7 @@ model arrived at here.
 5. **The audit tap should not ship enabled.** It exists to prove this note's
    central claim. An operator who turns it on is recording users' ciphertext,
    which is rude even though it is unreadable.
+
+The network AROUND this relay ... discovery, multi-relay failover, enrollment
+(item 4 made actionable), and how a household chooses its own root ... is
+`docs/RELAY-NETWORK.md`.

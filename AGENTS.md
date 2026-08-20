@@ -63,7 +63,8 @@ lag the current architecture (see Known Documentation Drift).
   ClientHello (in the clear before the handshake) and splices raw sockets
   without decrypting; the agent dials OUTBOUND from the house and terminates
   TLS in front of `hive-api`. Two binaries, `hive-relay` and
-  `hive-relay-agent`. Design note: docs/RELAY.md.
+  `hive-relay-agent`. Design note: docs/RELAY.md; the network around it
+  (discovery, failover, enrollment): docs/RELAY-NETWORK.md.
 - `shared/`: Rust shared domain types.
 - `embed/`: embedding seam, ONNX/BGE implementation, and hash fallback.
 - `jmap-sync/`: JMAP mailbox sync library. No Hive types and no database
