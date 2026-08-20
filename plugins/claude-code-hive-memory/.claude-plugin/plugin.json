@@ -2,7 +2,7 @@
   "name": "hive-memory",
   "displayName": "Hive Memory",
   "version": "0.7.0",
-  "description": "Boots Claude Code Hive-aware, against the hive store on this machine: injects a recall brief (profile, open tasks, inbox, relevant journal) at session start, syncs the identity's skills/agents/commands into .claude, and exposes Hive's tools over MCP through the hive-bridge binary.",
+  "description": "NOT WORKING — do not install. It was built for the removed hive-bridge stdio transport against a local hive data directory; there is no bridge crate and no local store, so .mcp.json fails to spawn and hooks-handlers/*.mjs soft-fail. Kept as the porting target for an HTTP rewrite against POST /mcp. README has the path that works today.",
   "author": {
     "name": "Bee's Roadhouse",
     "url": "https://github.com/bees-roadhouse/hive"

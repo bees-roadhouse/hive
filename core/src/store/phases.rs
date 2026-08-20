@@ -33,11 +33,6 @@ impl Store {
             .await?;
         row.as_ref().map(row_to_phase).transpose()
     }
-
-    pub async fn phases_ensure(&self, project_id: &str, name: &str) -> Result<Phase> {
-        let mut conn = self.db().acquire().await?;
-        phases_ensure_conn(&mut conn, project_id, name).await
-    }
 }
 
 /// Connection-level variant so phase emergence can ride a caller's

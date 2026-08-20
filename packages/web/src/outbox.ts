@@ -42,7 +42,6 @@ export interface OutboxOp {
 }
 
 const [ops, setOps] = createSignal<OutboxOp[]>([]);
-export const outboxOps = ops;
 export const queuedOps = () => ops().filter((o) => o.state === "queued");
 export const attentionOps = () => ops().filter((o) => o.state !== "queued");
 

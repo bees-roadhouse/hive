@@ -26,11 +26,6 @@ impl Store {
         let mut conn = self.db().acquire().await?;
         topics_by_slug_conn(&mut conn, slug).await
     }
-
-    pub async fn topics_ensure(&self, name: &str) -> Result<Topic> {
-        let mut conn = self.db().acquire().await?;
-        topics_ensure_conn(&mut conn, name).await
-    }
 }
 
 pub(crate) async fn topics_by_slug_conn(

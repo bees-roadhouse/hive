@@ -19,9 +19,6 @@ data/*.db-wal
 data/artifacts/
 *.tsbuildinfo
 
-# Claude Desktop bundle build output (scripts/build-mcpb.sh)
-/dist/
-
 # agent worktrees (managed by the Agent tool)
 .claude/worktrees/
 
@@ -29,7 +26,3 @@ data/artifacts/
 # from an old Node layout, and a bare `node/` entry would silently hide a whole
 # crate if one is ever added back. `node_modules/` above covers the real case.
 hive.local.env
-
-# flatpak local build artifacts
-packaging/flatpak/build-dir/
-.flatpak-builder/
