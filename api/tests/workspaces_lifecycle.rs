@@ -12,6 +12,9 @@ async fn test_app() -> (Router, hive_api::store::Store, hive_api::db::TestDb) {
     // Hash embedder: deterministic + offline (set before any embed call; the
     // provider choice is latched once per process).
     std::env::set_var("HIVE_EMBED", "hash");
+    // Hosted workspaces are the retired agent surface, dark by default
+    // (docs/FLOWS.md D9) — this suite exercises the enabled shape.
+    std::env::set_var("HIVE_AGENTS_ENABLED", "1");
     // Isolated Postgres schema per test (uses DATABASE_URL / local dev default).
     let test_db = hive_api::db::test_pool().await;
     let store = hive_api::store::Store::new(test_db.pool.clone());

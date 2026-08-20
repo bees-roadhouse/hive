@@ -355,6 +355,10 @@ export interface AuthConfig {
   /** HIVE_MAIL_ENABLED: gates the Mail tab, the Settings mail-accounts
    *  section, and every /api/mail route (404 when off). */
   mailEnabled: boolean;
+  /** HIVE_AGENTS_ENABLED: the retired hosted-agent surface (Conversations,
+   *  runtime credentials). Off by default — agent runtimes are external MCP
+   *  clients or flows now (docs/FLOWS.md D9). */
+  agentsEnabled: boolean;
 }
 
 /** Management view of a connected mail account (Settings): sync state and
@@ -680,6 +684,67 @@ export interface WireEvent {
   kind: string;
   actor: string;
   payload: unknown;
+  created_at: string;
+}
+
+// ---- flows (pluggable workflows; registry + runs — docs/FLOWS.md) ----
+
+/** builtin = native store dispatch; wasm = sandboxed module (F3). */
+export type FlowKind = "builtin" | "wasm";
+
+export interface FlowOpDef {
+  name: string;
+  title: string;
+  description: string;
+  input_schema?: unknown;
+  /** Requires an admin credential to call. */
+  admin: boolean;
+}
+
+export interface FlowTrigger {
+  kind: string;
+  config: unknown;
+}
+
+export interface FlowManifest {
+  slug: string;
+  name: string;
+  description: string;
+  version: string;
+  abi: number;
+  operations: FlowOpDef[];
+  triggers: FlowTrigger[];
+  allowed_hosts: string[];
+}
+
+export interface Flow {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  version: string;
+  abi: number;
+  kind: FlowKind;
+  module_sha256: string | null;
+  manifest: FlowManifest;
+  enabled: boolean;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface FlowRun {
+  id: string;
+  flow_id: string;
+  op: string;
+  trigger: string;
+  status: string;
+  input: unknown;
+  output: unknown | null;
+  error: string | null;
+  started_at: string;
+  finished_at: string;
+  created_by: string;
   created_at: string;
 }
 

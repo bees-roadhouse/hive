@@ -21,6 +21,18 @@ use crate::store::cc_credentials::NewCcCredential;
 use crate::store::workspaces::{LinkedEntity, NewCcMessage, NewCcSession};
 use crate::store::{now_iso, Store};
 
+/// The hosted-agent surface is RETIRED (docs/FLOWS.md D9): agent runtimes are
+/// external MCP clients (Claude Code, Claude Desktop, Codex, ChatGPT desktop)
+/// or flows, so this router and the capture REST ship dark unless the
+/// operator flips them back on. Mirrors the mail gate: routes answer 404 (not
+/// 403) when disabled so the feature's existence isn't an oracle. Data stays
+/// intact — cc_sessions/cc_messages history remains readable over MCP.
+pub fn agents_enabled() -> bool {
+    std::env::var("HIVE_AGENTS_ENABLED")
+        .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 pub fn router() -> Router<Store> {
     Router::new()
         .route("/api/workspaces", get(list).post(create))

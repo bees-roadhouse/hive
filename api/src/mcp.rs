@@ -971,7 +971,45 @@ fn build_tools() -> Value {
             }
         }
     ));
+    // ---- flows (docs/FLOWS.md) ----
+    // The registry inspector. The registry-driven `flow_<slug>_<op>` tools are
+    // NOT in this static array — tools_list_full appends them per request from
+    // the acting org's registry.
+    tools.push(json!(
+        {
+            "name": "flows_list",
+            "title": "List installed flows",
+            "description": "The flow registry: every installed flow (builtin + wasm) with its declared operations, triggers, and enabled state. Each enabled flow's operations are also served directly as flow_<slug>_<op> tools (Rust-branch addition; not in the Node toolset).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+                "$schema": "http://json-schema.org/draft-07/schema#"
+            },
+            "execution": {"taskSupport": FORBIDDEN}
+        }
+    ));
     Value::Array(tools)
+}
+
+/// tools/list as served: the static parity array plus the registry-driven
+/// section — one tool per operation of every enabled flow in the acting org
+/// (docs/FLOWS.md D6). A registry failure degrades to the static array with a
+/// warning: a DB blip must not blind every MCP client to the parity toolset.
+pub async fn tools_list_full(store: &Store) -> Value {
+    let mut tools = tools_list().as_array().cloned().unwrap_or_default();
+    match flow_tools(store).await {
+        Ok(mut dynamic) => tools.append(&mut dynamic),
+        Err(e) => {
+            tracing::warn!(error = %e, "flow registry unavailable; serving static tools only")
+        }
+    }
+    Value::Array(tools)
+}
+
+async fn flow_tools(store: &Store) -> anyhow::Result<Vec<Value>> {
+    store.flows_ensure_builtins().await?;
+    store.flows_mcp_tools().await
 }
 
 // ---- tool results ----
@@ -2023,6 +2061,14 @@ async fn dispatch(
                 _ => Ok(ok_content(&json!({"error": "not found"}))),
             }
         }
+        // ---- flows (docs/FLOWS.md) ----
+        "flows_list" => {
+            let a = Args::new("flows_list", args);
+            a.finish()?;
+            store.flows_ensure_builtins().await?;
+            let flows = store.flows_list().await?;
+            Ok(ok_content(&json!({"count": flows.len(), "flows": flows})))
+        }
         // ---- conversation capture + reflection queue ----
         "conversation_log" => conversation_log(store, ctx, args).await,
         "conversation_list_pending" => {
@@ -2063,9 +2109,17 @@ async fn dispatch(
                 None => Ok(ok_content(&json!({"error": "not found"}))),
             }
         }
-        _ => Ok(tool_error(&format!(
-            "MCP error -32602: Tool {name} not found"
-        ))),
+        // Registry-driven tools route on the `flow_` prefix, AFTER the static
+        // arms — order is load-bearing: `flows_list` itself parses as slug
+        // `s` + op `list`, so the prefix route must never preempt a static
+        // tool. Slugs allow no underscores, so the first `_` after the prefix
+        // ends the slug (docs/FLOWS.md D6).
+        _ => match parse_flow_tool(name) {
+            Some((slug, op)) => flow_call(store, ctx, name, slug, op, args).await,
+            None => Ok(tool_error(&format!(
+                "MCP error -32602: Tool {name} not found"
+            ))),
+        },
     }
 }
 
@@ -2135,6 +2189,174 @@ async fn conversation_log(store: &Store, ctx: &AuthCtx, args: &Map<String, Value
             .await?
     };
     Ok(ok_content(&json!({"id": id, "appended": appended})))
+}
+
+// ---- flow dispatch (docs/FLOWS.md D4/D6) ----
+
+/// `flow_<slug>_<op>` → (slug, op). Slugs contain no underscores, ops no
+/// hyphens (validated at registration), so the split is unambiguous.
+fn parse_flow_tool(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix("flow_")?;
+    let (slug, op) = rest.split_once('_')?;
+    if slug.is_empty() || op.is_empty() {
+        return None;
+    }
+    Some((slug, op))
+}
+
+fn flow_tool_not_found(name: &str) -> Value {
+    // Exactly the unknown-tool shape: a disabled or unregistered flow's tools
+    // are absent from tools/list, so this is the same "no such tool" case.
+    tool_error(&format!("MCP error -32602: Tool {name} not found"))
+}
+
+/// Dispatch one registry tool call: resolve the flow and its declared op,
+/// apply the op's admin gate, execute (builtin ops run native store code;
+/// wasm waits for the F3 `flow-exec` host), and record the run.
+async fn flow_call(
+    store: &Store,
+    ctx: &AuthCtx,
+    tool_name: &str,
+    slug: &str,
+    op_name: &str,
+    args: &Map<String, Value>,
+) -> ToolResult {
+    store.flows_ensure_builtins().await?;
+    let Some(flow) = store.flows_get(slug).await? else {
+        return Ok(flow_tool_not_found(tool_name));
+    };
+    if !flow.enabled {
+        return Ok(flow_tool_not_found(tool_name));
+    }
+    let Some(op) = flow.manifest.operations.iter().find(|o| o.name == op_name) else {
+        return Ok(flow_tool_not_found(tool_name));
+    };
+    if op.admin && !ctx.is_admin() {
+        return Ok(forbidden());
+    }
+    match flow.kind {
+        hive_shared::FlowKind::Wasm => {
+            // Registered but not executable in this build. A clean, actionable
+            // refusal rather than a stub result; no run is recorded, because
+            // nothing ran. The `flow-exec` cargo feature is where the wasmtime
+            // host mounts (docs/FLOWS.md F3).
+            Ok(tool_error(&format!(
+                "flow '{slug}' is registered but wasm execution is not built into this binary — \
+                 the flow-exec feature (docs/FLOWS.md F3) adds the wasmtime host. Builtin flow \
+                 ops keep working."
+            )))
+        }
+        hive_shared::FlowKind::Builtin => {
+            if slug != "wire" {
+                // A builtin row this build has no native dispatch for — a
+                // registry/build version skew, said plainly.
+                return Ok(tool_error(&format!(
+                    "builtin flow '{slug}' has no native dispatch in this build"
+                )));
+            }
+            wire_flow_op(store, ctx, &flow, op_name, args).await
+        }
+    }
+}
+
+/// The builtin `wire` flow's ops, mapped to the store functions that already
+/// exist (docs/FLOWS.md D4). Every executed op records a `flow_runs` row;
+/// argument-validation refusals record nothing, because nothing ran.
+async fn wire_flow_op(
+    store: &Store,
+    ctx: &AuthCtx,
+    flow: &hive_shared::Flow,
+    op_name: &str,
+    args: &Map<String, Value>,
+) -> ToolResult {
+    let actor = ctx.actor();
+    let started_at = crate::store::now_iso();
+    let input = Value::Object(args.clone());
+    let record = |status: &'static str, output: Option<Value>, error: Option<String>| {
+        let store = store.clone();
+        let flow_id = flow.id.clone();
+        let op = op_name.to_string();
+        let input = input.clone();
+        let started_at = started_at.clone();
+        let actor = actor.to_string();
+        async move {
+            store
+                .flow_run_record(
+                    &flow_id,
+                    &op,
+                    "mcp",
+                    status,
+                    &input,
+                    output.as_ref(),
+                    error.as_deref(),
+                    &started_at,
+                    &actor,
+                )
+                .await
+        }
+    };
+    match op_name {
+        "recent" => {
+            let mut a = Args::new("flow_wire_recent", args);
+            let limit = a.opt_int("limit", Some(1), Some(500));
+            a.finish()?;
+            let events = store.wire_log(limit.unwrap_or(50)).await?;
+            record("ok", Some(json!({"count": events.len()})), None).await?;
+            Ok(ok_content(&events))
+        }
+        "emit" => {
+            let mut a = Args::new("flow_wire_emit", args);
+            let kind = a.req_str("kind").map(String::from);
+            a.finish()?;
+            let kind = kind.unwrap();
+            if !valid_wire_kind(&kind) {
+                return Ok(tool_error(
+                    "kind must be 1-64 chars of [a-z0-9._-], starting alphanumeric",
+                ));
+            }
+            let payload = args.get("payload").cloned().unwrap_or(Value::Null);
+            // Namespaced: flow signal can never forge lifecycle kinds
+            // (journal.created, feed.item, …) that SSE consumers act on.
+            let ev = store
+                .emit(&format!("flow.wire.{kind}"), actor, payload)
+                .await?;
+            record("ok", Some(json!({"id": ev.id, "kind": ev.kind})), None).await?;
+            Ok(ok_content(&ev))
+        }
+        "poll" => {
+            let mut a = Args::new("flow_wire_poll", args);
+            let source_id = a.opt_str("source_id").map(String::from);
+            a.finish()?;
+            match store.poll_sources(source_id.as_deref()).await {
+                Ok(outcome) => {
+                    record(
+                        "ok",
+                        Some(json!({"polled": outcome.polled, "ingested": outcome.ingested})),
+                        None,
+                    )
+                    .await?;
+                    Ok(ok_content(&outcome))
+                }
+                Err(e) => {
+                    record("error", None, Some(e.to_string())).await?;
+                    Err(e.into())
+                }
+            }
+        }
+        // Declared in the manifest but not implemented here — a skew between
+        // the stored manifest and this build's dispatch, said plainly.
+        other => Ok(tool_error(&format!(
+            "wire flow op '{other}' has no native dispatch in this build"
+        ))),
+    }
+}
+
+fn valid_wire_kind(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
 }
 
 /// One shared identity gate for MCP and HTTP: crate::middleware::can_act_for_identity.

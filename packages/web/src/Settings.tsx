@@ -14,9 +14,14 @@ export const Settings: Component = () => {
   const [sources, { refetch }] = createResource(() => ({ _r: liveRev() }), () => api.sources(actor));
   const [status, { refetch: refetchStatus }] = createResource(() => ({ _r: liveRev() }), () => api.worker());
   const [outbox] = createResource(() => ({ _r: liveRev() }), () => api.outbox());
-  const [creds, { refetch: refetchCreds }] = createResource(() => ({ _r: liveRev() }), () => api.ccCredentials());
 
   const [authCfg] = createResource(() => api.authConfig());
+  // Runtime credentials ride the retired hosted-agent surface (docs/FLOWS.md
+  // D9): fetch only when the operator flipped HIVE_AGENTS_ENABLED back on.
+  const [creds, { refetch: refetchCreds }] = createResource(
+    () => ({ _r: liveRev(), on: authCfg()?.agentsEnabled === true }),
+    (k) => (k.on ? api.ccCredentials() : Promise.resolve([])),
+  );
   const [mailAccounts, { refetch: refetchMail }] = createResource(
     () => ({ _r: liveRev(), on: authCfg()?.mailEnabled === true }),
     (k) => (k.on ? api.mailAccountsManage() : Promise.resolve([])),
@@ -239,6 +244,9 @@ export const Settings: Component = () => {
         </For>
       </Show>
 
+      {/* Hosted-agent runtime sign-in — retired surface (docs/FLOWS.md D9),
+          rendered only when HIVE_AGENTS_ENABLED brings it back. */}
+      <Show when={authCfg()?.agentsEnabled}>
       <h3 class="sec">Agent runtime sign-in</h3>
       <p class="dim sm">Connect Codex or Claude Code once, then choose that runtime when starting a Conversation. Secrets are encrypted and never shown again.</p>
 
@@ -286,6 +294,7 @@ export const Settings: Component = () => {
           </div>
         )}
       </For>
+      </Show>
 
       <Show when={authCfg()?.mailEnabled}>
         <h3 class="sec">Mail accounts</h3>

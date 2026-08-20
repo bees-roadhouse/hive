@@ -49,6 +49,8 @@ import type {
   EntityTypeView,
   NewCustomEntity,
   NewEntityType,
+  Flow,
+  FlowRun,
 } from "@hive/shared";
 
 // Vite proxies /api → hive-api in dev (see vite.config.ts).
@@ -582,6 +584,13 @@ export const api = {
   // Hard delete: transcript + conversation links go too; journal mirrors stay.
   deleteWorkspace: (id: string) =>
     req<{ ok: boolean }>(`/workspaces/${id}`, { method: "DELETE" }),
+
+  // ---- flows (pluggable workflows — docs/FLOWS.md) ----
+  flows: () => req<Flow[]>("/flows"),
+  flow: (slug: string) => req<Flow>(`/flows/${slug}`),
+  setFlowEnabled: (slug: string, enabled: boolean) =>
+    req<Flow>(`/flows/${slug}`, { method: "PATCH", body: JSON.stringify({ enabled }) }),
+  flowRuns: (slug: string, limit = 50) => req<FlowRun[]>(`/flows/${slug}/runs?limit=${limit}`),
 
   // ---- user-defined custom entity types ----
   entityTypes: (includeArchived = false) =>

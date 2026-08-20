@@ -7,7 +7,9 @@ These instructions apply to the whole `bees-roadhouse/hive` repository.
 GitHub `main` is canonical (the old `development`/`release` pair collapsed into
 it on 2026-07-05). Hive is a self-hostable web application: an axum API over
 PostgreSQL with row-level security, serving a SolidJS SPA (design note in
-docs/WEB-APP.md; test tiers and conventions in docs/TESTING-STRATEGY.md).
+docs/WEB-APP.md; the flows program — pluggable workflows, dynamic MCP
+exposure, the hosted-agent retirement — in docs/FLOWS.md; test tiers and
+conventions in docs/TESTING-STRATEGY.md).
 docs/DIRECTION.md, docs/PLAN.md, and docs/PLAN-v2.1.md are history. They
 describe the local-first desktop architecture WEB-APP.md replaced and carry
 superseded banners saying so ... read them for why a decision was made, never
@@ -71,7 +73,10 @@ lag the current architecture (see Known Documentation Drift).
   dependency ... the consumer implements `CursorStore` and `MailSink`. The
   `jmap-client` dependency is contained in `client.rs`, so replacing it with
   reqwest+serde stays a one-module rewrite. Mail routes and the store's mail
-  archive live behind `HIVE_MAIL_ENABLED`.
+  archive live behind `HIVE_MAIL_ENABLED`. The hosted-agent/chat surface
+  (workspaces, conversations capture REST, runtime credentials) is retired
+  and lives behind `HIVE_AGENTS_ENABLED`, default off — agent runtimes are
+  external MCP clients or flows now (docs/FLOWS.md D9).
 - `packages/web`: the SolidJS SPA (vite, TipTap editor), served in production
   by `hive-api` from `HIVE_WEB_DIST`. `packages/shared` holds the TypeScript
   domain types it shares with the API's wire shapes.
