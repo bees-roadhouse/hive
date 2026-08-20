@@ -672,10 +672,12 @@ impl Store {
     /// author + mentions; task/decision/event → assignees.
     async fn hit_actors(&self, kind: &str, ref_id: &str) -> Result<Vec<String>> {
         if kind == "journal" {
-            let row = crate::pgq::query("SELECT author, mentions FROM journal WHERE id = ?")
-                .bind(ref_id)
-                .fetch_optional(self.db())
-                .await?;
+            let row = crate::pgq::query(
+                "SELECT author, mentions::text AS mentions FROM journal WHERE id = ?",
+            )
+            .bind(ref_id)
+            .fetch_optional(self.db())
+            .await?;
             let Some(r) = row else { return Ok(vec![]) };
             let mut actors = vec![r.try_get::<String, _>("author")?];
             actors.extend(super::json_vec(&r.try_get::<String, _>("mentions")?));

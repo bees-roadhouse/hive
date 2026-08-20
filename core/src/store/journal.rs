@@ -165,7 +165,7 @@ impl Store {
         // system/worker write → global/continuous history).
         crate::pgq::query(
             "INSERT INTO journal (id, author, body, tags, mentions, user_scope, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?::jsonb, ?, ?)",
         )
         .bind(&entry.id)
         .bind(&entry.author)
@@ -804,10 +804,10 @@ impl Store {
         // AI authors that @mentioned viewer in any entry.
         let mentioned: Vec<String> = crate::pgq::query_scalar(
             "SELECT DISTINCT j.author FROM journal j \
-             WHERE j.mentions LIKE ? \
+             WHERE j.mentions @> jsonb_build_array(?) \
                AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')",
         )
-        .bind(mention_like(viewer))
+        .bind(viewer)
         .fetch_all(self.db())
         .await?;
         push(mentioned, &mut authors);
@@ -846,11 +846,12 @@ impl Store {
                 .bind(viewer)
                 .fetch_all(self.db())
                 .await?;
-        let mentioned_ids: Vec<String> =
-            crate::pgq::query_scalar("SELECT id FROM journal WHERE mentions LIKE ?")
-                .bind(mention_like(viewer))
-                .fetch_all(self.db())
-                .await?;
+        let mentioned_ids: Vec<String> = crate::pgq::query_scalar(
+            "SELECT id FROM journal WHERE mentions @> jsonb_build_array(?)",
+        )
+        .bind(viewer)
+        .fetch_all(self.db())
+        .await?;
         let mut extra_ids: Vec<String> = Vec::new();
         for id in shared_entry_ids.into_iter().chain(mentioned_ids) {
             if !extra_ids.contains(&id) {
@@ -1056,11 +1057,12 @@ impl Store {
                 .fetch_all(self.db())
                 .await?;
         ids.extend(shared);
-        let mentioned: Vec<String> =
-            crate::pgq::query_scalar("SELECT id FROM journal WHERE mentions LIKE ?")
-                .bind(mention_like(viewer))
-                .fetch_all(self.db())
-                .await?;
+        let mentioned: Vec<String> = crate::pgq::query_scalar(
+            "SELECT id FROM journal WHERE mentions @> jsonb_build_array(?)",
+        )
+        .bind(viewer)
+        .fetch_all(self.db())
+        .await?;
         ids.extend(mentioned);
 
         // Base author streams are namespace-gated: global or own-namespace only.
@@ -1101,15 +1103,13 @@ fn row_to_entry(r: &sqlx::postgres::PgRow) -> Result<JournalEntry> {
         author: r.try_get("author")?,
         body: r.try_get("body")?,
         tags: json_vec(r.try_get::<String, _>("tags")?.as_str()),
-        mentions: json_vec(r.try_get::<String, _>("mentions")?.as_str()),
+        // jsonb column (migration 0003): decode directly, not via ::text.
+        mentions: r
+            .try_get::<sqlx::types::Json<Vec<String>>, _>("mentions")?
+            .0,
         user_scope: r.try_get("user_scope")?,
         created_at: r.try_get("created_at")?,
     })
-}
-
-/// `%"viewer"%` — Node's LIKE probe into the mentions JSON column.
-fn mention_like(viewer: &str) -> String {
-    format!("%\"{viewer}\"%")
 }
 
 /// Sentinel scope value meaning "the global / continuous (un-owned) stream"

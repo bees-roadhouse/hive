@@ -2,8 +2,15 @@
 // convention promises to tolerate: a fresh database (inline DDL builds the
 // final shape, the migration no-ops) and an old-shape database (2-col PK,
 // NOT NULL vec, no chunk_idx/owner/vec_v — the migration wipes + reshapes).
+//
+// Migration 0003 (journal.mentions TEXT -> JSONB + GIN) gets the same
+// both-bases treatment below, plus the behavioral assertion that the RLS
+// mention-widening branch (@> containment, no more LIKE) still surfaces an
+// entry to the user it @mentions.
 
+use hive_core::acting::{self, ActingScope};
 use sqlx::PgPool;
+use uuid::Uuid;
 
 async fn column_exists(pool: &PgPool, column: &str) -> bool {
     sqlx::query_scalar::<_, i32>(
@@ -146,4 +153,236 @@ async fn migration_reshapes_and_wipes_old_embeddings_table() {
     // DDL + a second boot racing are the everyday case).
     hive_api::db::migrate(&pool).await.expect("re-migrate");
     assert_final_embeddings_shape(&pool).await;
+}
+
+// ---------- 0003: journal.mentions TEXT -> JSONB + GIN (jsonb_path_ops) ----------
+
+/// The final shape both bases must converge on: jsonb column, GIN index.
+async fn assert_final_mentions_shape(pool: &PgPool) {
+    let data_type: String = sqlx::query_scalar(
+        "SELECT data_type FROM information_schema.columns \
+         WHERE table_schema = current_schema() AND table_name = 'journal' AND column_name = 'mentions'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("mentions type probe");
+    assert_eq!(data_type, "jsonb", "journal.mentions must be jsonb");
+    let gin: Option<String> = sqlx::query_scalar(
+        "SELECT indexname FROM pg_indexes \
+         WHERE schemaname = current_schema() AND tablename = 'journal' \
+           AND indexname = 'journal_mentions_gin'",
+    )
+    .fetch_optional(pool)
+    .await
+    .expect("index probe");
+    assert!(gin.is_some(), "journal_mentions_gin missing");
+}
+
+/// The journal policy installed on this database is the containment one, not
+/// the retired LIKE probe. (The deparser renders LIKE as `~~`.)
+async fn assert_containment_policy(pool: &PgPool) {
+    let qual: String = sqlx::query_scalar(
+        "SELECT qual FROM pg_policies \
+         WHERE schemaname = current_schema() AND tablename = 'journal' AND policyname = 'journal_org'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("policy probe");
+    assert!(
+        qual.contains("@>") && qual.contains("jsonb_build_array"),
+        "journal read policy must use containment, got: {qual}"
+    );
+    assert!(
+        !qual.contains("~~"),
+        "journal read policy must not LIKE-match mentions, got: {qual}"
+    );
+}
+
+/// Seed one entry in `org` that @mentions `mentioned` from inside someone
+/// else's namespace, written by raw SQL on purpose: the store's append path
+/// also auto-shares mentioned entries, and a share row would make the entry
+/// visible through the policy's shares branch — masking the mentions branch
+/// this test exists to prove.
+async fn seed_mentioning_entry(pool: &PgPool, org: Uuid) {
+    acting::scope(ActingScope::new(org, "bob", false), async {
+        hive_core::pgq::query(
+            "INSERT INTO journal (id, author, body, tags, mentions, user_scope, created_at) \
+             VALUES ('jrnl_mentions_probe', 'bob', 'ping @alice', '[]', \
+                     ?::jsonb, 'bob', '2026-01-01T00:00:00.000Z')",
+        )
+        .bind("[\"alice\"]")
+        .execute(pool)
+        .await
+        .expect("seed mentioning entry");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn fresh_database_lands_on_jsonb_mentions() {
+    // STRICT: no fallback scope, so the reads below exercise the real policy.
+    let test_db = hive_api::db::test_pool_strict().await;
+    let pool = test_db.pool.clone();
+    assert_final_mentions_shape(&pool).await;
+    assert_containment_policy(&pool).await;
+
+    let org = hive_core::store::Store::new(pool.clone())
+        .orgs_default()
+        .await
+        .expect("default org")
+        .id;
+    seed_mentioning_entry(&pool, org).await;
+
+    // The mention branch pierces the namespace: alice is not the author and
+    // the entry lives in bob's namespace, yet the @mention makes it visible
+    // to her. Carol gets nothing.
+    let read_as = |user: &str| {
+        let pool = pool.clone();
+        let user = user.to_string();
+        async move {
+            acting::scope(ActingScope::new(org, user, false), async {
+                sqlx::query_scalar::<_, String>("SELECT id FROM journal")
+                    .fetch_all(&pool)
+                    .await
+                    .expect("scoped read")
+            })
+            .await
+        }
+    };
+    assert!(
+        read_as("alice")
+            .await
+            .contains(&"jrnl_mentions_probe".to_string()),
+        "an entry @mentioning alice must be visible to her"
+    );
+    assert!(
+        !read_as("carol")
+            .await
+            .contains(&"jrnl_mentions_probe".to_string()),
+        "an unmentioned reader must not see another namespace's entry"
+    );
+    assert!(
+        read_as("bob")
+            .await
+            .contains(&"jrnl_mentions_probe".to_string()),
+        "the namespace owner still sees his own entry"
+    );
+}
+
+#[tokio::test]
+async fn migration_reshapes_journal_mentions_without_losing_rows() {
+    // An empty schema with migrate() NOT run: lay down the pre-0003 shape by
+    // hand (mentions TEXT), with rows the reshape must carry across.
+    let test_db = hive_api::db::test_pool_unmigrated().await;
+    let pool = test_db.pool.clone();
+    sqlx::raw_sql(
+        "CREATE TABLE journal (
+           id         TEXT PRIMARY KEY,
+           author     TEXT NOT NULL,
+           body       TEXT NOT NULL,
+           tags       TEXT NOT NULL DEFAULT '[]',
+           mentions   TEXT NOT NULL DEFAULT '[]',
+           user_scope TEXT,
+           created_at TEXT NOT NULL
+         )",
+    )
+    .execute(&pool)
+    .await
+    .expect("old-shape table");
+    // Both rows live in bob's namespace, so only the @mention — not the
+    // base namespace predicate — can surface the first one to alice.
+    for (id, mentions) in [
+        ("jrnl_legacy_mention", "[\"alice\"]"),
+        ("jrnl_legacy_plain", "[]"),
+    ] {
+        sqlx::query(
+            "INSERT INTO journal (id, author, body, mentions, user_scope, created_at) \
+                     VALUES ($1, 'nate', 'legacy prose', $2, 'bob', '2025-01-01T00:00:00.000Z')",
+        )
+        .bind(id)
+        .bind(mentions)
+        .execute(&pool)
+        .await
+        .expect("legacy row");
+    }
+
+    hive_api::db::migrate(&pool).await.expect("migrate");
+
+    assert_final_mentions_shape(&pool).await;
+    assert_containment_policy(&pool).await;
+    // Rows survived the TEXT -> JSONB cast with their contents intact.
+    let mention: sqlx::types::Json<Vec<String>> =
+        sqlx::query_scalar("SELECT mentions FROM journal WHERE id = 'jrnl_legacy_mention'")
+            .fetch_one(&pool)
+            .await
+            .expect("mention readback");
+    assert_eq!(mention.0, vec!["alice".to_string()]);
+    let plain: sqlx::types::Json<Vec<String>> =
+        sqlx::query_scalar("SELECT mentions FROM journal WHERE id = 'jrnl_legacy_plain'")
+            .fetch_one(&pool)
+            .await
+            .expect("plain readback");
+    assert!(plain.0.is_empty());
+
+    // The policy scopes reads on the reshaped table too. This pool connects
+    // as the DATABASE_URL role — a superuser, which bypasses RLS outright —
+    // so the assertions run under SET ROLE as the unprivileged serving role,
+    // with the acting-org GUCs stamped the way the app pool stamps them.
+    async fn read_as(conn: &mut sqlx::PgConnection, org: &str, user: &str) -> Vec<String> {
+        sqlx::query(
+            "SELECT set_config('hive.acting_org', $1, false), \
+                    set_config('hive.acting_user', $2, false), \
+                    set_config('hive.acting_admin', 'off', false)",
+        )
+        .bind(org)
+        .bind(user)
+        .execute(&mut *conn)
+        .await
+        .expect("stamp scope");
+        let mut ids = sqlx::query_scalar::<_, String>("SELECT id FROM journal")
+            .fetch_all(&mut *conn)
+            .await
+            .expect("scoped read");
+        ids.sort();
+        ids
+    }
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(&pool)
+        .await
+        .expect("current database");
+    let role = hive_api::db::app_role_for_db(&db);
+    let mut conn = pool.acquire().await.expect("dedicated connection");
+    sqlx::raw_sql(&format!("SET ROLE {role}"))
+        .execute(&mut *conn)
+        .await
+        .expect("set role");
+    // migrate() backfilled both legacy rows into the default org.
+    let org = hive_api::db::DEFAULT_ORG_ID.to_string();
+    assert_eq!(
+        read_as(&mut conn, &org, "alice").await,
+        vec!["jrnl_legacy_mention".to_string()],
+        "alice sees exactly the entry that @mentions her"
+    );
+    assert!(
+        read_as(&mut conn, &org, "carol").await.is_empty(),
+        "carol sees nothing in a namespace that is not hers"
+    );
+    assert_eq!(
+        read_as(&mut conn, &org, "bob").await,
+        vec![
+            "jrnl_legacy_mention".to_string(),
+            "jrnl_legacy_plain".to_string()
+        ],
+        "the namespace owner still sees both of his entries"
+    );
+    sqlx::raw_sql("RESET ROLE")
+        .execute(&mut *conn)
+        .await
+        .expect("reset role");
+    drop(conn);
+
+    // Re-runnable on the now-final shape (the everyday second boot).
+    hive_api::db::migrate(&pool).await.expect("re-migrate");
+    assert_final_mentions_shape(&pool).await;
+    assert_containment_policy(&pool).await;
 }

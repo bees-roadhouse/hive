@@ -49,7 +49,7 @@ impl Store {
         for e in payload.journal.as_deref().unwrap_or_default() {
             let r = crate::pgq::query(
                 "INSERT INTO journal (id, author, body, tags, mentions, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                 VALUES (?, ?, ?, ?, ?::jsonb, ?) ON CONFLICT DO NOTHING",
             )
             .bind(&e.id)
             .bind(&e.author)
