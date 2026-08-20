@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use hive_shared::{slugify, Topic};
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 
 use super::{new_id, now_iso, Store};
 
@@ -23,33 +23,48 @@ impl Store {
     }
 
     pub async fn topics_by_slug(&self, slug: &str) -> Result<Option<Topic>> {
-        let row = crate::pgq::query("SELECT * FROM topics WHERE slug = ?")
-            .bind(slug)
-            .fetch_optional(self.db())
-            .await?;
-        row.as_ref().map(row_to_topic).transpose()
+        let mut conn = self.db().acquire().await?;
+        topics_by_slug_conn(&mut conn, slug).await
     }
 
     pub async fn topics_ensure(&self, name: &str) -> Result<Topic> {
-        let slug = slugify(name);
-        if let Some(existing) = self.topics_by_slug(&slug).await? {
-            return Ok(existing);
-        }
-        let t = Topic {
-            id: new_id("top"),
-            name: name.to_string(),
-            slug,
-            created_at: now_iso(),
-        };
-        crate::pgq::query("INSERT INTO topics (id, name, slug, created_at) VALUES (?, ?, ?, ?)")
-            .bind(&t.id)
-            .bind(&t.name)
-            .bind(&t.slug)
-            .bind(&t.created_at)
-            .execute(self.db())
-            .await?;
-        Ok(t)
+        let mut conn = self.db().acquire().await?;
+        topics_ensure_conn(&mut conn, name).await
     }
+}
+
+pub(crate) async fn topics_by_slug_conn(
+    conn: &mut PgConnection,
+    slug: &str,
+) -> Result<Option<Topic>> {
+    let row = crate::pgq::query("SELECT * FROM topics WHERE slug = ?")
+        .bind(slug)
+        .fetch_optional(&mut *conn)
+        .await?;
+    row.as_ref().map(row_to_topic).transpose()
+}
+
+/// Connection-level variant so topic emergence can ride a caller's
+/// transaction (the journal write path).
+pub(crate) async fn topics_ensure_conn(conn: &mut PgConnection, name: &str) -> Result<Topic> {
+    let slug = slugify(name);
+    if let Some(existing) = topics_by_slug_conn(conn, &slug).await? {
+        return Ok(existing);
+    }
+    let t = Topic {
+        id: new_id("top"),
+        name: name.to_string(),
+        slug,
+        created_at: now_iso(),
+    };
+    crate::pgq::query("INSERT INTO topics (id, name, slug, created_at) VALUES (?, ?, ?, ?)")
+        .bind(&t.id)
+        .bind(&t.name)
+        .bind(&t.slug)
+        .bind(&t.created_at)
+        .execute(&mut *conn)
+        .await?;
+    Ok(t)
 }
 
 pub(crate) fn row_to_topic(r: &sqlx::postgres::PgRow) -> Result<Topic> {

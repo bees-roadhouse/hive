@@ -1,11 +1,12 @@
 // Events list/get (store.ts `events`). Owned by core-stores.
 
 use anyhow::Result;
-use hive_shared::EventItem;
+use hive_shared::{EventItem, WireEvent};
 use serde_json::json;
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 
-use super::{json_vec, new_id, now_iso, to_json, Store};
+use super::search::index_entity_conn;
+use super::{emit_persist, json_vec, new_id, now_iso, to_json, Store};
 
 /// Inputs for the internal creation path (store.ts `events.create` input shape).
 #[derive(Debug, Clone, Default)]
@@ -36,42 +37,60 @@ impl Store {
     }
 
     pub async fn events_create(&self, input: EventCreate, actor: &str) -> Result<EventItem> {
-        let e = EventItem {
-            id: new_id("evt"),
-            title: input.title,
-            body: input.body,
-            at: input.at,
-            tags: input.tags,
-            assignees: input.assignees,
-            origin_entry_id: input.origin_entry_id,
-            anchor_text: input.anchor_text,
-            created_at: now_iso(),
-        };
-        crate::pgq::query(
-            "INSERT INTO events (id, title, body, at, tags, assignees, origin_entry_id, anchor_text, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&e.id)
-        .bind(&e.title)
-        .bind(&e.body)
-        .bind(&e.at)
-        .bind(to_json(&e.tags))
-        .bind(to_json(&e.assignees))
-        .bind(&e.origin_entry_id)
-        .bind(&e.anchor_text)
-        .bind(&e.created_at)
-        .execute(self.db())
-        .await?;
-        self.index_entity("event", &e.id, &e.title, &e.body, &e.tags)
-            .await?;
-        self.emit(
+        let mut conn = self.db().acquire().await?;
+        let mut outbox = Vec::new();
+        let e = events_create_conn(&mut conn, input, actor, &mut outbox).await?;
+        self.publish_all(outbox);
+        Ok(e)
+    }
+}
+
+/// Connection-level variant so event emergence can ride a caller's transaction
+/// (the journal write path). The `event.created` event is persisted on the
+/// same connection and pushed to `outbox`; the caller publishes after commit.
+pub(crate) async fn events_create_conn(
+    conn: &mut PgConnection,
+    input: EventCreate,
+    actor: &str,
+    outbox: &mut Vec<WireEvent>,
+) -> Result<EventItem> {
+    let e = EventItem {
+        id: new_id("evt"),
+        title: input.title,
+        body: input.body,
+        at: input.at,
+        tags: input.tags,
+        assignees: input.assignees,
+        origin_entry_id: input.origin_entry_id,
+        anchor_text: input.anchor_text,
+        created_at: now_iso(),
+    };
+    crate::pgq::query(
+        "INSERT INTO events (id, title, body, at, tags, assignees, origin_entry_id, anchor_text, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&e.id)
+    .bind(&e.title)
+    .bind(&e.body)
+    .bind(&e.at)
+    .bind(to_json(&e.tags))
+    .bind(to_json(&e.assignees))
+    .bind(&e.origin_entry_id)
+    .bind(&e.anchor_text)
+    .bind(&e.created_at)
+    .execute(&mut *conn)
+    .await?;
+    index_entity_conn(conn, "event", &e.id, &e.title, &e.body, &e.tags).await?;
+    outbox.push(
+        emit_persist(
+            conn,
             "event.created",
             actor,
             json!({"id": e.id, "title": e.title}),
         )
-        .await?;
-        Ok(e)
-    }
+        .await?,
+    );
+    Ok(e)
 }
 
 pub(crate) fn row_to_event(r: &sqlx::postgres::PgRow) -> Result<EventItem> {

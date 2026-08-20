@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use hive_shared::Link;
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 
 use super::{new_id, now_iso, Store};
 
@@ -16,29 +16,16 @@ impl Store {
         target_id: &str,
         rel: &str,
     ) -> Result<Link> {
-        let l = Link {
-            id: new_id("link"),
-            source_kind: source_kind.to_string(),
-            source_id: source_id.to_string(),
-            target_kind: target_kind.to_string(),
-            target_id: target_id.to_string(),
-            rel: rel.to_string(),
-            created_at: now_iso(),
-        };
-        crate::pgq::query(
-            "INSERT INTO links (id, source_kind, source_id, target_kind, target_id, rel, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        let mut conn = self.db().acquire().await?;
+        links_create_conn(
+            &mut conn,
+            source_kind,
+            source_id,
+            target_kind,
+            target_id,
+            rel,
         )
-        .bind(&l.id)
-        .bind(&l.source_kind)
-        .bind(&l.source_id)
-        .bind(&l.target_kind)
-        .bind(&l.target_id)
-        .bind(&l.rel)
-        .bind(&l.created_at)
-        .execute(self.db())
-        .await?;
-        Ok(l)
+        .await
     }
 
     pub async fn links_for_entity(&self, ref_id: &str) -> Result<Vec<Link>> {
@@ -51,6 +38,41 @@ impl Store {
         .await?;
         rows.iter().map(row_to_link).collect()
     }
+}
+
+/// Connection-level variant so link creation can ride a caller's transaction
+/// (the journal write path). Never emits — Node's links.create doesn't either.
+pub(crate) async fn links_create_conn(
+    conn: &mut PgConnection,
+    source_kind: &str,
+    source_id: &str,
+    target_kind: &str,
+    target_id: &str,
+    rel: &str,
+) -> Result<Link> {
+    let l = Link {
+        id: new_id("link"),
+        source_kind: source_kind.to_string(),
+        source_id: source_id.to_string(),
+        target_kind: target_kind.to_string(),
+        target_id: target_id.to_string(),
+        rel: rel.to_string(),
+        created_at: now_iso(),
+    };
+    crate::pgq::query(
+        "INSERT INTO links (id, source_kind, source_id, target_kind, target_id, rel, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&l.id)
+    .bind(&l.source_kind)
+    .bind(&l.source_id)
+    .bind(&l.target_kind)
+    .bind(&l.target_id)
+    .bind(&l.rel)
+    .bind(&l.created_at)
+    .execute(&mut *conn)
+    .await?;
+    Ok(l)
 }
 
 /// Kinds pass through as strings: with user-defined entity types an
