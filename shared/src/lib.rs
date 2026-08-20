@@ -319,6 +319,11 @@ pub struct AuthConfig {
     /// section, and every /api/mail route (404 when off).
     #[serde(rename = "mailEnabled", default)]
     pub mail_enabled: bool,
+    /// HIVE_AGENTS_ENABLED: the retired hosted-agent surface (workspaces,
+    /// runtime credentials, capture REST). Off by default — agent runtimes
+    /// are external MCP clients or flows now (docs/FLOWS.md D9).
+    #[serde(rename = "agentsEnabled", default)]
+    pub agents_enabled: bool,
 }
 
 // ---- bulk historical import ----
@@ -1356,6 +1361,121 @@ pub struct WorkerStatus {
     /// the worker (per its last cycle) or in the api process itself — either
     /// way embeddings are degraded and the backfill is paused.
     pub latched: bool,
+}
+
+// ---- flows (pluggable workflows; registry + runs — docs/FLOWS.md) ----
+
+/// How a flow executes: `builtin` dispatches to native store functions, `wasm`
+/// to a sandboxed module (behind the `flow-exec` feature until F3 lands).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlowKind {
+    Builtin,
+    Wasm,
+}
+
+impl FlowKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FlowKind::Builtin => "builtin",
+            FlowKind::Wasm => "wasm",
+        }
+    }
+    pub fn from_str_lossy(s: &str) -> Self {
+        if s == "builtin" {
+            FlowKind::Builtin
+        } else {
+            FlowKind::Wasm
+        }
+    }
+}
+
+/// One declared operation. `name` allows no hyphens and the flow slug allows
+/// no underscores, so the MCP tool name `flow_<slug>_<op>` parses
+/// unambiguously (docs/FLOWS.md D6). `input_schema` is the CLIENT contract —
+/// served verbatim over tools/list; the guest validates its own input.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowOpDef {
+    pub name: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub input_schema: Option<serde_json::Value>,
+    /// Requires `ctx.is_admin()` — the same admin rule every surface uses.
+    #[serde(default)]
+    pub admin: bool,
+}
+
+/// Declared trigger (schedule | wire | journal_tag | manual). Declarative
+/// data until the F4 trigger runtime exists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowTrigger {
+    pub kind: String,
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+/// What `flow_manifest()` returns and the registry stores verbatim — the
+/// unit of authorship (docs/FLOWS.md D3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowManifest {
+    pub slug: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default = "default_flow_abi")]
+    pub abi: i64,
+    #[serde(default)]
+    pub operations: Vec<FlowOpDef>,
+    #[serde(default)]
+    pub triggers: Vec<FlowTrigger>,
+    /// Egress allowlist for the `http_get` host function (F3).
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
+}
+
+fn default_flow_abi() -> i64 {
+    1
+}
+
+/// A registered flow (one row per installed flow per org).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Flow {
+    pub id: String,
+    pub slug: String,
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub abi: i64,
+    pub kind: FlowKind,
+    pub module_sha256: Option<String>,
+    pub manifest: FlowManifest,
+    pub enabled: bool,
+    pub created_by: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One execution of one flow op, whatever triggered it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowRun {
+    pub id: String,
+    pub flow_id: String,
+    pub op: String,
+    pub trigger: String,
+    pub status: String,
+    pub input: serde_json::Value,
+    /// Compact result summary, never a payload dump.
+    pub output: Option<serde_json::Value>,
+    pub error: Option<String>,
+    pub started_at: String,
+    pub finished_at: String,
+    pub created_by: String,
+    pub created_at: String,
 }
 
 // ---- views (server resolves anchors → their entities for the client) ----

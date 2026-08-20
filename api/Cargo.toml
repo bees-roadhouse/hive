@@ -46,6 +46,12 @@ urlencoding = "2.1"
 # streaming response body without buffering the object.
 tokio-util = { version = "0.7", features = ["io"] }
 
+[features]
+# F3 mounts the wasmtime flow host here (docs/FLOWS.md D1/D2). Until it
+# lands, the feature is declared-but-empty: wasm flow ops answer with a clean
+# not-yet-executable error and builtin flows execute natively either way.
+flow-exec = []
+
 [dev-dependencies]
 tempfile = "3"
 # Tests wrap the storage driver's write trait to interleave an upload with a

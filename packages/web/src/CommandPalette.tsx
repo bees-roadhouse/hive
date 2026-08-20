@@ -47,6 +47,7 @@ const COMMANDS: Cmd[] = [
   { id: "search", label: "Search", hint: "keyword + semantic", icon: "search", section: "Go to", run: (nav) => nav("/search") },
   { id: "mail", label: "Mail", hint: "read-only archive", icon: "mail", section: "Go to", keywords: "email messages mailbox", run: (nav) => nav("/mail") },
   { id: "workspaces", label: "Conversations", hint: "agent sessions", icon: "chats", section: "Go to", keywords: "claude code codex opencode terminal workspaces sessions conversations", run: (nav) => nav("/workspaces") },
+  { id: "flows", label: "Flows", hint: "pluggable workflows", icon: "graph", section: "Go to", keywords: "flows wasm workflows registry automation mcp tools", run: (nav) => nav("/flows") },
   { id: "tasks", label: "Tasks", hint: "board", icon: "tasks", section: "Boards", run: (nav) => nav("/tasks") },
   { id: "decisions", label: "Decisions", hint: "log", icon: "decisions", section: "Boards", run: (nav) => nav("/decisions") },
   { id: "events", label: "Events", hint: "log", icon: "events", section: "Boards", run: (nav) => nav("/events") },

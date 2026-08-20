@@ -19,6 +19,7 @@ import { Login } from "./Login.tsx";
 import { OAuthConsent } from "./OAuthConsent.tsx";
 import { Icon } from "./icons.tsx";
 import { EntityBoard } from "./EntityBoard.tsx";
+import { Flows } from "./Flows.tsx";
 import { Decisions, Events, PeopleView, ProjectsView, SearchPane, Tasks, TopicsView, Wire } from "./Boards.tsx";
 
 // Every tab stays a registered route (deep links, refresh, back/forward all
@@ -39,6 +40,7 @@ const TABS = [
   { id: "graph" },
   { id: "search" },
   { id: "wire" },
+  { id: "flows" },
   { id: "admin" },
   { id: "account" },
   { id: "settings" },
@@ -57,11 +59,23 @@ const MailGate: Component = () => {
   );
 };
 
+// The hosted-agent surface is retired (docs/FLOWS.md D9): agent runtimes are
+// external MCP clients or flows now, so Conversations bounces home unless the
+// operator flipped HIVE_AGENTS_ENABLED back on. Same shape as MailGate.
+const WorkspacesGate: Component = () => {
+  const [cfg] = createResource(() => api.authConfig());
+  return (
+    <Show when={!(cfg() && !cfg()!.agentsEnabled)} fallback={<Navigate href="/journal" />}>
+      <Workspaces />
+    </Show>
+  );
+};
+
 const PAGES: Record<Tab, Component> = {
   journal: Journal,
   inbox: Inbox,
   dashboard: Dashboard,
-  workspaces: Workspaces,
+  workspaces: WorkspacesGate,
   mail: MailGate,
   tasks: Tasks,
   decisions: Decisions,
@@ -72,6 +86,7 @@ const PAGES: Record<Tab, Component> = {
   graph: Graph,
   search: SearchPane,
   wire: Wire,
+  flows: Flows,
   admin: Admin,
   account: Account,
   settings: Settings,
@@ -112,10 +127,15 @@ const Workspace = (props: {
     connectLive(); // open the SSE stream now that we're authenticated
 
     // The mail surface ships dark until HIVE_MAIL_ENABLED flips server-side;
-    // the sidebar slot appears only once the config confirms it.
+    // the sidebar slot appears only once the config confirms it. Conversations
+    // (the retired hosted-agent surface, docs/FLOWS.md D9) gates the same way.
     const [authCfg] = createResource(() => api.authConfig());
     const primaryTabs = () =>
-      PRIMARY.filter((t) => t.id !== "mail" || authCfg()?.mailEnabled === true);
+      PRIMARY.filter(
+        (t) =>
+          (t.id !== "mail" || authCfg()?.mailEnabled === true) &&
+          (t.id !== "workspaces" || authCfg()?.agentsEnabled === true),
+      );
 
     const [unread] = createResource(
       () => ({ actor: actor(), _r: liveRev() }),

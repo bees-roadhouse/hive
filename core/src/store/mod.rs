@@ -20,6 +20,7 @@ pub mod embed_backfill;
 pub mod entity_types;
 pub mod entity_validation;
 pub mod events;
+pub mod flows;
 pub mod identities;
 pub mod identity_artifacts;
 pub mod import;

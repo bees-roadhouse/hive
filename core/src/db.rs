@@ -876,6 +876,46 @@ const SCHEMA_SEARCH: &str = r#"
     CREATE INDEX IF NOT EXISTS mail_attachments_blob ON mail_attachments (blob_hash);
 "#;
 
+/// Flows: the pluggable-workflow registry + run log (docs/FLOWS.md D3).
+/// `manifest` is the flow's declared surface stored verbatim — the manifest
+/// is the unit of authorship, so operations are NOT normalized into rows
+/// (deliberate contrast with entity_types/entity_fields, whose fields are
+/// user-edited one at a time). Per-org slug uniqueness comes from the
+/// ORG_UNIQUE_REBUILDS pass, so there is no global UNIQUE here.
+const SCHEMA_FLOWS: &str = r#"
+    CREATE TABLE IF NOT EXISTS flows (
+      id            TEXT PRIMARY KEY,
+      slug          TEXT NOT NULL,
+      name          TEXT NOT NULL,
+      description   TEXT NOT NULL DEFAULT '',
+      version       TEXT NOT NULL DEFAULT '0.0.0',
+      abi           BIGINT NOT NULL DEFAULT 1,
+      kind          TEXT NOT NULL DEFAULT 'wasm',
+      module_sha256 TEXT,
+      manifest      TEXT NOT NULL DEFAULT '{}',
+      enabled       BOOLEAN NOT NULL DEFAULT TRUE,
+      created_by    TEXT NOT NULL,
+      created_at    TEXT NOT NULL,
+      updated_at    TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS flow_runs (
+      id          TEXT PRIMARY KEY,
+      flow_id     TEXT NOT NULL,
+      op          TEXT NOT NULL,
+      trigger     TEXT NOT NULL DEFAULT 'manual',
+      status      TEXT NOT NULL DEFAULT 'ok',
+      input       TEXT NOT NULL DEFAULT 'null',
+      output      TEXT,
+      error       TEXT,
+      started_at  TEXT NOT NULL,
+      finished_at TEXT NOT NULL,
+      created_by  TEXT NOT NULL,
+      created_at  TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS flow_runs_flow ON flow_runs (flow_id, created_at DESC);
+"#;
+
 /// The tenancy plane. Deliberately NOT row-level-secured: resolving a session
 /// cookie to a user, and a user to an org, has to happen before an acting org
 /// exists. These four tables are the only ones a request may touch unscoped,
@@ -946,6 +986,8 @@ const ORG_TABLES: &[&str] = &[
     "entity_types",
     "entity_fields",
     "entities",
+    "flows",
+    "flow_runs",
     "mail_accounts",
     "mail_mailboxes",
     "mail_messages",
@@ -991,6 +1033,9 @@ const ORG_UNIQUE_REBUILDS: &[(&str, &str, &str)] = &[
     ("projects", "projects_name_key", "name"),
     ("topics", "topics_slug_key", "slug"),
     ("entity_types", "entity_types_slug_key", "slug"),
+    // A new table (no pre-org shape): the DROPs are no-ops and this pass IS
+    // where its per-org unique gets created.
+    ("flows", "flows_slug_key", "slug"),
     (
         "identities",
         "identities_platform_platform_id_key",
@@ -1693,6 +1738,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
 
     sqlx::raw_sql(SCHEMA).execute(pool).await?;
     sqlx::raw_sql(SCHEMA_SEARCH).execute(pool).await?;
+    sqlx::raw_sql(SCHEMA_FLOWS).execute(pool).await?;
 
     // Idempotent column additions for DBs created before these columns existed.
     // Postgres has ADD COLUMN IF NOT EXISTS, so no existence probe is needed.

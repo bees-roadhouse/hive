@@ -17,6 +17,7 @@ pub mod auth;
 pub mod conversations;
 pub mod custom;
 pub mod entities;
+pub mod flows;
 pub mod identity_artifacts;
 pub mod journal;
 pub mod mail;
@@ -36,7 +37,7 @@ pub fn router(store: Store) -> Router {
         .merge(auth::router())
         .merge(people::router())
         .merge(journal::router())
-        .merge(conversations::router())
+        .merge(agents_gated(conversations::router()))
         .merge(mail::router())
         .merge(entities::router())
         .merge(custom::router())
@@ -45,7 +46,8 @@ pub fn router(store: Store) -> Router {
         .merge(admin::router())
         .merge(artifacts::router())
         .merge(identity_artifacts::router())
-        .merge(workspaces::router())
+        .merge(agents_gated(workspaces::router()))
+        .merge(flows::router())
         .merge(mcp::router())
         .merge(stream::router())
         .merge(spa::router())
@@ -88,4 +90,19 @@ async fn projects_list(
 /// Standard JSON 404 body (Node's `{error: "not found"}` shape).
 pub fn json_404() -> axum::response::Response {
     (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+}
+
+/// The retired hosted-agent surface (docs/FLOWS.md D9): every route in the
+/// wrapped router answers the standard 404 unless `HIVE_AGENTS_ENABLED` flips
+/// it back on. `route_layer` so unmatched paths keep their normal handling.
+fn agents_gated(r: Router<Store>) -> Router<Store> {
+    r.route_layer(axum::middleware::from_fn(
+        |req: axum::extract::Request, next: axum::middleware::Next| async move {
+            if workspaces::agents_enabled() {
+                next.run(req).await
+            } else {
+                json_404()
+            }
+        },
+    ))
 }

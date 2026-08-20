@@ -14,6 +14,9 @@ use tower::ServiceExt;
 async fn test_app() -> (Router, hive_api::store::Store, hive_api::db::TestDb) {
     // Hash embedder: deterministic + offline (latched once per process).
     std::env::set_var("HIVE_EMBED", "hash");
+    // The capture REST rides the retired hosted-agent surface, dark by
+    // default (docs/FLOWS.md D9) — these tests exercise the enabled shape.
+    std::env::set_var("HIVE_AGENTS_ENABLED", "1");
     // Isolated Postgres schema per test (uses DATABASE_URL / local dev default).
     let test_db = hive_api::db::test_pool().await;
     let store = hive_api::store::Store::new(test_db.pool.clone());

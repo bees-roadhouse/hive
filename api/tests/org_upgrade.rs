@@ -206,10 +206,11 @@ async fn the_tenancy_migration_is_idempotent() {
     .await
     .expect("policies");
     // 30 at the orgs workstream, +1 for `artifacts`, +2 for `blobs` and
-    // `runtime_oauth_states`. The number is not the point ... running the
-    // migration three times must not triple it, which is what a CREATE POLICY
-    // without a DROP-if-exists would do.
-    assert_eq!(policies, 33, "one policy per content table, not three");
+    // `runtime_oauth_states`, +2 for `flows` and `flow_runs` (docs/FLOWS.md).
+    // The number is not the point ... running the migration three times must
+    // not triple it, which is what a CREATE POLICY without a DROP-if-exists
+    // would do.
+    assert_eq!(policies, 35, "one policy per content table, not three");
 }
 
 /// Two databases on ONE Postgres cluster — a self-hoster with a staging copy,

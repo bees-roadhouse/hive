@@ -208,7 +208,8 @@ async fn handle_request(store: &Store, ctx: &AuthCtx, msg: &Value) -> Value {
     match method {
         "initialize" => initialize(&id, params),
         "ping" => rpc_result(&id, json!({})),
-        "tools/list" => rpc_result(&id, json!({"tools": mcp::tools_list().clone()})),
+        // Static parity array + the registry-driven flow tools (docs/FLOWS.md D6).
+        "tools/list" => rpc_result(&id, json!({"tools": mcp::tools_list_full(store).await})),
         "tools/call" => {
             let Some(p) = params.and_then(Value::as_object) else {
                 return rpc_error(&id, -32603, &v4_issue("object", &["params"], params));
@@ -526,6 +527,13 @@ mod tests {
                 "conversation_list_pending",
                 "conversation_get",
                 "conversation_mark_reflected",
+                "flows_list",
+                // The registry-driven section: the builtin wire flow's ops,
+                // in manifest order, self-seeded on the first tools/list
+                // (docs/FLOWS.md D4/D6).
+                "flow_wire_recent",
+                "flow_wire_emit",
+                "flow_wire_poll",
             ]
         );
         // Spot-check a schema verbatim against the captured Node output.
@@ -753,6 +761,201 @@ mod tests {
         )
         .await;
         assert_eq!(content_text(&res["result"]), json!({"marked": true}));
+    }
+
+    /// The registry-driven MCP section end to end (docs/FLOWS.md D4/D6):
+    /// builtin wire ops execute for real and record runs, admin gates come
+    /// from the manifest, wasm flows refuse cleanly until F3, and disabling
+    /// a flow withdraws its tools.
+    #[tokio::test]
+    async fn flow_tools_are_registry_driven() {
+        let (store, _test_db) = test_store().await;
+
+        // Static dispatch wins over the flow_ prefix route: "flows_list"
+        // parses as slug `s` + op `list`, so this call is the regression
+        // guard for the arm ordering in dispatch().
+        let res = handle_request(
+            &store,
+            &authed(),
+            &req(
+                "tools/call",
+                json!({"name": "flows_list", "arguments": {}}),
+                0,
+            ),
+        )
+        .await;
+        let registry = content_text(&res["result"]);
+        assert_eq!(registry["count"], 1, "{registry}");
+        assert_eq!(registry["flows"][0]["slug"], "wire");
+
+        // flow_wire_emit executes the builtin: a namespaced event lands, and
+        // the kind prefix means flow signal cannot forge lifecycle kinds.
+        let res = handle_request(
+            &store,
+            &ctx_for("pia"),
+            &req(
+                "tools/call",
+                json!({"name": "flow_wire_emit", "arguments": {"kind": "cve", "payload": {"id": "CVE-2026-0001"}}}),
+                1,
+            ),
+        )
+        .await;
+        let ev = content_text(&res["result"]);
+        assert_eq!(ev["kind"], "flow.wire.cve", "{res}");
+        assert_eq!(ev["actor"], "pia");
+
+        // The execution recorded a run.
+        let wire = store.flows_get("wire").await.unwrap().unwrap();
+        let runs = store.flow_runs_list(&wire.id, 10).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            (runs[0].op.as_str(), runs[0].status.as_str()),
+            ("emit", "ok")
+        );
+        assert_eq!(runs[0].trigger, "mcp");
+
+        // recent serves the log, including what was just emitted.
+        let res = handle_request(
+            &store,
+            &ctx_for("pia"),
+            &req(
+                "tools/call",
+                json!({"name": "flow_wire_recent", "arguments": {"limit": 5}}),
+                2,
+            ),
+        )
+        .await;
+        let events = content_text(&res["result"]);
+        assert!(
+            events
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["kind"] == "flow.wire.cve"),
+            "{events}"
+        );
+
+        // poll carries `admin: true` in the manifest — the same gate the REST
+        // poll route enforces…
+        let res = handle_request(
+            &store,
+            &ctx_for("pia"),
+            &req(
+                "tools/call",
+                json!({"name": "flow_wire_poll", "arguments": {}}),
+                3,
+            ),
+        )
+        .await;
+        assert_eq!(
+            content_text(&res["result"]),
+            json!({"error": "forbidden — admin only"})
+        );
+        // …and runs clean for an admin (zero sources configured — no network).
+        let res = handle_request(
+            &store,
+            &authed(),
+            &req(
+                "tools/call",
+                json!({"name": "flow_wire_poll", "arguments": {}}),
+                4,
+            ),
+        )
+        .await;
+        assert_eq!(
+            content_text(&res["result"]),
+            json!({"polled": 0, "ingested": 0})
+        );
+
+        // A registered wasm flow surfaces its op as a tool and refuses
+        // execution cleanly until the flow-exec host (F3) exists.
+        let manifest = hive_shared::FlowManifest {
+            slug: "scout".to_string(),
+            name: "Scout".to_string(),
+            description: "test wasm flow".to_string(),
+            version: "0.1.0".to_string(),
+            abi: 1,
+            operations: vec![hive_shared::FlowOpDef {
+                name: "run_once".to_string(),
+                title: String::new(),
+                description: String::new(),
+                input_schema: None,
+                admin: false,
+            }],
+            triggers: Vec::new(),
+            allowed_hosts: Vec::new(),
+        };
+        store
+            .flows_register(
+                manifest,
+                hive_shared::FlowKind::Wasm,
+                Some("ab".repeat(32).as_str()),
+                "nate",
+            )
+            .await
+            .unwrap();
+        let res = handle_request(&store, &authed(), &req("tools/list", json!({}), 5)).await;
+        let names: Vec<&str> = res["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"flow_scout_run_once"), "{names:?}");
+        let res = handle_request(
+            &store,
+            &authed(),
+            &req(
+                "tools/call",
+                json!({"name": "flow_scout_run_once", "arguments": {}}),
+                6,
+            ),
+        )
+        .await;
+        assert_eq!(res["result"]["isError"], true);
+        let text = res["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("flow-exec"), "{text}");
+        // A refusal is not an execution: no run recorded.
+        let scout = store.flows_get("scout").await.unwrap().unwrap();
+        assert!(store
+            .flow_runs_list(&scout.id, 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Disabling a flow withdraws its tools; calls answer like any unknown
+        // tool, and ensure_builtins does NOT re-enable it.
+        store
+            .flows_set_enabled("wire", false, "nate")
+            .await
+            .unwrap()
+            .unwrap();
+        let res = handle_request(&store, &authed(), &req("tools/list", json!({}), 7)).await;
+        let names: Vec<&str> = res["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with("flow_wire_")),
+            "{names:?}"
+        );
+        let res = handle_request(
+            &store,
+            &authed(),
+            &req(
+                "tools/call",
+                json!({"name": "flow_wire_recent", "arguments": {}}),
+                8,
+            ),
+        )
+        .await;
+        assert_eq!(res["result"]["isError"], true);
+        assert_eq!(
+            res["result"]["content"][0]["text"],
+            "MCP error -32602: Tool flow_wire_recent not found"
+        );
     }
 
     #[tokio::test]
