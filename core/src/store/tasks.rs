@@ -2,11 +2,13 @@
 // Owned by the core-stores workstream.
 
 use anyhow::Result;
-use hive_shared::{Priority, Task, TaskPatch, TaskStatus};
+use hive_shared::{Priority, Task, TaskPatch, TaskStatus, WireEvent};
 use serde_json::json;
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 
-use super::{json_vec, new_id, now_iso, to_json, Store};
+use super::projects::{projects_ensure_conn, projects_get_conn};
+use super::search::index_entity_conn;
+use super::{emit_persist, json_vec, new_id, now_iso, to_json, Store};
 
 /// Inputs for the internal creation path (store.ts `tasks.create` input shape).
 /// Tasks only ever emerge from journal anchors / bracket tokens.
@@ -99,53 +101,10 @@ impl Store {
     }
 
     pub async fn tasks_create(&self, input: TaskCreate, actor: &str) -> Result<Task> {
-        // Only ensure-by-name when the project value is not already a known project id.
-        if let Some(project) = &input.project {
-            if self.projects_get(project).await?.is_none() {
-                self.projects_ensure(project).await?;
-            }
-        }
-        let ts = now_iso();
-        let t = Task {
-            id: new_id("task"),
-            title: input.title,
-            body: input.body,
-            status: input.status,
-            priority: input.priority,
-            tags: input.tags,
-            assignees: input.assignees,
-            project: input.project,
-            phase: input.phase,
-            due: input.due,
-            origin_entry_id: input.origin_entry_id,
-            anchor_text: input.anchor_text,
-            created_at: ts.clone(),
-            updated_at: ts,
-        };
-        crate::pgq::query(
-            "INSERT INTO tasks (id, project, phase, due, title, body, status, priority, tags, assignees, origin_entry_id, anchor_text, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(&t.id)
-        .bind(&t.project)
-        .bind(&t.phase)
-        .bind(&t.due)
-        .bind(&t.title)
-        .bind(&t.body)
-        .bind(t.status.as_str())
-        .bind(t.priority.as_str())
-        .bind(to_json(&t.tags))
-        .bind(to_json(&t.assignees))
-        .bind(&t.origin_entry_id)
-        .bind(&t.anchor_text)
-        .bind(&t.created_at)
-        .bind(&t.updated_at)
-        .execute(self.db())
-        .await?;
-        self.index_entity("task", &t.id, &t.title, &t.body, &t.tags)
-            .await?;
-        self.emit("task.created", actor, json!({"id": t.id, "title": t.title}))
-            .await?;
+        let mut conn = self.db().acquire().await?;
+        let mut outbox = Vec::new();
+        let t = tasks_create_conn(&mut conn, input, actor, &mut outbox).await?;
+        self.publish_all(outbox);
         Ok(t)
     }
 
@@ -191,6 +150,71 @@ impl Store {
         .await?;
         Ok(Some(next))
     }
+}
+
+/// Connection-level variant so task emergence can ride a caller's transaction
+/// (the journal write path). The `task.created` event is persisted on the same
+/// connection and pushed to `outbox`; the caller publishes after its commit.
+pub(crate) async fn tasks_create_conn(
+    conn: &mut PgConnection,
+    input: TaskCreate,
+    actor: &str,
+    outbox: &mut Vec<WireEvent>,
+) -> Result<Task> {
+    // Only ensure-by-name when the project value is not already a known project id.
+    if let Some(project) = &input.project {
+        if projects_get_conn(conn, project).await?.is_none() {
+            projects_ensure_conn(conn, project).await?;
+        }
+    }
+    let ts = now_iso();
+    let t = Task {
+        id: new_id("task"),
+        title: input.title,
+        body: input.body,
+        status: input.status,
+        priority: input.priority,
+        tags: input.tags,
+        assignees: input.assignees,
+        project: input.project,
+        phase: input.phase,
+        due: input.due,
+        origin_entry_id: input.origin_entry_id,
+        anchor_text: input.anchor_text,
+        created_at: ts.clone(),
+        updated_at: ts,
+    };
+    crate::pgq::query(
+        "INSERT INTO tasks (id, project, phase, due, title, body, status, priority, tags, assignees, origin_entry_id, anchor_text, created_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&t.id)
+    .bind(&t.project)
+    .bind(&t.phase)
+    .bind(&t.due)
+    .bind(&t.title)
+    .bind(&t.body)
+    .bind(t.status.as_str())
+    .bind(t.priority.as_str())
+    .bind(to_json(&t.tags))
+    .bind(to_json(&t.assignees))
+    .bind(&t.origin_entry_id)
+    .bind(&t.anchor_text)
+    .bind(&t.created_at)
+    .bind(&t.updated_at)
+    .execute(&mut *conn)
+    .await?;
+    index_entity_conn(conn, "task", &t.id, &t.title, &t.body, &t.tags).await?;
+    outbox.push(
+        emit_persist(
+            conn,
+            "task.created",
+            actor,
+            json!({"id": t.id, "title": t.title}),
+        )
+        .await?,
+    );
+    Ok(t)
 }
 
 pub(crate) fn row_to_task(r: &sqlx::postgres::PgRow) -> Result<Task> {

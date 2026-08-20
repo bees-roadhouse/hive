@@ -1,11 +1,11 @@
 // Per-actor inbox (store.ts `inbox`).
 
 use anyhow::Result;
-use hive_shared::{InboxItem, InboxReason};
+use hive_shared::{InboxItem, InboxReason, WireEvent};
 use serde_json::json;
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 
-use super::{new_id, now_iso, snip140, Store};
+use super::{emit_persist, new_id, now_iso, snip140, Store};
 
 impl Store {
     #[allow(clippy::too_many_arguments)]
@@ -19,43 +19,22 @@ impl Store {
         entry_id: Option<&str>,
         snippet: &str,
     ) -> Result<Option<InboxItem>> {
-        if recipient == from {
-            return Ok(None); // don't notify yourself
-        }
-        let item = InboxItem {
-            id: new_id("inb"),
-            recipient: recipient.to_string(),
-            from: from.to_string(),
-            reason,
-            ref_kind: ref_kind.to_string(),
-            ref_id: ref_id.to_string(),
-            entry_id: entry_id.map(String::from),
-            snippet: snip140(snippet),
-            created_at: now_iso(),
-            read_at: None,
-        };
-        crate::pgq::query(
-            r#"INSERT INTO inbox (id, recipient, "from", reason, ref_kind, ref_id, entry_id, snippet, created_at, read_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"#,
-        )
-        .bind(&item.id)
-        .bind(&item.recipient)
-        .bind(&item.from)
-        .bind(item.reason.as_str())
-        .bind(&item.ref_kind)
-        .bind(&item.ref_id)
-        .bind(&item.entry_id)
-        .bind(&item.snippet)
-        .bind(&item.created_at)
-        .execute(self.db())
-        .await?;
-        self.emit(
-            "inbox.delivered",
+        let mut conn = self.db().acquire().await?;
+        let mut outbox = Vec::new();
+        let item = inbox_add_conn(
+            &mut conn,
+            recipient,
             from,
-            json!({"to": recipient, "reason": item.reason.as_str(), "ref_kind": item.ref_kind.as_str(), "ref_id": ref_id}),
+            reason,
+            ref_kind,
+            ref_id,
+            entry_id,
+            snippet,
+            &mut outbox,
         )
         .await?;
-        Ok(Some(item))
+        self.publish_all(outbox);
+        Ok(item)
     }
 
     pub async fn inbox_list(&self, recipient: &str, unread_only: bool) -> Result<Vec<InboxItem>> {
@@ -114,6 +93,63 @@ impl Store {
         .fetch_one(self.db())
         .await?)
     }
+}
+
+/// Connection-level variant so inbox fan-out can ride a caller's transaction
+/// (the journal write path). The `inbox.delivered` event is persisted on the
+/// same connection and pushed to `outbox`; the caller publishes after commit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn inbox_add_conn(
+    conn: &mut PgConnection,
+    recipient: &str,
+    from: &str,
+    reason: InboxReason,
+    ref_kind: &str,
+    ref_id: &str,
+    entry_id: Option<&str>,
+    snippet: &str,
+    outbox: &mut Vec<WireEvent>,
+) -> Result<Option<InboxItem>> {
+    if recipient == from {
+        return Ok(None); // don't notify yourself
+    }
+    let item = InboxItem {
+        id: new_id("inb"),
+        recipient: recipient.to_string(),
+        from: from.to_string(),
+        reason,
+        ref_kind: ref_kind.to_string(),
+        ref_id: ref_id.to_string(),
+        entry_id: entry_id.map(String::from),
+        snippet: snip140(snippet),
+        created_at: now_iso(),
+        read_at: None,
+    };
+    crate::pgq::query(
+        r#"INSERT INTO inbox (id, recipient, "from", reason, ref_kind, ref_id, entry_id, snippet, created_at, read_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)"#,
+    )
+    .bind(&item.id)
+    .bind(&item.recipient)
+    .bind(&item.from)
+    .bind(item.reason.as_str())
+    .bind(&item.ref_kind)
+    .bind(&item.ref_id)
+    .bind(&item.entry_id)
+    .bind(&item.snippet)
+    .bind(&item.created_at)
+    .execute(&mut *conn)
+    .await?;
+    outbox.push(
+        emit_persist(
+            conn,
+            "inbox.delivered",
+            from,
+            json!({"to": recipient, "reason": item.reason.as_str(), "ref_kind": item.ref_kind.as_str(), "ref_id": ref_id}),
+        )
+        .await?,
+    );
+    Ok(Some(item))
 }
 
 /// ref_kind passes through as a string: with user-defined entity types an

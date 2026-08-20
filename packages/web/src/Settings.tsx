@@ -1,6 +1,6 @@
 import { createResource, createSignal, For, Show, type Component } from "solid-js";
 import { ACTOR_NAMES, SEVERITIES, type Severity, type SourceKind } from "@hive/shared";
-import { api, getActor, getCurrentUser, type RuntimeKind } from "./api.ts";
+import { api, getActor, getCurrentUser, isQueuedWrite, type RuntimeKind } from "./api.ts";
 import { relTime } from "./lib.tsx";
 import { liveRev } from "./live.ts";
 import { EmptyState } from "./primitives.tsx";
@@ -101,23 +101,35 @@ export const Settings: Component = () => {
     e.preventDefault();
     const f = form();
     if (!f.name.trim() || !f.url.trim()) return;
-    await api.addSource({
-      name: f.name,
-      url: f.url,
-      kind: f.kind,
-      severity: f.severity,
-      notify: f.notify || null,
-      scope: f.scope,
-    });
-    setForm({ name: "", url: "", kind: "rss", severity: "info", notify: "", scope: "global" });
+    try {
+      await api.addSource({
+        name: f.name,
+        url: f.url,
+        kind: f.kind,
+        severity: f.severity,
+        notify: f.notify || null,
+        scope: f.scope,
+      });
+      setForm({ name: "", url: "", kind: "rss", severity: "info", notify: "", scope: "global" });
+    } catch (e2) {
+      if (!isQueuedWrite(e2)) throw e2; // queued offline: the outbox replays it
+    }
     refreshAll();
   };
   const toggle = async (id: string, enabled: boolean) => {
-    await api.patchSource(id, { enabled });
+    try {
+      await api.patchSource(id, { enabled });
+    } catch (e2) {
+      if (!isQueuedWrite(e2)) throw e2;
+    }
     refreshAll();
   };
   const remove = async (id: string) => {
-    await api.delSource(id);
+    try {
+      await api.delSource(id);
+    } catch (e2) {
+      if (!isQueuedWrite(e2)) throw e2;
+    }
     refreshAll();
   };
 

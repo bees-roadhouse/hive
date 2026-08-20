@@ -8,17 +8,25 @@ use anyhow::{anyhow, Result};
 use hive_shared::{
     parse_mentions, slugify, snip, ActorKind, Anchor, AnchorFields, AnchorKind, DecisionStatus,
     EntityKind, InboxReason, JournalEntry, JournalEntryView, JournalRef, JournalWriter, NewAnchor,
-    NewJournalEntry, NewShare, Priority, ResolvedAnchor, ShareScope, TaskStatus, ACTORS,
+    NewJournalEntry, NewShare, Priority, ResolvedAnchor, ShareScope, TaskStatus, WireEvent, ACTORS,
 };
 use serde_json::json;
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 
 use crate::Visibility;
 
-use super::decisions::DecisionCreate;
-use super::events::EventCreate;
-use super::tasks::TaskCreate;
-use super::{json_vec, new_id, now_iso, placeholders_or_never, to_json, Store};
+use super::decisions::{decisions_create_conn, DecisionCreate};
+use super::events::{events_create_conn, EventCreate};
+use super::inbox::inbox_add_conn;
+use super::links::links_create_conn;
+use super::people::people_ensure_conn;
+use super::phases::phases_ensure_conn;
+use super::projects::projects_ensure_conn;
+use super::search::index_entity_conn;
+use super::shares::shares_create_conn;
+use super::tasks::{tasks_create_conn, TaskCreate};
+use super::topics::topics_ensure_conn;
+use super::{emit_persist, json_vec, new_id, now_iso, placeholders_or_never, to_json, Store};
 
 impl Store {
     pub async fn journal_list(&self, limit: i64, offset: i64) -> Result<Vec<JournalEntryView>> {
@@ -93,9 +101,12 @@ impl Store {
     /// inline [person:], [topic:], [project:], [phase:], [task:] tokens to
     /// emerge/link entities and feed inboxes.
     ///
-    /// Node wraps this in a SQLite transaction; here the steps run sequentially on
-    /// the pool because emit/inbox/ensure helpers are pool-level (a wrapping write
-    /// transaction would deadlock against them under WAL's single-writer rule).
+    /// The entry and everything it emerges (anchors, tasks, decisions, events,
+    /// links, inbox items, shares, search rows, wire rows) commits as ONE
+    /// transaction — a failure mid-append must never leave an entry whose
+    /// emergence half-applied. Wire events persist inside the transaction but
+    /// reach the SSE bus only after commit, so a listener never observes an
+    /// event for a rolled-back row.
     pub async fn journal_append(
         &self,
         input: NewJournalEntry,
@@ -147,11 +158,14 @@ impl Store {
             user_scope,
             created_at: now_iso(),
         };
+        let mut tx = self.db().begin().await?;
+        let mut outbox: Vec<WireEvent> = Vec::new();
+
         // Namespace owner: the human the writing principal acts for (None = a
         // system/worker write → global/continuous history).
         crate::pgq::query(
             "INSERT INTO journal (id, author, body, tags, mentions, user_scope, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?::jsonb, ?, ?)",
         )
         .bind(&entry.id)
         .bind(&entry.author)
@@ -160,9 +174,10 @@ impl Store {
         .bind(to_json(&entry.mentions))
         .bind(&entry.user_scope)
         .bind(&entry.created_at)
-        .execute(self.db())
+        .execute(&mut *tx)
         .await?;
-        self.index_entity(
+        index_entity_conn(
+            &mut tx,
             "journal",
             &entry.id,
             &format!("{author}: {}", snip(&input.body, 50)),
@@ -173,19 +188,20 @@ impl Store {
 
         let mut assigned: HashSet<String> = HashSet::new();
         for a in input.anchors.as_deref().unwrap_or_default() {
-            self.materialise_anchor(&entry, a, &author, &mut assigned)
+            self.materialise_anchor(&mut tx, &entry, a, &author, &mut assigned, &mut outbox)
                 .await?;
         }
 
         // Parse bracket tokens: emerge/link entities, fan to inboxes.
-        self.parse_bracket_tokens(&entry, &author, &mut assigned)
+        self.parse_bracket_tokens(&mut tx, &entry, &author, &mut assigned, &mut outbox)
             .await?;
 
         // Anyone @mentioned but not already pulled into an anchor gets a plain
         // "mention" inbox item — humans and AIs alike.
         for m in &mentions {
             if !assigned.contains(m) {
-                self.inbox_add(
+                inbox_add_conn(
+                    &mut tx,
                     m,
                     &author,
                     InboxReason::Mention,
@@ -193,6 +209,7 @@ impl Store {
                     &entry.id,
                     Some(&entry.id),
                     &input.body,
+                    &mut outbox,
                 )
                 .await?;
             }
@@ -202,30 +219,44 @@ impl Store {
         // entry is visible in their scoped journal view.
         for m in &mentions {
             if m != &author {
-                self.shares_create(NewShare {
-                    scope: ShareScope::Entry,
-                    ref_: entry.id.clone(),
-                    viewer: m.clone(),
-                })
+                shares_create_conn(
+                    &mut tx,
+                    NewShare {
+                        scope: ShareScope::Entry,
+                        ref_: entry.id.clone(),
+                        viewer: m.clone(),
+                    },
+                    &mut outbox,
+                )
                 .await?;
             }
         }
 
-        self.emit(
-            "journal.created",
-            &author,
-            json!({"id": entry.id, "anchors": input.anchors.as_ref().map_or(0, Vec::len)}),
-        )
-        .await?;
+        outbox.push(
+            emit_persist(
+                &mut *tx,
+                "journal.created",
+                &author,
+                json!({"id": entry.id, "anchors": input.anchors.as_ref().map_or(0, Vec::len)}),
+            )
+            .await?,
+        );
+
+        tx.commit().await?;
+        // The commit is durable; only now may listeners hear about any of it.
+        self.publish_all(outbox);
+
         self.entry_view(entry).await
     }
 
     async fn materialise_anchor(
         &self,
+        conn: &mut PgConnection,
         entry: &JournalEntry,
         a: &NewAnchor,
         author: &str,
         assigned: &mut HashSet<String>,
+        outbox: &mut Vec<WireEvent>,
     ) -> Result<()> {
         let text = js_slice_utf16(&entry.body, a.start, a.end)
             .trim()
@@ -263,69 +294,72 @@ impl Store {
 
         let (ref_id, reason, ref_kind) = match a.kind {
             AnchorKind::Task => {
-                let t = self
-                    .tasks_create(
-                        TaskCreate {
-                            title,
-                            body: text.clone(),
-                            status: f
-                                .status
-                                .as_deref()
-                                .map(TaskStatus::from_str_lossy)
-                                .unwrap_or(TaskStatus::Todo),
-                            priority: f.priority.unwrap_or(Priority::Normal),
-                            tags: f.tags.clone().unwrap_or_default(),
-                            assignees: assignees_for_task.clone(),
-                            project: f.project.clone().flatten(),
-                            origin_entry_id: Some(entry.id.clone()),
-                            anchor_text: Some(text.clone()),
-                            ..TaskCreate::default()
-                        },
-                        author,
-                    )
-                    .await?;
+                let t = tasks_create_conn(
+                    conn,
+                    TaskCreate {
+                        title,
+                        body: text.clone(),
+                        status: f
+                            .status
+                            .as_deref()
+                            .map(TaskStatus::from_str_lossy)
+                            .unwrap_or(TaskStatus::Todo),
+                        priority: f.priority.unwrap_or(Priority::Normal),
+                        tags: f.tags.clone().unwrap_or_default(),
+                        assignees: assignees_for_task.clone(),
+                        project: f.project.clone().flatten(),
+                        origin_entry_id: Some(entry.id.clone()),
+                        anchor_text: Some(text.clone()),
+                        ..TaskCreate::default()
+                    },
+                    author,
+                    outbox,
+                )
+                .await?;
                 (t.id, InboxReason::Assignment, EntityKind::Task)
             }
             AnchorKind::Decision => {
-                let d = self
-                    .decisions_create(
-                        DecisionCreate {
-                            title,
-                            context: f.context.clone().unwrap_or_default(),
-                            decision: f.decision.clone().unwrap_or_else(|| text.clone()),
-                            consequences: f.consequences.clone().unwrap_or_default(),
-                            status: f
-                                .status
-                                .as_deref()
-                                .map(DecisionStatus::from_str_lossy)
-                                .unwrap_or(DecisionStatus::Proposed),
-                            tags: f.tags.clone().unwrap_or_default(),
-                            assignees: assignees.clone(),
-                            project: f.project.clone().flatten(),
-                            supersedes: f.supersedes.clone().flatten(),
-                            origin_entry_id: Some(entry.id.clone()),
-                            anchor_text: Some(text.clone()),
-                        },
-                        author,
-                    )
-                    .await?;
+                let d = decisions_create_conn(
+                    conn,
+                    DecisionCreate {
+                        title,
+                        context: f.context.clone().unwrap_or_default(),
+                        decision: f.decision.clone().unwrap_or_else(|| text.clone()),
+                        consequences: f.consequences.clone().unwrap_or_default(),
+                        status: f
+                            .status
+                            .as_deref()
+                            .map(DecisionStatus::from_str_lossy)
+                            .unwrap_or(DecisionStatus::Proposed),
+                        tags: f.tags.clone().unwrap_or_default(),
+                        assignees: assignees.clone(),
+                        project: f.project.clone().flatten(),
+                        supersedes: f.supersedes.clone().flatten(),
+                        origin_entry_id: Some(entry.id.clone()),
+                        anchor_text: Some(text.clone()),
+                    },
+                    author,
+                    outbox,
+                )
+                .await?;
                 (d.id, InboxReason::Decision, EntityKind::Decision)
             }
             AnchorKind::Event => {
-                let e = self
-                    .events_create(
-                        EventCreate {
-                            title,
-                            body: text.clone(),
-                            at: f.at.clone().flatten(),
-                            tags: f.tags.clone().unwrap_or_default(),
-                            assignees: assignees.clone(),
-                            origin_entry_id: Some(entry.id.clone()),
-                            anchor_text: Some(text.clone()),
-                        },
-                        author,
-                    )
-                    .await?;
+                let e = events_create_conn(
+                    conn,
+                    EventCreate {
+                        title,
+                        body: text.clone(),
+                        at: f.at.clone().flatten(),
+                        tags: f.tags.clone().unwrap_or_default(),
+                        assignees: assignees.clone(),
+                        origin_entry_id: Some(entry.id.clone()),
+                        anchor_text: Some(text.clone()),
+                    },
+                    author,
+                    outbox,
+                )
+                .await?;
                 (e.id, InboxReason::Event, EntityKind::Event)
             }
         };
@@ -341,9 +375,10 @@ impl Store {
         .bind(a.kind.as_str())
         .bind(&ref_id)
         .bind(now_iso())
-        .execute(self.db())
+        .execute(&mut *conn)
         .await?;
-        self.links_create(
+        links_create_conn(
+            conn,
             EntityKind::Journal.as_str(),
             &entry.id,
             ref_kind.as_str(),
@@ -360,7 +395,8 @@ impl Store {
         };
         for who in recipients {
             assigned.insert(who.clone());
-            self.inbox_add(
+            inbox_add_conn(
+                conn,
                 who,
                 author,
                 reason,
@@ -368,6 +404,7 @@ impl Store {
                 &ref_id,
                 Some(&entry.id),
                 &text,
+                outbox,
             )
             .await?;
         }
@@ -380,9 +417,11 @@ impl Store {
     /// [project:] and/or [phase:], any [task:] that emerges is related to it.
     async fn parse_bracket_tokens(
         &self,
+        conn: &mut PgConnection,
         entry: &JournalEntry,
         author: &str,
         assigned: &mut HashSet<String>,
+        outbox: &mut Vec<WireEvent>,
     ) -> Result<()> {
         let tokens = scan_tokens(&entry.body);
 
@@ -392,12 +431,12 @@ impl Store {
         for t in &tokens {
             match t.kind {
                 "project" => {
-                    let p = self.projects_ensure(&t.name).await?;
+                    let p = projects_ensure_conn(conn, &t.name).await?;
                     ctx_project = Some(p.id);
                 }
                 "phase" => {
                     if let Some(pid) = &ctx_project {
-                        let ph = self.phases_ensure(pid, &t.name).await?;
+                        let ph = phases_ensure_conn(conn, pid, &t.name).await?;
                         ctx_phase = Some(ph.id);
                     }
                 }
@@ -415,10 +454,11 @@ impl Store {
                         .iter()
                         .find(|(n, _)| *n == slug || slugify(n) == slug);
                     let person = match actor_match {
-                        Some((n, k)) => self.people_ensure(&capitalize(n), *k).await?,
-                        None => self.people_ensure(&t.name, ActorKind::Human).await?,
+                        Some((n, k)) => people_ensure_conn(conn, &capitalize(n), *k).await?,
+                        None => people_ensure_conn(conn, &t.name, ActorKind::Human).await?,
                     };
-                    self.links_create(
+                    links_create_conn(
+                        conn,
                         EntityKind::Journal.as_str(),
                         &entry.id,
                         EntityKind::Person.as_str(),
@@ -429,7 +469,8 @@ impl Store {
                     // Fan to inbox if this person is a known actor (same as @mention).
                     if let Some((n, _)) = actor_match {
                         assigned.insert((*n).to_string());
-                        self.inbox_add(
+                        inbox_add_conn(
+                            conn,
                             n,
                             author,
                             InboxReason::Mention,
@@ -437,13 +478,15 @@ impl Store {
                             &entry.id,
                             Some(&entry.id),
                             &entry.body,
+                            outbox,
                         )
                         .await?;
                     }
                 }
                 "topic" => {
-                    let topic = self.topics_ensure(&t.name).await?;
-                    self.links_create(
+                    let topic = topics_ensure_conn(conn, &t.name).await?;
+                    links_create_conn(
+                        conn,
                         EntityKind::Journal.as_str(),
                         &entry.id,
                         EntityKind::Topic.as_str(),
@@ -453,8 +496,9 @@ impl Store {
                     .await?;
                 }
                 "project" => {
-                    let proj = self.projects_ensure(&t.name).await?;
-                    self.links_create(
+                    let proj = projects_ensure_conn(conn, &t.name).await?;
+                    links_create_conn(
+                        conn,
                         EntityKind::Journal.as_str(),
                         &entry.id,
                         EntityKind::Project.as_str(),
@@ -465,8 +509,9 @@ impl Store {
                 }
                 "phase" => {
                     if let Some(pid) = &ctx_project {
-                        let ph = self.phases_ensure(pid, &t.name).await?;
-                        self.links_create(
+                        let ph = phases_ensure_conn(conn, pid, &t.name).await?;
+                        links_create_conn(
+                            conn,
                             EntityKind::Journal.as_str(),
                             &entry.id,
                             EntityKind::Phase.as_str(),
@@ -478,22 +523,24 @@ impl Store {
                 }
                 "task" => {
                     // Emerge a task anchored to this entry, auto-assigned to the author.
-                    let task = self
-                        .tasks_create(
-                            TaskCreate {
-                                title: t.name.clone(),
-                                body: String::new(),
-                                assignees: vec![author.to_string()],
-                                project: ctx_project.clone(),
-                                phase: ctx_phase.clone(),
-                                origin_entry_id: Some(entry.id.clone()),
-                                anchor_text: Some(t.name.clone()),
-                                ..TaskCreate::default()
-                            },
-                            author,
-                        )
-                        .await?;
-                    self.links_create(
+                    let task = tasks_create_conn(
+                        conn,
+                        TaskCreate {
+                            title: t.name.clone(),
+                            body: String::new(),
+                            assignees: vec![author.to_string()],
+                            project: ctx_project.clone(),
+                            phase: ctx_phase.clone(),
+                            origin_entry_id: Some(entry.id.clone()),
+                            anchor_text: Some(t.name.clone()),
+                            ..TaskCreate::default()
+                        },
+                        author,
+                        outbox,
+                    )
+                    .await?;
+                    links_create_conn(
+                        conn,
                         EntityKind::Journal.as_str(),
                         &entry.id,
                         EntityKind::Task.as_str(),
@@ -502,7 +549,8 @@ impl Store {
                     )
                     .await?;
                     // author is assigned; inbox_add silently skips self-notification.
-                    self.inbox_add(
+                    inbox_add_conn(
+                        conn,
                         author,
                         author,
                         InboxReason::Assignment,
@@ -510,6 +558,7 @@ impl Store {
                         &task.id,
                         Some(&entry.id),
                         &t.name,
+                        outbox,
                     )
                     .await?;
                 }
@@ -533,10 +582,11 @@ impl Store {
                     )
                     .bind(token)
                     .bind(&effective_scope)
-                    .fetch_optional(self.db())
+                    .fetch_optional(&mut *conn)
                     .await?;
                     if let Some(mail_id) = visible {
-                        self.links_create(
+                        links_create_conn(
+                            conn,
                             EntityKind::Journal.as_str(),
                             &entry.id,
                             EntityKind::Mail.as_str(),
@@ -754,10 +804,10 @@ impl Store {
         // AI authors that @mentioned viewer in any entry.
         let mentioned: Vec<String> = crate::pgq::query_scalar(
             "SELECT DISTINCT j.author FROM journal j \
-             WHERE j.mentions LIKE ? \
+             WHERE j.mentions @> jsonb_build_array(?) \
                AND EXISTS (SELECT 1 FROM people WHERE slug=j.author AND kind='ai')",
         )
-        .bind(mention_like(viewer))
+        .bind(viewer)
         .fetch_all(self.db())
         .await?;
         push(mentioned, &mut authors);
@@ -796,11 +846,12 @@ impl Store {
                 .bind(viewer)
                 .fetch_all(self.db())
                 .await?;
-        let mentioned_ids: Vec<String> =
-            crate::pgq::query_scalar("SELECT id FROM journal WHERE mentions LIKE ?")
-                .bind(mention_like(viewer))
-                .fetch_all(self.db())
-                .await?;
+        let mentioned_ids: Vec<String> = crate::pgq::query_scalar(
+            "SELECT id FROM journal WHERE mentions @> jsonb_build_array(?)",
+        )
+        .bind(viewer)
+        .fetch_all(self.db())
+        .await?;
         let mut extra_ids: Vec<String> = Vec::new();
         for id in shared_entry_ids.into_iter().chain(mentioned_ids) {
             if !extra_ids.contains(&id) {
@@ -1006,11 +1057,12 @@ impl Store {
                 .fetch_all(self.db())
                 .await?;
         ids.extend(shared);
-        let mentioned: Vec<String> =
-            crate::pgq::query_scalar("SELECT id FROM journal WHERE mentions LIKE ?")
-                .bind(mention_like(viewer))
-                .fetch_all(self.db())
-                .await?;
+        let mentioned: Vec<String> = crate::pgq::query_scalar(
+            "SELECT id FROM journal WHERE mentions @> jsonb_build_array(?)",
+        )
+        .bind(viewer)
+        .fetch_all(self.db())
+        .await?;
         ids.extend(mentioned);
 
         // Base author streams are namespace-gated: global or own-namespace only.
@@ -1051,15 +1103,13 @@ fn row_to_entry(r: &sqlx::postgres::PgRow) -> Result<JournalEntry> {
         author: r.try_get("author")?,
         body: r.try_get("body")?,
         tags: json_vec(r.try_get::<String, _>("tags")?.as_str()),
-        mentions: json_vec(r.try_get::<String, _>("mentions")?.as_str()),
+        // jsonb column (migration 0003): decode directly, not via ::text.
+        mentions: r
+            .try_get::<sqlx::types::Json<Vec<String>>, _>("mentions")?
+            .0,
         user_scope: r.try_get("user_scope")?,
         created_at: r.try_get("created_at")?,
     })
-}
-
-/// `%"viewer"%` — Node's LIKE probe into the mentions JSON column.
-fn mention_like(viewer: &str) -> String {
-    format!("%\"{viewer}\"%")
 }
 
 /// Sentinel scope value meaning "the global / continuous (un-owned) stream"

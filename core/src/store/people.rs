@@ -3,7 +3,7 @@
 use anyhow::Result;
 use hive_shared::{slugify, ActorKind, Person, PersonPatch};
 use serde_json::json;
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 
 use super::{new_id, now_iso, Store};
 
@@ -25,11 +25,8 @@ impl Store {
     }
 
     pub async fn people_by_slug(&self, slug: &str) -> Result<Option<Person>> {
-        let row = crate::pgq::query("SELECT * FROM people WHERE slug = ?")
-            .bind(slug)
-            .fetch_optional(self.db())
-            .await?;
-        row.as_ref().map(row_to_person).transpose()
+        let mut conn = self.db().acquire().await?;
+        people_by_slug_conn(&mut conn, slug).await
     }
 
     /// AI identities a given human owns — the grantable set for OAuth consent.
@@ -43,32 +40,8 @@ impl Store {
     }
 
     pub async fn people_ensure(&self, name: &str, kind: ActorKind) -> Result<Person> {
-        let slug = slugify(name);
-        if let Some(existing) = self.people_by_slug(&slug).await? {
-            return Ok(existing);
-        }
-        let p = Person {
-            id: new_id("per"),
-            name: name.to_string(),
-            slug,
-            kind,
-            owner: None,
-            bio: None,
-            role: None,
-            created_at: now_iso(),
-        };
-        crate::pgq::query(
-            "INSERT INTO people (id, name, slug, kind, owner, bio, role, created_at) \
-             VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?)",
-        )
-        .bind(&p.id)
-        .bind(&p.name)
-        .bind(&p.slug)
-        .bind(p.kind.as_str())
-        .bind(&p.created_at)
-        .execute(self.db())
-        .await?;
-        Ok(p)
+        let mut conn = self.db().acquire().await?;
+        people_ensure_conn(&mut conn, name, kind).await
     }
 
     /// Insert under an explicit slug (importers / identity mapping). No-op if taken.
@@ -197,6 +170,52 @@ impl Store {
             created_at: cur.created_at,
         }))
     }
+}
+
+pub(crate) async fn people_by_slug_conn(
+    conn: &mut PgConnection,
+    slug: &str,
+) -> Result<Option<Person>> {
+    let row = crate::pgq::query("SELECT * FROM people WHERE slug = ?")
+        .bind(slug)
+        .fetch_optional(&mut *conn)
+        .await?;
+    row.as_ref().map(row_to_person).transpose()
+}
+
+/// Connection-level variant so person emergence can ride a caller's
+/// transaction (the journal write path). No emit — `people_create` owns that.
+pub(crate) async fn people_ensure_conn(
+    conn: &mut PgConnection,
+    name: &str,
+    kind: ActorKind,
+) -> Result<Person> {
+    let slug = slugify(name);
+    if let Some(existing) = people_by_slug_conn(conn, &slug).await? {
+        return Ok(existing);
+    }
+    let p = Person {
+        id: new_id("per"),
+        name: name.to_string(),
+        slug,
+        kind,
+        owner: None,
+        bio: None,
+        role: None,
+        created_at: now_iso(),
+    };
+    crate::pgq::query(
+        "INSERT INTO people (id, name, slug, kind, owner, bio, role, created_at) \
+         VALUES (?, ?, ?, ?, NULL, NULL, NULL, ?)",
+    )
+    .bind(&p.id)
+    .bind(&p.name)
+    .bind(&p.slug)
+    .bind(p.kind.as_str())
+    .bind(&p.created_at)
+    .execute(&mut *conn)
+    .await?;
+    Ok(p)
 }
 
 pub(crate) fn row_to_person(r: &sqlx::postgres::PgRow) -> Result<Person> {

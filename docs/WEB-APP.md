@@ -193,22 +193,20 @@ The Solid frontend caches in IndexedDB. Scope it honestly: this is a **cache**,
 not local-first. Reads served from it when the network is gone; writes queued
 and replayed.
 
-The hard part is not caching, it is **write conflicts**, and the old
-architecture answered them with a per-device append-only log that no longer
-exists. Two options, and one should be chosen before the first offline write
-ships rather than after:
-
-* **Last-write-wins per field**, with the server as the authority. Simple,
-  lossy, and honest about being lossy.
-* **Queue and reject.** Offline writes replay; a conflicting one surfaces to
-  the human instead of resolving itself.
+The conflict model is decided — **queue and reject**, in
+`docs/DECISION-offline-conflict-model.md`. Reads are network-first with the
+cache as the offline fallback. Queueable writes (journal appends, patches,
+inbox reads, the everyday creates and deletes) carry client-minted ids or a
+base `updated_at` precondition, replay in order on reconnect, and a replayed
+write whose base has moved surfaces to a human — keep mine, take theirs, or
+discard — instead of resolving itself. Admin, mail, and workspace writes stay
+online-only.
 
 Anything more ambitious is a CRDT, which is a different project.
 
 ## Open questions
 
-1. Which offline conflict model, above.
-2. Does an org own artifacts, or a user within an org? It changes what happens
+1. Does an org own artifacts, or a user within an org? It changes what happens
    when someone leaves.
-3. Roles: is `memberships.role` a flat enum now, or does it need to be
+2. Roles: is `memberships.role` a flat enum now, or does it need to be
    per-resource from the start? Flat is right until it very suddenly is not.

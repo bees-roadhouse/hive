@@ -1,6 +1,6 @@
 import { createEffect, createMemo, createResource, createSignal, For, Show, type Component } from "solid-js";
 import type { Person } from "@hive/shared";
-import { api, getActor, getCurrentUser } from "./api.ts";
+import { api, getActor, getCurrentUser, isQueuedWrite } from "./api.ts";
 import { liveRev } from "./live.ts";
 import { Mentions, relTime } from "./lib.tsx";
 import { EmptyState } from "./primitives.tsx";
@@ -50,7 +50,7 @@ export const Inbox: Component = () => {
     if (!tabs().some((t) => t.slug === who())) setWho(getActor());
   });
 
-  const [items, { refetch }] = createResource(
+  const [items, { refetch, mutate }] = createResource(
     () => ({ who: who(), unread: unreadOnly(), _r: liveRev() }),
     // A 403 (tab revoked between refetches) reads as an empty inbox; real
     // outages still surface through the app-level boundary.
@@ -64,19 +64,28 @@ export const Inbox: Component = () => {
   const read = async (id: string) => {
     try {
       await api.markRead(id);
-    } catch (e) {
-      console.error("mark read failed", e);
-    } finally {
       refetch();
+    } catch (e) {
+      if (isQueuedWrite(e)) {
+        // Queued offline: mark it read locally; the replay re-asserts it.
+        const now = new Date().toISOString();
+        mutate((prev) => (prev ?? []).map((it) => (it.id === id ? { ...it, read_at: now } : it)));
+        return;
+      }
+      console.error("mark read failed", e);
     }
   };
   const readAll = async () => {
     try {
       await api.markAllRead(who());
-    } catch (e) {
-      console.error("mark all read failed", e);
-    } finally {
       refetch();
+    } catch (e) {
+      if (isQueuedWrite(e)) {
+        const now = new Date().toISOString();
+        mutate((prev) => (prev ?? []).map((it) => ({ ...it, read_at: it.read_at ?? now })));
+        return;
+      }
+      console.error("mark all read failed", e);
     }
   };
 

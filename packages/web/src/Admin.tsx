@@ -1,7 +1,7 @@
 import { createMemo, createResource, createSignal, For, Show, type Component } from "solid-js";
 import type { ActorDeleteResult, ActorMergeResult, NewEntityField, Person } from "@hive/shared";
 import { FIELD_TYPES } from "@hive/shared";
-import { api } from "./api.ts";
+import { api, isQueuedWrite } from "./api.ts";
 import { relTime } from "./lib.tsx";
 import { liveRev } from "./live.ts";
 
@@ -136,7 +136,11 @@ const WritersSection: Component = () => {
   const [people, { refetch }] = createResource(() => ({ _r: liveRev() }), () => api.people());
   const humans = () => (people() ?? []).filter((p) => p.kind === "human");
   const setOwner = async (p: Person, owner: string) => {
-    await api.patchPerson(p.slug, { owner: owner || null });
+    try {
+      await api.patchPerson(p.slug, { owner: owner || null });
+    } catch (e) {
+      if (!isQueuedWrite(e)) throw e;
+    }
     refetch();
   };
 
@@ -161,7 +165,11 @@ const WritersSection: Component = () => {
   const saveEdit = async () => {
     const id = editId();
     if (!id) return;
-    await api.patchPerson(id, { name: editName().trim() || undefined, kind: editKind() });
+    try {
+      await api.patchPerson(id, { name: editName().trim() || undefined, kind: editKind() });
+    } catch (e) {
+      if (!isQueuedWrite(e)) throw e;
+    }
     setEditId(null);
     refetch();
   };
@@ -174,6 +182,9 @@ const WritersSection: Component = () => {
       await api.addPerson({ name, kind: newKind() });
       setNewName("");
       setNewKind("human");
+      refetch();
+    } catch (e) {
+      if (!isQueuedWrite(e)) throw e;
       refetch();
     } finally {
       setAdding(false);

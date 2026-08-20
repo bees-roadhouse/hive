@@ -303,3 +303,91 @@ async fn two_databases_on_one_cluster_both_keep_serving() {
         .expect("first instance still serves after the second booted");
     assert_eq!(ok, 1);
 }
+
+/// The scoping pass runs under a pinned `t_*,public` search_path on what may
+/// be a SHARED database whose public schema holds another install's tables.
+/// The unique-rebuild step used to emit a bare `DROP INDEX IF EXISTS
+/// projects_name_key`: the name resolved down search_path, landed on the
+/// public index, and either errored on the constraint owning it (breaking
+/// every migrate on the polluted dev database) or silently ate a bare index
+/// belonging to another schema. The drops are schema-qualified now; this
+/// pollutes public with the exact shapes and migrates over them.
+#[tokio::test]
+async fn org_scoping_ddl_cannot_escape_into_public() {
+    let test_db = db::test_pool_unmigrated().await;
+    let pool = test_db.pool.clone();
+
+    // A constraint-backed projects_name_key in public (the original failure:
+    // DROP INDEX cannot drop an index a constraint owns) plus bare indexes
+    // named for every other rebuild target (the silent-eat case). Index names
+    // are schema-scoped, so one probe table carries all of them.
+    sqlx::raw_sql("CREATE TABLE IF NOT EXISTS public.zz_scope_escape (id TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .expect("probe table");
+    sqlx::raw_sql(
+        "DO $$ BEGIN \
+           IF NOT EXISTS (SELECT 1 FROM pg_constraint \
+                          WHERE conname = 'projects_name_key' \
+                            AND conrelid = 'public.zz_scope_escape'::regclass) THEN \
+             ALTER TABLE public.zz_scope_escape ADD CONSTRAINT projects_name_key UNIQUE (id); \
+           END IF; \
+         END $$",
+    )
+    .execute(&pool)
+    .await
+    .expect("constraint-backed probe index");
+    let bare = [
+        "people_slug_key",
+        "topics_slug_key",
+        "entity_types_slug_key",
+        "identities_platform_platform_id_key",
+        "identity_artifacts_actor_kind_name_key",
+        "mail_accounts_owner_address_key",
+        "shares_uniq",
+        "cc_sessions_captured_ext",
+    ];
+    for idx in &bare {
+        sqlx::raw_sql(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {idx} ON public.zz_scope_escape (id)"
+        ))
+        .execute(&pool)
+        .await
+        .expect("bare probe index");
+    }
+
+    // The whole migrate over the polluted database must succeed — pre-fix it
+    // died at `DROP INDEX IF EXISTS projects_name_key`.
+    db::migrate(&pool)
+        .await
+        .expect("migrate over a polluted public schema");
+
+    // Every public probe survived: the drops never left the test schema.
+    for idx in bare.iter().chain(["projects_name_key"].iter()) {
+        let present: bool = hive_core::pgq::query_scalar::<bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_indexes \
+                           WHERE schemaname = 'public' AND indexname = ?)",
+        )
+        .bind(idx)
+        .fetch_one(&pool)
+        .await
+        .expect("public index probe");
+        assert!(
+            present,
+            "public.{idx} must survive another schema's migrate"
+        );
+    }
+
+    // And the pass did its real work in the test schema: per-org uniques exist.
+    let rebuilt: i64 = hive_core::pgq::query_scalar::<i64>(
+        "SELECT count(*) FROM pg_indexes \
+         WHERE schemaname = current_schema() AND indexname LIKE '%\\_org\\_uniq'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("per-org unique probe");
+    assert!(
+        rebuilt >= 8,
+        "per-org unique indexes must still be built in the test schema, got {rebuilt}"
+    );
+}

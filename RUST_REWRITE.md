@@ -1,5 +1,27 @@
 # Hive Rust Rewrite
 
+> **Superseded. History, not orientation.** This note documents the Node-to-Rust
+> parity port as it landed: one axum binary plus a `hive-worker`, against the
+> same SQLite database, scrypt hashes, and `hive_pat_*` tokens the Node API
+> used. The tree has since moved again — [docs/WEB-APP.md](./docs/WEB-APP.md)
+> is the current design. What that means for anything below:
+>
+> * **The worker binary is gone.** There is no `worker/` crate; the workspace
+>   is `[shared, embed, core, api, jmap-sync, relay]`, and `hive-api` is the
+>   only process that speaks to the database.
+> * **SQLite parity is over.** PostgreSQL with pgvector is the store, access
+>   control is row-level security keyed on an acting org, and the org model
+>   postdates this note entirely: one org per credential, pinned when the
+>   credential is minted (`api/src/middleware.rs`, `core/src/acting.rs`).
+>   SQLite survives in exactly one place: reading an uploaded legacy `hive.db`
+>   during import (`api/src/legacy_import.rs`).
+> * The wire-compat notes (scrypt, token prefixes, `toISOString()` timestamps,
+>   `prefix_nanoid(12)` ids) still describe the *formats*; they no longer
+>   describe a shared database.
+>
+> Kept intact below as the record of the port itself. Read it for why a
+> decision was made, never for what the tree looks like.
+
 A drop-in Rust replacement for the Node hive API + worker: one Axum binary
 serves the full REST surface, the MCP server, the SSE stream, AND the Solid.js
 SPA (no nginx container). A second binary runs the worker. Both speak the exact

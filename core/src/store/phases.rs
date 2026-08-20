@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use hive_shared::Phase;
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 
 use super::{new_id, now_iso, Store};
 
@@ -35,40 +35,51 @@ impl Store {
     }
 
     pub async fn phases_ensure(&self, project_id: &str, name: &str) -> Result<Phase> {
-        let existing =
-            crate::pgq::query("SELECT * FROM phases WHERE project = ? AND LOWER(name) = LOWER(?)")
-                .bind(project_id)
-                .bind(name)
-                .fetch_optional(self.db())
-                .await?;
-        if let Some(row) = existing {
-            return row_to_phase(&row);
-        }
-        let pos: i64 = crate::pgq::query_scalar(
-            "SELECT COALESCE(MAX(position)+1, 0) FROM phases WHERE project = ?",
-        )
-        .bind(project_id)
-        .fetch_one(self.db())
-        .await?;
-        let ph = Phase {
-            id: new_id("ph"),
-            project: project_id.to_string(),
-            name: name.to_string(),
-            position: pos,
-            created_at: now_iso(),
-        };
-        crate::pgq::query(
-            "INSERT INTO phases (id, project, name, position, created_at) VALUES (?, ?, ?, ?, ?)",
-        )
-        .bind(&ph.id)
-        .bind(&ph.project)
-        .bind(&ph.name)
-        .bind(ph.position)
-        .bind(&ph.created_at)
-        .execute(self.db())
-        .await?;
-        Ok(ph)
+        let mut conn = self.db().acquire().await?;
+        phases_ensure_conn(&mut conn, project_id, name).await
     }
+}
+
+/// Connection-level variant so phase emergence can ride a caller's
+/// transaction (the journal write path).
+pub(crate) async fn phases_ensure_conn(
+    conn: &mut PgConnection,
+    project_id: &str,
+    name: &str,
+) -> Result<Phase> {
+    let existing =
+        crate::pgq::query("SELECT * FROM phases WHERE project = ? AND LOWER(name) = LOWER(?)")
+            .bind(project_id)
+            .bind(name)
+            .fetch_optional(&mut *conn)
+            .await?;
+    if let Some(row) = existing {
+        return row_to_phase(&row);
+    }
+    let pos: i64 = crate::pgq::query_scalar(
+        "SELECT COALESCE(MAX(position)+1, 0) FROM phases WHERE project = ?",
+    )
+    .bind(project_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    let ph = Phase {
+        id: new_id("ph"),
+        project: project_id.to_string(),
+        name: name.to_string(),
+        position: pos,
+        created_at: now_iso(),
+    };
+    crate::pgq::query(
+        "INSERT INTO phases (id, project, name, position, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&ph.id)
+    .bind(&ph.project)
+    .bind(&ph.name)
+    .bind(ph.position)
+    .bind(&ph.created_at)
+    .execute(&mut *conn)
+    .await?;
+    Ok(ph)
 }
 
 pub(crate) fn row_to_phase(r: &sqlx::postgres::PgRow) -> Result<Phase> {

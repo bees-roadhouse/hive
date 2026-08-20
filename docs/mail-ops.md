@@ -1,5 +1,26 @@
 # Mail operations
 
+> **Hosted-era runbook; the daemon it was written against is gone.** The
+> current shape: mail sync is the `jmap-sync/` library (no Hive types, no
+> database) driven by `Store::mail_sync_tick` in `hive-core`
+> (`core/src/store/mail_sync.rs`), and the mail archive plus the `/api/mail/*`
+> routes live in `hive-api` behind `HIVE_MAIL_ENABLED`. Two operational facts
+> override whole sections below:
+>
+> * **No shipped binary currently schedules the tick.** `hive-api` spawns the
+>   artifact sweeper and nothing else; `mail_sync_tick` has no caller outside
+>   its own tests. Connecting an account stores it, and until a scheduler is
+>   wired in, nothing backfills or polls.
+> * The cadence knobs this file documents — `HIVE_MAIL_TICK`,
+>   `HIVE_MAIL_POLL_SECS` — exist nowhere in code, and the CI e2e it pins is
+>   not run by `.github/workflows/ci.yml` (the `ci/stalwart/` harness remains,
+>   unreferenced).
+>
+> What still holds: the `HIVE_CRED_KEY` vault guidance, the "backups now
+> contain your mailbox" warning, admin-only connect with pre-storage JMAP
+> validation, nothing-ingested-until-a-mailbox-is-opted-in, and the
+> 8-consecutive-failures disable (all in `hive-core`, dormant with the tick).
+
 How to turn on, connect, protect, and validate hive-mail: the daemon that
 syncs JMAP accounts (Stalwart at `https://mail.beesroadhouse.com`) into
 Hive's searchable mail archive. Everything here assumes the Rust compose
@@ -9,6 +30,12 @@ stack (`docker/docker-compose.rust.yml`).
 
 Mail ships dark. The `hive-mail` service always runs but idles, and every
 `/api/mail/*` route 404s, until the flag flips.
+
+> **Correction.** There is no `hive-mail` service in the compose stack and no
+> `mail/` crate. `docker/docker-compose.rust.yml` is two services — `postgres`
+> and `hive-api` — and the flag gates the routes inside `hive-api` (404 when
+> off, so the feature's existence isn't an oracle). The rest of this section
+> is accurate.
 
 1. Generate the credential-vault key once:
 
@@ -30,9 +57,9 @@ Mail ships dark. The `hive-mail` service always runs but idles, and every
    docker compose -f docker/docker-compose.rust.yml up -d
    ```
 
-`HIVE_CRED_KEY` is hard-required by `hive-api` and `hive-mail` (compose
-refuses to start without it). It is the AES-256-GCM key for the credential
-vault, which holds mail account passwords and runtime sign-ins.
+`HIVE_CRED_KEY` is hard-required by `hive-api` (compose refuses to start
+without it). It is the AES-256-GCM key for the credential vault, which holds
+mail account passwords and runtime sign-ins.
 
 **Back the key up separately from the database.** A database backup does not
 contain the key, and the key does not live anywhere else. Losing it orphans
@@ -68,32 +95,44 @@ fails at the form, not silently in the daemon.
      account has one)
 3. Connect. The account row appears with backfill status `pending`.
 4. Tick the mailboxes to ingest (the per-mailbox checkboxes under the
-   account row; they arrive after hive-mail's first mailbox sync, within
-   `HIVE_MAIL_TICK` seconds). **Nothing is ingested until a mailbox is
-   opted in.** This is the spam gate: leave Junk unticked.
-5. Backfill starts on the next tick and pages newest-first. Progress events
-   land on the wire every 50 pages; the row flips to `complete` when done.
+   account row; they arrive after the first mailbox sync). **Nothing is
+   ingested until a mailbox is opted in.** This is the spam gate: leave Junk
+   unticked.
+5. Backfill pages newest-first. Progress events land on the wire every 50
+   pages (`PAGE_BUDGET`); the row flips to `complete` when done.
 
 Sync failures back off exponentially and surface on the account row
 (`last_error`). After 8 consecutive failures the account disables itself
 and notifies its owner; fix the cause, then hit resume (the ⏸/▶ toggle).
 
+> **Dormant, not absent.** The supervision described here — backoff, the
+> 8th-failure disable with a `mail.account.disabled` wire event, the
+> newest-first backfill — is `hive-core` code that runs when a tick runs.
+> With no scheduler wired into `hive-api` (see the banner), steps 4-5
+> describe what a tick does once one exists, not what a running instance
+> does today.
+
 ## Stalwart version pinning
 
 Stalwart invalidates JMAP state strings after upgrades and store
-compactions. That is expected: the daemon answers `cannotCalculateChanges`
+compactions. That is expected: the sync pass answers `cannotCalculateChanges`
 with a full reconciliation (a paged, ids-only diff that never re-fetches
 messages it already holds), so mail keeps flowing. You may notice one
 slightly slower cycle after a Stalwart upgrade, nothing more. If an account
 ever looks wedged or inconsistent, **Settings → Mail accounts → ⟳** forces
-that same reconciliation on the next cycle.
+that same reconciliation on the next pass.
 
 Two pins to maintain when upgrading the mail server:
 
-- CI runs the sync e2e against `stalwartlabs/stalwart:v0.15.5`
-  (`.github/workflows/ci.yml`, config in `ci/stalwart/`). Keep that tag
-  tracking the version deployed at `mail.beesroadhouse.com`, so CI exercises
-  the server behavior production actually has.
+> **The CI half of this is unscheduled.** `.github/workflows/ci.yml` has no
+> Stalwart job today; `ci/stalwart/` (config + `provision.sh`) and the e2e
+> this note describes are not run anywhere. The v0.16 config-registry warning
+> below is still the thing to know before upgrading the server.
+
+- The e2e harness pinned `stalwartlabs/stalwart:v0.15.5`
+  (config in `ci/stalwart/`). Keep that tag tracking the version deployed at
+  `mail.beesroadhouse.com`, so the harness exercises the server behavior
+  production actually has when it is run.
 - v0.16.0 moved Stalwart's configuration from a config file into a
   database-backed registry provisioned via the admin API. When the box
   moves past v0.15, the CI harness (`ci/stalwart/config.toml` +
@@ -103,20 +142,25 @@ Two pins to maintain when upgrading the mail server:
 
 | Env | Default | Used by | What it does |
 | --- | --- | --- | --- |
-| `HIVE_MAIL_ENABLED` | `0` | api, hive-mail | Master switch: 404s the mail routes and idles the daemon when off |
-| `HIVE_CRED_KEY` | required | api, hive-mail | AES-256-GCM credential-vault key. Generate once, back up separately |
-| `HIVE_MAIL_TICK` | `15` | hive-mail | Seconds between scans for due accounts |
-| `HIVE_MAIL_POLL_SECS` | `300` | hive-mail | Doorbell wait per cycle; the poll cadence when the EventSource stream is down |
-| `HIVE_MAIL_MAX_BODY_BYTES` | `262144` | hive-mail | Per-message bodyValues cap requested from the server |
-| `HIVE_MAIL_PAGE_SIZE` | `200` | hive-mail | Backfill/delta page size. Mostly a test knob (the CI e2e sets 10) |
-| `HIVE_MAIL_MAX_ATTACHMENT_BYTES` | `15728640` | hive-mail | Reserved: attachment byte cap, lands with the attachment pipeline |
-| `HIVE_MAIL_EMBED_LIMIT` | `5000` | worker | Reserved: mail embedding gate, lifted by the retrieval workstream |
-| `HIVE_TEST_STALWART_URL` / `_USER` / `_PASS` | unset | CI | Points `mail/tests/stalwart_e2e.rs` at a live Stalwart; the test self-skips without the URL |
+| `HIVE_MAIL_ENABLED` | `0` | hive-api | Master switch: 404s the mail routes and hides the Settings section when off |
+| `HIVE_CRED_KEY` | required | hive-api | AES-256-GCM credential-vault key. Generate once, back up separately |
+| `HIVE_MAIL_MAX_BODY_BYTES` | `262144` | hive-core | Per-message bodyValues cap requested from the server |
+| `HIVE_MAIL_PAGE_SIZE` | `200` | hive-core | Backfill/delta page size. Mostly a test knob |
+| `HIVE_MAIL_MAX_ATTACHMENT_BYTES` | `15728640` | hive-core | Reserved: attachment byte cap, lands with the attachment pipeline |
+| `HIVE_MAIL_EMBED_LIMIT` | `5000` | hive-core | Reserved: mail embedding gate, lifted by the retrieval workstream |
+
+> **Gone from code:** `HIVE_MAIL_TICK` and `HIVE_MAIL_POLL_SECS` (the daemon's
+> cadence knobs — no scheduler reads anything today), and
+> `HIVE_TEST_STALWART_URL` / `_USER` / `_PASS` with `mail/tests/stalwart_e2e.rs`
+> (the `mail/` crate no longer exists). Setting any of them has no effect.
 
 ## Real-mailbox validation checklist
 
 Run once against `mail.beesroadhouse.com` after enabling mail on the box
-(and record the numbers in the journal):
+(and record the numbers in the journal). **Blocked today on the missing
+scheduler** — with nothing calling `Store::mail_sync_tick`, the
+sync-dependent items below cannot pass. Wiring an interval spawn into
+`hive-api` is the prerequisite, and this checklist is how to prove it works.
 
 - [ ] Connect the real account; session discovery accepts the credential.
 - [ ] Opt the Inbox (and chosen archives) into ingest; leave Junk out.
@@ -128,8 +172,8 @@ Run once against `mail.beesroadhouse.com` after enabling mail on the box
 - [ ] Search a known phrase from old mail; the message surfaces next to
       journal results.
 - [ ] **Delete-in-Stalwart propagates**: delete a test message in Stalwart
-      (webmail/IMAP); within one poll interval (`HIVE_MAIL_POLL_SECS`,
-      default 5 min) it is tombstoned here and gone from search.
+      (webmail/IMAP); within one poll interval it is tombstoned here and
+      gone from search.
 - [ ] **Ingest-toggle drops FTS rows**: untick a mailbox; its messages
       leave search immediately (rows stay, D6 semantics). Re-tick; backfill
       re-arms and re-indexes with zero duplicates.

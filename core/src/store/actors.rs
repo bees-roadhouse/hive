@@ -278,14 +278,17 @@ async fn remove_in_tx(conn: &mut PgConnection, slug: &str) -> Result<ActorDelete
     }
 
     // 3. journal.mentions scrub on surviving entries (other authors who @mentioned slug).
-    let mention_rows: Vec<(String, String)> =
-        crate::pgq::query_as("SELECT id, mentions FROM journal WHERE mentions LIKE ?")
-            .bind(&like)
-            .fetch_all(&mut *conn)
-            .await?;
+    // mentions is jsonb: containment probe, ::text out for the string helpers,
+    // ::jsonb back in on write.
+    let mention_rows: Vec<(String, String)> = crate::pgq::query_as(
+        "SELECT id, mentions::text FROM journal WHERE mentions @> jsonb_build_array(?)",
+    )
+    .bind(slug)
+    .fetch_all(&mut *conn)
+    .await?;
     for (id, mentions) in &mention_rows {
         if let Some(next) = without_slug(mentions, slug) {
-            crate::pgq::query("UPDATE journal SET mentions = ? WHERE id = ?")
+            crate::pgq::query("UPDATE journal SET mentions = ?::jsonb WHERE id = ?")
                 .bind(&next)
                 .bind(id)
                 .execute(&mut *conn)
@@ -513,15 +516,17 @@ async fn merge_in_tx(conn: &mut PgConnection, from: &str, to: &str) -> Result<Ac
     .await?;
 
     // journal.mentions: rewrite from→to (dedupe) on every entry that mentioned from.
+    // mentions is jsonb: containment probe, ::text out, ::jsonb back in.
     let like = format!("%\"{from}\"%");
-    let mention_rows: Vec<(String, String)> =
-        crate::pgq::query_as("SELECT id, mentions FROM journal WHERE mentions LIKE ?")
-            .bind(&like)
-            .fetch_all(&mut *conn)
-            .await?;
+    let mention_rows: Vec<(String, String)> = crate::pgq::query_as(
+        "SELECT id, mentions::text FROM journal WHERE mentions @> jsonb_build_array(?)",
+    )
+    .bind(from)
+    .fetch_all(&mut *conn)
+    .await?;
     for (id, mentions) in &mention_rows {
         if let Some(next) = replace_slug(mentions, from, to) {
-            crate::pgq::query("UPDATE journal SET mentions = ? WHERE id = ?")
+            crate::pgq::query("UPDATE journal SET mentions = ?::jsonb WHERE id = ?")
                 .bind(&next)
                 .bind(id)
                 .execute(&mut *conn)

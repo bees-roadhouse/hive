@@ -25,7 +25,7 @@ import type {
 } from "@hive/shared";
 import { TASK_STATUSES } from "@hive/shared";
 import { A, useSearchParams } from "@solidjs/router";
-import { api, getDoneRetentionHours, setDoneRetentionHours } from "./api.ts";
+import { api, getDoneRetentionHours, isQueuedWrite, setDoneRetentionHours } from "./api.ts";
 import { liveRev } from "./live.ts";
 import { Icon } from "./icons.tsx";
 import { DECISION_GLYPH, highlightSnippet, relTime, SkeletonList, TASK_GLYPH } from "./lib.tsx";
@@ -163,7 +163,15 @@ export const Tasks: Component = () => {
 
   const cycle = async (t: Task) => {
     const next = TASK_STATUSES[(TASK_STATUSES.indexOf(t.status) + 1) % TASK_STATUSES.length];
-    await api.patchTask(t.id, { status: next });
+    try {
+      await api.patchTask(t.id, { status: next, base_updated_at: t.updated_at });
+    } catch (e) {
+      if (!isQueuedWrite(e)) throw e;
+      // Queued offline: show the flip now; the refetch would only snap the
+      // card back to the cached (pre-flip) list.
+      mutate((prev) => (prev ?? []).map((x) => (x.id === t.id ? { ...x, status: next } : x)));
+      return;
+    }
     refetch();
   };
 
@@ -232,10 +240,15 @@ export const Tasks: Component = () => {
       const status = key as TaskStatus;
       mutate((prev) => (prev ?? []).map((x) => (x.id === id ? { ...x, status } : x)));
       try {
-        await api.patchTask(id, { status });
-      } finally {
+        await api.patchTask(id, { status, base_updated_at: t.updated_at });
+      } catch (e) {
+        // Queued offline: keep the optimistic move (a refetch would read the
+        // stale cache). A real failure still snaps back to server truth.
+        if (isQueuedWrite(e)) return;
         refetch();
+        throw e;
       }
+      refetch();
     } else {
       // Reassign: a single-owner column means the dropped task becomes owned by
       // that one person (UNASSIGNED clears assignees). No-op if already there.
@@ -245,10 +258,13 @@ export const Tasks: Component = () => {
       if (same) return;
       mutate((prev) => (prev ?? []).map((x) => (x.id === id ? { ...x, assignees: next } : x)));
       try {
-        await api.patchTask(id, { assignees: next });
-      } finally {
+        await api.patchTask(id, { assignees: next, base_updated_at: t.updated_at });
+      } catch (e) {
+        if (isQueuedWrite(e)) return;
         refetch();
+        throw e;
       }
+      refetch();
     }
   };
 
@@ -672,7 +688,7 @@ export const Wire: Component = () => {
 // ---- People view ----
 
 export const PeopleView: Component = () => {
-  const [people, { refetch }] = createResource(() => ({ _r: liveRev() }), () => api.people());
+  const [people, { refetch, mutate }] = createResource(() => ({ _r: liveRev() }), () => api.people());
   const [editing, setEditing] = createSignal<string | null>(null);
   const [bio, setBio] = createSignal("");
   const [role, setRole] = createSignal("");
@@ -682,7 +698,14 @@ export const PeopleView: Component = () => {
     setRole(p.role ?? "");
   };
   const save = async (slug: string) => {
-    await api.patchPerson(slug, { bio: bio(), role: role() });
+    const patch = { bio: bio(), role: role() };
+    try {
+      await api.patchPerson(slug, patch);
+    } catch (e) {
+      if (!isQueuedWrite(e)) throw e;
+      // Queued offline: show the edit locally until the replay confirms it.
+      mutate((prev) => (prev ?? []).map((p) => (p.slug === slug ? { ...p, ...patch } : p)));
+    }
     setEditing(null);
     refetch();
   };

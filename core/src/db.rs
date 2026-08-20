@@ -207,13 +207,18 @@ const SCHEMA: &str = r#"
       author     TEXT NOT NULL,
       body       TEXT NOT NULL,
       tags       TEXT NOT NULL DEFAULT '[]',
-      mentions   TEXT NOT NULL DEFAULT '[]',
+      -- JSONB (reshaped from TEXT by migration 0003): the RLS read predicate
+      -- and the store's mention probes use @> containment against it, which
+      -- the GIN index below serves. The wire shape is unchanged — a string
+      -- array serializes identically either way.
+      mentions   JSONB NOT NULL DEFAULT '[]',
       -- Namespace owner: the human user this entry belongs to. NULL = global /
       -- "continuous" history visible to everyone. Non-NULL = visible only to
       -- that user (+ admins). See the Visibility model in middleware.rs.
       user_scope TEXT,
       created_at TEXT NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS journal_mentions_gin ON journal USING gin (mentions jsonb_path_ops);
 
     -- A span of a journal entry that produced a structured entity.
     CREATE TABLE IF NOT EXISTS anchors (
@@ -1048,7 +1053,7 @@ fn journal_read_predicate() -> String {
                     AND s.viewer = {ACTING_USER} \
                     AND ((s.scope = 'entry' AND s.ref = journal.id) \
                       OR (s.scope = 'journal' AND s.ref = journal.author))) \
-            OR journal.mentions LIKE '%\"' || {ACTING_USER} || '\"%' \
+            OR journal.mentions @> jsonb_build_array({ACTING_USER}) \
          )))"
     )
 }
@@ -1328,10 +1333,22 @@ async fn apply_org_policies(conn: &mut sqlx::PgConnection) -> Result<()> {
         }
     }
 
+    // Bare index names resolve down search_path: on a shared database whose
+    // public schema holds another install's tables, `DROP INDEX IF EXISTS
+    // projects_name_key` falls through to public and either errors on the
+    // constraint that owns the index there or silently eats it. Qualify with
+    // the current schema so these statements can only act on objects this
+    // migrate owns. (Everything else in this pass is already safe: policies
+    // and constraints are reached through `ALTER TABLE {table}` /
+    // `ON {table}`, and CREATE INDEX always lands in its table's schema.)
+    let schema: String = crate::pgq::query_scalar::<String>("SELECT current_schema()")
+        .fetch_one(&mut *tx)
+        .await?;
+
     for (table, index, cols) in ORG_UNIQUE_REBUILDS {
         for sql in [
             format!("ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {index}"),
-            format!("DROP INDEX IF EXISTS {index}"),
+            format!("DROP INDEX IF EXISTS \"{schema}\".{index}"),
             format!(
                 "CREATE UNIQUE INDEX IF NOT EXISTS {table}_org_uniq ON {table} (org_id, {cols})"
             ),
@@ -1344,11 +1361,12 @@ async fn apply_org_policies(conn: &mut sqlx::PgConnection) -> Result<()> {
     }
     // cc_sessions' capture-dedup index is partial, so it is rebuilt on its own.
     for sql in [
-        "DROP INDEX IF EXISTS cc_sessions_captured_ext",
+        format!("DROP INDEX IF EXISTS \"{schema}\".cc_sessions_captured_ext"),
         "CREATE UNIQUE INDEX IF NOT EXISTS cc_sessions_captured_ext ON cc_sessions \
-         (org_id, runtime, claude_session_id) WHERE origin = 'captured'",
+         (org_id, runtime, claude_session_id) WHERE origin = 'captured'"
+            .to_string(),
     ] {
-        sqlx::raw_sql(sql).execute(&mut *tx).await?;
+        sqlx::raw_sql(&sql).execute(&mut *tx).await?;
     }
     // `profile` is keyed on an actor slug, which is only unique inside an org
     // now — so its PRIMARY KEY has to move too, or two orgs cannot both have a

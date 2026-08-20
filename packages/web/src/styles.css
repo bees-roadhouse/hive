@@ -1911,6 +1911,49 @@ button.x.danger { color: var(--danger); }
 .dot-pulse, .chat-dot.st-provisioning, .chat-dot.st-running { animation: dot-pulse 1.6s ease-in-out infinite; }
 @keyframes dot-pulse { 50% { opacity: 0.3; } }
 
+/* ---- offline sync: status pill + conflict drawer ----
+   The pill only appears when there's something to say (offline, queued
+   writes, conflicts). It sits above content at the corner, quiet graphite
+   unless something needs a human — danger is reserved for that, per the
+   color rule at the top of this file. */
+.sync-pill {
+  position: fixed; right: 1rem; bottom: 1rem; z-index: 20;
+  display: flex; align-items: center; gap: 0.5rem;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-pill);
+  padding: 0.4rem 0.8rem; color: var(--dim); font: inherit; font-size: var(--fs-sm);
+  cursor: pointer; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  transition: color var(--t-base) ease, border-color var(--t-base) ease;
+}
+.sync-pill:hover { color: var(--ink); border-color: var(--dim); }
+
+.sync-section-head {
+  margin: var(--sp-4) 0 var(--sp-2); font-size: var(--fs-sm); font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.04em; color: var(--dim);
+}
+
+/* A queued write that met the world: kind badge, label, when — then the
+   state-specific body (diff grid for a 409, a note for a 404 or a failure),
+   then the human's choices. Danger left border only while it needs a call. */
+.conflict-card {
+  border: 1px solid var(--line); border-left: 3px solid var(--danger);
+  border-radius: var(--r-md); padding: 0.6rem 0.7rem; margin: 0 0 0.6rem;
+  background: var(--panel2);
+}
+.conflict-card-queued { border-left-color: var(--line); }
+.conflict-head { display: flex; align-items: center; gap: 0.5rem; }
+.conflict-head .conflict-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-sm); }
+.conflict-note { margin: 0.45rem 0 0; line-height: 1.5; }
+
+.conflict-grid {
+  display: grid; grid-template-columns: 6.5rem 1fr 1fr; gap: 0.15rem 0.6rem;
+  margin-top: 0.5rem; font-size: var(--fs-sm);
+  border-top: 1px dashed var(--line); padding-top: 0.45rem;
+}
+.conflict-field-name { color: var(--ink); overflow-wrap: anywhere; }
+.conflict-mine { color: var(--accent); overflow-wrap: anywhere; }
+.conflict-theirs { color: var(--dim); overflow-wrap: anywhere; }
+.conflict-actions { display: flex; gap: 0.5rem; margin-top: 0.6rem; }
+
 /* ---- reduced motion: one master switch ----
    Everything stops except meaning-bearing progress (spinner) — status-dot
    pulses go static at full opacity. */
