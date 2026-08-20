@@ -2,15 +2,15 @@
 
 > **Hosted-era runbook; the daemon it was written against is gone.** The
 > current shape: mail sync is the `jmap-sync/` library (no Hive types, no
-> database) driven by `Store::mail_sync_tick` in `hive-core`
-> (`core/src/store/mail_sync.rs`), and the mail archive plus the `/api/mail/*`
-> routes live in `hive-api` behind `HIVE_MAIL_ENABLED`. Two operational facts
-> override whole sections below:
+> database), and the mail archive plus the `/api/mail/*` routes live in
+> `hive-api` behind `HIVE_MAIL_ENABLED`. Two operational facts override whole
+> sections below:
 >
-> * **No shipped binary currently schedules the tick.** `hive-api` spawns the
->   artifact sweeper and nothing else; `mail_sync_tick` has no caller outside
->   its own tests. Connecting an account stores it, and until a scheduler is
->   wired in, nothing backfills or polls.
+> * **There is no driver at all any more.** `Store::mail_sync_tick` lived in
+>   `core/src/store/mail_sync.rs`, a file that was never `mod`-declared after
+>   the #137 pivot and has now been deleted. `hive-api` spawns the artifact
+>   sweeper and nothing else, and no code path can reach `jmap-sync`.
+>   Connecting an account stores it; nothing backfills, polls, or sends.
 > * The cadence knobs this file documents — `HIVE_MAIL_TICK`,
 >   `HIVE_MAIL_POLL_SECS` — exist nowhere in code, and the CI e2e it pins is
 >   not run by `.github/workflows/ci.yml` (the `ci/stalwart/` harness remains,
@@ -158,9 +158,10 @@ Two pins to maintain when upgrading the mail server:
 
 Run once against `mail.beesroadhouse.com` after enabling mail on the box
 (and record the numbers in the journal). **Blocked today on the missing
-scheduler** — with nothing calling `Store::mail_sync_tick`, the
-sync-dependent items below cannot pass. Wiring an interval spawn into
-`hive-api` is the prerequisite, and this checklist is how to prove it works.
+driver** — `Store::mail_sync_tick` no longer exists, so the sync-dependent
+items below cannot pass. Rebuilding a driver over `jmap-sync` and scheduling
+it in `hive-api` is the prerequisite, and this checklist is how to prove it
+works.
 
 - [ ] Connect the real account; session discovery accepts the credential.
 - [ ] Opt the Inbox (and chosen archives) into ingest; leave Junk out.

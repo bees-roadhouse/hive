@@ -8,7 +8,7 @@
     {
       "name": "hive-memory",
       "source": "./plugins/claude-code-hive-memory",
-      "description": "Boot Claude Code as a known Hive identity: recall brief at session start, identity skills/agents/commands sync, Hive MCP tools, and transcript capture into Conversations for reflection."
+      "description": "NOT WORKING — do not install. Targets the removed hive-bridge stdio transport, so its MCP server fails to spawn and both hooks soft-fail. Connect Claude Code to POST /mcp on your hive instead; see the plugin README."
     }
   ]
 }

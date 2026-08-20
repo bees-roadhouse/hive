@@ -15,7 +15,7 @@ services:
     # .so (same PG major, same data dir — an in-place restart on hive-pgdata).
     # Community image: NOT on the gcr mirror, so it pulls from docker.io;
     # digest-pinned to keep the retag-not-rebuild story honest. Take a pg_dump
-    # + volume snapshot before the first swap (docker/README runbook).
+    # + volume snapshot before the first swap.
     image: docker.io/pgvector/pgvector:pg17@sha256:d2ef61f42ef767baa5a1475393303cc235bcd92febd9d7014eddb48b41f3bad0
     environment:
       - POSTGRES_USER=hive

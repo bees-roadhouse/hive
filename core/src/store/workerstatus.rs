@@ -1,32 +1,14 @@
-// Worker heartbeat + status composition (store.ts setHeartbeat/setLastRun/
-// workerStatus). Owned by the admin workstream.
+// Worker status composition (store.ts workerStatus). Owned by the admin
+// workstream. The WRITE half is gone with the Node worker that was the only
+// caller: `heartbeat` and `last_run` read as NULL until something schedules
+// work again and brings its own writer.
 
 use anyhow::Result;
 use hive_shared::{WorkerEmbeddingCounts, WorkerLastRun, WorkerSourceCounts, WorkerStatus};
 
-use super::{now_iso, Store};
+use super::Store;
 
 impl Store {
-    pub async fn worker_set_heartbeat(&self) -> Result<()> {
-        crate::pgq::query(
-            "INSERT INTO worker_status (id, heartbeat) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET heartbeat = excluded.heartbeat",
-        )
-        .bind(now_iso())
-        .execute(self.db())
-        .await?;
-        Ok(())
-    }
-
-    pub async fn worker_set_last_run(&self, stats: &WorkerLastRun) -> Result<()> {
-        crate::pgq::query(
-            "INSERT INTO worker_status (id, last_run) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET last_run = excluded.last_run",
-        )
-        .bind(serde_json::to_string(stats)?)
-        .execute(self.db())
-        .await?;
-        Ok(())
-    }
-
     pub async fn worker_status(&self) -> Result<WorkerStatus> {
         let row: Option<(Option<String>, Option<String>)> =
             crate::pgq::query_as("SELECT heartbeat, last_run FROM worker_status WHERE id = 1")

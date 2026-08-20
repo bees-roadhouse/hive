@@ -99,8 +99,6 @@ export const setDoneRetentionHours = (hours: number): void =>
 // online 409 is the same conflict a replayed write hits, so it goes to the
 // same human surface rather than throwing at the call site.
 
-export const isOffline = (): boolean => !navigator.onLine;
-
 /** Thrown (in place of a result) when a write was queued for later replay or
  *  parked as a conflict. Call sites catch it and treat the write as accepted. */
 export class QueuedWrite extends Error {

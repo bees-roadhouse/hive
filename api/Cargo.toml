@@ -11,7 +11,6 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 axum = { workspace = true }
@@ -23,7 +22,6 @@ pgvector = { workspace = true }
 reqwest = { workspace = true }
 
 hive-shared = { workspace = true }
-hive-embed = { workspace = true }
 hive-core = { path = "../core" }
 
 # Auth
@@ -40,7 +38,6 @@ nanoid = { workspace = true }
 uuid = { workspace = true }
 dotenvy = { workspace = true }
 async-stream = "0.3"
-futures = "0.3"
 urlencoding = "2.1"
 # ReaderStream: an AsyncRead from the artifact storage driver becomes a
 # streaming response body without buffering the object.
@@ -51,3 +48,9 @@ tempfile = "3"
 # Tests wrap the storage driver's write trait to interleave an upload with a
 # concurrent delete at an exact point (tests/artifacts.rs).
 async-trait = { workspace = true }
+# Test-only: streaming upload bodies (tests/artifacts.rs) and the concurrent
+# OAuth-code redemption race (tests/privilege_escalation.rs).
+futures = "0.3"
+# Test-only: tests seed embedding rows and install a fake 384-dim provider.
+# The binary reaches the embedder through hive-core, not directly.
+hive-embed = { workspace = true }

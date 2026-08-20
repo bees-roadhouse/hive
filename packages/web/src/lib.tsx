@@ -1,5 +1,5 @@
 import { For, type JSX } from "solid-js";
-import type { AnchorKind, DecisionStatus, ResolvedAnchor, TaskStatus } from "@hive/shared";
+import type { AnchorKind, DecisionStatus, TaskStatus } from "@hive/shared";
 
 export const ANCHOR_GLYPH: Record<AnchorKind, string> = {
   task: "◻",
@@ -53,52 +53,6 @@ export const relTime = (iso: string) => {
   if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
   return new Date(iso).toLocaleDateString();
 };
-
-/**
- * Render journal prose with its anchored spans highlighted (click → onAnchor)
- * and @mentions chipped. `anchors` are server-resolved with start/end offsets.
- */
-export function Prose(props: {
-  body: string;
-  anchors: ResolvedAnchor[];
-  onAnchor?: (a: ResolvedAnchor) => void;
-}): JSX.Element {
-  const sorted = () => [...props.anchors].sort((a, b) => a.start - b.start);
-
-  // Build a flat list of segments: anchored spans + the plain text between them.
-  const segments = () => {
-    const segs: ({ type: "plain"; text: string } | { type: "anchor"; a: ResolvedAnchor })[] = [];
-    let cursor = 0;
-    for (const a of sorted()) {
-      if (a.start > cursor) segs.push({ type: "plain", text: props.body.slice(cursor, a.start) });
-      segs.push({ type: "anchor", a });
-      cursor = Math.max(cursor, a.end);
-    }
-    if (cursor < props.body.length) segs.push({ type: "plain", text: props.body.slice(cursor) });
-    return segs;
-  };
-
-  return (
-    <p class="prose">
-      <For each={segments()}>
-        {(seg) =>
-          seg.type === "plain" ? (
-            <Mentions text={seg.text} />
-          ) : (
-            <span
-              class={`anchor anchor-${seg.a.kind}`}
-              title={`${seg.a.kind} — click to open`}
-              onClick={() => props.onAnchor?.(seg.a)}
-            >
-              {seg.a.text}
-              <sup>{ANCHOR_GLYPH[seg.a.kind]}</sup>
-            </span>
-          )
-        }
-      </For>
-    </p>
-  );
-}
 
 /** Wrap @mentions in chips. */
 export function Mentions(props: { text: string }): JSX.Element {

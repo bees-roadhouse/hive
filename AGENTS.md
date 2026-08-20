@@ -71,7 +71,10 @@ lag the current architecture (see Known Documentation Drift).
   dependency ... the consumer implements `CursorStore` and `MailSink`. The
   `jmap-client` dependency is contained in `client.rs`, so replacing it with
   reqwest+serde stays a one-module rewrite. Mail routes and the store's mail
-  archive live behind `HIVE_MAIL_ENABLED`.
+  archive live behind `HIVE_MAIL_ENABLED`. It currently has NO consumer: the
+  driver that implemented those traits died with the #137 pivot, so the
+  library builds and tests but nothing in the tree can invoke it. Rebuilding
+  the driver or dropping the crate is an open decision.
 - `packages/web`: the SolidJS SPA (vite, TipTap editor), served in production
   by `hive-api` from `HIVE_WEB_DIST`. `packages/shared` holds the TypeScript
   domain types it shares with the API's wire shapes.
@@ -297,17 +300,20 @@ Prioritize these when reviewing before real use:
 
 ## Known Documentation Drift
 
-- `README.md` still describes the local-first desktop app: op-log storage,
-  crypto-shred, a Dioxus shell, a stdio bridge. None of that is in the tree.
-- `RUST_REWRITE.md` has useful notes on the Node-to-Rust port, but it predates
-  orgs and RLS, and the worker binary it names is gone.
-- `docs/mail-ops.md` describes hosted-era mail operations against a compose
-  stack that no longer matches. Mail routes and the mail archive do exist,
-  behind `HIVE_MAIL_ENABLED`.
-- `plugins/claude-code-hive-memory/` and `integrations/claude-desktop/` both
-  tell the reader to `cargo install --path bridge` and run `hive-bridge` on
-  stdio. There is no bridge crate; MCP is `POST /mcp` on `hive-api`.
-- `docs/ARTIFACTS.md` and `docs/SELF-HOST.md` predate the current shape in
-  places (blockstore naming, a Node `hive-server`).
+- The pre-#137 notes all carry supersession banners now: `RUST_REWRITE.md`,
+  `docs/DIRECTION.md`, `docs/PLAN.md`, `docs/PLAN-v2.1.md`, `docs/SELF-HOST.md`,
+  `docs/ARTIFACTS.md`. They are history and say so at the top. Read them for
+  why a decision was made, never for what the tree looks like, and do not
+  "fix" them into describing the current shape.
+- `docs/mail-ops.md` is a hosted-era runbook. Its banner is accurate about the
+  cadence knobs and the missing scheduler, but it still names
+  `core/src/store/mail_sync.rs` as the driver and that file is gone. Mail
+  routes and the mail archive are real, behind `HIVE_MAIL_ENABLED`; nothing in
+  the tree drives sync or send.
+- `plugins/claude-code-hive-memory/` and `integrations/claude-desktop/`: both
+  READMEs are honest tombstones, but the machine-readable parts they describe
+  (`.mcp.json`, `hooks-handlers/*.mjs`, `mcpb/manifest.json`) still spawn a
+  `hive-bridge` binary that does not exist. They are kept as porting targets
+  for an HTTP rewrite against `POST /mcp`, not as working config.
 
 Fix these docs when touching the related area.
