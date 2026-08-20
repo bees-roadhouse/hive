@@ -54,12 +54,22 @@ import type {
 // Vite proxies /api → hive-api in dev (see vite.config.ts).
 // Identity is the authenticated user (v0.1.1) — set once auth resolves, read by
 // the journal/inbox views. No more spoofable localStorage actor.
+import { READS, idbClear, idbGet, idbPut } from "./idb.ts";
+import {
+  enqueue,
+  parseConflictRow,
+  setIdentityGetter,
+  type OutboxKind,
+  type OutboxOp,
+} from "./outbox.ts";
+
 let currentUser: SafeUser | null = null;
 export const setCurrentUser = (u: SafeUser | null) => {
   currentUser = u;
 };
 export const getCurrentUser = () => currentUser;
 export const getActor = () => currentUser?.actor ?? "nate";
+setIdentityGetter(() => currentUser?.id);
 
 // Done-retention: how long (in hours) a DONE task stays visible before it's
 // hidden by default. The Tasks board respects this unless "show done" is toggled.
@@ -74,23 +84,279 @@ export const getDoneRetentionHours = (): number => {
 export const setDoneRetentionHours = (hours: number): void =>
   localStorage.setItem(DONE_RETENTION_KEY, String(hours));
 
-async function req<T>(path: string, init?: RequestInit, timeoutMs = 15000): Promise<T> {
+// ---- offline layer (docs/DECISION-offline-conflict-model.md) ----
+//
+// Reads: network-first; every successful GET populates the IndexedDB read
+// cache, and when the network is gone the cache answers instead. A cache, not
+// local-first — no TTLs, no optimistic writes into it; SSE bumps still drive
+// refetch exactly as before.
+//
+// Writes: the queueable surface below enqueues on a NETWORK failure (never on
+// a 4xx, which is the server answering, not the network failing) and replay is
+// the outbox's job. Creates mint their id here at call time — the first
+// attempt already carries it, so a lost response followed by a replay can
+// never double-land. Patches carry the base updated_at the caller read. An
+// online 409 is the same conflict a replayed write hits, so it goes to the
+// same human surface rather than throwing at the call site.
+
+export const isOffline = (): boolean => !navigator.onLine;
+
+/** Thrown (in place of a result) when a write was queued for later replay or
+ *  parked as a conflict. Call sites catch it and treat the write as accepted. */
+export class QueuedWrite extends Error {
+  op: OutboxOp;
+  constructor(op: OutboxOp) {
+    super(`queued for replay: ${op.label}`);
+    this.op = op;
+  }
+}
+export const isQueuedWrite = (e: unknown): e is QueuedWrite => e instanceof QueuedWrite;
+
+// The server mints ids as `{prefix}_{nanoid(12)}` (core/src/store/mod.rs);
+// client-minted ids match that shape so server-side validation can pin the
+// endpoint's namespace. The alphabet is nanoid's default 64-char url-safe set.
+const NANOID_ALPHABET = "_-0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+function nanoid(size = 12): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(size));
+  let id = "";
+  for (let i = 0; i < size; i++) id += NANOID_ALPHABET[bytes[i] & 63];
+  return id;
+}
+
+interface QueueRoute {
+  kind: OutboxKind;
+  /** Creates: the id namespace this endpoint owns. */
+  idPrefix?: string;
+  label: (path: string, body: Record<string, unknown> | undefined) => string;
+}
+
+const tail = (p: string) => p.split("/").pop() ?? p;
+const snippet = (v: unknown, n = 48): string => {
+  if (typeof v !== "string") return "";
+  const oneLine = v.replace(/\s+/g, " ").trim();
+  return oneLine.length > n ? `${oneLine.slice(0, n)}…` : oneLine;
+};
+const patchKeys = (b: Record<string, unknown> | undefined): string =>
+  Object.keys(b ?? {}).filter((k) => k !== "base_updated_at" && k !== "id").join(", ") || "update";
+
+// What the offline queue replays. Admin, mail, workspace, and credential
+// writes are deliberately absent: they stay online-only per the decision doc
+// (and secrets never sit in IndexedDB).
+const QUEUE_ROUTES: { method: string; re: RegExp; route: QueueRoute }[] = [
+  {
+    method: "POST",
+    re: /^\/journal$/,
+    route: {
+      kind: "create",
+      idPrefix: "jrnl",
+      label: (_p, b) => `journal entry — “${snippet(b?.body)}”`,
+    },
+  },
+  {
+    method: "PATCH",
+    re: /^\/tasks\/[^/]+$/,
+    route: { kind: "patch", label: (p, b) => `task ${tail(p)} — set ${patchKeys(b)}` },
+  },
+  {
+    method: "PATCH",
+    re: /^\/decisions\/[^/]+$/,
+    route: { kind: "patch", label: (p, b) => `decision ${tail(p)} — set ${patchKeys(b)}` },
+  },
+  {
+    method: "POST",
+    re: /^\/inbox\/item\/[^/]+\/read$/,
+    route: { kind: "action", label: (p) => `mark inbox item ${tail(p.split("/")[3] ?? p)} read` },
+  },
+  {
+    method: "POST",
+    re: /^\/inbox\/[^/]+\/read$/,
+    route: { kind: "action", label: (p) => `mark all read for ${p.split("/")[2] ?? "inbox"}` },
+  },
+  {
+    method: "POST",
+    re: /^\/people$/,
+    route: { kind: "create", idPrefix: "per", label: (_p, b) => `add person “${snippet(b?.name, 24)}”` },
+  },
+  {
+    method: "PATCH",
+    re: /^\/people\/[^/]+$/,
+    route: { kind: "patch", label: (p, b) => `person ${tail(p)} — set ${patchKeys(b)}` },
+  },
+  {
+    method: "POST",
+    re: /^\/sources$/,
+    route: { kind: "create", idPrefix: "src", label: (_p, b) => `add source “${snippet(b?.name, 24)}”` },
+  },
+  {
+    method: "PATCH",
+    re: /^\/sources\/[^/]+$/,
+    route: { kind: "patch", label: (p, b) => `source ${tail(p)} — set ${patchKeys(b)}` },
+  },
+  {
+    method: "DELETE",
+    re: /^\/sources\/[^/]+$/,
+    route: { kind: "delete", label: (p) => `delete source ${tail(p)}` },
+  },
+  {
+    method: "POST",
+    re: /^\/shares$/,
+    route: { kind: "create", idPrefix: "shr", label: (_p, b) => `share with ${snippet(b?.viewer, 24)}` },
+  },
+  {
+    method: "POST",
+    re: /^\/entities$/,
+    route: { kind: "create", idPrefix: "ent", label: (_p, b) => `add ${snippet(b?.type, 16)} “${snippet(b?.title, 24)}”` },
+  },
+  {
+    method: "PATCH",
+    re: /^\/entities\/[^/]+$/,
+    route: { kind: "patch", label: (p, b) => `entity ${tail(p)} — set ${patchKeys(b)}` },
+  },
+  {
+    method: "DELETE",
+    re: /^\/entities\/[^/]+$/,
+    route: { kind: "delete", label: (p) => `delete entity ${tail(p)}` },
+  },
+];
+
+function matchQueueRoute(method: string, path: string): QueueRoute | null {
+  // Query strings never appear on the write surface, but match on the bare
+  // path so a future caller can't slip past the allowlist with one.
+  const bare = path.split("?")[0];
+  for (const r of QUEUE_ROUTES) {
+    if (r.method === method && r.re.test(bare)) return r.route;
+  }
+  return null;
+}
+
+async function cacheGet<T>(path: string): Promise<T | undefined> {
+  try {
+    return await idbGet<T>(READS, path);
+  } catch {
+    return undefined;
+  }
+}
+
+function cachePut(path: string, value: unknown): void {
+  idbPut(READS, value, path).catch((e) => console.warn("read-cache put failed", e));
+}
+
+/** Logout hygiene: the cache is per-browser, so drop it when the session ends
+ *  rather than leave one user's journal readable by the next. */
+export async function clearReadCache(): Promise<void> {
+  try {
+    await idbClear(READS);
+  } catch (e) {
+    console.warn("read-cache clear failed", e);
+  }
+}
+
+async function doFetch(path: string, init: RequestInit | undefined, timeoutMs: number): Promise<Response> {
   // Bound every call so a slow/cold API (e.g. just-restarted hive-api) can't hang
   // the UI indefinitely — the caller gets a rejection it can retry.
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(new Error("request timed out")), timeoutMs);
   try {
-    const res = await fetch(`/api${path}`, {
+    return await fetch(`/api${path}`, {
       ...init,
       credentials: "include", // send the session cookie
       signal: ctrl.signal,
       headers: { "content-type": "application/json", ...init?.headers },
     });
-    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
-    return (res.status === 204 ? undefined : await res.json()) as T;
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function reqGet<T>(path: string, timeoutMs: number): Promise<T> {
+  if (navigator.onLine) {
+    let res: Response;
+    try {
+      res = await doFetch(path, undefined, timeoutMs);
+    } catch (e) {
+      // The network failed (or onLine lied): answer from the cache if we can.
+      const hit = await cacheGet<T>(path);
+      if (hit !== undefined) return hit;
+      throw e;
+    }
+    if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+    const data = (await res.json()) as T;
+    cachePut(path, data);
+    return data;
+  }
+  const hit = await cacheGet<T>(path);
+  if (hit !== undefined) return hit;
+  // Offline with nothing cached: try the wire anyway — onLine is advisory.
+  const res = await doFetch(path, undefined, timeoutMs);
+  if (!res.ok) throw new Error(`${res.status} ${await res.text()}`);
+  const data = (await res.json()) as T;
+  cachePut(path, data);
+  return data;
+}
+
+async function reqWrite<T>(path: string, init: RequestInit, timeoutMs: number): Promise<T> {
+  const method = (init.method ?? "POST").toUpperCase();
+  const route = matchQueueRoute(method, path);
+  let bodyText = typeof init.body === "string" ? init.body : undefined;
+  let bodyObj: Record<string, unknown> | undefined;
+  if (bodyText) {
+    try {
+      bodyObj = JSON.parse(bodyText) as Record<string, unknown>;
+    } catch {
+      bodyObj = undefined;
+    }
+  }
+  if (route?.idPrefix && bodyObj && bodyObj.id === undefined) {
+    bodyObj.id = `${route.idPrefix}_${nanoid(12)}`;
+    bodyText = JSON.stringify(bodyObj);
+  }
+
+  let res: Response;
+  try {
+    res = await doFetch(path, { ...init, body: bodyText }, timeoutMs);
+  } catch (e) {
+    // Network error or timeout — never an HTTP status: the server didn't
+    // answer, so queue the write (if this endpoint is queueable) instead of
+    // losing it. A 4xx/5xx below still throws normally.
+    if (route) {
+      const op = await enqueue({
+        kind: route.kind,
+        method,
+        path,
+        body: bodyObj,
+        label: route.label(path, bodyObj),
+      });
+      throw new QueuedWrite(op);
+    }
+    throw e;
+  }
+
+  if (!res.ok) {
+    const text = await res.text();
+    if (route && res.status === 409) {
+      // Base precondition failed while online — park it as a conflict with the
+      // server's current row, exactly as a replayed write would surface.
+      const op = await enqueue({
+        kind: route.kind,
+        method,
+        path,
+        body: bodyObj,
+        label: route.label(path, bodyObj),
+        state: "conflict",
+        status: 409,
+        current: parseConflictRow(text),
+      });
+      throw new QueuedWrite(op);
+    }
+    throw new Error(`${res.status} ${text}`);
+  }
+  return (res.status === 204 ? undefined : await res.json()) as T;
+}
+
+async function req<T>(path: string, init?: RequestInit, timeoutMs = 15000): Promise<T> {
+  const method = (init?.method ?? "GET").toUpperCase();
+  if (method === "GET") return reqGet(path, timeoutMs);
+  return reqWrite(path, init ?? {}, timeoutMs);
 }
 
 export const api = {
@@ -191,7 +457,7 @@ export const api = {
     ),
 
   people: () => req<Person[]>("/people"),
-  addPerson: (p: { name: string; kind?: "human" | "ai" }) =>
+  addPerson: (p: { name: string; kind?: "human" | "ai"; id?: string }) =>
     req<Person>("/people", { method: "POST", body: JSON.stringify(p) }),
   patchPerson: (slug: string, patch: PersonPatch) =>
     req<Person>(`/people/${slug}`, { method: "PATCH", body: JSON.stringify(patch) }),

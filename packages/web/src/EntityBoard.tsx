@@ -9,7 +9,7 @@
 import { createMemo, createResource, createSignal, For, Show, type Component } from "solid-js";
 import { useParams } from "@solidjs/router";
 import type { CustomEntity, EntityFieldView, EntityTypeView } from "@hive/shared";
-import { api } from "./api.ts";
+import { api, isQueuedWrite } from "./api.ts";
 import { EntityList } from "./EntityList.tsx";
 import { kindForType } from "./kinds.ts";
 import { Icon } from "./icons.tsx";
@@ -135,12 +135,23 @@ const EntityForm: Component<{
     }
     try {
       if (props.existing) {
-        await api.patchEntity(props.existing.id, { title: title().trim(), fields, scope: scope() });
+        await api.patchEntity(props.existing.id, {
+          title: title().trim(),
+          fields,
+          scope: scope(),
+          base_updated_at: props.existing.updated_at,
+        });
       } else {
         await api.createEntity({ type: props.type.slug, title: title().trim(), fields, scope: scope() });
       }
       props.onDone();
     } catch (e2) {
+      // A queued offline write is accepted — close the form and let the
+      // outbox replay it on reconnect.
+      if (isQueuedWrite(e2)) {
+        props.onDone();
+        return;
+      }
       setErr(friendlyError(e2));
     } finally {
       setBusy(false);
@@ -155,6 +166,10 @@ const EntityForm: Component<{
       await api.deleteEntity(props.existing.id);
       props.onDone();
     } catch (e2) {
+      if (isQueuedWrite(e2)) {
+        props.onDone();
+        return;
+      }
       setErr(friendlyError(e2));
     } finally {
       setBusy(false);

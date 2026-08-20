@@ -65,6 +65,8 @@ export interface Share {
 }
 
 export interface NewShare {
+  /** Optional client-minted id (`shr_` + nanoid(12)) for idempotent offline replay. */
+  id?: string;
   scope: ShareScope;
   ref: string;
   viewer: string;
@@ -800,6 +802,8 @@ export interface Source {
 }
 
 export interface NewSource {
+  /** Optional client-minted id (`src_` + nanoid(12)) for idempotent offline replay. */
+  id?: string;
   name: string;
   url: string;
   kind?: SourceKind;
@@ -976,6 +980,10 @@ export interface NewAnchor {
 }
 
 export interface NewJournalEntry {
+  /** Optional client-minted id (`jrnl_` + nanoid(12)) from the offline outbox;
+   *  the server inserts ON CONFLICT DO NOTHING so a replayed append lands once.
+   *  See docs/DECISION-offline-conflict-model.md. */
+  id?: string;
   /** Optional legacy/client hint. The server overwrites authorship from auth. */
   author?: string;
   body: string;
@@ -983,8 +991,14 @@ export interface NewJournalEntry {
   anchors?: NewAnchor[];
 }
 
-export type TaskPatch = Partial<Pick<Task, "status" | "priority" | "assignees" | "title" | "body" | "tags">>;
-export type DecisionPatch = Partial<Pick<Decision, "status" | "title" | "context" | "decision" | "consequences" | "tags" | "assignees">>;
+/** Base-precondition for queue-and-reject: the `updated_at` the client's edit
+ *  was based on. A server-side mismatch answers 409 with the current row. */
+export interface BasePrecondition {
+  base_updated_at?: string;
+}
+
+export type TaskPatch = Partial<Pick<Task, "status" | "priority" | "assignees" | "title" | "body" | "tags">> & BasePrecondition;
+export type DecisionPatch = Partial<Pick<Decision, "status" | "title" | "context" | "decision" | "consequences" | "tags" | "assignees">> & BasePrecondition;
 
 /** Pull @mentions of known actors out of prose. */
 export function parseMentions(text: string): string[] {
@@ -1101,13 +1115,15 @@ export interface EntityTypePatch {
 }
 
 export interface NewCustomEntity {
+  /** Optional client-minted id (`ent_` + nanoid(12)) for idempotent offline replay. */
+  id?: string;
   type: string;
   title: string;
   fields?: Record<string, unknown>;
   scope?: "global" | "me";
 }
 
-export interface CustomEntityPatch {
+export interface CustomEntityPatch extends BasePrecondition {
   title?: string;
   /** Shallow merge; a JSON null clears that key. */
   fields?: Record<string, unknown>;
