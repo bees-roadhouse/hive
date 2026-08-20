@@ -118,7 +118,7 @@ password. That creates the admin user, the default org, and signs you in.
 | `DATABASE_URL` | ... | pgvector-capable PostgreSQL 17. The role needs `CREATEROLE`, or set `HIVE_APP_DATABASE_URL` to a serving role you provisioned |
 | `HIVE_CRED_KEY` | ... | Required. AES-GCM key for the mail credential vault. Back it up separately from the database |
 | `PORT` | `7878` | HTTP listener |
-| `HIVE_EMBED` | ONNX | `hash` for a deterministic offline embedder with no model download |
+| `HIVE_EMBED` | `transformers` | Default provider is BGE via ONNX, lazily downloaded. `hash` is a deterministic offline embedder with no model download |
 | `HIVE_WEB_DIST` | `packages/web/dist`, then `/app/web` | Where the built SPA lives |
 | `HIVE_PUBLIC_URL` | unset | Public origin for OAuth metadata. Also settable as the `instance.url` config value |
 | `HIVE_MAIL_ENABLED` | `0` | JMAP mail sync |
